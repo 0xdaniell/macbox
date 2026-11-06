@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 02:23:01 +0000
+Subject: [PATCH 5/9] coherent: a stale page is no surface's,
+ and a crash stops at one
+
+census_coherent_touch read the surface of a word before its state, and a stale
+page's id is a sentinel: any device access to a page of a surface that had gone
+crashed QEMU once anything was tracked. It also now waits for markers in motion,
+and address_space_unmap reports a write finished after a page was held again.
+
+The view is the guest's RAM, so it stays out of a core, and a core is capped at
+8 GiB. coherent.running in the census's directory survives a crash, a kill or the
+fuse, and until it is removed later starts run with no coherent pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/census.c     | 86 +++++++++++++++++++++++++++++++++++++++---
+ hw/display/apple-gfx.c |  4 ++
+ system/physmem.c       |  2 +
+ 3 files changed, 87 insertions(+), 5 deletions(-)
+
+diff --git a/accel/kvm/census.c b/accel/kvm/census.c
+index 3a3740675d..fb34f6f247 100644
+--- a/accel/kvm/census.c
++++ b/accel/kvm/census.c
+@@ -80,6 +80,7 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/resource.h>
+ #include <sys/stat.h>
+ #include <sys/syscall.h>
+ #include <time.h>
+@@ -99,6 +100,8 @@
+ #define RIP_SEEN_SLOTS (1 << 16)
+ #define POISON_TRIES 4
+ #define FREEZE_TRIES 4096
++#define WORK_WAIT_NS 1000000000
++#define CORE_LIMIT (8ULL << 30)
+ #define SPIN_LIMIT 100000 /* about 0.5 s of repeated SIGBUS on one page: real poison */
+ /* An -EFAULT unanswered this long is no race: first the markers go, then QEMU's fatal path. */
+ #define EFAULT_GAP_NS 5000000
+@@ -199,6 +202,9 @@ static struct {
+     bool active;
+     _Atomic bool dead;
+     char dir[3584];
++    char guard[3584 + 32];
++    /* QEMU's own accesses, by the state of the page. */
++    _Atomic uint64_t touches[8];
+     uint8_t *view;
+     uint8_t *main_map;
+     uint64_t len;
+@@ -1097,10 +1103,23 @@ void census_coherent_touch(void *main_ptr, uint64_t len, bool write)
+         return;
+     }
+     for (uint64_t p = off >> PG_SHIFT; p <= (off + len - 1) >> PG_SHIFT && p < census.pages; p++) {
+-        uint32_t w = atomic_load(&census.pg[p]), st = PW_ST(w), id = PW_ID(w);
++        uint32_t w = atomic_load(&census.pg[p]), st, id;
+ 
+-        if (w && census.surfaces[id].tracked &&
+-            (st == ST_ARMED || st == ST_FROZEN || (write && st == ST_HELD))) {
++        /* Markers moving: this access uses the main mapping, which no marker stops, so it waits. */
++        for (uint64_t start = 0; PW_ST(w) == ST_WORK; w = atomic_load(&census.pg[p])) {
++            start = start ? start : now_ns();
++            if (now_ns() - start > WORK_WAIT_NS) {
++                count_error("waiting for a page's markers", p);
++                break;
++            }
++            sched_yield();
++        }
++        st = PW_ST(w);
++        id = PW_ID(w);
++        atomic_fetch_add(&census.touches[st], 1);
++        /* Only these states hold a surface's id: a stale page's is not one. */
++        if ((st == ST_ARMED || st == ST_FROZEN || (write && st == ST_HELD)) &&
++            census.surfaces[id].tracked) {
+             census.ops.fault(census.ops.ctx, coh_addr(id, p), write);
+         }
+     }
+@@ -1587,6 +1606,11 @@ static void coherent_report(const char *label)
+     }
+     n = census.ops.report(census.ops.ctx, label, text, sizeof(text));
+     fwrite(text, 1, MIN(n, sizeof(text)), census.report);
++    fprintf(census.report, "{\"touches\":\"%s\",\"open\":%" PRIu64 ",\"armed\":%" PRIu64
++            ",\"held\":%" PRIu64 ",\"frozen\":%" PRIu64 ",\"stale\":%" PRIu64 "}\n", label,
++            atomic_load(&census.touches[ST_OPEN]), atomic_load(&census.touches[ST_ARMED]),
++            atomic_load(&census.touches[ST_HELD]), atomic_load(&census.touches[ST_FROZEN]),
++            atomic_load(&census.touches[ST_STALE]));
+     fflush(census.report);
+ }
+ 
+@@ -1698,10 +1722,53 @@ void census_flush(void)
+     write_lines();
+ }
+ 
+-static void census_at_exit(void)
++static void census_at_exit(int status, void *arg)
+ {
+     census_flush();
+     coherent_report("exit");
++    fprintf(stderr, "census: touches by QEMU: open %" PRIu64 " armed %" PRIu64 " held %" PRIu64
++            " frozen %" PRIu64 " stale %" PRIu64 " none %" PRIu64 "\n",
++            atomic_load(&census.touches[ST_OPEN]), atomic_load(&census.touches[ST_ARMED]),
++            atomic_load(&census.touches[ST_HELD]), atomic_load(&census.touches[ST_FROZEN]),
++            atomic_load(&census.touches[ST_STALE]), atomic_load(&census.touches[ST_NONE]));
++    /* Only an exit nothing went wrong in lets the next start use the markers. */
++    if (census.coherent && status == 0 && !atomic_load(&census.dead)) {
++        unlink(census.guard);
++    }
++}
++
++/*
++ * A coherent run leaves this file until it exits well: a crash, a kill or the fuse keep it, and
++ * every later start refuses the markers, so that the watchdog's restarts boot the plain VM and a
++ * fault here costs one crash. Removing the file allows the next try. It costs a clean stop that
++ * ended in SIGKILL one plain boot. A crash's core stays bounded too: the view holds no guest RAM
++ * for it, and the limit covers what grows beside it.
++ */
++static bool coherent_guard(void)
++{
++    struct rlimit core;
++    char text[64];
++    int fd, n;
++
++    snprintf(census.guard, sizeof(census.guard), "%s/coherent.running", census.dir);
++    fd = open(census.guard, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
++    if (fd < 0) {
++        fprintf(stderr, "census: %s: %s; the last coherent run did not end well. Starting "
++                "without coherent pages until that file is removed\n", census.guard,
++                errno == EEXIST ? "present" : strerror(errno));
++        return false;
++    }
++    n = snprintf(text, sizeof(text), "pid %d at %.0f\n", getpid(), census_time());
++    if (write(fd, text, n) != n || fsync(fd)) {
++        close(fd);
++        return false;
++    }
++    close(fd);
++    if (getrlimit(RLIMIT_CORE, &core) == 0 && core.rlim_cur > CORE_LIMIT) {
++        core.rlim_cur = CORE_LIMIT;
++        setrlimit(RLIMIT_CORE, &core);
++    }
++    return true;
+ }
+ 
+ void census_counts(CensusCounts *out)
+@@ -1743,6 +1810,9 @@ static bool census_refuse(const char *what)
+ {
+     fprintf(stderr, "census: %s: %s; the census is off\n", what, strerror(errno));
+     census.wanted = 0;
++    if (census.guard[0]) {
++        unlink(census.guard);
++    }
+     if (census.view) {
+         munmap(census.view, census.len);
+         census.view = NULL;
+@@ -1764,6 +1834,10 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+     struct uffdio_register reg = { .mode = UFFDIO_REGISTER_MODE_WP };
+ 
+     mkdir(census.dir, 0777);
++    if (census.coherent && !coherent_guard()) {
++        census.wanted = 0;
++        return false;
++    }
+     census.ticks = open_output("ticks.jsonl");
+     census.facts = open_output("surfaces.jsonl");
+     census.rips = open_output("rips.jsonl");
+@@ -1785,6 +1859,8 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+     }
+     /* A fork's child, which only execs, needs none of this. */
+     madvise(census.view, len, MADV_DONTFORK);
++    /* It is the guest's RAM again, which dump-guest-core=off keeps out of a core. */
++    madvise(census.view, len, MADV_DONTDUMP);
+     reg.range.start = (uint64_t)census.view;
+     reg.range.len = len;
+     if (ioctl(census.uffd, UFFDIO_REGISTER, &reg)) {
+@@ -1820,7 +1896,7 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+         census.active = false;
+         return census_refuse("the census's thread");
+     }
+-    atexit(census_at_exit);
++    on_exit(census_at_exit, NULL);
+     queue_line("{\"started\":%.3f,\"pid\":%d,\"bytes\":%" PRIu64 ",\"rw\":%d,\"every\":%u,"
+                "\"min_pixels\":%u,\"saturate\":%u}\n", census_time(), getpid(), len, census.rw,
+                census.every, census.min_pixels, census.saturate_at);
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index 84df348295..4d8610c48c 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -1031,6 +1031,10 @@ static void apple_gfx_census_mapped(void *ctx, const RvgCensusSurface *surface,
+     };
+ 
+     census_surface_mapped(&facts, pages, page_count, page_size);
++    if (census_coherent() && page_count) {
++        rvg_coherent_rehearse(surface->base_address, surface->width, surface->height,
++                              surface->bytes_per_row);
++    }
+ }
+ 
+ static void apple_gfx_census_unmapped(void *ctx, uint32_t mapping_id)
+diff --git a/system/physmem.c b/system/physmem.c
+index c4f9363775..146f14163f 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3836,6 +3836,8 @@ void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
+     if (mr != NULL) {
+         if (is_write) {
+             invalidate_and_set_dirty(mr, addr1, access_len);
++            /* Its page may have been held again since the map: the image takes this write. */
++            census_ram_access(buffer, access_len, true);
+         }
+         if (xen_map_cache_enabled()) {
+             xen_invalidate_map_cache_entry(buffer);

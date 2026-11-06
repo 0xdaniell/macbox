@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 17:09:48 +0000
+Subject: [PATCH 07/34] diagnostic:the pass timer's window
+ follows the live switch pass_times
+
+A command buffer is captured where <dir>/on exists or, with M2V_LIVE set,
+where its file says pass_times=1 (live.rs, re-read at most once a second),
+checked once as the command buffer begins recording.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/pass_times.rs | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/pass_times.rs b/crates/metal2vulkan-runtime/src/pass_times.rs
+index ca083acb..9cd4574c 100644
+--- a/crates/metal2vulkan-runtime/src/pass_times.rs
++++ b/crates/metal2vulkan-runtime/src/pass_times.rs
+@@ -5,9 +5,11 @@
+ //!
+ //! - **The switch** is read once. Unset (or empty), nothing changes: no query pool, no command,
+ //!   no line; each hook is one check of a `OnceLock`.
+-//! - **The window.** Set, a command buffer is captured only where the file `<dir>/on` exists as the
+-//!   runtime begins recording it (its first encoder's opening, or its first `VkCommandBuffer`
+-//!   handed out): checked once per command buffer. `touch <dir>/on` opens a window, `rm` closes
++//! - **The window.** Set, a command buffer is captured only where the file `<dir>/on` exists, or
++//!   the live switch `pass_times` is on (`live.rs`: `pass_times=1` in the file `M2V_LIVE` names,
++//!   which it re-reads at most once a second), as the runtime begins recording it (its first
++//!   encoder's opening, or its first `VkCommandBuffer` handed out): checked once per command
++//!   buffer. `touch <dir>/on` (or `pass_times=1`) opens a window, `rm` (or `pass_times=0`) closes
+ //!   it; the first command buffer begun after the close flushes the lines held.
+ //! - **Where the timestamps go.** Every routed command passes the recorder's entry points
+ //!   (`recorder/thunks.rs`), whatever the runtime records it from (an encoder, its own kernels, a
+@@ -521,7 +523,8 @@ fn decide<'a>(
+ fn start(device: &Device, queue: &CommandQueue, key: usize) -> Option<Arc<Capture>> {
+     let times = device.shared().pass_times.as_ref()?;
+     let dir = dir()?;
+-    if !dir.join("on").exists() {
++    // The window: `<dir>/on`, or the live switch `pass_times=1` (`live.rs`, `M2V_LIVE`).
++    if !dir.join("on").exists() && !crate::live::on("pass_times", false) {
+         times.flush();
+         return None;
+     }

@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 03:50:10 +0000
+Subject: [PATCH 6/9] census: a surface's marks move in runs of the view
+
+A guest's allocator hands a surface's pages out mostly descending, so in the surface's order each
+page was a run of its own, three syscalls each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/census.c          | 103 +++++++++++++++++++++++++++---------
+ include/system/kvm_census.h |   4 +-
+ 2 files changed, 80 insertions(+), 27 deletions(-)
+
+diff --git a/accel/kvm/census.c b/accel/kvm/census.c
+index fb34f6f247..28b3d2df95 100644
+--- a/accel/kvm/census.c
++++ b/accel/kvm/census.c
+@@ -186,6 +186,8 @@ typedef struct Surface {
+     uint32_t *pages;
+     uint64_t page_total;
+     uint64_t view_start;
++    /* Which of those pages a call means; only the call under the surface's lock uses it. */
++    uint64_t *wanted;
+     bool tracked;
+     _Atomic uint64_t presents;
+     _Atomic uint32_t window_traps;
+@@ -205,6 +207,8 @@ static struct {
+     char guard[3584 + 32];
+     /* QEMU's own accesses, by the state of the page. */
+     _Atomic uint64_t touches[8];
++    /* Runs the marks moved in, each its syscalls: what a sync's hold and an arm cost. */
++    _Atomic uint64_t coh_runs;
+     uint8_t *view;
+     uint8_t *main_map;
+     uint64_t len;
+@@ -817,9 +821,21 @@ static Surface *coh_surface(uint64_t addr, uint32_t *id, uint64_t *index)
+     return NULL;
+ }
+ 
++static void run_ends(RunFn *fn, uint64_t first, uint64_t *count, uint32_t id, bool *any_held, void *arg)
++{
++    if (*count) {
++        fn(first, *count, id, *any_held, arg);
++        atomic_fetch_add(&census.coh_runs, 1);
++        *count = 0;
++        *any_held = false;
++    }
++}
++
+ /*
+  * Calls fn over the runs of contiguous pages of the n addresses' surface, each run of those whose
+- * state is in mask, moved to ST_WORK. Addresses are ascending page addresses of one surface.
++ * state is in mask, moved to ST_WORK. Addresses are page addresses of one surface. The runs follow
++ * the view, not the surface: a guest's allocator hands a surface's pages out mostly descending, so
++ * in the surface's order every page would be a run of its own, three syscalls each.
+  */
+ static void coh_runs(const uint64_t *addrs, size_t n, uint32_t mask, RunFn *fn, void *arg)
+ {
+@@ -833,33 +849,32 @@ static void coh_runs(const uint64_t *addrs, size_t n, uint32_t mask, RunFn *fn,
+     }
+     for (size_t i = 0; i < n; i++) {
+         uint64_t off = (addrs[i] - s->view_start) >> PG_SHIFT;
+-        uint64_t p;
+-        uint32_t w;
+ 
+-        if (off >= s->page_total) {
+-            continue;
+-        }
+-        p = s->pages[off];
+-        w = atomic_load(&census.pg[p]);
+-        if (count && first + count != p) {
+-            fn(first, count, id, any_held, arg);
+-            count = 0;
+-            any_held = false;
+-        }
+-        if (PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
+-            atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
+-            first = count ? first : p;
+-            count++;
+-            any_held |= PW_ST(w) == ST_HELD;
+-        } else if (count) {
+-            fn(first, count, id, any_held, arg);
+-            count = 0;
+-            any_held = false;
++        if (off < s->page_total) {
++            s->wanted[off / 64] |= 1ull << (off % 64);
+         }
+     }
+-    if (count) {
+-        fn(first, count, id, any_held, arg);
++    for (uint32_t r = 0; r < s->run_count; r++) {
++        for (uint64_t p = s->runs[r].first; p < s->runs[r].first + s->runs[r].count; p++) {
++            uint64_t off = census.coh_index[p];
++            uint64_t bit = 1ull << (off % 64);
++            uint32_t w = atomic_load(&census.pg[p]);
++
++            if (first + count != p) {
++                run_ends(fn, first, &count, id, &any_held, arg);
++            }
++            if ((s->wanted[off / 64] & bit) && PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
++                atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
++                first = count ? first : p;
++                count++;
++                any_held |= PW_ST(w) == ST_HELD;
++            } else {
++                run_ends(fn, first, &count, id, &any_held, arg);
++            }
++            s->wanted[off / 64] &= ~bit;
++        }
+     }
++    run_ends(fn, first, &count, id, &any_held, arg);
+ }
+ 
+ /* Where the pages a vCPU reached as their markers moved go. */
+@@ -974,6 +989,11 @@ size_t census_coh_hold(const uint64_t *addrs, size_t n, bool open_too, uint64_t
+     return found.found;
+ }
+ 
++uint64_t census_coh_run_count(void)
++{
++    return atomic_load(&census.coh_runs);
++}
++
+ void census_coh_open(uint64_t addr)
+ {
+     coh_runs(&addr, 1, MASK(ST_HELD), open_held, NULL);
+@@ -1274,6 +1294,31 @@ static void surface_close(Surface *s, uint32_t id, const char *event)
+     s->run_count = 0;
+     free(s->pages);
+     s->pages = NULL;
++    free(s->wanted);
++    s->wanted = NULL;
++}
++
++static int run_order(const void *a, const void *b)
++{
++    uint64_t x = ((const Run *)a)->first, y = ((const Run *)b)->first;
++
++    return x < y ? -1 : x > y;
++}
++
++/* A surface's runs ascending, those that meet joined. */
++static void runs_by_view(Surface *s)
++{
++    uint32_t kept = 0;
++
++    qsort(s->runs, s->run_count, sizeof(*s->runs), run_order);
++    for (uint32_t i = 0; i < s->run_count; i++) {
++        if (kept && s->runs[kept - 1].first + s->runs[kept - 1].count == s->runs[i].first) {
++            s->runs[kept - 1].count += s->runs[i].count;
++        } else {
++            s->runs[kept++] = s->runs[i];
++        }
++    }
++    s->run_count = kept;
+ }
+ 
+ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t page_count,
+@@ -1298,6 +1343,11 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+     s->tracked = false;
+     if (census.coherent && page_count) {
+         s->pages = calloc(page_count, sizeof(*s->pages));
++        s->wanted = calloc(page_count / 64 + 1, sizeof(*s->wanted));
++        if (!s->wanted) {
++            free(s->pages);
++            s->pages = NULL;
++        }
+         s->view_start = f->base_address - f->offset;
+     }
+     atomic_store(&s->presents, 0);
+@@ -1349,6 +1399,7 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+             s->armed_pages++;
+         }
+     }
++    runs_by_view(s);
+     for (uint32_t i = 0; i < s->run_count; i++) {
+         if (census.coherent) {
+             /* Nothing on it until the library tracks the surface. */
+@@ -1606,8 +1657,8 @@ static void coherent_report(const char *label)
+     }
+     n = census.ops.report(census.ops.ctx, label, text, sizeof(text));
+     fwrite(text, 1, MIN(n, sizeof(text)), census.report);
+-    fprintf(census.report, "{\"touches\":\"%s\",\"open\":%" PRIu64 ",\"armed\":%" PRIu64
+-            ",\"held\":%" PRIu64 ",\"frozen\":%" PRIu64 ",\"stale\":%" PRIu64 "}\n", label,
++    fprintf(census.report, "{\"touches\":\"%s\",\"runs\":%" PRIu64 ",\"open\":%" PRIu64 ",\"armed\":%" PRIu64
++            ",\"held\":%" PRIu64 ",\"frozen\":%" PRIu64 ",\"stale\":%" PRIu64 "}\n", label, atomic_load(&census.coh_runs),
+             atomic_load(&census.touches[ST_OPEN]), atomic_load(&census.touches[ST_ARMED]),
+             atomic_load(&census.touches[ST_HELD]), atomic_load(&census.touches[ST_FROZEN]),
+             atomic_load(&census.touches[ST_STALE]));
+diff --git a/include/system/kvm_census.h b/include/system/kvm_census.h
+index 3673e4286e..8fa6568d96 100644
+--- a/include/system/kvm_census.h
++++ b/include/system/kvm_census.h
+@@ -83,7 +83,7 @@ void census_presented(uint64_t mapping_id);
+ 
+ /*
+  * Trap-coherent surfaces (census.c, and shadow_coherent.rs in metal2vulkan). Addresses are of the
+- * library's mapping of the surface, whole pages, ascending, one surface to a call. The census_coh_
++ * library's mapping of the surface, whole pages, one surface to a call. The census_coh_
+  * calls come only under the surface's lock in the library; fault takes that lock, so nothing here
+  * holds a lock across fault.
+  */
+@@ -111,6 +111,8 @@ size_t census_coh_arm(const uint64_t *addrs, size_t n, uint64_t *refused, size_t
+ /* Into up to room of came, the pages a vCPU reached as these moved: written, for all it knows. */
+ size_t census_coh_hold(const uint64_t *addrs, size_t n, bool open_too, uint64_t *came, size_t room);
+ void census_coh_open(uint64_t addr);
++/* Runs of contiguous pages the marks have moved in so far, some syscalls each. */
++uint64_t census_coh_run_count(void);
+ void census_coh_freeze(const uint64_t *addrs, size_t n);
+ void census_coh_thaw(const uint64_t *addrs, size_t n);
+ /* The surface of a mapping id, and whether the library tracks it. */

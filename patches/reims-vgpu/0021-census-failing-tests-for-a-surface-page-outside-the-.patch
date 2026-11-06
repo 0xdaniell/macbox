@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 02:16:32 +0000
+Subject: [PATCH 21/25] census: failing tests for a surface page outside the
+ texture's rows
+
+A write by the guest CPU fuses the whole census; a DMA write untracks the surface while
+its armed pages are ahead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/coherent_test.c | 52 ++++++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+index 16eb14f0..e9744270 100644
+--- a/scripts/internal/census/coherent_test.c
++++ b/scripts/internal/census/coherent_test.c
+@@ -27,6 +27,11 @@ static struct {
+ 
+ static uint64_t page_at(int i) { return s.base + i * PG; }
+ 
++// AUDIT: the pages the library names. Coherent::all_pages() and find() cover Layout.range(), the
++// texture's rows, while census_coh_track holds every page of the census surface: past the rows of
++// a 3200x1800 surface whose allocation has 25 more pages, a plane's neighbour in a biplanar one.
++static int named = PAGES;
++
+ static void note(const uint64_t *pages, size_t n) {
+     for (size_t i = 0; i < n; i++) s.dirty |= 1u << ((pages[i] - s.base) / PG);
+ }
+@@ -60,6 +65,11 @@ static void sync_all_locked(void) {
+ static void on_fault(void *ctx, uint64_t addr, bool write) {
+     uint64_t page = addr & ~(PG - 1);
+ 
++    // AUDIT: as shadow_coherent.rs's free fault(): no surface's range() holds it, so it untracks.
++    if ((page - s.base) / PG >= (uint64_t)named) {
++        census_coh_untrack(addr);
++        return;
++    }
+     pthread_mutex_lock(&s.lock);
+     s.faults++;
+     sync_all_locked();
+@@ -68,7 +78,7 @@ static void on_fault(void *ctx, uint64_t addr, bool write) {
+ 
+         s.probing = 0;
+         list_all(list);
+-        size_t found = census_coh_hold(list, PAGES, false, came, PAGES);
++        size_t found = census_coh_hold(list, named, false, came, PAGES);
+         s.came += found;
+         note(came, found);
+     } else if (write && s.probing) {
+@@ -93,7 +103,7 @@ static void on_probe(void *ctx) {
+     s.probed_at = now_ns();
+     s.probes++;
+     list_all(list);
+-    size_t found = census_coh_probe(list, PAGES, list, PAGES);
++    size_t found = census_coh_probe(list, named, list, PAGES);
+     s.came += found;
+     note(list, found);
+     pthread_mutex_unlock(&s.lock);
+@@ -699,6 +709,39 @@ static void t_fuse_coherent(struct vcpu *c) {
+     CHECK(plain && s.faults == faults, "and the guest writes every page with no marker left");
+ }
+ 
++// AUDIT: a guest CPU write to a page of the surface that the library never named.
++static void t_outside_write(struct vcpu *c) {
++    printf("[outside] a guest write to a held page past the texture's rows\n");
++    named = PAGES - 1;
++    surface(12, 0xe00000);
++    CHECK(state(PAGES - 1) == 2, "census_coh_track held it too");
++    int abandons = s.abandons, probes = s.probes;
++    uint64_t start = now_ns();
++    setr(c, STUB(g_write), 0x7777, gpa(PAGES - 1), 0, 0, 0, 0);
++    int run = run_guest(c, 0);
++    printf("    %.1f ms, %d probes\n", (now_ns() - start) / 1e6, s.probes - probes);
++    CHECK(run == RUN_IO, "the write ran");
++    CHECK(*(uint64_t *)(main_map + s.off + (PAGES - 1) * PG) == 0x7777, "into the page");
++    CHECK(s.abandons == abandons, "and the census stayed on: every surface is still coherent");
++    named = PAGES;
++}
++
++// AUDIT: a device's DMA into that page, then a guest read of a page the image is ahead of.
++static void t_outside_dma(struct vcpu *c) {
++    printf("[outside] DMA into a held page past the texture's rows, with page 0 armed\n");
++    named = PAGES - 1;
++    surface(13, 0xe80000);
++    *(uint64_t *)(main_map + s.off) = 0x1;
++    completed(1, 0x8888);
++    CHECK(state(0) == 1, "page 0 is armed: the image is ahead");
++    census_coherent_touch(main_map + s.off + (PAGES - 1) * PG, 8, true);
++    CHECK(state(0) == 1, "and stays armed after the DMA");
++    setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO && getr(c).rax == 0x8888, "so the guest reads the image's word");
++    printf("    the guest read %#llx\n", (unsigned long long)getr(c).rax);
++    named = PAGES;
++}
++
+ int main(int argc, char **argv) {
+     setvbuf(stdout, 0, _IOLBF, 0);
+     if (argc < 2) return 2;
+@@ -709,6 +752,11 @@ int main(int argc, char **argv) {
+     census_coherent_set_ops(&ops);
+     struct vcpu c;
+     vcpu_init(&c, 0);
++    if (getenv("CENSUS_OUTSIDE")) {
++        if (atoi(getenv("CENSUS_OUTSIDE")) == 1) t_outside_write(&c); else t_outside_dma(&c);
++        printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
++        return failures != 0;
++    }
+     t_read(&c);
+     t_write(&c);
+     t_write_interrupts_on(&c);

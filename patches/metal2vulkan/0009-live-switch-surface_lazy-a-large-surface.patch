@@ -1,0 +1,732 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 19:12:44 +0000
+Subject: [PATCH 09/34] live switch surface_lazy: a large
+ surface's optimal image kept across command buffers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/buffer_descriptor.rs                  |   1 +
+ .../src/buffer_texture.rs                     |   7 +
+ .../src/command_buffer/mod.rs                 |   4 +
+ crates/metal2vulkan-runtime/src/host_rt.rs    |   4 +
+ crates/metal2vulkan-runtime/src/lib.rs        |   1 +
+ crates/metal2vulkan-runtime/src/shadow.rs     |  40 +++-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 226 ++++++++++++++++++
+ .../metal2vulkan-runtime/src/tests/shadow.rs  |   2 +
+ crates/metal2vulkan-runtime/src/texture.rs    |   2 +
+ .../metal2vulkan-runtime/src/texture/heap.rs  |   3 +
+ .../src/texture/surface_depth.rs              |   1 +
+ .../src/texture/surface_two_planes.rs         |   1 +
+ .../src/texture/view_shadow.rs                |   1 +
+ .../src/texture/ycbcr_image.rs                |   3 +
+ .../src/runtime_lane/host_rt_frames.rs        |  55 ++++-
+ 15 files changed, 334 insertions(+), 17 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/shadow_lazy.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+index 51b73aac..3dfe1a02 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+@@ -371,6 +371,7 @@ impl Device {
+     /// live it returns at once, and otherwise it finds the buffers over the range by address,
+     /// whether the range covers none of them or many, never reading them all.
+     pub fn host_range_remapped(&self, bytes: NonNull<u8>, length: u64) {
++        crate::shadow_lazy::everything_written(); // LOCAL (Atlas)
+         let start = bytes.as_ptr() as u64;
+         let shared = self.shared();
+         // The unit an import's pages round out to: an import by pointer over a page the call
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 45801900..c4c29b08 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1142,6 +1142,7 @@ impl Texels {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         })
+     }
+ 
+@@ -1312,6 +1313,7 @@ impl Texels {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         };
+         texels.staged = Some(Arc::new(copies));
+         let (offset, alignment) = (
+@@ -1424,6 +1426,11 @@ impl Texels {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            // LOCAL (Atlas): `shadow_lazy.rs`.
++            lazy: super::shadow_lazy::Lazy::of(
++                self.backing() == super::shadow::Backing::Surface,
++                self.layout.row_bytes / self.texel_bytes * u64::from(self.layout.rows),
++            ),
+         })
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index b08a9994..7b19ebee 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2505,6 +2505,10 @@ impl CommandBuffer {
+         failure: Option<CommitFailure>,
+         run: CommitRun,
+     ) -> Result<(), Error> {
++        // LOCAL (Atlas): a later command buffer may take its surfaces' images (`shadow_lazy.rs`).
++        if let Some(id) = self.state().shadow_carry.as_ref().map(ShadowCarry::id) {
++            crate::shadow_lazy::committed(id);
++        }
+         // The waiting fetched render targets take their storage form at this commit where it
+         // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
+         // ends the switch once it submitted the command buffer. None where nothing of it runs.
+diff --git a/crates/metal2vulkan-runtime/src/host_rt.rs b/crates/metal2vulkan-runtime/src/host_rt.rs
+index bffcd13f..fbf18b08 100644
+--- a/crates/metal2vulkan-runtime/src/host_rt.rs
++++ b/crates/metal2vulkan-runtime/src/host_rt.rs
+@@ -259,6 +259,10 @@ impl Device {
+         if max_texels().is_some_and(|max| texels > max) {
+             return false;
+         }
++        // LOCAL (Atlas): an optimal image kept across command buffers instead (`shadow_lazy.rs`).
++        if crate::shadow_lazy::takes_surface(texels) {
++            return false;
++        }
+         if self.compile_device().policy().host_page_textures != HostPageTexturePolicy::InPlace {
+             return false;
+         }
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 9cdcc6a5..48b3a27d 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -203,6 +203,7 @@ mod shader_cache;
+ mod shadow;
+ mod shadow_copy_back;
+ mod shadow_copy_in;
++pub mod shadow_lazy; // LOCAL (Atlas)
+ mod shadow_merge;
+ mod shadow_stencil;
+ mod sharing;
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 55c34686..a70e6a7c 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -215,6 +215,9 @@ pub(super) struct ShadowCopies {
+     /// serve is counted as one an earlier command buffer's standing stands behind, or as one of a
+     /// shadow that never held a standing ([`CarryTally`]).
+     pub(super) stood: AtomicU64,
++    /// LOCAL (Atlas): the image's standing across command buffers, where `shadow_lazy.rs` takes
++    /// the texture.
++    pub(super) lazy: Option<Arc<super::shadow_lazy::Lazy>>,
+ }
+ 
+ /// The texels of a texture over an IOSurface's plane from which its shadow's copies in count
+@@ -758,7 +761,12 @@ impl ShadowCopies {
+     pub(super) fn merges_back(&self) -> bool {
+         let bytes = matches!(&self.source, ShadowSource::Bytes { .. });
+         let other_writer = self.backing != Backing::PrivateBuffer || !self.tracked;
+-        bytes && other_writer && !self.drops_writes && self.unmerged().is_none()
++        // LOCAL (Atlas): a lazy surface copies back (`shadow_lazy.rs`).
++        bytes
++            && other_writer
++            && !self.drops_writes
++            && self.unmerged().is_none()
++            && self.lazy.is_none()
+     }
+ 
+     /// Whether two shadowed textures copy some of the same truth.
+@@ -2167,6 +2175,8 @@ impl<M> ShadowSync<M> {
+     /// where each stands; this covers the commands of an encoder that meets none of them, whose
+     /// writes nothing else here would see.
+     pub(super) fn wrote(&mut self, uses: &[Use<ResourceKey>]) {
++        // LOCAL (Atlas): any surface's, whatever this encoder uses (`shadow_lazy.rs`).
++        super::shadow_lazy::note_writes(uses);
+         if self.carry.entries.is_empty() {
+             return;
+         }
+@@ -2189,6 +2199,16 @@ impl<M> ShadowSync<M> {
+         carry.entries.append(&mut self.carry.entries);
+         for entry in &self.entries {
+             let touched = entry.copies.touched.fetch_add(1, Ordering::Relaxed);
++            // LOCAL (Atlas): what a later command buffer takes (`shadow_lazy.rs`).
++            if let Some(lazy) = &entry.copies.lazy {
++                if entry.standing == Standing::Current && touched == entry.met && !entry.dirty {
++                    let (key, range) = entry.copies.truth();
++                    let truth = (key, entry.copies.alias(), range);
++                    lazy.stand(truth, carry.id, touched + 1, entry.held, entry.stale);
++                } else {
++                    lazy.fall();
++                }
++            }
+             if entry.standing != Standing::Current {
+                 continue;
+             }
+@@ -2288,6 +2308,11 @@ struct Carried {
+ }
+ 
+ impl ShadowCarry {
++    /// LOCAL (Atlas): the command buffer's identity (`shadow_lazy.rs`).
++    pub(super) fn id(&self) -> u64 {
++        self.id
++    }
++
+     /// Carry nothing, under the same identity: every shadowed texture copies in again at its
+     /// next use, and a first copy in of one this command buffer stood behind still reads as that.
+     pub(super) fn clear(&mut self) {
+@@ -2326,9 +2351,16 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     .position(|carried| carried.copies.shadow_key == copies.shadow_key)
+                     .map(|at| self.carry.entries.swap_remove(at))
+                     .filter(|carried| carried.touched == met);
+-                let (standing, held, stale) = match &carried {
+-                    Some(carried) => (Standing::Current, carried.held, carried.stale),
+-                    None => (Standing::Unread, None, None),
++                // LOCAL (Atlas): an earlier command buffer's image, where nothing wrote its bytes
++                // since (`shadow_lazy.rs`).
++                let lazily = match (&carried, &copies.lazy) {
++                    (None, Some(lazy)) => lazy.take(self.carry.id, met),
++                    _ => None,
++                };
++                let (standing, held, stale) = match (&carried, lazily) {
++                    (Some(carried), _) => (Standing::Current, carried.held, carried.stale),
++                    (None, Some((held, stale))) => (Standing::Current, held, stale),
++                    (None, None) => (Standing::Unread, None, None),
+                 };
+                 self.entries.push(Entry {
+                     copies: Arc::clone(copies),
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+new file mode 100644
+index 00000000..e05af1f8
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -0,0 +1,226 @@
++//! LOCAL (Atlas): a large surface over host pages rendered in an optimal image kept across command
++//! buffers, under the live switch `surface_lazy` (default off).
++//!
++//! `host_rt_in_place` renders the macOS desktop and a Simulator's display surface straight into
++//! their pages as a linear image, where a pass costs far more than into an optimal one (a whole
++//! 3200x1800 surface blended, Arrow Lake: 5.1 ms against 1.5). The plain shadow (`shadow.rs`) pays
++//! instead a copy in and a keep and merge at every command buffer, and WindowServer's command
++//! buffers hold about one pass each: the copies cost more than the linear image.
++//!
++//! Under the switch a texture over a surface's plane of at least `surface_lazy_min_texels`
++//! (default 2,000,000) texels is a shadow ([`takes_surface`]), and three things change for it:
++//!
++//! - **No copy in where the image still holds the bytes.** An encoder's end leaves the image's
++//!   standing ([`Lazy::stand`]), as `shadow::ShadowCarry` leaves it to the command buffer's later
++//!   encoders; a later command buffer's encoder takes it ([`Lazy::take`]), so it copies in nothing,
++//!   where nothing wrote the bytes since. Every write a command records of them, through anything
++//!   else over them (`shadow::ShadowCopies::meets`, an alias of the same pages too) drops it
++//!   ([`note_writes`]), as do a remap of host pages and a CPU write through a texture
++//!   ([`everything_written`]).
++//! - **No keep and merge.** Its copy back writes the rectangle the commands wrote in, where their
++//!   scissors bound it, or every texel. A CPU write inside that rectangle while the command buffer
++//!   runs is lost, where the merge keeps it: the guest's CPU does not write a surface it renders
++//!   into at the same time.
++//! - **Copy back as ever: at each encoder's end**, in the command buffer, so before its completion
++//!   reaches the guest. So the guest's CPU, a screenshot, ScreenCaptureKit and the display read the
++//!   pages as they read them shadowed or in place, at every command buffer's completion, and a
++//!   later command's read through another import is ordered after the copy by the tracker.
++//!
++//! **What it cannot see**: a write of the guest's CPU into the pages between command buffers, which
++//! reaches the host through no call. Metal shows it to a later command buffer. Here the image misses
++//! it until the next copy in: at least every `surface_lazy_resync_ms` (default 250, 0 never) a
++//! surface's next encoder takes no standing and copies in as the plain shadow does.
++//!
++//! The switch is read as a texture is made and as an encoder ends: a texture keeps its form.
++//!
++//! **Command buffers encoded out of order**: a standing is taken only from a command buffer already
++//! committed ([`committed`]), whose commands Metal orders before the taker's.
++
++use super::resource::ResourceKey;
++use super::tracker::{Use, UseRange};
++use std::collections::VecDeque;
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
++use std::time::Instant;
++
++/// The live switch.
++const SWITCH: &str = "surface_lazy";
++const DEFAULT_MIN_TEXELS: u64 = 2_000_000;
++const DEFAULT_RESYNC_MS: u64 = 250;
++/// The committed command buffers remembered: an older one's standing is not taken.
++const COMMITTED_KEPT: usize = 256;
++
++/// Moved on by what may have written any surface's bytes without a command.
++static EPOCH: AtomicU64 = AtomicU64::new(0);
++/// Whether any surface is registered: every hook returns at once while none is.
++static ANY: AtomicBool = AtomicBool::new(false);
++static TAKEN: AtomicU64 = AtomicU64::new(0);
++static REFUSED: AtomicU64 = AtomicU64::new(0);
++static RESYNCS: AtomicU64 = AtomicU64::new(0);
++static ACTIVE: AtomicUsize = AtomicUsize::new(0);
++
++fn registry() -> &'static RwLock<Vec<Weak<Lazy>>> {
++    static ALL: OnceLock<RwLock<Vec<Weak<Lazy>>>> = OnceLock::new();
++    ALL.get_or_init(RwLock::default)
++}
++
++fn committed_ids() -> &'static Mutex<VecDeque<u64>> {
++    static IDS: OnceLock<Mutex<VecDeque<u64>>> = OnceLock::new();
++    IDS.get_or_init(Mutex::default)
++}
++
++/// Whether a texture over host pages of `texels` stays a shadow to render lazily (`host_rt.rs`).
++pub(crate) fn takes_surface(texels: u64) -> bool {
++    crate::live::on(SWITCH, false)
++        && texels
++            >= crate::live::get("surface_lazy_min_texels")
++                .and_then(|v| v.parse().ok())
++                .unwrap_or(DEFAULT_MIN_TEXELS)
++}
++
++/// Note that what may hold any surface's bytes changed without a command.
++pub(crate) fn everything_written() {
++    if ANY.load(Ordering::Relaxed) {
++        EPOCH.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// Note the command buffer of identity `id` committed.
++pub(crate) fn committed(id: u64) {
++    if !ANY.load(Ordering::Relaxed) {
++        return;
++    }
++    let mut ids = committed_ids().lock().unwrap();
++    if ids.len() == COMMITTED_KEPT {
++        ids.pop_front();
++    }
++    ids.push_back(id);
++}
++
++/// Note a recorded command with `uses` (the host memory's among them): each of its writes of a
++/// surface's truth drops that surface's standing. A surface's own copy back counts too: its
++/// encoder's end reads the count after it ([`Lazy::stand`]).
++pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
++    if !ANY.load(Ordering::Relaxed) {
++        return;
++    }
++    let all = registry().read().unwrap();
++    for used in uses.iter().filter(|used| !used.write.is_empty()) {
++        for lazy in all.iter().filter_map(Weak::upgrade) {
++            if lazy.meets(used) {
++                lazy.written.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++    }
++}
++
++/// The counts so far, for a lane or a stderr line: standings taken, refused, and resyncs.
++pub fn counts() -> (u64, u64, u64) {
++    (
++        TAKEN.load(Ordering::Relaxed),
++        REFUSED.load(Ordering::Relaxed),
++        RESYNCS.load(Ordering::Relaxed),
++    )
++}
++
++/// What an encoder's end left of the image.
++#[derive(Clone, Copy)]
++struct Stood {
++    /// The command buffer's identity (`shadow::ShadowCarry::id`).
++    id: u64,
++    /// `ShadowCopies::touched` as the encoder left it.
++    touched: u64,
++    held: Option<[u32; 4]>,
++    stale: Option<[u32; 4]>,
++    written: u64,
++    epoch: u64,
++}
++
++/// One surface's standing.
++pub(super) struct Lazy {
++    truth: OnceLock<(ResourceKey, Option<ResourceKey>, UseRange)>,
++    written: AtomicU64,
++    stood: Mutex<Option<Stood>>,
++    resynced: Mutex<Instant>,
++}
++
++impl Lazy {
++    /// The state of a new shadow of `texels` texels with `surface` as its backing, where the switch
++    /// takes it.
++    pub(super) fn of(surface: bool, texels: u64) -> Option<Arc<Lazy>> {
++        (surface && takes_surface(texels)).then(|| {
++            Arc::new(Lazy {
++                truth: OnceLock::new(),
++                written: AtomicU64::new(0),
++                stood: Mutex::new(None),
++                resynced: Mutex::new(Instant::now()),
++            })
++        })
++    }
++
++    fn meets(&self, used: &Use<ResourceKey>) -> bool {
++        self.truth.get().is_some_and(|(key, alias, range)| {
++            (used.key == *key || Some(used.key) == *alias) && used.range.overlaps(range)
++        })
++    }
++
++    /// Leave the image's standing: `id`'s encoder ended with the image holding the truth, inside
++    /// `held` where given, stale inside `stale`. Its own copies back are behind it.
++    pub(super) fn stand(
++        self: &Arc<Self>,
++        (key, alias, range): (ResourceKey, Option<ResourceKey>, UseRange),
++        id: u64,
++        touched: u64,
++        held: Option<[u32; 4]>,
++        stale: Option<[u32; 4]>,
++    ) {
++        if self.truth.set((key, alias, range)).is_ok() {
++            let mut all = registry().write().unwrap();
++            all.retain(|lazy| lazy.strong_count() > 0);
++            all.push(Arc::downgrade(self));
++            ACTIVE.store(all.len(), Ordering::Relaxed);
++            ANY.store(true, Ordering::Relaxed);
++        }
++        *self.stood.lock().unwrap() = Some(Stood {
++            id,
++            touched,
++            held,
++            stale,
++            written: self.written.load(Ordering::Relaxed),
++            epoch: EPOCH.load(Ordering::Relaxed),
++        });
++    }
++
++    /// The encoder's end left the image not holding the truth.
++    pub(super) fn fall(&self) {
++        *self.stood.lock().unwrap() = None;
++    }
++
++    /// Where the image stands for an encoder that met `touched`, of a command buffer of identity
++    /// `id`: `Some((held, stale))` where it needs no copy in (the module docs).
++    pub(super) fn take(&self, id: u64, touched: u64) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
++        let stood = (*self.stood.lock().unwrap())?;
++        let current = stood.touched == touched
++            && stood.written == self.written.load(Ordering::Relaxed)
++            && stood.epoch == EPOCH.load(Ordering::Relaxed)
++            && stood.id != id
++            && committed_ids().lock().unwrap().contains(&stood.id);
++        if !current {
++            REFUSED.fetch_add(1, Ordering::Relaxed);
++            return None;
++        }
++        let every = crate::live::get("surface_lazy_resync_ms")
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(DEFAULT_RESYNC_MS);
++        if every > 0 {
++            let mut resynced = self.resynced.lock().unwrap();
++            if resynced.elapsed().as_millis() as u64 >= every {
++                *resynced = Instant::now();
++                RESYNCS.fetch_add(1, Ordering::Relaxed);
++                return None;
++            }
++        }
++        TAKEN.fetch_add(1, Ordering::Relaxed);
++        Some((stood.held, stood.stale))
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+index 3b723a86..cb943ca2 100644
+--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+@@ -98,6 +98,7 @@ fn shadow_in(
+         merge_scratch: ScratchSpares::default(),
+         touched: AtomicU64::new(0),
+         stood: AtomicU64::new(0),
++        lazy: None,
+     })
+ }
+ 
+@@ -1430,6 +1431,7 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
+         merge_scratch: ScratchSpares::default(),
+         touched: AtomicU64::new(0),
+         stood: AtomicU64::new(0),
++        lazy: None,
+     })
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 6a13c30a..dc5b4a08 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -5372,6 +5372,7 @@ impl Texture {
+         bytes_per_row: u64,
+         bytes_per_image: u64,
+     ) -> Result<(), Error> {
++        crate::shadow_lazy::everything_written(); // LOCAL (Atlas)
+         let upload = Upload::Slice(bytes);
+         self.replace(region, level, slice, upload, bytes_per_row, bytes_per_image)
+     }
+@@ -5393,6 +5394,7 @@ impl Texture {
+         bytes_per_row: u64,
+         bytes_per_image: u64,
+     ) -> Result<(), Error> {
++        crate::shadow_lazy::everything_written(); // LOCAL (Atlas)
+         let upload = Upload::Host {
+             bytes,
+             copy: OnceCell::new(),
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 1e13281c..8aba80f4 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -3380,6 +3380,7 @@ impl Device {
+                 merge_scratch: ScratchSpares::default(),
+                 touched: AtomicU64::new(0),
+                 stood: AtomicU64::new(0),
++                lazy: None,
+             };
+             Owner::HeapShadow(Box::new(HeapShadow {
+                 placement,
+@@ -3480,6 +3481,7 @@ impl Device {
+                 merge_scratch: ScratchSpares::default(),
+                 touched: AtomicU64::new(0),
+                 stood: AtomicU64::new(0),
++                lazy: None,
+             };
+             Owner::HeapShadow(Box::new(HeapShadow {
+                 placement,
+@@ -3557,6 +3559,7 @@ impl Device {
+                 merge_scratch: ScratchSpares::default(),
+                 touched: AtomicU64::new(0),
+                 stood: AtomicU64::new(0),
++                lazy: None,
+             };
+             Owner::HeapShadow(Box::new(HeapShadow {
+                 placement,
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+index 8617e0c5..563fbde8 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+@@ -171,6 +171,7 @@ impl Texture {
+                 merge_scratch: ScratchSpares::default(),
+                 touched: AtomicU64::new(0),
+                 stood: AtomicU64::new(0),
++                lazy: None,
+             };
+             let storage = Storage::Shadow {
+                 image: image.shared(),
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 322cb108..43c812d2 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -240,6 +240,7 @@ impl Device {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         };
+         self.degrade(Degradation::ShadowedTexture, || {
+             let [width, height, _] = layout.extent;
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 654c899d..c73065f2 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -483,6 +483,7 @@ impl Device {
+                     merge_scratch: ScratchSpares::default(),
+                     touched: AtomicU64::new(0),
+                     stood: AtomicU64::new(0),
++                    lazy: None,
+                 };
+                 Owner::ViewShadow(Box::new(ViewShadow {
+                     placement,
+diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+index 2465608d..cf1d6816 100644
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -376,6 +376,7 @@ impl Device {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         };
+         Ok(Storage::Shadow {
+             image: image.shared(),
+@@ -671,6 +672,7 @@ impl Texture {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         };
+         Ok((image, copies))
+     }
+@@ -839,6 +841,7 @@ impl Texture {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
++            lazy: None,
+         };
+         let storage = Storage::Shadow {
+             image: image.shared(),
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs b/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
+index d1c701b0..491f874d 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
+@@ -32,7 +32,7 @@ use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+ use metal2vulkan_runtime::{
+     live, Buffer, CommandBuffer, CpuCacheMode, Device, HazardTrackingMode, HostMemory,
+     IoSurfacePlane, LoadAction, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+-    StorageMode, StoreAction, Texture, TextureDescriptor, WorkCounts,
++    ScissorRect, StorageMode, StoreAction, Texture, TextureDescriptor, WorkCounts,
+ };
+ use std::time::Instant;
+ 
+@@ -56,6 +56,13 @@ enum Shape {
+     /// The iOS Simulator's screen at 3x (1206x2622, rows of 4864 bytes): 42 command buffers of
+     /// one pass each blending a sixteenth of it, as the coordinator measured the sim's frames.
+     SimSmallApart,
++    /// LOCAL (Atlas): the 3200x1800 HiDPI desktop, 8 command buffers of one pass each, each
++    /// blending the whole surface.
++    HidpiWhole,
++    /// As [`Shape::HidpiWhole`], each pass scissored to a window's damage: a 1000x600 rectangle.
++    HidpiDamage,
++    /// LOCAL (Atlas): the Simulator's screen at 3x, 8 passes a frame blending all of it.
++    SimWhole,
+ }
+ 
+ impl Shape {
+@@ -66,16 +73,21 @@ impl Shape {
+             Shape::PassesApart => (3440, 1440, 13824, 10, true, false),
+             Shape::SmallApart => (3440, 1440, 13824, 10, true, true),
+             Shape::SimSmallApart => (1206, 2622, 4864, 42, true, true),
++            Shape::HidpiWhole | Shape::HidpiDamage => (3200, 1800, 12864, 8, true, false),
++            Shape::SimWhole => (1206, 2622, 4864, 8, true, false),
+         }
+     }
+ }
+ 
+-const SHAPES: [Shape; 5] = [
++const SHAPES: [Shape; 8] = [
+     Shape::Passes,
+     Shape::PassesViews,
+     Shape::PassesApart,
+     Shape::SmallApart,
+     Shape::SimSmallApart,
++    Shape::HidpiWhole,
++    Shape::HidpiDamage,
++    Shape::SimWhole,
+ ];
+ 
+ /// The switches' settings weighed.
+@@ -87,6 +99,8 @@ enum Setting {
+     InPlace,
+     /// `shadow_compressed`: the shadow, its image eligible for the driver's compression.
+     Compressed,
++    /// LOCAL (Atlas): `surface_lazy`: the image kept across command buffers (`shadow_lazy.rs`).
++    Lazy,
+     /// For the parts: the passes into a `Private` texture of the surface's size (optimal tiling,
+     /// the device's own memory), no shadow.
+     Private,
+@@ -96,19 +110,21 @@ enum Setting {
+ }
+ 
+ impl Setting {
+-    fn switches(self) -> [(&'static str, &'static str); 2] {
++    fn switches(self) -> [(&'static str, &'static str); 3] {
+         let on = |yes: bool| if yes { "1" } else { "0" };
+         [
+             ("host_rt_in_place", on(self == Setting::InPlace)),
+             ("shadow_compressed", on(self == Setting::Compressed)),
++            ("surface_lazy", on(self == Setting::Lazy)),
+         ]
+     }
+ }
+ 
+-const SETTINGS: [Setting; 5] = [
++const SETTINGS: [Setting; 6] = [
+     Setting::Shadow,
+     Setting::InPlace,
+     Setting::Compressed,
++    Setting::Lazy,
+     Setting::Private,
+     Setting::LinearOwn,
+ ];
+@@ -158,6 +174,7 @@ fn pass(
+     blend: &RenderPipelineState,
+     rects: &[Buffer],
+     color: &Buffer,
++    damage: Option<ScissorRect>,
+ ) {
+     let mut descriptor = RenderPassDescriptor::new();
+     let attachment = &mut descriptor.color_attachments[0];
+@@ -167,6 +184,9 @@ fn pass(
+     let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
+     encoder.set_render_pipeline_state(blend).unwrap();
+     encoder.set_fragment_buffer(Some(color), 0, 0).unwrap();
++    if let Some(damage) = damage {
++        encoder.set_scissor_rect(damage).unwrap();
++    }
+     for rect in rects {
+         encoder.set_vertex_buffer(Some(rect), 0, 0).unwrap();
+         encoder
+@@ -202,7 +222,7 @@ fn hash(bytes: &[u8]) -> u64 {
+ #[test]
+ #[ignore = "a release-mode measurement: run by name"]
+ fn host_rt_frame_costs() {
+-    let len = ((13824 * 1440) as usize).next_multiple_of(16384);
++    let len = ((12864 * 1800) as usize).next_multiple_of(16384);
+     let mapping = Mapping::anonymous(len);
+     // SAFETY: the mapping's bytes, which no device uses between the cases.
+     let bytes = || unsafe { std::slice::from_raw_parts_mut(mapping.pointer().as_ptr(), len) };
+@@ -215,7 +235,8 @@ fn host_rt_frame_costs() {
+                 // image on ANV.
+                 let parts = matches!(setting, Setting::Private | Setting::LinearOwn);
+                 if (shape == Shape::PassesViews && parts)
+-                    || (shape == Shape::SimSmallApart && setting == Setting::LinearOwn)
++                    || (matches!(shape, Shape::SimSmallApart | Shape::SimWhole)
++                        && setting == Setting::LinearOwn)
+                 {
+                     continue;
+                 }
+@@ -305,6 +326,12 @@ fn host_rt_frame_costs() {
+                         (buffer, surface, form)
+                     }
+                 };
++                let damage = (shape == Shape::HidpiDamage).then_some(ScissorRect {
++                    x: 800,
++                    y: 500,
++                    width: 1000,
++                    height: 600,
++                });
+                 let (mut waits, mut gpus) = (Vec::new(), Vec::new());
+                 let mut before = device.work_counts();
+                 for k in 0..WARM + FRAMES {
+@@ -312,20 +339,21 @@ fn host_rt_frame_costs() {
+                         before = device.work_counts();
+                     }
+                     let mut command_buffers = vec![queue.command_buffer().unwrap()];
+-                    pass(&command_buffers[0], &surface, &blend, rects, &color);
++                    pass(&command_buffers[0], &surface, &blend, rects, &color, damage);
++                    let committed = Instant::now();
+                     for _ in 1..passes {
+                         if apart {
++                            // As the guest's: each committed before the next is encoded.
++                            let last = command_buffers.last().unwrap();
++                            last.commit().unwrap();
+                             let command_buffer = queue.command_buffer().unwrap();
+-                            pass(&command_buffer, &surface, &blend, rects, &color);
++                            pass(&command_buffer, &surface, &blend, rects, &color, damage);
+                             command_buffers.push(command_buffer);
+                         } else {
+-                            pass(&command_buffers[0], &surface, &blend, rects, &color);
++                            pass(&command_buffers[0], &surface, &blend, rects, &color, damage);
+                         }
+                     }
+-                    let committed = Instant::now();
+-                    for command_buffer in &command_buffers {
+-                        command_buffer.commit().unwrap();
+-                    }
++                    command_buffers.last().unwrap().commit().unwrap();
+                     let mut gpu = 0.0;
+                     for command_buffer in &command_buffers {
+                         command_buffer.wait_until_completed_for(WAIT).unwrap();
+@@ -357,6 +385,7 @@ fn host_rt_frame_costs() {
+                     device.name(),
+                     per_frame(&before, &after),
+                 );
++                eprintln!("LAZY-COUNTS {:?}", metal2vulkan_runtime::shadow_lazy::counts());
+                 results.push((shape, setting, digest, between_kept));
+             }
+         }

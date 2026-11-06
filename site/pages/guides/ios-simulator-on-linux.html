@@ -63,10 +63,10 @@ mac-sim down                <span class="c"># give it back</span></code></pre>
 <tbody>
 <tr><th>1x (402×874)</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
 <tr><th>2x (804×1748)</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
-<tr><th>3x (1206×2622)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
+<tr><th>3x (1206×2622)</th><td class="num">17.2 fps</td><td class="num"><strong>50.6 fps</strong> (70.0 with Coherent, experimental)</td></tr>
 </tbody>
 </table></div>
-<p>The GPU sets the ceiling: a 3x simulator keeps that iGPU 96 to 98% busy. Simulators animating at the same time share it. Recording uses the VM's software H.264 encoder, about 50 fps with one simulator animating. Full method: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
+<p>1x and 2x are from the October 28 build; 3x is the current one. The GPU sets the ceiling: a 3x simulator keeps that iGPU 96 to 98% busy (70% with Coherent). Simulators animating at the same time share it. Recording uses the VM's software H.264 encoder, about 50 fps with one simulator animating. Full method: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
 
 <h2 id="limits">Limits</h2>
 <ul>

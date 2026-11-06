@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 19:57:22 +0000
+Subject: [PATCH 10/34] surface_lazy: a commit does nothing
+ while no surface is lazy; counts on stderr
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../metal2vulkan-runtime/src/command_buffer/mod.rs |  6 ++++--
+ crates/metal2vulkan-runtime/src/shadow_lazy.rs     | 14 ++++++++++----
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 7b19ebee..3c1c74f2 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2506,8 +2506,10 @@ impl CommandBuffer {
+         run: CommitRun,
+     ) -> Result<(), Error> {
+         // LOCAL (Atlas): a later command buffer may take its surfaces' images (`shadow_lazy.rs`).
+-        if let Some(id) = self.state().shadow_carry.as_ref().map(ShadowCarry::id) {
+-            crate::shadow_lazy::committed(id);
++        if crate::shadow_lazy::active() {
++            if let Some(id) = self.state().shadow_carry.as_ref().map(ShadowCarry::id) {
++                crate::shadow_lazy::committed(id);
++            }
+         }
+         // The waiting fetched render targets take their storage form at this commit where it
+         // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index e05af1f8..b1d61a39 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -85,11 +85,13 @@ pub(crate) fn everything_written() {
+     }
+ }
+ 
++/// Whether any surface is lazy, one atomic read: while none is, a commit does nothing here.
++pub(crate) fn active() -> bool {
++    ANY.load(Ordering::Relaxed)
++}
++
+ /// Note the command buffer of identity `id` committed.
+ pub(crate) fn committed(id: u64) {
+-    if !ANY.load(Ordering::Relaxed) {
+-        return;
+-    }
+     let mut ids = committed_ids().lock().unwrap();
+     if ids.len() == COMMITTED_KEPT {
+         ids.pop_front();
+@@ -216,7 +218,11 @@ impl Lazy {
+             let mut resynced = self.resynced.lock().unwrap();
+             if resynced.elapsed().as_millis() as u64 >= every {
+                 *resynced = Instant::now();
+-                RESYNCS.fetch_add(1, Ordering::Relaxed);
++                let resyncs = RESYNCS.fetch_add(1, Ordering::Relaxed) + 1;
++                if resyncs % 40 == 1 {
++                    let (taken, refused, resyncs) = counts();
++                    eprintln!("surface_lazy: taken {taken} refused {refused} resyncs {resyncs}");
++                }
+                 return None;
+             }
+         }

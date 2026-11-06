@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 11:18:39 +0000
+Subject: [PATCH 20/34] surface lazy: one image for a surface's textures
+
+A compositor's sampled-only texture over a surface's pages was a linear
+image in place, with no standing of its own: its read met the bytes, so
+the writer's whole surface went back every frame. A texture made over
+pages a lazy surface's first shadow covers now binds that image and its
+copies under its own record, where the extent, levels, layers, samples,
+type, hazard tracking, usage, offset and rows fit and the image takes a
+view of its format. It holds the first texture's texels, as the copies'
+way back is weak. Anything else keeps today's path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/buffer_texture.rs                     |  14 ++
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  27 ++-
+ crates/metal2vulkan-runtime/src/texture.rs    |  17 +-
+ .../src/texture/rotation.rs                   |   2 +
+ .../src/texture/surface_depth.rs              |   1 +
+ .../src/texture/surface_twin.rs               | 108 ++++++++++++
+ .../src/texture/surface_two_planes.rs         |   1 +
+ .../src/texture/ycbcr_image.rs                |   2 +
+ .../src/runtime_lane/surface_coherent.rs      | 162 +++++++++++++++++-
+ 9 files changed, 326 insertions(+), 8 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 7197fdc2..4a8e11b7 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1449,6 +1449,20 @@ impl Texels {
+             )
+     }
+ 
++    /// LOCAL (Atlas): where these surface texels lie, as a table of a surface's textures
++    /// (`surface_twin.rs`) finds them.
++    pub(super) fn surface_key(&self) -> Option<(usize, u64)> {
++        Some((self.buffer.host_range()?.start, self.layout.offset))
++    }
++
++    /// LOCAL (Atlas): whether `other` lies as these do, over the same pages, tracked as they are.
++    pub(super) fn same_place(&self, other: &Texels) -> bool {
++        self.buffer.host_range() == other.buffer.host_range()
++            && self.layout == other.layout
++            && self.texel_bytes == other.texel_bytes
++            && self.tracked() == other.tracked()
++    }
++
+     /// LOCAL (Atlas): where the texels of a one-texel-a-block image of `extent` lie in host pages,
+     /// for a trapping surface (`shadow_coherent.rs`).
+     pub(super) fn surface_layout(&self, extent: [u32; 2]) -> Option<super::shadow_coherent::Layout> {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 1f4d8b3e..ed44b544 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -142,6 +142,8 @@ static FLUSHES: AtomicU64 = AtomicU64::new(0);
+ static FLUSHED_WHOLE: AtomicU64 = AtomicU64::new(0);
+ static FLUSHED_TEXELS: AtomicU64 = AtomicU64::new(0);
+ static DISCARDED: AtomicU64 = AtomicU64::new(0);
++/// Textures that bound a surface's image (`surface_twin.rs`).
++static TWINS: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS_UNMATCHED: AtomicU64 = AtomicU64::new(0);
+ /// Milliseconds since the first report's chance at the last report.
+@@ -326,7 +328,8 @@ pub(crate) fn display_image(bytes: &Range<usize>) -> Option<Hold> {
+     let lazy = surfaces().into_iter().find(|lazy| lazy.over(bytes))?;
+     let coherent = lazy.coherent()?;
+     let takes = coherent.presented() && lazy.standing_committed() && !lazy.beside_another();
+-    takes.then(|| lazy.owner.get().and_then(Weak::upgrade)).flatten()
++    let owner = || lazy.owners.lock().unwrap().iter().find_map(Weak::upgrade);
++    takes.then(owner).flatten()
+ }
+ 
+ /// A command buffer completed, before its handlers: its writes in images trap from here.
+@@ -566,7 +569,7 @@ fn report() {
+         "surface_lazy: taken {taken} refused {refused} resyncs {resyncs} | refused: touched {} \
+          written {} epoch {} own {} uncommitted {} no-standing {} | in: first {} beyond-held {} \
+          changed {} bounded {} | ahead: deferred {} shared {} flushes {} whole {} texels {} \
+-         discarded {} presents {} unmatched {}",
++         discarded {} presents {} unmatched {} twins {}",
+         by[Refused::Touched as usize],
+         by[Refused::Written as usize],
+         by[Refused::Epoch as usize],
+@@ -585,6 +588,7 @@ fn report() {
+         read(&DISCARDED),
+         read(&PRESENTS),
+         read(&PRESENTS_UNMATCHED),
++        read(&TWINS),
+     );
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+@@ -601,6 +605,11 @@ fn report() {
+     }
+ }
+ 
++/// A texture bound a surface's image (`surface_twin.rs`).
++pub(crate) fn twin_bound() {
++    TWINS.fetch_add(1, Ordering::Relaxed);
++}
++
+ /// The counts so far, for a lane or a stderr line: standings taken, refused, and resyncs.
+ pub fn counts() -> (u64, u64, u64) {
+     (
+@@ -685,6 +694,8 @@ pub struct AheadCounts {
+     pub texels: u64,
+     /// The copies dropped, their texture gone.
+     pub discarded: u64,
++    /// The textures that bound a surface's image (`surface_twin.rs`).
++    pub twins: u64,
+ }
+ 
+ /// The counts of writes left ahead so far.
+@@ -696,6 +707,7 @@ pub fn ahead_counts() -> AheadCounts {
+         whole: read(&FLUSHED_WHOLE),
+         texels: read(&FLUSHED_TEXELS),
+         discarded: read(&DISCARDED),
++        twins: read(&TWINS),
+     }
+ }
+ 
+@@ -728,8 +740,9 @@ pub(crate) struct Lazy {
+     presents: AtomicU64,
+     /// Its trap coherence (`shadow_coherent.rs`), where the texture's image takes it.
+     coherent: OnceLock<Arc<Coherent>>,
+-    /// Weakly, the texture the display samples instead of the pages ([`display_image`]).
+-    owner: OnceLock<Weak<dyn Any + Send + Sync>>,
++    /// Weakly, the textures the display may sample instead of the pages ([`display_image`]): its
++    /// own, and those that bind its image (`surface_twin.rs`).
++    owners: Mutex<Vec<Weak<dyn Any + Send + Sync>>>,
+ }
+ 
+ impl Lazy {
+@@ -762,7 +775,7 @@ impl Lazy {
+                 copied_in: AtomicU64::new(0),
+                 presents: AtomicU64::new(0),
+                 coherent: OnceLock::new(),
+-                owner: OnceLock::new(),
++                owners: Mutex::new(Vec::new()),
+             })
+         })
+     }
+@@ -774,7 +787,9 @@ impl Lazy {
+ 
+     /// The texture over it, the display's way to its image.
+     pub(crate) fn owned_by(&self, texture: Weak<dyn Any + Send + Sync>) {
+-        let _ = self.owner.set(texture);
++        let mut owners = self.owners.lock().unwrap();
++        owners.retain(|owner| owner.strong_count() > 0);
++        owners.push(texture);
+     }
+ 
+     /// Its trap coherence, while it holds: `None` where it never traps or no longer does.
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 94970fef..4e722b99 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -177,6 +177,7 @@ pub(super) mod storage_form;
+ pub(super) mod surface_depth;
+ pub(super) mod surface_two_planes;
+ mod twin_decode;
++mod surface_twin;
+ mod usage_shadow;
+ mod view_shadow;
+ pub(super) mod wrapped;
+@@ -205,6 +206,9 @@ pub(super) struct TextureState {
+     placement: ImagePlacement,
+     /// The neutral images and samplers bindings take where nothing is bound (`neutral.rs`).
+     pub(super) neutrals: Mutex<Neutrals>,
++    /// LOCAL (Atlas): each surface's first shadow, for its later textures to bind
++    /// (`surface_twin.rs`).
++    twins: surface_twin::Twins,
+     /// Parked images, and the makings of the live recyclable ones (`recycle.rs`).
+     pub(super) recycled: Mutex<Recycler<vk::Image, ImageMaking>>,
+     /// The placeholder images of the colors a render pass instance leaves out of its subpass for
+@@ -265,6 +269,7 @@ impl TextureState {
+                 &crate::driver_defects::of(description),
+             ),
+             neutrals: Mutex::new(Neutrals::default()),
++            twins: surface_twin::Twins::default(),
+             recycled: Mutex::new(Recycler::new(recycle::IMAGES)),
+             storage_placeholders: Mutex::new(Placeholders::default()),
+             usage_answers: Mutex::new(UsageAnswers::default()),
+@@ -503,6 +508,9 @@ enum Storage {
+         image: Arc<Image>,
+         texels: Arc<Texels>,
+         copies: Arc<ShadowCopies>,
++        /// LOCAL (Atlas): the texels `image` and `copies` were made for, where they are another
++        /// texture's that this one binds (`surface_twin.rs`).
++        first: Option<Arc<Texels>>,
+     },
+ }
+ 
+@@ -2140,7 +2148,13 @@ impl Device {
+         id_use: IdUse,
+     ) -> Result<Texture, Error> {
+         let record = ViewRecord::of_descriptor(layout, descriptor);
+-        let storage = self.storage_over_buffer(call, Arc::new(texels), descriptor, layout)?;
++        let texels = Arc::new(texels);
++        // LOCAL (Atlas): one image for a surface's bytes (`surface_twin.rs`).
++        if let Some(storage) = self.surface_twin(&texels, descriptor, layout) {
++            return Ok(Texture::made(self, storage, record, None, id_use));
++        }
++        let storage = self.storage_over_buffer(call, texels, descriptor, layout)?;
++        self.note_surface_first(&storage);
+         Ok(Texture::made(self, storage, record, None, id_use))
+     }
+ 
+@@ -2462,6 +2476,7 @@ impl Device {
+             image,
+             texels,
+             copies: Arc::new(copies),
++            first: None,
+         })
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture/rotation.rs b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+index ed90a7e7..e0570caf 100644
+--- a/crates/metal2vulkan-runtime/src/texture/rotation.rs
++++ b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+@@ -255,6 +255,7 @@ impl Device {
+             (object, reason)
+         });
+         Ok(Storage::Shadow {
++            first: None,
+             image: image.shared(),
+             texels: rows,
+             copies: Arc::new(copies),
+@@ -292,6 +293,7 @@ impl Device {
+             (object, reason)
+         });
+         Ok(Storage::Shadow {
++            first: None,
+             image: image.shared(),
+             texels: turned,
+             copies: Arc::new(copies),
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+index 563fbde8..56410690 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_depth.rs
+@@ -174,6 +174,7 @@ impl Texture {
+                 lazy: None,
+             };
+             let storage = Storage::Shadow {
++                first: None,
+                 image: image.shared(),
+                 texels: Arc::new(texels.tiled_span(base..end, bytes)),
+                 copies: Arc::new(copies),
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+new file mode 100644
+index 00000000..fb35755d
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+@@ -0,0 +1,108 @@
++//! LOCAL (Atlas): one image for one surface's bytes. A program's textures of one IOSurface plane
++//! (each over a no-copy buffer of the surface's pages, `host_aliases.rs`) were one image each: the
++//! surface's first texture, which renders, a shadow that holds its writes ahead (`shadow_lazy.rs`),
++//! and a later texture that only reads, a linear image in place over the pages. A compositor that
++//! samples such a texture meets the bytes every frame, so the first one's writes went back whole
++//! every frame. Sim 3x: 1 such read a frame, of one of three surfaces in turn, and the Sim's own
++//! rate on Tahoe rose to 60 fps with it gone.
++//!
++//! - **Which.** A texture made over the same host pages as the live first shadow of a lazy
++//!   surface ([`Twins`]), at the same offset and rows, of the same extent, levels, layers, sample
++//!   count, type and hazard tracking, whose declared usage the image has, and of a pixel format
++//!   the image takes a view of (`Device::image_takes_view`: the same one, its sRGB twin, one of
++//!   its list). Any other keeps today's path: an image of its own, in place or a shadow.
++//! - **What it binds.** The first texture's image and copies, under its own record: its format,
++//!   swizzle and usage are its views' (`binding_view`), the image's flags and usage are fixed by
++//!   the first texture's plan, which is why the check above stands. Its own texels stay, for what
++//!   the CPU and the program ask of it. To every encoder it is that image: one resource key for
++//!   the tracker's barriers across textures, one entry of `ShadowSync`, one standing, no
++//!   `beside_another`.
++//! - **Lifetime.** It holds the image, the copies and the first texture's texels (the copies name
++//!   that buffer): the first texture may go first, and the surface's trapping and standing go on
++//!   as they did. The display finds any live one ([`Lazy::owned_by`]).
++//! - **One device.** The tasks of a guest share one `VkDevice`; a table is a device's, so a task
++//!   on another device keeps today's path.
++//! - **Order.** Only what comes after the first shadow binds it: a reader made first stays in
++//!   place, and the shadow made after it stays beside it, as before.
++
++use super::*;
++
++/// The live switch.
++const SWITCH: &str = "surface_twin";
++
++/// A surface's first shadow, weakly: it goes with its last texture.
++struct First {
++    image: Weak<Image>,
++    texels: Weak<Texels>,
++    copies: Weak<ShadowCopies>,
++}
++
++/// A device's first shadow of each surface plane, by the first host address of its bytes and its
++/// offset in them.
++#[derive(Default)]
++pub(super) struct Twins(Mutex<HashMap<(usize, u64), First>>);
++
++impl Device {
++    /// The storage of a texture of `descriptor` (checked as `layout`) over `texels` that binds a
++    /// lazy surface's first shadow (the module docs), where one takes it.
++    pub(super) fn surface_twin(
++        &self,
++        texels: &Arc<Texels>,
++        descriptor: &TextureDescriptor,
++        layout: &TextureLayout,
++    ) -> Option<Storage> {
++        if !crate::live::on(SWITCH, true) || !texels.lies_lazily() || texels.buffer.detached() {
++            return None;
++        }
++        if surface_depth_unit(layout.pixel_format).is_some() {
++            return None;
++        }
++        let (image, first, copies) = {
++            let twins = lock(&self.shared().textures.twins.0);
++            let found = twins.get(&texels.surface_key()?)?;
++            (found.image.upgrade()?, found.texels.upgrade()?, found.copies.upgrade()?)
++        };
++        let facts = self.shared().textures.facts(self.compile_device().profile());
++        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
++        let plan = plan_image(layout, usage, false, &facts).ok()?;
++        let theirs = image.plan();
++        let same = plan.extent == theirs.extent
++            && plan.levels == theirs.levels
++            && plan.layers == theirs.layers
++            && plan.samples == theirs.samples
++            && plan.image_type == theirs.image_type
++            && plan.unavailable == theirs.unavailable
++            && theirs.usage.contains(plan.usage)
++            && theirs.flags.contains(plan.flags);
++        let takes = same
++            && first.same_place(texels)
++            && !copies.converts()
++            && self.image_takes_view(&image, layout.pixel_format);
++        takes.then(|| {
++            crate::shadow_lazy::twin_bound();
++            Storage::Shadow {
++                image,
++                texels: Arc::clone(texels),
++                copies,
++                first: Some(first),
++            }
++        })
++    }
++
++    /// Note `storage`, a new texture's, where it is the first shadow of a lazy surface.
++    pub(super) fn note_surface_first(&self, storage: &Storage) {
++        let Storage::Shadow { image, texels, copies, first: None } = storage else {
++            return;
++        };
++        let Some(key) = texels.surface_key().filter(|_| copies.lazy.is_some()) else {
++            return;
++        };
++        let mut twins = lock(&self.shared().textures.twins.0);
++        twins.retain(|_, first| first.texels.strong_count() > 0);
++        twins.entry(key).or_insert_with(|| First {
++            image: Arc::downgrade(image),
++            texels: Arc::downgrade(texels),
++            copies: Arc::downgrade(copies),
++        });
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 43c812d2..d2daa1ef 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -255,6 +255,7 @@ impl Device {
+             (object, why)
+         });
+         let storage = Storage::Shadow {
++            first: None,
+             image: image.shared(),
+             texels: Arc::new(texels.with_alpha(alpha_layout)),
+             copies: Arc::new(copies),
+diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+index cf1d6816..98bf9b65 100644
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -379,6 +379,7 @@ impl Device {
+             lazy: None,
+         };
+         Ok(Storage::Shadow {
++            first: None,
+             image: image.shared(),
+             texels,
+             copies: Arc::new(copies),
+@@ -844,6 +845,7 @@ impl Texture {
+             lazy: None,
+         };
+         let storage = Storage::Shadow {
++            first: None,
+             image: image.shared(),
+             texels: Arc::clone(texels),
+             copies: Arc::new(copies),
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index d9393d7a..7da9b9dc 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -12,9 +12,12 @@ use super::{validated_device_with, Messages, ScratchCache};
+ use crate::gpu::TEST_DEVICE;
+ use metal2vulkan::device::HostPageTexturePolicy;
+ use super::pitched_surfaces::{bgra8_sampling, drawn_small, sampled_bgra8};
+-use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan::metal::{
++    PixelFormat, PrimitiveType, TextureSwizzle, TextureSwizzleChannels, TextureUsage,
++};
+ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor};
+ use metal2vulkan_runtime::shadow_coherent::{self, Pages};
++use metal2vulkan_runtime::shadow_lazy;
+ use metal2vulkan_runtime::{
+     live, Buffer, CommandBuffer, CommandQueue, Device, IoSurfacePlane, LoadAction, PipelineOptions,
+     RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, StoreAction,
+@@ -678,6 +681,145 @@ fn surface_coherent_the_display_samples_the_image() {
+     });
+ }
+ 
++/// A compositor's texture over the surface it reads, made after the texture that renders it: one
++/// image for the bytes (`surface_twin.rs`), so its read meets no bytes.
++#[test]
++fn surface_twin_a_reader_takes_the_surfaces_image() {
++    on_surface(true, |case| {
++        let twins = shadow_lazy::ahead_counts().twins;
++        let reader = case.reader(PixelFormat::BGRA8Unorm);
++        assert_eq!(shadow_lazy::ahead_counts().twins, twins + 1);
++        case.draw(RED, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], RED_TEXEL);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "nothing went back for the read");
++        assert_eq!(case.count("flushes"), 0);
++        case.draw(GREEN, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], GREEN_TEXEL);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "still");
++        assert_eq!(case.read(5, 5), GREEN_TEXEL, "and the guest reads what lay ahead");
++    });
++}
++
++/// The reader on a queue of its own, as a compositor's task has, while the write it reads is in
++/// flight: the one image's key orders them.
++#[test]
++fn surface_twin_a_read_waits_for_a_write_on_another_queue() {
++    on_surface(true, |case| {
++        let reader = case.reader(PixelFormat::BGRA8Unorm);
++        let other = case.device.new_command_queue().unwrap();
++        for (color, texel) in [(RED, RED_TEXEL), (GREEN, GREEN_TEXEL), (RED, RED_TEXEL)] {
++            let command_buffer = case.queue.command_buffer().unwrap();
++            case.pass(&command_buffer, color, None);
++            command_buffer.commit().unwrap();
++            assert_eq!(sampled_bgra8(&other, &reader, WIDTH, HEIGHT)[..4], texel);
++        }
++    });
++}
++
++/// What the guest writes reaches a reader of the image through its traps.
++#[test]
++fn surface_twin_a_reader_reads_a_cpu_write() {
++    on_surface(true, |case| {
++        let reader = case.reader(PixelFormat::BGRA8Unorm);
++        case.draw(RED, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], RED_TEXEL);
++        case.write(0, 0, [1, 2, 3, 255]);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], [1, 2, 3, 255]);
++    });
++}
++
++/// A reader's format is its own view of the image: the sRGB twin decodes what the first stored.
++#[test]
++fn surface_twin_a_reader_views_the_image_in_its_own_format() {
++    on_surface(true, |case| {
++        let twins = shadow_lazy::ahead_counts().twins;
++        let reader = case.reader(PixelFormat::BGRA8UnormSRGB);
++        assert_eq!(shadow_lazy::ahead_counts().twins, twins + 1);
++        case.draw([0.5, 0.5, 0.5, 1.0], None);
++        let read = sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT);
++        // 0x80 decodes to 0.2158.
++        assert!(read[0].abs_diff(55) <= 1, "decoded to {}", read[0]);
++        assert_eq!(read[3], 255);
++    });
++}
++
++/// A reader's swizzle is its own too: the texture that renders keeps its channels.
++#[test]
++fn surface_twin_a_reader_keeps_its_swizzle() {
++    on_surface(true, |case| {
++        let mut d = case.reader_descriptor(PixelFormat::BGRA8Unorm);
++        d.swizzle = TextureSwizzleChannels {
++            red: TextureSwizzle::Blue,
++            green: TextureSwizzle::Green,
++            blue: TextureSwizzle::Red,
++            alpha: TextureSwizzle::Alpha,
++        };
++        let reader = case.over_other_import(&d);
++        case.draw(RED, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], [255, 0, 0, 255]);
++        assert_eq!(sampled_bgra8(&case.queue, case.texture(), WIDTH, HEIGHT)[..4], RED_TEXEL);
++    });
++}
++
++/// The display finds the image through the reader once the texture it was made for went.
++#[test]
++fn surface_twin_the_display_finds_the_image_through_a_reader() {
++    on_surface(true, |case| {
++        let mapping = Mapping::anonymous(case.len);
++        mapping.fill(BEFORE);
++        let first_bytes = surface_buffer(case.device, &mapping, case.len);
++        let mut d = case.reader_descriptor(PixelFormat::BGRA8Unorm);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        let plane = IoSurfacePlane::new(0, ROW, false);
++        let first = first_bytes.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        d.usage = TextureUsage::SHADER_READ;
++        let other = surface_buffer(case.device, &mapping, case.len);
++        let reader = other.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        case.draw_on(&first, RED);
++        drop(first);
++        let shown = reader.surface_presented().expect("the reader stands for the first");
++        assert_eq!(sampled_bgra8(&case.queue, &shown, WIDTH, HEIGHT)[..4], RED_TEXEL);
++        assert_eq!(mapping.read(0..4), [BEFORE; 4], "and it copied nothing");
++    });
++}
++
++/// A format the image takes no view of keeps a texture of its own, and reads the right texels.
++#[test]
++fn surface_twin_a_format_the_image_does_not_list_stays_apart() {
++    on_surface(true, |case| {
++        let twins = shadow_lazy::ahead_counts().twins;
++        let reader = case.reader(PixelFormat::RGBA8Unorm);
++        assert_eq!(shadow_lazy::ahead_counts().twins, twins);
++        case.draw(RED, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], [255, 0, 0, 255]);
++    });
++}
++
++/// A reader outlives the texture and the buffer the image was made for: the image, its standing
++/// and its way back to the pages stay.
++#[test]
++fn surface_twin_a_reader_outlives_the_first_texture() {
++    on_surface(true, |case| {
++        let mapping = Mapping::anonymous(case.len);
++        mapping.fill(BEFORE);
++        let first_bytes = surface_buffer(case.device, &mapping, case.len);
++        let mut d = case.reader_descriptor(PixelFormat::BGRA8Unorm);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        let plane = IoSurfacePlane::new(0, ROW, false);
++        let first = first_bytes.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        d.usage = TextureUsage::SHADER_READ;
++        let other = surface_buffer(case.device, &mapping, case.len);
++        let reader = other.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        case.draw_on(&first, RED);
++        drop(first);
++        drop(first_bytes);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], RED_TEXEL);
++        assert_eq!(mapping.read(0..4), [BEFORE; 4], "it stays ahead");
++        shadow_coherent::fault(mapping.pointer().as_ptr() as u64, false);
++        assert_eq!(mapping.read(0..4), RED_TEXEL, "and comes back through the reader's hold");
++    });
++}
++
+ /// What a copy back's GPU time is taken to be: 1 ns a MiB leaves nothing a surface's traps can pay
+ /// for, so every sync costs more than it saved; a second a MiB, the other way.
+ const COPIES_COST_NOTHING: &str = "1";
+@@ -1070,6 +1212,24 @@ impl Case<'_> {
+             .unwrap()
+     }
+ 
++    /// A descriptor of a texture that only reads, at the surface's size.
++    fn reader_descriptor(&self, format: PixelFormat) -> TextureDescriptor {
++        let mut d = TextureDescriptor::texture_2d(format, WIDTH, HEIGHT, false);
++        d.usage = TextureUsage::SHADER_READ;
++        d.resource_options = self.buffer.resource_options();
++        d
++    }
++
++    /// A texture of `descriptor` over a buffer of its own of the surface's pages.
++    fn over_other_import(&self, descriptor: &TextureDescriptor) -> Texture {
++        let plane = IoSurfacePlane::new(0, self.row, false);
++        self.other_import().new_texture_with_iosurface_plane(descriptor, plane).unwrap()
++    }
++
++    fn reader(&self, format: PixelFormat) -> Texture {
++        self.over_other_import(&self.reader_descriptor(format))
++    }
++
+     fn draw_on(&self, texture: &Texture, color: [f32; 4]) {
+         let color = staged(self.device, &floats4(color));
+         let rects = std::slice::from_ref(&self.rect);

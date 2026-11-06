@@ -1,9 +1,9 @@
-From 0cb65c2d01e8fc3fd3eb6dc68feb1e55fb0d787e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 19:40:43 +0000
-Subject: [PATCH 5/5] order uses through two imports of the same
- pages with MEMORY_WRITE; keep a remapped memory whose imports follow their
- address
+Subject: [PATCH 05/34] order uses through two imports of the
+ same pages with MEMORY_WRITE; keep a remapped memory whose imports follow
+ their address
 
 The host_rt_in_place failure (surface_aliases'
 a_second_buffer_that_joined_nothing_reads_what_the_first_wrote, AfterRemap
@@ -37,7 +37,7 @@ still stale.
   whose live imports are all by pointer now stays (remapped_keeping,
   HostImport::by_pointer): a later buffer over the bytes joins its key and
   lies in its import. ARL's device lacks the fact (not in M2V_ARL_FACTS),
-  so on the reference host the barrier above is what fixes it; with
+  so on Atlas the barrier above is what fixes it; with
   facts_on=PointerImportsFollowTheirAddress the buffer lies in one import.
 - host_rt::orders_images: an image use takes its key's bytes while the
   switch is on and once a texture was made in place under it, so turning
@@ -72,7 +72,7 @@ index 169f4307..57d569a8 100644
          self.shape.drops_writes
      }
  
-+    /// macbox: whether its pages were imported by their pointer, neither as dma-bufs nor
++    /// LOCAL (Atlas): whether its pages were imported by their pointer, neither as dma-bufs nor
 +    /// through a read-only view: an import that follows its address where the driver's pointer
 +    /// imports do (`host_aliases.rs`).
 +    pub(super) fn by_pointer(&self) -> bool {
@@ -90,7 +90,7 @@ index 9045fd4d..51b73aac 100644
  use super::values::{ResourceOptions, StorageMode};
  use super::work_counts::Counters;
  use super::Device;
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use crate::release;
  use ash::vk;
  use std::ptr::NonNull;
@@ -106,7 +106,7 @@ index 9045fd4d..51b73aac 100644
 -    /// once, and otherwise it finds the buffers over the range by address, whether the range
 -    /// covers none of them or many, never reading them all.
 +    /// new pages: a buffer made over those bytes while it runs may lie in either pages. LOCAL
-+    /// (macbox): where the driver's pointer imports follow their address, a live buffer's import of
++    /// (Atlas): where the driver's pointer imports follow their address, a live buffer's import of
 +    /// the pointer reads the new pages from the call on, as a new import would: a buffer made
 +    /// after the call over the bytes a live one was made over, of its memory class, lies in its
 +    /// import still, and joins its key, unless an import of the memory is of dma-bufs
@@ -124,7 +124,7 @@ index 9045fd4d..51b73aac 100644
          let unit = (shared.host_import.as_ref())
              .map_or(1, |importer| importer.page.max(importer.alignment));
 -        let imports = (shared.aliases).remapped(start, start.saturating_add(length), unit);
-+        // macbox: on a driver whose pointer imports follow their address, a memory whose
++        // LOCAL (Atlas): on a driver whose pointer imports follow their address, a memory whose
 +        // imports are all of the pointer stays: they read the new pages from the remap on, as
 +        // an import made after it would, so a later buffer over the bytes lies in one of them
 +        // (`host_aliases.rs`).
@@ -141,7 +141,7 @@ index 9045fd4d..51b73aac 100644
                  .aliases
                  .join(buffer.identity().key, made_over, class, &import);
 -            shared.aliases.place(buffer.identity().key, made_over);
-+            // macbox: placed with the import it lies in (`host_aliases.rs`).
++            // LOCAL (Atlas): placed with the import it lies in (`host_aliases.rs`).
 +            let note = super::host_aliases::import_note(&import);
 +            shared.aliases.place(buffer.identity().key, made_over, note);
              return Ok(buffer);
@@ -151,7 +151,7 @@ index 9045fd4d..51b73aac 100644
          // a later one lies in its import; one whose GPU writes are dropped joins none.
          // A buffer just made lies in its pages (`HostCell::current`).
          let current = buffer.host_cell().and_then(|cell| cell.current());
-+        // macbox: the import it lies in, which it is placed with (`host_aliases.rs`).
++        // LOCAL (Atlas): the import it lies in, which it is placed with (`host_aliases.rs`).
 +        let note =
 +            (current.as_ref()).map_or(0, |pages| super::host_aliases::import_note(pages.import()));
          if let (false, false, Some(current)) = (of_heap, drops_writes, current) {
@@ -172,7 +172,7 @@ index 9045fd4d..51b73aac 100644
          shared.aliases.leave(key);
 -        // Its uses from now on order against the keys over the new bytes.
 -        shared.aliases.place(key, (pointer.as_ptr() as u64, length));
-+        // Its uses from now on order against the keys over the new bytes; macbox: placed
++        // Its uses from now on order against the keys over the new bytes; LOCAL (Atlas): placed
 +        // with the import of its new pages (`host_aliases.rs`).
 +        let note = super::host_aliases::import_note(pages.import());
 +        shared
@@ -189,7 +189,7 @@ index 11b17838..330c0690 100644
  //!   (`WorkCounts::host_imports_remapped`). The lock is a leaf: nothing else is locked, and no buffer, pages hold or
  //!   deallocator is dropped, while it is held (the imports noted are weak), so the call may be
  //!   made from any thread, a deallocator's among them.
-+//! - **macbox: a remap over imports that follow their address.** On a driver whose pointer
++//! - **LOCAL (Atlas): a remap over imports that follow their address.** On a driver whose pointer
 +//!   imports follow their address (`DriverFact::PointerImportsFollowTheirAddress`), an import of
 +//!   the pointer reads the pages mapped there at each submission, the new ones from a remap on, as
 +//!   an import made after it would. There a reported remap keeps a memory whose every live
@@ -197,7 +197,7 @@ index 11b17838..330c0690 100644
 +//!   joins its key and lies in its import, one `VkDeviceMemory` again, where it would otherwise
 +//!   import the same pages anew. A memory with an import of dma-bufs (which keeps its pages)
 +//!   still ends.
-+//! - **macbox: two imports of the same pages.** Each import is a `VkDeviceMemory` of its
++//! - **LOCAL (Atlas): two imports of the same pages.** Each import is a `VkDeviceMemory` of its
 +//!   own, mapped at a GPU address of its own, and on ANV (Mesa 26.2.4, the Arrow Lake iGPU) a
 +//!   barrier from a pass's color writes through one to a read through another of the same pages
 +//!   left about 2% of the texels stale within one submission: those still in the GPU's L3 under
@@ -228,7 +228,7 @@ index 11b17838..330c0690 100644
          }
      }
  
-+    /// macbox: [`remapped_keeping`](Self::remapped_keeping), keeping no memory (the
++    /// LOCAL (Atlas): [`remapped_keeping`](Self::remapped_keeping), keeping no memory (the
 +    /// tests' form, upstream's call).
 +    #[cfg(test)]
 +    pub(super) fn remapped(&self, start: u64, end: u64, unit: u64) -> usize {
@@ -244,7 +244,7 @@ index 11b17838..330c0690 100644
      /// takes anew at its next submission (`WorkCounts::host_imports_remapped`).
 -    pub(super) fn remapped(&self, start: u64, end: u64, unit: u64) -> usize {
 +    ///
-+    /// macbox: but a memory each of whose live imports `keeps` (an import of the pointer
++    /// LOCAL (Atlas): but a memory each of whose live imports `keeps` (an import of the pointer
 +    /// on a driver whose pointer imports follow their address, which reads the pages the remap
 +    /// put there: the module docs) stays, so a later buffer over its bytes joins it and lies in
 +    /// its import. A memory with no live import ends.
@@ -301,7 +301,7 @@ index 11b17838..330c0690 100644
      /// its length) from now on, made or rebound there, and no longer where it lay before
 -    /// ([`Placements`]).
 -    pub(super) fn place(&self, key: ResourceKey, at: (u64, u64)) {
-+    /// ([`Placements`]). macbox: in the import `import` names (its address; 0 for one not
++    /// ([`Placements`]). LOCAL (Atlas): in the import `import` names (its address; 0 for one not
 +    /// known, which no other import is taken to be: the module docs).
 +    pub(super) fn place(&self, key: ResourceKey, at: (u64, u64), import: u64) {
          let mut inner = lock(&self.inner);
@@ -315,7 +315,7 @@ index 11b17838..330c0690 100644
      }
  }
  
-+/// macbox: the note of `import` in the placements: its address, which no other live
++/// LOCAL (Atlas): the note of `import` in the placements: its address, which no other live
 +/// import shares (the module docs).
 +pub(super) fn import_note<I>(import: &Arc<I>) -> u64 {
 +    Arc::as_ptr(import) as usize as u64
@@ -351,7 +351,7 @@ index 11b17838..330c0690 100644
 -                range,
 -                ..used.clone()
 -            });
-+            // macbox: a buffer that joined a memory lies in its import but where two
++            // LOCAL (Atlas): a buffer that joined a memory lies in its import but where two
 +            // were made over it at once (the module docs): one placed in another import than
 +            // the memory's key's is apart.
 +            let other = placements.is_some_and(|placements| placements.apart(used.key, key));
@@ -390,7 +390,7 @@ index 11b17838..330c0690 100644
      !all.is_empty()
  }
  
-+/// macbox: `used`, a use added for a key of another import of the same pages where
++/// LOCAL (Atlas): `used`, a use added for a key of another import of the same pages where
 +/// `other` (the module docs), with `MEMORY_WRITE` among the access types of its reads and of its
 +/// writes: a barrier between it and any use of the key it is added for then carries
 +/// `MEMORY_WRITE` on its side, which ANV takes as its full flush, so a write through one import
@@ -418,7 +418,7 @@ index 11b17838..330c0690 100644
 -    /// Each placed key's bytes: their first byte's host address and their length.
 -    at: KeyMap<ResourceKey, (u64, u64)>,
 +    /// Each placed key's bytes: their first byte's host address and their length; LOCAL
-+    /// (macbox): and the import it lies in ([`import_note`]; 0: not known, apart from every
++    /// (Atlas): and the import it lies in ([`import_note`]; 0: not known, apart from every
 +    /// other).
 +    at: KeyMap<ResourceKey, ((u64, u64), u64)>,
      /// Each range of bytes some key lies over, by its first byte's address and its length.
@@ -428,13 +428,13 @@ index 11b17838..330c0690 100644
      keys: usize,
      /// Whether its key lies over it still.
      first: bool,
-+    /// macbox: the import its key lies in, kept once the key went: the key's uses still
++    /// LOCAL (Atlas): the import its key lies in, kept once the key went: the key's uses still
 +    /// recorded lie there, and hold the import, whose address no other import takes meanwhile.
 +    import: u64,
      /// The other ranges that meet it (share a byte with it), each with its key (a range's key
 -    /// is its own while it lives), in the order the lookup by address finds them ([`seat`]).
 -    meets: Vec<((u64, u64), ResourceKey)>,
-+    /// is its own while it lives) and macbox that key's import, in the order the lookup by
++    /// is its own while it lives) and LOCAL (Atlas) that key's import, in the order the lookup by
 +    /// address finds them ([`seat`]).
 +    meets: Vec<((u64, u64), ResourceKey, u64)>,
  }
@@ -473,7 +473,7 @@ index 11b17838..330c0690 100644
      }
  }
  
-+/// macbox: whether two imports, as placements note them (0: not known), are apart:
++/// LOCAL (Atlas): whether two imports, as placements note them (0: not known), are apart:
 +/// either not known, or two.
 +fn imports_apart(a: u64, b: u64) -> bool {
 +    a == 0 || b == 0 || a != b
@@ -489,7 +489,7 @@ index 11b17838..330c0690 100644
 -    /// Place `key`, lying over no bytes, over `at`.
 -    pub(super) fn place(&mut self, key: ResourceKey, at: (u64, u64)) {
 +    /// Place `key`, lying over no bytes, over `at`, in the import `import` names (LOCAL
-+    /// (macbox)).
++    /// (Atlas)).
 +    pub(super) fn place(&mut self, key: ResourceKey, at: (u64, u64), import: u64) {
          if at.1 == 0 {
              return;
@@ -540,7 +540,7 @@ index 11b17838..330c0690 100644
          }
      }
  
-+    /// macbox: whether the placed keys `a` and `b` lie in two imports, or either in one not
++    /// LOCAL (Atlas): whether the placed keys `a` and `b` lie in two imports, or either in one not
 +    /// known (the module docs); `false` where either is not placed.
 +    pub(super) fn apart(&self, a: ResourceKey, b: ResourceKey) -> bool {
 +        match (self.at.get(&a), self.at.get(&b)) {
@@ -553,7 +553,7 @@ index 11b17838..330c0690 100644
      /// share, and the bytes of it they are (counted from its range's first byte), to `each`: its
      /// own range's key where another, and each other range's the bytes meet, clipped to it, in
 -    /// the order the lookup by address finds them. The ranges the bytes may meet are those that
-+    /// the order the lookup by address finds them; macbox: and whether that key lies in
++    /// the order the lookup by address finds them; LOCAL (Atlas): and whether that key lies in
 +    /// another import than `key` ([`imports_apart`]). The ranges the bytes may meet are those that
      /// meet the key's own range, which it keeps: they are read from there while no more than the
      /// classes of length the lookup by address visits (a range query each, where a kept range is
@@ -667,7 +667,7 @@ index fd28d676..db2af089 100644
  /// The host page of the tests that name none of their own: an import's unit.
  const PAGE: u64 = 0x1000;
  
-+/// macbox: the import the tests that name none place every key in: one import.
++/// LOCAL (Atlas): the import the tests that name none place every key in: one import.
 +const ONE: u64 = 1;
 +
  /// A reported remap counts the ranges placed buffers lie over that have a page among its bytes
@@ -789,7 +789,7 @@ index fd28d676..db2af089 100644
      changed("forgotten");
  }
 +
-+/// macbox: `used` as a use added for a key of another import takes it: `MEMORY_WRITE`
++/// LOCAL (Atlas): `used` as a use added for a key of another import takes it: `MEMORY_WRITE`
 +/// among the access types of its reads and of its writes.
 +fn apart(mut used: Use<ResourceKey>) -> Use<ResourceKey> {
 +    for side in [&mut used.read, &mut used.write] {
@@ -800,7 +800,7 @@ index fd28d676..db2af089 100644
 +    used
 +}
 +
-+/// macbox: keys over one surface's pages in two imports (one made after a remap of them):
++/// LOCAL (Atlas): keys over one surface's pages in two imports (one made after a remap of them):
 +/// a use of the second's bytes carries a use of the first's key with `MEMORY_WRITE` among its
 +/// access types, where a key in the first's import carries it as it was; a range in a third
 +/// import that meets the surface's last page carries the first's key so too, clipped; and a key
@@ -849,7 +849,7 @@ index fd28d676..db2af089 100644
 +    );
 +}
 +
-+/// macbox: two buffers made at once over one memory, each importing it: the second joins
++/// LOCAL (Atlas): two buffers made at once over one memory, each importing it: the second joins
 +/// the first's key, and where they are placed in two imports its uses carry the first's key with
 +/// `MEMORY_WRITE`; in one import, as they were.
 +#[test]
@@ -883,7 +883,7 @@ index fd28d676..db2af089 100644
 +    drop((one, two));
 +}
 +
-+/// macbox: a remap over a memory each of whose live imports follows its address keeps
++/// LOCAL (Atlas): a remap over a memory each of whose live imports follows its address keeps
 +/// it: a later buffer over its bytes lies in its import and joins its key. One whose import does
 +/// not, or with no import live, ends.
 +#[test]
@@ -930,7 +930,7 @@ index 8df378c2..aaf61433 100644
  //! says so and passes.
  
  use super::blit_holds::{device, over_host, until, Host, Scratch, BYTES};
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use crate::{
      BlitOption, Buffer, CommandBufferStatus, CommandQueue, Device, Error, Origin, ResourceOptions,
      Size, Texture, TextureDescriptor, WorkCounts,
@@ -939,7 +939,7 @@ index 8df378c2..aaf61433 100644
      assert_eq!(remaps(&device)[..3], [reported + 2, over + 1, remapped + 1]);
      // A second buffer over the remapped bytes imports them anew (`host_aliases.rs`): two live
 -    // imports over the same bytes, one placed range, which a report counts once.
-+    // imports over the same bytes, one placed range, which a report counts once. macbox:
++    // imports over the same bytes, one placed range, which a report counts once. LOCAL (Atlas):
 +    // where the driver's pointer imports follow their address, it lies in the first's import,
 +    // which reads the new pages: one import, the same range.
      let again = over_host(&device, &imported, &runs).unwrap();
@@ -971,7 +971,7 @@ index c453e0b2..bda123a2 100644
  //! memory a buffer was made over; the runtime orders their uses by the bytes each lies over now
  //! (`host_aliases.rs`'s placements), so their reads are fresh wherever one buffer's would be, two
 -//! queues in submission order included.
-+//! queues in submission order included. macbox: the one made after a remap imports the
++//! queues in submission order included. LOCAL (Atlas): the one made after a remap imports the
 +//! pages anew, a second `VkDeviceMemory` of them (on a driver whose pointer imports follow their
 +//! address it joins the first and lies in its import instead), and its uses through that import
 +//! carry `MEMORY_WRITE`, so their barriers flush what a pass wrote through the other: on ANV a
@@ -985,7 +985,7 @@ index c453e0b2..bda123a2 100644
      Rebound,
      /// Made over them after the program reported their range remapped while the first lived
 -    /// (with no remap made): it joins nothing, and imports them anew.
-+    /// (with no remap made): it joins nothing, and imports them anew (macbox: on a driver
++    /// (with no remap made): it joins nothing, and imports them anew (LOCAL (Atlas): on a driver
 +    /// whose pointer imports follow their address it joins the first instead).
      AfterRemap,
  }

@@ -92,26 +92,27 @@ description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine w
   <div class="wrap">
     <header class="head">
       <p class="eyebrow">Performance</p>
-      <p class="mega grad">92–96 fps</p>
+      <p class="mega grad">17 → 50 fps</p>
       <h2>Smooth enough to judge an&nbsp;animation.</h2>
-      <p>An iPhone simulator running a heavy Liquid Glass screen on an Intel integrated GPU. That's almost twice as fast as the GPU code macbox builds on.</p>
+      <p>An iPhone simulator at 3x, an iPhone's real pixels, running a heavy Liquid Glass screen on an Intel integrated GPU. That's three times what the GPU code macbox builds on manages, and the experimental Coherent switch takes it to 70.</p>
     </header>
     <figure class="chart">
-      <img src="/images/fps-dark.svg" width="900" height="370" loading="lazy" alt="iOS Simulator frame rate in a Liquid Glass benchmark. 1x: 53.5 fps upstream, 94.2 with the macbox build. 2x: 33.5 and 64.2. 3x: 17.2 and 39.0.">
+      <img src="/images/fps-dark.svg" width="900" height="320" loading="lazy" alt="iOS Simulator at 3x in a Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 with the current build, 70.0 with Coherent on.">
     </figure>
     <details class="more">
       <summary>The exact numbers</summary>
       <div class="table"><table>
-        <thead><tr><th>Workload</th><th class="num">Reims 2ce3209, upstream</th><th class="num">macbox build (two runs)</th></tr></thead>
+        <thead><tr><th>Workload</th><th class="num">Reims 2ce3209, upstream</th><th class="num">macbox, Oct 28</th><th class="num">macbox now</th><th class="num">now, Coherent on</th></tr></thead>
         <tbody>
-          <tr><th>iOS Simulator 1x (402×874), Liquid Glass</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
-          <tr><th>iOS Simulator 2x (804×1748), Liquid Glass</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
-          <tr><th>iOS Simulator 3x (1206×2622, an iPhone's pixels)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
-          <tr><th>Safari at 3x, a page under a blurred floating bar</th><td class="num">n/a</td><td class="num">66.4 / 64.2 fps</td></tr>
-          <tr><th>macOS desktop, Genie minimize at 3440×1440</th><td class="num">~12 frames</td><td class="num">19.5 frames</td></tr>
+          <tr><th>iOS Simulator 3x (1206×2622, an iPhone's pixels)</th><td class="num">17.2 fps</td><td class="num">38.5 / 39.5 fps</td><td class="num"><strong>50.6 fps</strong></td><td class="num"><strong>70.0 fps</strong></td></tr>
+          <tr><th>iOS Simulator 1x (402×874), Liquid Glass</th><td class="num">53.5 fps</td><td class="num">95.8 / 92.5 fps</td><td class="num">n/m</td><td class="num">n/m</td></tr>
+          <tr><th>iOS Simulator 2x (804×1748), Liquid Glass</th><td class="num">33.5 fps</td><td class="num">67.8 / 60.5 fps</td><td class="num">n/m</td><td class="num">n/m</td></tr>
+          <tr><th>macOS desktop, dragging a window (presents/s)</th><td class="num"></td><td class="num"></td><td class="num">105</td><td class="num">130</td></tr>
+          <tr><th>macOS desktop, Safari scrolling (presents/s)</th><td class="num"></td><td class="num"></td><td class="num">75–79</td><td class="num">110</td></tr>
+          <tr><th>macOS desktop, Genie minimize at 3440×1440</th><td class="num">~12 frames</td><td class="num">19.5 frames</td><td class="num"></td><td class="num">29.5 / 30.5 frames</td></tr>
         </tbody>
       </table></div>
-      <p class="note">Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, a VM with 8 vCPUs and 12 GB. Frames counted at the simulator's own screen, after a warm-up, one simulator animating. The GPU is the limit, so a faster GPU moves every number up; other GPUs haven't been measured yet. Method and patches: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
+      <p class="note">Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, a VM with 8 vCPUs and 12 GB. Frames counted at the simulator's own screen, after a warm-up, one simulator animating; n/m: not measured on the new build yet. "Now" and "Coherent on" are one A/B in one window. Coherent is off by default: it hung the GPU once on its first day of daily use, and the cause isn't settled. The GPU is the limit, so a faster GPU moves every number up; other GPUs haven't been measured yet. Method and patches: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
     </details>
   </div>
 </section>

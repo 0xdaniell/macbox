@@ -1,7 +1,7 @@
-From 4d7bde28d0e2369d3a6c5f871ddaf84456bd5290 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 17:00:38 +0000
-Subject: [PATCH 3/5] live experiment switches (M2V_LIVE):
+Subject: [PATCH 03/34] live experiment switches (M2V_LIVE):
  driver facts and heap compression change without a restart
 
 ---
@@ -37,7 +37,7 @@ index fb683618..ec9acf03 100644
  //! runtime announces `shader-resolve` (performance) for the extra pass (naming the copy where the
  //! resolve reads one), and `unmeasured-resolve` (precision) at more than 4 samples.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::binding_view::{views_as, VkView};
  use super::blit::TRANSFER;
  use super::command_buffer::CommandBuffer;
@@ -58,7 +58,7 @@ index 78c7b052..dc2c7a37 100644
  //!   keeps with their room: the scheduler thread allocates nothing for it
  //!   (`runtime_lane::frame_costs`, `a_frame_s_commits_allocate_within_their_bound`).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::submit::Submission;
  use super::{submission_error, CommandBufferShared};
  use crate::degradation::Degradation;
@@ -79,7 +79,7 @@ index 3b97ede6..a0fbce2a 100644
  //!   texels the device decodes otherwise than Metal where the device makes it (`texture.rs`,
  //!   `texture/shared.rs`, `texture/heap.rs`).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::attachment_stand_in::{Cause, StandIn};
  use super::color_resolve;
  use super::device::{DebugMessage, Device, MessageKind, MessageSeverity};
@@ -109,7 +109,7 @@ index b749a897..184d2cdd 100644
  //! device; a copy's descriptor set and framebuffer are its own, held by its command buffer until
  //! it completes.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::binding_view::VkView;
  use super::degradation::Degradation;
  use super::device::{device_error, lock};
@@ -132,7 +132,7 @@ index 59062a3d..5c24c7e0 100644
  //! image or backing that has it, which an image copy fills and empties at the same sample count
  //! (`attachment_stand_in.rs`).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::color_resolve;
  use super::depth_stencil_scratch;
  use super::device::lock;
@@ -153,7 +153,7 @@ index fd889f83..64dca27b 100644
  //!   did not fit); the device's dma-buf memories (`dma_buf_memories_live`) and its
  //!   imports of host pages by their pointer (`host_imports_live`) fall as imports are released.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::buffer::{FixedPages, HostImport, Imported, Pages, Shape};
  use super::device::lock;
  use super::dma_buf::{DmaBufRequest, DmaBufSource};
@@ -174,7 +174,7 @@ index f3b4901f..13e3c7b4 100644
  //! The device's image limits for the result (`vkGetPhysicalDeviceImageFormatProperties2`) are
  //! checked by [`check_image_limits`].
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::chroma_pairs::plan_pairs;
  use super::framebuffer_fetch;
  use super::memory::MemoryClass;
@@ -201,7 +201,7 @@ index 8cb8e6b7..27ef226b 100644
  #![warn(missing_docs)]
  
  mod address;
-+/// macbox: live experiment switches (`M2V_LIVE`).
++/// LOCAL (Atlas): live experiment switches (`M2V_LIVE`).
 +pub mod live;
  mod address_map;
  mod address_pool;
@@ -212,7 +212,7 @@ index 00000000..cc6e810b
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/live.rs
 @@ -0,0 +1,129 @@
-+//! macbox experiment switches that change while the process runs. `M2V_LIVE=<path>`
++//! LOCAL (Atlas) experiment switches that change while the process runs. `M2V_LIVE=<path>`
 +//! names a file of `name=value` lines (`#` starts a comment); a switch asked re-reads the file
 +//! at most once a second, when its modification time changed, so an A/B pair shares one boot.
 +//! Unset, every switch answers its default and no file is read. A changed file is logged once
@@ -349,7 +349,7 @@ index 58767624..7f9458e6 100644
  //! scratch past `max_buffer_length`, a dispatch past `maxComputeWorkGroupCount`) or the scratch's
  //! memory runs out, nothing is recorded and the call is refused.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::binding_view::{views_as, VkView};
  use super::blit::BlitCommandEncoder;
  use super::error::Error;
@@ -369,7 +369,7 @@ index 851e8b7c..64a9932c 100644
  //! [`residual_made`]: RenderVariant::residual_made
  //! [`residual_drawn`]: RenderVariant::residual_drawn
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::{DrawPipeline, GraphicsState, RenderVariant};
  use crate::degradation::BoundFormats;
  use crate::pipeline::graphics::GraphicsKey;
@@ -388,7 +388,7 @@ index 24a90d82..ba3449ed 100644
  //!   draws at once runs once per group of them: the encoder records the first group's pass, and
  //!   as it ends each later group's, from its log, over a twin of the depth and stencil.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::address_map::{self, SamplerMaps};
  use super::amplification::{Amplification, VertexAmplificationViewMapping};
  use super::argument_table::{check_index, ArgumentTable};
@@ -418,7 +418,7 @@ index b39ec934..0f9afa2c 100644
  //!   reaches the rest through a heap or a sparse heap, which make one of it as the device does
  //!   (`metal::format::padded_words`).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::capture::CapturedReach;
  use crate::buffer_texture::Texels;
  use crate::clear_reach::{DrawnTiles, PassReach};
@@ -439,7 +439,7 @@ index 210b283b..4eaf142d 100644
  //! framebuffer limits is refused `Unsupported` (`Feature::RenderTargetSize`), naming the limit
  //! (`framebuffer_fits`).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::attachment_stand_in::{self, Cause, StandIn};
  use super::binding_view::views_as;
  use super::buffer::Buffer;
@@ -469,7 +469,7 @@ index c37092eb..26da60fe 100644
  //!   until it completes. A render pass is never changed once made, so one serves every encoder
  //!   and thread at once. The framebuffer is made per instance; its command buffer holds it.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::attachment_stand_in::Cause;
  use super::attachmentless;
  use super::binding_view::VkView;
@@ -501,7 +501,7 @@ index bd5918fb..e233cb0b 100644
  //! - **Counted.** `WorkCounts::row_copies`, `row_copy_regions`, `row_copy_regions_most` and
  //!   `row_copies_dispatched`.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::owned_kernel::{OwnedBinds, OwnedKernel, OwnedModule, OwnedSet, OwnedSets};
  use super::tracker::Access;
  use super::Device;
@@ -522,7 +522,7 @@ index df3a2b2d..99b4df48 100644
  //! storage buffer range or workgroup counts, a buffer whose `VkBuffer` went, or a set the device
  //! does not make: each copies back as before, the exact form every device takes.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::image_plan::{compatible, ImageFacts, ImagePlan};
  use super::owned_kernel::{OwnedBinds, OwnedKernel, OwnedModule, OwnedSet};
  use super::Device;
@@ -552,7 +552,7 @@ index 85ab19f3..0eb14cb2 100644
  //!   in-process handle opens new textures over the same image.
  //! - **Not yet:** blits of textures over buffers are refused `NotImplemented`.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::address::{ObjectsToken, RangeToken};
  use super::address_map::AddressModeMap;
  use super::attachment_stand_in::KeptBacking;
@@ -582,7 +582,7 @@ index 6f15f1b3..1e13281c 100644
  //!   answers `heap`, `heap_offset`, `make_aliasable` and `is_aliasable` through the buffer, which
  //!   is no resource of the program's (Metal's texture answers `buffer` nil).
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::first_move::FirstMove;
  use super::heap_tiled::{
      footprint_size, metal_compresses_layout, metal_heap_layout, modelled_size, own_heap_layout,
@@ -609,7 +609,7 @@ index 6f15f1b3..1e13281c 100644
          }
          let policy = self.compile_device().policy().heap_compression;
 -        if compressed && policy == HeapCompressionPolicy::Compressed {
-+        // macbox: the live switch `heap_compressed` overrides the policy for the heaps'
++        // LOCAL (Atlas): the live switch `heap_compressed` overrides the policy for the heaps'
 +        // textures made after it changes (`live.rs`).
 +        let take_compressed =
 +            crate::live::on("heap_compressed", policy == HeapCompressionPolicy::Compressed);
@@ -643,7 +643,7 @@ index 7918bb7c..dec60427 100644
  //!   usage says. A texture reached through an argument buffer without `use_resource` registers
  //!   nothing, which Metal's contract does not allow.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use super::super::key_hash::KeyMap;
  use super::super::resource::ResourceKey;
  use super::super::tracker::{Access, Use, UseRange};
@@ -664,7 +664,7 @@ index afecfa6d..5fe2920c 100644
  //! - **Counted.** Each fill counts as one of the two forms (`WorkCounts::fills_recorded` and
  //!   `fills_by_transfers`), so a run shows which its device took.
  
-+use crate::live::LiveFacts as _; // macbox: live fact switches
++use crate::live::LiveFacts as _; // LOCAL (Atlas): live fact switches
  use crate::Device;
  use ash::vk;
  use metal2vulkan::device::DriverFact;

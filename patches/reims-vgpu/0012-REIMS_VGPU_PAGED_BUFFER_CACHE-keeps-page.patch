@@ -1,0 +1,885 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 23:26:32 +0000
+Subject: [PATCH 12/25] REIMS_VGPU_PAGED_BUFFER_CACHE keeps
+ paged textures' buffers
+
+Safari's compositor makes a texture per rAF on a dozen recycled page ranges.
+Each cost about 148 mmaps, a Vulkan import, a free and munmaps on the exec's
+serial path, 53% of the busy task thread. Off by default. A hit needs the
+pages the task maps now: every lookup walks the guest's page table.
+
+Also: mapstat per present, a log line per 600 presents, tdesc and srf events.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                                     |   1 +
+ crates/reims-vgpu-core/src/display/frame.rs   |   2 +
+ crates/reims-vgpu-core/src/gpu_task.rs        |   1 +
+ crates/reims-vgpu-core/src/gpu_task/memory.rs | 284 ++++++++++++++++-
+ .../src/gpu_task/paged_buffers.rs             | 300 ++++++++++++++++++
+ crates/reims-vgpu-core/src/gpu_task/paging.rs |   3 +
+ .../reims-vgpu-core/src/gpu_task/service.rs   |  18 ++
+ .../reims-vgpu-core/src/gpu_task/surfaces.rs  |   3 +
+ crates/reims-vgpu-core/src/resources/host.rs  |  11 +
+ .../reims-vgpu-core/src/resources/texture.rs  |  15 +-
+ 10 files changed, 631 insertions(+), 7 deletions(-)
+ create mode 100644 crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+
+diff --git a/README.md b/README.md
+index 78441900..abfbbda0 100644
+--- a/README.md
++++ b/README.md
+@@ -181,6 +181,7 @@ reads them once per process, and an unset or unparsable value is the default.
+ | `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
+ | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
+ | `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
++| `REIMS_VGPU_PAGED_BUFFER_CACHE=32` | LOCAL (Atlas): entries per task of the buffers kept over guest pages for paged textures (`gpu_task/paged_buffers.rs`); unset or 0 keeps none |
+ | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS: SDL3's window in place of AppKit's |
+ | `REIMS_VGPU_STRICT=1` | the Vulkan platform: end the process at each difference from Metal's answer it would otherwise log |
+ | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+diff --git a/crates/reims-vgpu-core/src/display/frame.rs b/crates/reims-vgpu-core/src/display/frame.rs
+index 551e03d8..8b0aab56 100644
+--- a/crates/reims-vgpu-core/src/display/frame.rs
++++ b/crates/reims-vgpu-core/src/display/frame.rs
+@@ -84,6 +84,8 @@ impl<P: Platform> DisplayCore<P> {
+         self.wait_for_pending_frames(&mut g);
+         // presented: frames in flight were waited for
+         crate::trace::event("presented", &[]);
++        // LOCAL (Atlas): the guest-page mapping counters, per present.
++        crate::gpu_task::paged_buffers::present_counted();
+         if self.guest_color_space_dirty() {
+             // The guest display's colour space (nil without a guest display). The guest display
+             // pointer is read without its lock held across the call; the cell is a leaf.
+diff --git a/crates/reims-vgpu-core/src/gpu_task.rs b/crates/reims-vgpu-core/src/gpu_task.rs
+index b4c229e7..d79d51cf 100644
+--- a/crates/reims-vgpu-core/src/gpu_task.rs
++++ b/crates/reims-vgpu-core/src/gpu_task.rs
+@@ -59,6 +59,7 @@ mod blit;
+ mod exec;
+ mod handshake;
+ mod memory;
++pub(crate) mod paged_buffers;
+ mod paging;
+ mod service;
+ mod surfaces;
+diff --git a/crates/reims-vgpu-core/src/gpu_task/memory.rs b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+index 3a4df4dc..26254d2c 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/memory.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+@@ -16,7 +16,9 @@
+ //! task (the suite's `service_gap_cmdbuf_outside_ram` and `covgap_mem_reply_in_hole`).
+ 
+ use std::sync::Arc;
++use std::sync::atomic::Ordering;
+ 
++use super::paged_buffers::{self, Runs, STATS};
+ use super::service::GpuTask;
+ use super::{DeathKind, RaiseKind, exception, raise_carrying, raise_caught, raise_on};
+ use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
+@@ -27,6 +29,7 @@ use crate::memory::mapping::Mapping;
+ use crate::num::{ToU64, ToUsize};
+ use crate::platform::Platform;
+ use crate::platform::device::GpuDevice;
++use crate::platform::os::clock::{Clock, MonoTime};
+ use crate::platform::types::ResourceAddressRange;
+ use crate::raise::{Kept, keep_forever};
+ use crate::raise::{OnFault, RaiseResult};
+@@ -91,6 +94,23 @@ impl<P: Platform> GpuTask<P> {
+                 format_args!("map of 0 bytes at task offset {offset:#x}"),
+             );
+         }
++        let walked = self.mono();
++        let runs = self.task_page_runs(hold, offset, length)?;
++        paged_buffers::add_since(&STATS.walk_ns, walked, self.mono());
++        if need_writable && !runs.writable {
++            return Ok(None);
++        }
++        Ok(self.mapping_of_runs(&runs, length))
++    }
++
++    /// The monotonic clock, for the mapping counters.
++    pub(super) fn mono(&self) -> MonoTime {
++        self.platform.clock().now_mono()
++    }
++
++    /// The guest pages behind the task's `offset..offset + length`, one run per contiguous
++    /// stretch, and whether all of them are writable.
++    fn task_page_runs(&self, hold: Hold<'_>, offset: u64, length: u64) -> RaiseResult<Runs> {
+         let mut ranges: Vec<PhysRange> = Vec::new();
+         let mut writable = true;
+         let mut range = PhysRange::default();
+@@ -124,12 +144,20 @@ impl<P: Platform> GpuTask<P> {
+         if range.physical_length != 0 {
+             ranges.push(range);
+         }
+-        if need_writable && !writable {
+-            return Ok(None);
+-        }
+-        Ok(self
++        Ok(Runs { ranges, writable })
++    }
++
++    /// A view of `runs`, whose bytes come to `length`.
++    fn mapping_of_runs(&self, runs: &Runs, length: u64) -> Option<Arc<Mapping<P>>> {
++        let made = self.mono();
++        let mapping = self
+             .map()
+-            .and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
++            .and_then(|m| m.new_range_mapping(&runs.ranges, length, u32::from(!runs.writable)));
++        paged_buffers::add_since(&STATS.map_ns, made, self.mono());
++        if mapping.is_some() {
++            STATS.made.fetch_add(1, Ordering::Relaxed);
++        }
++        mapping
+     }
+ 
+     /// The host address of task offset `offset`, through a mapping of the pages
+@@ -512,7 +540,9 @@ impl<P: Platform> GpuTask<P> {
+                 format_args!("Metal made no buffer over task page {page:#x}"),
+             );
+         };
++        let imported = self.mono();
+         let buffer = Self::no_copy_buffer(&device, address, length, mapping)?;
++        paged_buffers::add_since(&STATS.import_ns, imported, self.mono());
+         let Some(buffer) = buffer else {
+             // Metal released the deallocator's reference; the kept one stays
+             keep_forever(kept, Kept::AddressSpace);
+@@ -526,6 +556,40 @@ impl<P: Platform> GpuTask<P> {
+         Ok(buffer)
+     }
+ 
++    /// LOCAL (Atlas): the buffer a paged texture pages through: a kept one over exactly the pages
++    /// the task maps at `page` now, else a new one, kept (`paged_buffers`). Every call walks the
++    /// page table, so a stale entry is never used.
++    pub(super) fn paged_texture_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<P::Buffer> {
++        if !self.paged_buffers.enabled() {
++            return self.new_buffer_for_virtual_page(hold, page, length);
++        }
++        let offset = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
++        Self::check_task_range(offset, length, self.task_length())?;
++        let Some(lease) = self.map().map(|m| Arc::as_ptr(&m).addr()) else {
++            return self.new_buffer_for_virtual_page(hold, page, length);
++        };
++        let now = self.mono();
++        drop(self.paged_buffers.sweep(now));
++        let runs = self.task_page_runs(hold, offset, length)?;
++        paged_buffers::add_since(&STATS.walk_ns, now, self.mono());
++        let (kept, stale) = self.paged_buffers.lookup(page, length, &runs, &lease, now);
++        drop(stale);
++        if let Some(buffer) = kept {
++            return Ok(buffer);
++        }
++        let buffer = self.new_buffer_for_virtual_page(hold, page, length)?;
++        drop(
++            self.paged_buffers
++                .insert(page, length, runs, lease, &buffer, now),
++        );
++        Ok(buffer)
++    }
++
+     /// A buffer over `address..address + length`, whose deallocator releases `mapping`.
+     #[allow(unsafe_code)] // architecture 17.3: the call of an `unsafe fn` over host memory
+     fn no_copy_buffer(
+@@ -551,10 +615,13 @@ mod tests {
+     use super::super::testing::*;
+     use super::*;
+     use crate::guest::GuestPtr;
++    use crate::platform::Handle;
+     use crate::raise::death::DeathKind as Fault;
+     use crate::resources::host::ResourceHost;
++    use crate::tasks::launcher::ServiceSide;
++    use crate::tasks::wire::ToService;
+     use crate::testkit::capture::catch_death;
+-    use crate::testkit::objects::Model;
++    use crate::testkit::objects::{Fk, Model, kind};
+     use crate::testkit::script::Step;
+ 
+     /// The raise a call dies with, with no handler live.
+@@ -802,6 +869,211 @@ mod tests {
+         );
+     }
+ 
++    /// LOCAL (Atlas): a task keeping `entries` paged buffers, over four writable pages.
++    fn keeping(entries: usize) -> Tx {
++        let tx = ready(&rw_pages(4));
++        tx.task.paged_buffers.set_capacity(entries);
++        tx
++    }
++
++    fn paged(tx: &Tx, page: u32) -> Fk<kind::Buffer> {
++        tx.task
++            .paged_texture_buffer(Hold::NONE, page, PAGE)
++            .unwrap()
++    }
++
++    fn buffers_made(tx: &Tx) -> usize {
++        tx.p.call_log()
++            .calls_to("newBufferWithBytesNoCopy:length:options:deallocator:")
++            .len()
++    }
++
++    fn views_freed(tx: &Tx) -> usize {
++        tx.p.call_log().calls_to("mach_vm_deallocate").len()
++    }
++
++    /// Off, every paged texture gets its own buffer and view, as the plain path does
++    #[test]
++    fn off_keeps_nothing() {
++        let tx = keeping(0);
++        let before = views_freed(&tx);
++        drop(paged(&tx, 1));
++        drop(paged(&tx, 1));
++        assert_eq!(buffers_made(&tx), 2);
++        assert_eq!(views_freed(&tx), before + 2);
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++    }
++
++    /// The same pages again take the kept buffer: no new view, no new import, nothing freed
++    #[test]
++    fn the_same_pages_take_the_kept_buffer() {
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        let first = paged(&tx, 1);
++        let id = first.id();
++        drop(first);
++        assert_eq!(paged(&tx, 1).id(), id);
++        assert_eq!(buffers_made(&tx), 1);
++        assert_eq!(views_freed(&tx), before);
++    }
++
++    /// A guest page moved behind the same task page: the old view is never answered, and goes
++    #[test]
++    fn a_page_the_task_no_longer_maps_is_never_answered() {
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        let old = paged(&tx, 1);
++        let id = old.id();
++        drop(old);
++        tx.ram.write_u32(page_pa(PT_PAGE) + 4, (DATA_PAGE + 9) | W);
++        let new = paged(&tx, 1);
++        assert_ne!(new.id(), id);
++        assert_eq!(buffers_made(&tx), 2);
++        assert_eq!(views_freed(&tx), before + 1);
++        assert_eq!(tx.task.paged_buffers.len(), 1);
++    }
++
++    /// A leaf that turned read-only is a different mapping
++    #[test]
++    fn a_leaf_turned_read_only_is_not_the_kept_view() {
++        let tx = keeping(4);
++        let id = paged(&tx, 1).id();
++        tx.ram.write_u32(page_pa(PT_PAGE) + 4, DATA_PAGE + 1);
++        assert_ne!(paged(&tx, 1).id(), id);
++    }
++
++    /// A page gone from the page table raises as the plain path does, and keeps nothing new
++    #[test]
++    fn a_hole_is_not_answered_from_the_cache() {
++        let tx = keeping(4);
++        drop(paged(&tx, 1));
++        tx.ram.write_u32(page_pa(PT_PAGE) + 4, 0);
++        assert!(caught(|hold| tx.task.paged_texture_buffer(hold, 1, PAGE)).is_some());
++    }
++
++    /// `UnmapMemory` over the range lets the view go, and one elsewhere does not
++    #[test]
++    fn unmap_lets_the_view_go() {
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        drop(paged(&tx, 1));
++        let unmap = |offset| {
++            let (_, reply) = sink();
++            tx.send(ToService::UnmapMemory {
++                offset,
++                length: PAGE,
++                reply,
++            });
++        };
++        unmap(2 * PAGE);
++        assert_eq!(views_freed(&tx), before);
++        unmap(PAGE);
++        assert_eq!(views_freed(&tx), before + 1);
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++    }
++
++    /// `DiscardResources` and `ReplacePhysical` say nothing of pages: every entry goes
++    #[test]
++    fn discard_and_replace_clear_the_entries() {
++        let tx = keeping(4);
++        drop(paged(&tx, 1));
++        let (_, reply) = sink();
++        tx.send(ToService::DiscardResources {
++            resources: Vec::new(),
++            count: 0,
++            reply,
++        });
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++        drop(paged(&tx, 1));
++        let (_, reply) = sink();
++        tx.send(ToService::ReplacePhysical { physical: 0, reply });
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++    }
++
++    /// An invalidated view a user still holds stays until that user lets it go
++    #[test]
++    fn a_buffer_in_use_outlives_its_entry() {
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        let held = paged(&tx, 1);
++        drop(tx.task.paged_buffers.clear());
++        assert_eq!(views_freed(&tx), before);
++        drop(held);
++        assert_eq!(views_freed(&tx), before + 1);
++    }
++
++    /// The task's end lets every view go, before its memory map
++    #[test]
++    fn the_task_end_lets_the_views_go() {
++        // The end frees the task's own mappings too: the control counts those.
++        let control = keeping(4);
++        let before = views_freed(&control);
++        control.task.end();
++        let own = views_freed(&control) - before;
++
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        drop(paged(&tx, 1));
++        drop(paged(&tx, 2));
++        assert_eq!(views_freed(&tx), before);
++        tx.task.end();
++        assert_eq!(views_freed(&tx), before + own + 2);
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++    }
++
++    /// Another memory map, as a new lease of the guest's RAM would be, is not the kept view
++    #[test]
++    fn another_lease_is_not_the_kept_view() {
++        let tx = keeping(4);
++        let first = paged(&tx, 1);
++        let runs = tx.task.task_page_runs(Hold::NONE, PAGE, PAGE).unwrap();
++        let lease = tx.task.map().map(|m| Arc::as_ptr(&m).addr()).unwrap();
++        let now = tx.task.mono();
++        let (kept, stale) = tx.task.paged_buffers.lookup(1, PAGE, &runs, &lease, now);
++        assert_eq!(kept.map(|b| b.id()), Some(first.id()));
++        drop(stale);
++        let (kept, stale) = tx
++            .task
++            .paged_buffers
++            .lookup(1, PAGE, &runs, &(lease + 1), now);
++        assert!(kept.is_none());
++        drop(stale);
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++    }
++
++    /// Past the capacity the least recently used goes; a hit counts as a use
++    #[test]
++    fn the_capacity_drops_the_least_recently_used() {
++        let tx = keeping(2);
++        let before = views_freed(&tx);
++        drop(paged(&tx, 1));
++        drop(paged(&tx, 2));
++        drop(paged(&tx, 1));
++        drop(paged(&tx, 3));
++        assert_eq!(views_freed(&tx), before + 1);
++        assert_eq!(buffers_made(&tx), 3);
++        drop(paged(&tx, 1));
++        assert_eq!(buffers_made(&tx), 3);
++    }
++
++    /// An entry unused for the idle limit goes at the next sweep, used ones stay
++    #[test]
++    fn idle_entries_go() {
++        let tx = keeping(4);
++        let before = views_freed(&tx);
++        drop(paged(&tx, 1));
++        let now = tx.task.mono();
++        drop(tx.task.paged_buffers.sweep(now));
++        assert_eq!(tx.task.paged_buffers.len(), 1);
++        drop(
++            tx.task
++                .paged_buffers
++                .sweep(now.saturating_add(paged_buffers::MAX_IDLE)),
++        );
++        assert_eq!(tx.task.paged_buffers.len(), 0);
++        assert_eq!(views_freed(&tx), before + 1);
++    }
++
+     #[test]
+     fn data_from_virtual_offset_copies() {
+         let tx = ready(&rw_pages(4));
+diff --git a/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+new file mode 100644
+index 00000000..cfd7766b
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+@@ -0,0 +1,300 @@
++//! LOCAL (Atlas): the buffers over guest pages a paged texture pages through, kept across the
++//! textures that use the same pages.
++//!
++//! macOS's compositor makes and deletes a texture per frame on a dozen recycled ranges of task
++//! pages. Each new texture cost a walk, one `mmap` per run of guest pages (a 2.4 MB texture is
++//! about 148 of them, 2.7 ms on the exec's serial path), a Vulkan import and, at its release, the
++//! free and the `munmap`. `REIMS_VGPU_PAGED_BUFFER_CACHE=<entries>` keeps that many buffers per
++//! task; unset or 0 keeps none and the path is the plain one.
++//!
++//! **What a hit proves.** The key is the task page and the length, and every lookup walks the
++//! guest's page table first: a hit needs the same guest-physical runs, the same writability and
++//! the same memory map as the entry. An entry that no longer matches is dropped, never used. So
++//! nothing is ever paged through a view of pages the task does not map at that moment, whatever
++//! the guest did to them meanwhile, told or not.
++//!
++//! **When entries go.** At `UnmapMemory` over their range, at `ReplacePhysical` and
++//! `DiscardResources` (all of them: neither says which pages it means), at a failed match, past
++//! the capacity (least recently used first), [`MAX_IDLE`] after their last use, and at the task's
++//! end and drop, which is also where a device's guest-memory lease ends for its tasks. Dropping
++//! an entry drops one reference: a command buffer or texture still using the buffer keeps it,
++//! and the view goes with the last reference, by the buffer's own deallocator, as ever.
++
++use std::collections::VecDeque;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::time::Duration;
++
++use crate::host::PhysRange;
++use crate::num::ToU64;
++use crate::platform::Handle;
++use crate::platform::os::clock::MonoTime;
++
++/// The environment variable: entries per task.
++pub(crate) const ENV_VAR: &str = "REIMS_VGPU_PAGED_BUFFER_CACHE";
++/// The most entries the variable takes.
++const MAX_ENTRIES: usize = 256;
++/// An entry unused for this long goes at the next sweep.
++pub(crate) const MAX_IDLE: Duration = Duration::from_secs(1);
++/// A summary line per this many presents.
++const LOG_EVERY: u64 = 600;
++
++/// The entries the variable asks for (read once): 0 without it.
++pub(crate) fn entries_by_env() -> usize {
++    static ENTRIES: OnceLock<usize> = OnceLock::new();
++    *ENTRIES.get_or_init(|| {
++        std::env::var(ENV_VAR)
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or(0)
++            .min(MAX_ENTRIES)
++    })
++}
++
++/// Counters of the guest-page mappings of the whole process, relaxed, cumulative. They count with
++/// the switch off too, for the baseline.
++#[derive(Debug, Default)]
++pub struct MappingStats {
++    /// Views made of task pages for a new buffer.
++    pub made: AtomicU64,
++    /// Buffers a paged texture took from the cache.
++    pub reused: AtomicU64,
++    /// Entries dropped by an invalidation or a failed match (not by capacity or age).
++    pub invalidated: AtomicU64,
++    /// Nanoseconds walking page tables for these buffers.
++    pub walk_ns: AtomicU64,
++    /// Nanoseconds making views: `mmap`, its bookkeeping and locks.
++    pub map_ns: AtomicU64,
++    /// Nanoseconds making no-copy buffers over the views: the Vulkan import.
++    pub import_ns: AtomicU64,
++}
++
++/// The process's counters.
++pub static STATS: MappingStats = MappingStats {
++    made: AtomicU64::new(0),
++    reused: AtomicU64::new(0),
++    invalidated: AtomicU64::new(0),
++    walk_ns: AtomicU64::new(0),
++    map_ns: AtomicU64::new(0),
++    import_ns: AtomicU64::new(0),
++};
++
++impl MappingStats {
++    /// The counters, in the order of the `mapstat` event.
++    fn values(&self) -> [u64; 6] {
++        [
++            self.made.load(Ordering::Relaxed),
++            self.reused.load(Ordering::Relaxed),
++            self.invalidated.load(Ordering::Relaxed),
++            self.walk_ns.load(Ordering::Relaxed),
++            self.map_ns.load(Ordering::Relaxed),
++            self.import_ns.load(Ordering::Relaxed),
++        ]
++    }
++}
++
++/// Adds the time since `from` to `counter`.
++pub(crate) fn add_since(counter: &AtomicU64, from: MonoTime, to: MonoTime) {
++    let ns = u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX);
++    counter.fetch_add(ns, Ordering::Relaxed);
++}
++
++/// One present: the trace's `mapstat` (made, reused, invalidated, walk, map and import ns, all
++/// cumulative), and with the switch on a log line per [`LOG_EVERY`] presents, of the difference.
++pub fn present_counted() {
++    static PRESENTS: AtomicU64 = AtomicU64::new(0);
++    static LAST: crate::sync::Mutex<[u64; 6]> = crate::sync::Mutex::new([0; 6]);
++    let values = STATS.values();
++    crate::trace::event("mapstat", &values);
++    let presents = PRESENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
++    if entries_by_env() != 0 && presents.is_multiple_of(LOG_EVERY) {
++        let before = std::mem::replace(&mut *LAST.lock(), values);
++        let [made, reused, gone, walk, map, import] = values;
++        let [made0, reused0, gone0, walk0, map0, import0] = before;
++        let per = |now: u64, then: u64| now.wrapping_sub(then).div_euclid(LOG_EVERY);
++        let us = |now: u64, then: u64| per(now, then).div_euclid(1000);
++        log::info!(
++            "paged buffers, per present: {} views made, {} reused, {} invalidated, walk {} us, \
++             map {} us, import {} us",
++            per(made, made0),
++            per(reused, reused0),
++            per(gone, gone0),
++            us(walk, walk0),
++            us(map, map0),
++            us(import, import0)
++        );
++    }
++}
++
++/// What a walk found behind a task range.
++#[derive(Debug, Clone, Default)]
++pub(crate) struct Runs {
++    /// The guest-physical runs, in task order.
++    pub(crate) ranges: Vec<PhysRange>,
++    /// Whether every leaf is writable.
++    pub(crate) writable: bool,
++}
++
++impl Runs {
++    /// The same pages, in the same order, with the same writability.
++    fn same_as(&self, other: &Runs) -> bool {
++        self.writable == other.writable
++            && self.ranges.len() == other.ranges.len()
++            && self.ranges.iter().zip(&other.ranges).all(|(a, b)| {
++                a.physical_address == b.physical_address && a.physical_length == b.physical_length
++            })
++    }
++}
++
++/// One kept buffer.
++struct Entry<B, L> {
++    page: u32,
++    length: u64,
++    runs: Runs,
++    /// The memory map the view was made through: the guest's RAM under this lease.
++    lease: L,
++    buffer: B,
++    used: MonoTime,
++}
++
++/// The kept buffers of one task, most recently used last. A leaf lock: every removal hands its
++/// entries back in a [`Gone`], so no buffer is released under it.
++pub(crate) struct PagedBuffers<B, L> {
++    capacity: AtomicUsize,
++    entries: crate::sync::Mutex<VecDeque<Entry<B, L>>>,
++}
++
++/// Entries going, to drop outside the lock: a buffer's last release runs its deallocator.
++pub(crate) struct Gone<B, L>(#[expect(dead_code, reason = "held for its drop")] Vec<Entry<B, L>>);
++
++impl<B: Handle, L: PartialEq> PagedBuffers<B, L> {
++    pub(crate) fn new(capacity: usize) -> Self {
++        PagedBuffers {
++            capacity: AtomicUsize::new(capacity),
++            entries: crate::sync::Mutex::new(VecDeque::new()),
++        }
++    }
++
++    /// Whether the cache is switched on.
++    pub(crate) fn enabled(&self) -> bool {
++        self.capacity() != 0
++    }
++
++    fn capacity(&self) -> usize {
++        self.capacity.load(Ordering::Relaxed)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn set_capacity(&self, capacity: usize) {
++        self.capacity.store(capacity, Ordering::Relaxed);
++    }
++
++    /// The entry's buffer when it still shows exactly `runs` under `lease`; an entry of the key
++    /// that does not goes.
++    pub(crate) fn lookup(
++        &self,
++        page: u32,
++        length: u64,
++        runs: &Runs,
++        lease: &L,
++        now: MonoTime,
++    ) -> (Option<B>, Gone<B, L>) {
++        let mut entries = self.entries.lock();
++        let Some(at) = entries
++            .iter()
++            .position(|e| e.page == page && e.length == length)
++        else {
++            return (None, Gone(Vec::new()));
++        };
++        let Some(mut entry) = entries.remove(at) else {
++            return (None, Gone(Vec::new()));
++        };
++        if entry.lease == *lease && entry.runs.same_as(runs) {
++            entry.used = now;
++            let buffer = entry.buffer.clone_ref();
++            entries.push_back(entry);
++            drop(entries);
++            STATS.reused.fetch_add(1, Ordering::Relaxed);
++            return (Some(buffer), Gone(Vec::new()));
++        }
++        drop(entries);
++        STATS.invalidated.fetch_add(1, Ordering::Relaxed);
++        (None, Gone(vec![entry]))
++    }
++
++    /// Keeps `buffer` for its key; the oldest goes past the capacity.
++    pub(crate) fn insert(
++        &self,
++        page: u32,
++        length: u64,
++        runs: Runs,
++        lease: L,
++        buffer: &B,
++        now: MonoTime,
++    ) -> Gone<B, L> {
++        let mut gone = Vec::new();
++        let mut entries = self.entries.lock();
++        if let Some(at) = entries
++            .iter()
++            .position(|e| e.page == page && e.length == length)
++        {
++            gone.extend(entries.remove(at));
++        }
++        while entries.len() >= self.capacity() {
++            gone.extend(entries.pop_front());
++        }
++        entries.push_back(Entry {
++            page,
++            length,
++            runs,
++            lease,
++            buffer: buffer.clone_ref(),
++            used: now,
++        });
++        Gone(gone)
++    }
++
++    /// Entries unused for [`MAX_IDLE`] go.
++    pub(crate) fn sweep(&self, now: MonoTime) -> Gone<B, L> {
++        let mut entries = self.entries.lock();
++        let mut gone = Vec::new();
++        // Oldest first: the order of use.
++        while entries
++            .front()
++            .is_some_and(|e| now.saturating_duration_since(e.used) >= MAX_IDLE)
++        {
++            gone.extend(entries.pop_front());
++        }
++        Gone(gone)
++    }
++
++    /// Entries over task bytes `offset..offset + length` go (the ends wrap, as the message's do).
++    pub(crate) fn invalidate_range(&self, offset: u64, length: u64) -> Gone<B, L> {
++        let end = offset.wrapping_add(length);
++        let mut entries = self.entries.lock();
++        let (gone, kept): (Vec<_>, Vec<_>) = entries.drain(..).partition(|e| {
++            let first = u64::from(e.page).wrapping_shl(crate::guest::records::APV_PAGE_SHIFT);
++            first < end && offset < first.wrapping_add(e.length)
++        });
++        entries.extend(kept);
++        drop(entries);
++        STATS
++            .invalidated
++            .fetch_add(gone.len().to_u64(), Ordering::Relaxed);
++        Gone(gone)
++    }
++
++    /// Every entry goes.
++    pub(crate) fn clear(&self) -> Gone<B, L> {
++        let gone: Vec<_> = self.entries.lock().drain(..).collect();
++        STATS
++            .invalidated
++            .fetch_add(gone.len().to_u64(), Ordering::Relaxed);
++        Gone(gone)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn len(&self) -> usize {
++        self.entries.lock().len()
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/gpu_task/paging.rs b/crates/reims-vgpu-core/src/gpu_task/paging.rs
+index 65517055..f3ec99b4 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/paging.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/paging.rs
+@@ -63,6 +63,9 @@ impl<P: Platform> GpuTask<P> {
+         shared_texture_backing_ids: &mut Vec<u32>,
+     ) -> RaiseResult<PrepareSync> {
+         let _prepare = self.prepare_lock.lock();
++        if self.paged_buffers.enabled() {
++            drop(self.paged_buffers.sweep(self.mono()));
++        }
+         let core = self.core();
+         let mut blit_resources: Vec<Arc<Resource<P>>> = Vec::new();
+         let mut compute_resources: Vec<Arc<Resource<P>>> = Vec::new();
+diff --git a/crates/reims-vgpu-core/src/gpu_task/service.rs b/crates/reims-vgpu-core/src/gpu_task/service.rs
+index 4217bc88..b33c112a 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/service.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/service.rs
+@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock, Weak};
+ use parking_lot::{Mutex, MutexGuard};
+ 
+ use super::exec::FifoInfo;
++use super::paged_buffers::PagedBuffers;
+ use super::surfaces::CachedSurface;
+ use super::{DeathKind, Unsupported, blit, exception, unraised};
+ use crate::collections::LookupMap;
+@@ -78,6 +79,8 @@ pub struct GpuTask<P: Platform> {
+     pub(super) features: Arc<SharedFeatures>,
+     /// The IOSurfaces the host lent, by mapping id, with their retain counts (lookup only).
+     pub(super) surfaces: Mutex<LookupMap<u64, CachedSurface<P>>>,
++    /// LOCAL (Atlas): the buffers kept over task pages for paged textures (`paged_buffers`).
++    pub(super) paged_buffers: PagedBuffers<P::Buffer, usize>,
+     /// Serializes the execs' and infos' paging-in.
+     pub(super) prepare_lock: Mutex<()>,
+     /// Serializes the object lists' mapping.
+@@ -150,6 +153,7 @@ impl<P: Platform> GpuTask<P> {
+             queue,
+             features: Arc::new(SharedFeatures::new()),
+             surfaces: Mutex::new(LookupMap::new()),
++            paged_buffers: PagedBuffers::new(super::paged_buffers::entries_by_env()),
+             prepare_lock: Mutex::new(()),
+             object_lists_lock: Mutex::new(()),
+             fifos: Mutex::new(LookupMap::new()),
+@@ -321,6 +325,7 @@ impl<P: Platform> GpuTask<P> {
+     /// Replaces the physical page of the task's buffers: 1, or 2 when it raises.
+     fn replace_physical(&self, physical: u32, reply: Reply<u32>) {
+         self.job(move |this, hold| {
++            drop(this.paged_buffers.clear());
+             if let Err(t) = this.core().replace_physical(physical) {
+                 log::warn!(
+                     "task {}: discard of resource {physical} faulted: {}",
+@@ -430,6 +435,7 @@ impl<P: Platform> GpuTask<P> {
+     /// Discards the resources the records name: 1, or 2 when it raises.
+     fn discard_resources(&self, resources: Vec<u8>, count: u32, reply: Reply<u32>) {
+         self.job(move |this, hold| {
++            drop(this.paged_buffers.clear());
+             let discarded = {
+                 let records = records(&resources, count);
+                 this.core().discard_resources(hold, records)
+@@ -458,6 +464,7 @@ impl<P: Platform> GpuTask<P> {
+     fn unmap_memory(&self, offset: u64, length: u64, reply: Reply<u32>) {
+         self.job(move |this, _| {
+             let _lock = this.task_lock(Access::Unique);
++            drop(this.paged_buffers.invalidate_range(offset, length));
+             let lists = this.lists();
+             let end = offset.wrapping_add(length);
+             let objects = lists.object_list_range();
+@@ -650,6 +657,7 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
+     /// the object lists go with the core's parts; then the surfaces the host lent, the FIFOs'
+     /// events and the lists the handshake built.
+     fn end(&self) {
++        drop(self.paged_buffers.clear());
+         drop(self.device.lock().take());
+         drop(self.command_queue.lock().take());
+         if let Some(core) = self.core.get() {
+@@ -672,6 +680,7 @@ impl<P: Platform> Drop for GpuTask<P> {
+     /// its event and its parts), then the task root's mapping, the page table and the memory
+     /// map; the rest follows in field order. A task that ended released most of it then.
+     fn drop(&mut self) {
++        drop(self.paged_buffers.clear());
+         drop(self.host.take());
+         drop(self.device.get_mut().take());
+         drop(self.command_queue.get_mut().take());
+@@ -693,6 +702,15 @@ impl<P: Platform> ResourceHost<P> for GpuTask<P> {
+         GpuTask::new_buffer_for_virtual_page(self, hold, page, length)
+     }
+ 
++    fn paged_texture_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<P::Buffer> {
++        GpuTask::paged_texture_buffer(self, hold, page, length)
++    }
++
+     fn prepare_backing(
+         &self,
+         _hold: Hold<'_>,
+diff --git a/crates/reims-vgpu-core/src/gpu_task/surfaces.rs b/crates/reims-vgpu-core/src/gpu_task/surfaces.rs
+index cf57f92a..89c100ca 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/surfaces.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/surfaces.rs
+@@ -86,8 +86,11 @@ impl<P: Platform> GpuTask<P> {
+         let mut surfaces = self.surfaces.lock();
+         if let Some(cached) = surfaces.get_mut(&identifier) {
+             cached.count = cached.count.wrapping_add(1);
++            // srf: mapping id, 1 for a surface the task already held, 0 for a round trip
++            crate::trace::event("srf", &[identifier, 1]);
+             return Some(cached.surface.clone_ref());
+         }
++        crate::trace::event("srf", &[identifier, 0]);
+         let slot: Arc<ReplySlot<Option<P::Surface>>> = ReplySlot::new();
+         let fill = Arc::clone(&slot);
+         // The reply runs on the connection's queue while this one waits holding the cache
+diff --git a/crates/reims-vgpu-core/src/resources/host.rs b/crates/reims-vgpu-core/src/resources/host.rs
+index 5fa534ae..51801d7c 100644
+--- a/crates/reims-vgpu-core/src/resources/host.rs
++++ b/crates/reims-vgpu-core/src/resources/host.rs
+@@ -73,6 +73,17 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
+         length: u64,
+     ) -> RaiseResult<P::Buffer>;
+ 
++    /// LOCAL (Atlas): the same for a paged texture's transfer buffer, which a task may answer
++    /// with a buffer it kept over the same pages (`gpu_task::paged_buffers`).
++    fn paged_texture_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<P::Buffer> {
++        self.new_buffer_for_virtual_page(hold, page, length)
++    }
++
+     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
+     /// nothing checks: the backing's validity writes still happen.
+     fn prepare_backing(
+diff --git a/crates/reims-vgpu-core/src/resources/texture.rs b/crates/reims-vgpu-core/src/resources/texture.rs
+index 2a7a5e8c..673ca01e 100644
+--- a/crates/reims-vgpu-core/src/resources/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/texture.rs
+@@ -393,8 +393,21 @@ impl<P: Platform> PagedTexture<P> {
+         // Trace `tobj`: the guest object whose pages the next `tbuf` imports (4, a texture), its
+         // page and its length.
+         crate::trace::event("tobj", &[4, u64::from(self.page), self.length]);
++        if crate::trace::on() {
++            // Trace `tdesc`: that texture's width, height, format, storage mode and usage.
++            crate::trace::event(
++                "tdesc",
++                &[
++                    self.texture.width(),
++                    self.texture.height(),
++                    self.texture.pixel_format(),
++                    self.texture.storage_mode(),
++                    self.texture.usage(),
++                ],
++            );
++        }
+         // The task raises rather than answer nothing.
+-        let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
++        let buffer = task.paged_texture_buffer(hold, self.page, self.length)?;
+         // A plain store: a buffer a racing caller stored between the check above and this
+         // store is overwritten unreleased, and kept for good with its GPU VA and its guest
+         // pages' mapping.

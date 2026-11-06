@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 06:59:50 +0000
+Subject: [PATCH 23/34] coherent: a signal is seen once the writes before it
+ are in the pages (E1)
+
+A shared event's value, read from the semaphore's counter or seen at the
+completion turn, rose before the turn armed the pages of the command buffers it
+finished, so a guest that saw the value could read a trapping surface's held
+pages with their older bytes (upstream review E1). Three paths, each a lane
+that failed at 76ab0722:
+
+- A signal after the writer's command buffer: a signal kept while a tracked
+  surface holds open or running writes (shadow_coherent::unarmed, which waits
+  for no lock) is behind the arm: no counter read observes it or any after it,
+  and no wait is handed its index; the completion turn does. Ported by hand
+  from upstream 76d89d87 (EventTimeline::keep's behind_merge, the observe_read
+  clamp, landing), with its timeline unit test. Counted:
+  CoherentFallbackCounts::signals_behind_arm.
+- The completion turn arms the pages of each command buffer its batches end
+  (shadow_lazy::completing) before their signals are seen; complete() finds
+  them armed.
+- A plain event's chain (writer signals an MTLEvent, a relay on another queue
+  waits for it and signals a shared one): copy_back_before_signal now runs
+  before every event signal, not only a shared event's.
+
+Open, its lane ignored and run by name: a command buffer committed to wait for
+a shared event draws over a surface the guest writes before setting it; the
+encoder's copy in was decided as it was encoded (Coherent::taking), so the
+draw misses the write. It needs a copy in recorded as the held batch goes.
+
+Lanes (filter "surface", ANV): 129 passed 4 failed before (06:41Z), 131
+passed 1 failed after (06:49Z); the failure is ycbcr_textures, as before.
+Event lanes 24/24. Runtime unit tests 1149 -> 1150 passed, the one failure
+(exit_guard) as at 76ab0722.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/completion.rs          |  10 ++
+ .../src/command_buffer/mod.rs                 |  17 +-
+ .../src/command_buffer/submit.rs              |  10 +-
+ crates/metal2vulkan-runtime/src/event.rs      |   6 +-
+ .../src/event_timeline.rs                     |  40 ++++-
+ .../src/shadow_coherent.rs                    |  32 +++-
+ .../src/tests/event_timeline.rs               |  39 ++++-
+ .../src/tests/host_settable_event_waits.rs    |   4 +-
+ .../src/tests/scheduler.rs                    |   2 +-
+ .../src/runtime_lane/surface_coherent.rs      | 155 +++++++++++++++++-
+ 10 files changed, 295 insertions(+), 20 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index cc2497bb..e0335c15 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -411,6 +411,16 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+             batch.holds.clear();
+         }
+     }
++    // LOCAL (Atlas): the writes in surfaces' images of the command buffers they end trap before
++    // anything, their signals among them, can tell the guest the work ended
++    // (`shadow_coherent.rs`); the command buffer's own completion finds them armed.
++    if crate::shadow_lazy::ahead() {
++        for (_, batch) in finished.iter().filter(|(_, batch)| batch.last) {
++            if let Some(id) = batch.buffer.shadow_carry_id() {
++                crate::shadow_lazy::completing(id);
++            }
++        }
++    }
+     // Their event signals are seen before the scheduler looks again: a batch whose submission
+     // checks wait for a GPU signal to land may now go.
+     for (_, batch) in &finished {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 9c8ff0e5..9d984d79 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2182,9 +2182,11 @@ impl CommandBuffer {
+     /// after an abandoned encoder, and for another device's event.
+     pub fn encode_signal_event(&self, event: EventRef<'_>, value: u64) -> Result<(), Error> {
+         // LOCAL (Atlas): a CPU waiter on a shared event reads the pages once it is signalled,
+-        // before the command buffer completes: what its encoders left ahead in a surface's image
+-        // goes back first, in the command buffer (`shadow_lazy::signalled_by`).
+-        if matches!(event, EventRef::Shared(_)) && crate::shadow_lazy::ahead() {
++        // before the command buffer completes, and so does one on a shared event that a command
++        // buffer waiting for a plain one signals, or that completion: what its encoders left
++        // ahead in a surface's image goes back first, in the command buffer
++        // (`shadow_lazy::signalled_by`).
++        if crate::shadow_lazy::ahead() {
+             self.copy_back_before_signal();
+         }
+         self.event_command("encode_signal_event", event, |batches, event| {
+@@ -4350,6 +4352,12 @@ impl CommandBufferShared {
+     /// versions, what it retained and its encoders' logs, then open its gate, which releases its
+     /// waiters once the transition's [`Hold`] (and every other) is gone, and they wait for the
+     /// trails below the mark. Waits from inside these steps answer as [`own`] says.
++    /// LOCAL (Atlas): the identity of what its encoders carry of shadows (`shadow::ShadowCarry`),
++    /// the key of its writes in surfaces' images (`shadow_lazy.rs`).
++    pub(crate) fn shadow_carry_id(&self) -> Option<u64> {
++        lock(&self.state).shadow_carry.as_ref().map(ShadowCarry::id)
++    }
++
+     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
+         // A capture replay found a primitive whose reach was not measured: its pass rewrote
+         // every tile, announced once the lock is let go (below).
+@@ -4369,8 +4377,7 @@ impl CommandBufferShared {
+         // LOCAL (Atlas): its writes in surfaces' images trap before anything can tell the guest it
+         // completed (`shadow_coherent.rs`).
+         if crate::shadow_lazy::ahead() {
+-            let id = lock(&self.state).shadow_carry.as_ref().map(ShadowCarry::id);
+-            if let Some(id) = id {
++            if let Some(id) = self.shadow_carry_id() {
+                 crate::shadow_lazy::completing(id);
+             }
+         }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 2a90eafb..32022b28 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1062,8 +1062,16 @@ impl CommandBufferShared {
+                 shared.interop.wrapped.forget(image);
+             }
+         }
++        // LOCAL (Atlas): its signals are seen at its completion turn alone where a trapping
++        // surface holds writes its pages show only once their command buffer's completion turn
++        // arms them (`event_timeline.rs`, `shadow_coherent::unarmed`).
++        let behind_merge =
++            !kept.is_empty() && crate::shadow_lazy::ahead() && crate::shadow_coherent::unarmed();
++        if behind_merge {
++            crate::shadow_coherent::count_signals_behind_arm(kept.len());
++        }
+         for (event, signal, value) in &kept {
+-            event.keep(*signal, *value, queue);
++            event.keep(*signal, *value, queue, behind_merge);
+         }
+         // Its commands may reach every texture through its resource ID where one bound a heap
+         // set: the stale-reach degrade's trigger decides (`detach.rs`).
+diff --git a/crates/metal2vulkan-runtime/src/event.rs b/crates/metal2vulkan-runtime/src/event.rs
+index c51805a9..0e8575be 100644
+--- a/crates/metal2vulkan-runtime/src/event.rs
++++ b/crates/metal2vulkan-runtime/src/event.rs
+@@ -213,8 +213,10 @@ impl EventShared {
+     }
+ 
+     /// The batch of a kept signal was submitted.
+-    pub(super) fn keep(&self, index: u64, value: u64, queue: usize) {
+-        lock(&self.state).timeline.keep(index, value, queue);
++    pub(super) fn keep(&self, index: u64, value: u64, queue: usize, behind_merge: bool) {
++        lock(&self.state)
++            .timeline
++            .keep(index, value, queue, behind_merge);
+     }
+ 
+     /// The semaphore reached `index`: wake the host's waits and post the notifications that came
+diff --git a/crates/metal2vulkan-runtime/src/event_timeline.rs b/crates/metal2vulkan-runtime/src/event_timeline.rs
+index e803a2c5..78ed95e9 100644
+--- a/crates/metal2vulkan-runtime/src/event_timeline.rs
++++ b/crates/metal2vulkan-runtime/src/event_timeline.rs
+@@ -34,6 +34,17 @@
+ //!
+ //! The held batch goes once the value is reached: a host set wakes the scheduler, and so does a
+ //! completion turn that observes the GPU signal (`event.rs`).
++//!
++//! **A signal behind a merge is seen at its completion turn alone** ([`EventTimeline::keep`]).
++//! LOCAL (Atlas), after upstream 76d89d87: a batch submitted while a trapping surface
++//! (`shadow_coherent.rs`) holds writes its pages do not show yet, which they show only once the
++//! completion turn of their command buffer arms them; Metal's writes before a signal are in the
++//! pages once anyone sees its value. So no read of the counter observes such a signal, nor any
++//! after it (a read of the counter is a raw read of the GPU's progress), and no wait is handed its
++//! index, the scheduler's own host wait included: the completion turn, which arms first, observes
++//! it, and wakes every host wait and held batch for it. A plain event's wait for such a signal is
++//! held as a shared event's is. The signal itself stays the batch's GPU signal: no submission is
++//! added.
+ 
+ use crate::command_buffer::completion::seen;
+ use std::collections::VecDeque;
+@@ -45,6 +56,9 @@ struct Pending<Q> {
+     value: u64,
+     /// The `VkQueue` of the batch that signals it.
+     queue: Q,
++    /// Seen at its batch's completion turn alone, once the surfaces' pages are armed (the module
++    /// docs).
++    behind_merge: bool,
+ }
+ 
+ /// How a batch waits for a Metal value.
+@@ -139,6 +153,12 @@ impl<Q: Copy + Eq> EventTimeline<Q> {
+         read: u64,
+         reaches: impl FnOnce(u64) -> Result<bool, E>,
+     ) -> Result<bool, E> {
++        // Never past a signal behind a merge, which its completion turn observes (the module
++        // docs).
++        let read = match self.pending.iter().find(|pending| pending.behind_merge) {
++            Some(pending) => read.min(pending.index - 1),
++            None => read,
++        };
+         let index = seen(self.reached, None, read, reaches)?;
+         Ok(self.observe(index))
+     }
+@@ -165,14 +185,20 @@ impl<Q: Copy + Eq> EventTimeline<Q> {
+     /// holds on the host is one too; `None` while no submitted signal and no host set reaches it.
+     /// The host waits for the semaphore's index (the scheduler's thread, `scheduler/mod.rs`), and
+     /// a set meanwhile wakes it as any host signal does: no batch is handed that index.
++    /// A value a signal behind a merge reaches, or one after it, is `None` too: only its
++    /// completion turn observes it (the module docs).
+     pub(super) fn landing(&self, value: u64) -> Option<WaitFor> {
+         if value <= self.value() {
+             return Some(WaitFor::Reached);
+         }
+-        self.pending
+-            .iter()
+-            .find(|pending| pending.value >= value)
+-            .map(|pending| WaitFor::Index(pending.index))
++        let mut behind_merge = false;
++        for pending in &self.pending {
++            behind_merge |= pending.behind_merge;
++            if pending.value >= value {
++                return (!behind_merge).then_some(WaitFor::Index(pending.index));
++            }
++        }
++        None
+     }
+ 
+     /// Whether a wait for `value` is held on the host where a Vulkan wait for a submitted GPU
+@@ -205,12 +231,14 @@ impl<Q: Copy + Eq> EventTimeline<Q> {
+     }
+ 
+     /// The batch of a kept signal (`index` from [`EventTimeline::signal`]) of `value` on `queue`
+-    /// was submitted.
+-    pub(super) fn keep(&mut self, index: u64, value: u64, queue: Q) {
++    /// was submitted; `behind_merge` where a trapping surface held writes its pages did not show
++    /// then (the module docs).
++    pub(super) fn keep(&mut self, index: u64, value: u64, queue: Q, behind_merge: bool) {
+         self.pending.push_back(Pending {
+             index,
+             value,
+             queue,
++            behind_merge,
+         });
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index b312bc1f..26753f13 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -186,15 +186,23 @@ pub(crate) enum Fallback {
+     FlushNothingLeft,
+     /// A command buffer met a surface's bytes through an untracked use alone (`met_by`).
+     MetUntracked,
++    /// An event signal kept while a surface held writes its pages did not show yet: seen at its
++    /// completion turn alone (`event_timeline.rs`).
++    SignalBehindArm,
+ }
+ 
+-const FALLBACKS: usize = Fallback::MetUntracked as usize + 1;
++const FALLBACKS: usize = Fallback::SignalBehindArm as usize + 1;
+ static FALLBACK: [AtomicU64; FALLBACKS] = [const { AtomicU64::new(0) }; FALLBACKS];
+ 
+ pub(crate) fn count(what: Fallback) {
+     FALLBACK[what as usize].fetch_add(1, Ordering::Relaxed);
+ }
+ 
++/// `signals` kept event signals of a batch go behind the arm ([`unarmed`]).
++pub(crate) fn count_signals_behind_arm(signals: usize) {
++    FALLBACK[Fallback::SignalBehindArm as usize].fetch_add(signals as u64, Ordering::Relaxed);
++}
++
+ /// The process's counts of what [`Fallback`] names, in `WorkCounts::coherent`: every device's
+ /// counts show the same, as surfaces trap across devices. Not part of the API.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -235,6 +243,9 @@ pub struct CoherentFallbackCounts {
+     pub flush_nothing_left: u64,
+     /// Command buffers that met a surface through an untracked use alone.
+     pub met_untracked: u64,
++    /// Event signals seen at their completion turn alone, as a surface held writes its pages did
++    /// not show yet when they were submitted (`event_timeline.rs`).
++    pub signals_behind_arm: u64,
+ }
+ 
+ /// The counts of [`CoherentFallbackCounts`] so far.
+@@ -259,6 +270,7 @@ pub fn fallback_counts() -> CoherentFallbackCounts {
+         host_writes_opened: read(Fallback::HostWriteOpened),
+         flush_nothing_left: read(Fallback::FlushNothingLeft),
+         met_untracked: read(Fallback::MetUntracked),
++        signals_behind_arm: read(Fallback::SignalBehindArm),
+     }
+ }
+ 
+@@ -1474,6 +1486,24 @@ pub(crate) fn surfaces_tracked() -> bool {
+     !all().read().unwrap().is_empty()
+ }
+ 
++/// Whether a tracked surface holds writes of a command buffer not completed yet, open or running,
++/// which its pages show only once that completion arms them: a signal submitted now is seen at
++/// its completion turn alone (`event_timeline.rs`). Called by a submission, under the scheduler's
++/// lock: it waits for no lock, and a lock another thread holds answers yes.
++pub(crate) fn unarmed() -> bool {
++    let Ok(all) = all().try_read() else {
++        return true;
++    };
++    let holds = |state: &State| {
++        state.tracked && !state.closed && !(state.open.is_empty() && state.running.is_empty())
++    };
++    all.iter().any(|surface| match surface.state.try_lock() {
++        Ok(state) => holds(&state),
++        Err(std::sync::TryLockError::Poisoned(state)) => holds(&state.into_inner()),
++        Err(std::sync::TryLockError::WouldBlock) => true,
++    })
++}
++
+ /// One line a surface: what [`Coherent::line`] says, under `label`. A surface that went comes once.
+ pub fn report(label: &str) -> String {
+     let mut lines: String = std::mem::take(&mut *ended().lock().unwrap_or_else(|e| e.into_inner())).concat();
+diff --git a/crates/metal2vulkan-runtime/src/tests/event_timeline.rs b/crates/metal2vulkan-runtime/src/tests/event_timeline.rs
+index 2accb65c..56a961a7 100644
+--- a/crates/metal2vulkan-runtime/src/tests/event_timeline.rs
++++ b/crates/metal2vulkan-runtime/src/tests/event_timeline.rs
+@@ -10,7 +10,7 @@ use crate::event_timeline::{EventTimeline, Signal, WaitFor};
+ fn submit(timeline: &mut EventTimeline<usize>, value: u64, queue: usize) -> Signal {
+     let signal = timeline.signal(value, queue);
+     if let Signal::Kept { index, .. } = signal {
+-        timeline.keep(index, value, queue);
++        timeline.keep(index, value, queue, false);
+     }
+     signal
+ }
+@@ -237,3 +237,40 @@ fn a_counter_read_is_observed_only_once_a_host_wait_returned_for_it() {
+     assert_eq!(timeline.observe_read(3, |_| Err("lost")), Err("lost"));
+     assert_eq!(timeline.value(), 5);
+ }
++
++/// A signal kept behind a merge (its batch may write a copied host buffer, merged into the pages
++/// at its completion turn) is observed by that turn alone: a counter read past it observes only
++/// the signals before it, no wait is handed its index or a later one's (a plain event's wait is
++/// held as a shared event's is), and the completion turn's observation reaches it and those after
++/// it.
++#[test]
++fn a_signal_behind_a_merge_is_seen_at_its_completion_turn_alone() {
++    for settable in [false, true] {
++        let mut timeline = EventTimeline::new(settable);
++        for (value, behind_merge) in [(3, false), (5, true), (7, false)] {
++            let Signal::Kept { index, .. } = timeline.signal(value, 0) else {
++                panic!("kept");
++            };
++            timeline.keep(index, value, 0, behind_merge);
++        }
++        // The counter shows all three: the read observes the first alone.
++        assert_eq!(timeline.observe_read::<()>(3, |_| Ok(true)), Ok(true));
++        assert_eq!(timeline.value(), 3, "{settable}");
++        assert_eq!(timeline.observe_read::<()>(3, |_| Ok(true)), Ok(false));
++        assert_eq!(timeline.value(), 3, "{settable}");
++        // No wait is handed the index of the signal behind the merge, or a later one's.
++        for value in [4, 5, 6, 7] {
++            assert_eq!(timeline.landing(value), None, "{settable} {value}");
++            assert_eq!(timeline.wait(value), None, "{settable} {value}");
++        }
++        assert_eq!(timeline.wait(3), Some(WaitFor::Reached));
++        // The completion turn, after the merge, observes it.
++        assert!(timeline.observe(2));
++        assert_eq!(timeline.value(), 5, "{settable}");
++        // A later signal not behind a merge is read and waited for as before.
++        let want = (!settable).then_some(WaitFor::Index(3));
++        assert_eq!(timeline.wait(7), want, "{settable}");
++        assert_eq!(timeline.observe_read::<()>(3, |_| Ok(true)), Ok(true));
++        assert_eq!(timeline.value(), 7, "{settable}");
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/host_settable_event_waits.rs b/crates/metal2vulkan-runtime/src/tests/host_settable_event_waits.rs
+index f7557c83..c5761e1d 100644
+--- a/crates/metal2vulkan-runtime/src/tests/host_settable_event_waits.rs
++++ b/crates/metal2vulkan-runtime/src/tests/host_settable_event_waits.rs
+@@ -17,7 +17,7 @@ use crate::event_timeline::{EventTimeline, Signal, WaitFor};
+ /// Submit a GPU signal of `value` on `queue`, kept when it is.
+ fn submit(timeline: &mut EventTimeline<usize>, value: u64, queue: usize) {
+     if let Signal::Kept { index, .. } = timeline.signal(value, queue) {
+-        timeline.keep(index, value, queue);
++        timeline.keep(index, value, queue, false);
+     }
+ }
+ 
+@@ -87,7 +87,7 @@ fn the_signals_of_either_kind_take_the_same_indices() {
+                 after: None
+             }
+         );
+-        timeline.keep(1, 4, 0);
++        timeline.keep(1, 4, 0, false);
+         assert_eq!(timeline.signal(4, 1), Signal::Dropped);
+         assert_eq!(
+             timeline.signal(5, 1),
+diff --git a/crates/metal2vulkan-runtime/src/tests/scheduler.rs b/crates/metal2vulkan-runtime/src/tests/scheduler.rs
+index 9a72a25a..dc9c0d7a 100644
+--- a/crates/metal2vulkan-runtime/src/tests/scheduler.rs
++++ b/crates/metal2vulkan-runtime/src/tests/scheduler.rs
+@@ -155,7 +155,7 @@ impl Model {
+             let mut signaled = Vec::new();
+             for &(event, value) in &spec.signals {
+                 if let Signal::Kept { index, after } = self.events[event].signal(value, vk_queue) {
+-                    self.events[event].keep(index, value, vk_queue);
++                    self.events[event].keep(index, value, vk_queue, false);
+                     self.kept[event] = index;
+                     signaled.push((event, index));
+                     waits.extend(after.map(|after| (event, after)));
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index ccd8299c..795f63f4 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -21,7 +21,8 @@ use metal2vulkan_runtime::shadow_lazy;
+ use metal2vulkan_runtime::{
+     live, Buffer, CommandBuffer, CommandQueue, CpuCacheMode, Device, HazardTrackingMode,
+     HostMemory, IoSurfacePlane, LoadAction, PipelineOptions, RenderPassDescriptor,
+-    RenderPipelineState, ResourceOptions, ScissorRect, StorageMode, StoreAction, Texture,
++    RenderPipelineState, ResourceOptions, ScissorRect, SharedEvent, SharedEventListener,
++    StorageMode, StoreAction, Texture,
+     TextureDescriptor,
+ };
+ use std::collections::BTreeMap;
+@@ -1565,3 +1566,155 @@ fn surface_coherent_a_reader_on_another_device_reads_the_writes() {
+         assert!(reported.is_empty(), "the layer reported: {reported:#?}");
+     });
+ }
++
++/// The guest reads the texel at `offset` of the pages from `base` on another thread (a listener's):
++/// a marked page stops it first, as [`Case::read`]'s.
++fn guest_read_at(fake: &Fake, base: u64, offset: u64) -> [u8; 4] {
++    let addr = base + offset;
++    if matches!(
++        fake.mark(addr & !(PAGE - 1)),
++        Some(Mark::Armed | Mark::Frozen)
++    ) {
++        shadow_coherent::fault(addr, false);
++    }
++    // SAFETY: the case's mapping outlives every listener the lanes post (each waits for it).
++    unsafe { std::ptr::read_volatile(addr as *const [u8; 4]) }
++}
++
++/// E1: a shared event signalled by a command buffer after the one that wrote, on the queue, whose
++/// completion has not been seen yet (a completed handler of an earlier command buffer holds the
++/// completions back): once the value is seen, by a read of the counter, a host wait or a listener,
++/// the writes are in the pages. Before, the value rose with the semaphore and the completion turn
++/// saw the signal before it armed the writer's pages, which stayed held with the older bytes.
++#[test]
++fn surface_coherent_a_signal_after_the_writer_reads_its_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++        let (go, gate) = std::sync::mpsc::channel::<()>();
++        let first = case.queue.command_buffer().unwrap();
++        (first.add_completed_handler(Box::new(move |_: &CommandBuffer| {
++            let _ = gate.recv_timeout(SOON);
++        })))
++        .unwrap();
++        first.commit().unwrap();
++        let writer = case.queue.command_buffer().unwrap();
++        case.pass(&writer, GREEN, None);
++        writer.commit().unwrap();
++        let signal = case.device.new_shared_event().unwrap();
++        let listener = SharedEventListener::new();
++        let (heard, hear) = std::sync::mpsc::channel();
++        let (fake, base) = (case.fake.clone(), case.base());
++        signal.notify_listener(
++            &listener,
++            1,
++            Box::new(move |_: &SharedEvent, _| {
++                let _ = heard.send(guest_read_at(&fake, base, 5 * ROW + 5 * 4));
++            }),
++        );
++        let signaller = case.queue.command_buffer().unwrap();
++        signaller.encode_signal_event((&signal).into(), 1).unwrap();
++        signaller.commit().unwrap();
++        let start = Instant::now();
++        let mut early = None;
++        while start.elapsed() < Duration::from_millis(300) {
++            if signal.signaled_value() >= 1 {
++                early = Some(case.read(5, 5));
++                break;
++            }
++            std::thread::yield_now();
++        }
++        let _ = go.send(());
++        assert!(
++            signal.wait_until_signaled_value(1, SOON),
++            "the GPU reached the signal"
++        );
++        let late = case.read(5, 5);
++        let listened = hear.recv_timeout(SOON).unwrap();
++        for command_buffer in [&first, &writer, &signaller] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        assert_eq!(
++            early.unwrap_or(GREEN_TEXEL),
++            GREEN_TEXEL,
++            "the counter showed the signal"
++        );
++        assert_eq!(listened, GREEN_TEXEL, "the listener heard the signal");
++        assert_eq!(late, GREEN_TEXEL, "a host wait returned for the signal");
++    });
++}
++
++/// E1 through a plain event: the writer signals an `MTLEvent` after its pass and then waits; a
++/// command buffer on another queue waits for that event and signals a shared one. The shared
++/// event's value promises the writer's pass, whose command buffer has not completed.
++#[test]
++fn surface_coherent_a_plain_event_chain_reads_the_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++        let plain = case.device.new_event().unwrap();
++        let signal = case.device.new_shared_event().unwrap();
++        let hold = case.device.new_shared_event().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let writer = case.queue.command_buffer().unwrap();
++        case.pass(&writer, GREEN, None);
++        writer.encode_signal_event((&plain).into(), 1).unwrap();
++        writer.encode_wait_for_event((&hold).into(), 1).unwrap();
++        writer.commit().unwrap();
++        let relay = other.command_buffer().unwrap();
++        relay.encode_wait_for_event((&plain).into(), 1).unwrap();
++        relay.encode_signal_event((&signal).into(), 1).unwrap();
++        relay.commit().unwrap();
++        let seen = signal.wait_until_signaled_value(1, SOON);
++        let read = case.read(5, 5);
++        hold.set_signaled_value(1);
++        writer.wait_until_completed_for(SOON).unwrap();
++        relay.wait_until_completed_for(SOON).unwrap();
++        assert!(seen, "the relay signalled");
++        assert_eq!(read, GREEN_TEXEL, "what the chain promised");
++    });
++}
++
++/// E1, the other way: a command buffer committed to wait for a shared event before it draws over
++/// the surface; the guest writes a texel, then sets the event. Metal's draw sees the write, so its
++/// copy in must come after the wait, not as the command was encoded. Open: the encoder's copy in
++/// is decided as it is encoded, so the write lands in the pages (kept by the merge) but the draw
++/// never sees it; a fix needs a copy in recorded as the held batch is submitted.
++#[test]
++#[ignore = "open (E1 copy in): fails at 76ab0722 and after the signal fix; run by name"]
++fn surface_coherent_a_cpu_write_before_a_signal_reaches_a_waiting_command() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let color = staged(case.device, &floats4([0.0; 4]));
++        let rects = std::slice::from_ref(&case.rect);
++        let blending = rects_blending(case.device);
++        let command_buffer = case.queue.command_buffer().unwrap();
++        command_buffer
++            .encode_wait_for_event((&hold).into(), 1)
++            .unwrap();
++        pass(
++            &command_buffer,
++            case.texture(),
++            &blending,
++            rects,
++            &color,
++            None,
++        );
++        command_buffer.commit().unwrap();
++        case.write(0, 0, [1, 2, 3, 4]);
++        hold.set_signaled_value(1);
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(
++            case.read(0, 0),
++            [1, 2, 3, 0],
++            "the draw blended over the guest's write"
++        );
++        assert_eq!(
++            case.read(1, 0),
++            [0, 0, 255, 0],
++            "and over the GPU's texels beside it"
++        );
++    });
++}

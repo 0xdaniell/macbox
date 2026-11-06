@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:31:52 +0000
+Subject: [PATCH 08/25] census: the guests of the boot tests, the C harness, an
+ honest write count
+
+The report keeps pages a write opened without naming one apart from pages
+caught writing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/src/census.rs             |   7 +-
+ crates/reims-vgpu-c/tests/c/harness.c         |   2 +
+ crates/reims-vgpu-c/tests/c_harness.rs        |   2 +-
+ .../src/resources/manager/texture.rs          |   6 +-
+ scripts/internal/census/census_report.py      |  10 +-
+ scripts/internal/census/guest/device.c        | 107 ++++++++++++++++++
+ scripts/internal/census/guest/device_start.S  |  15 +++
+ scripts/internal/census/guest/guest.S         | 101 +++++++++++++++++
+ scripts/internal/census/guest/link.ld         |   9 ++
+ scripts/internal/census/guest/run.sh          |  32 ++++++
+ 10 files changed, 281 insertions(+), 10 deletions(-)
+ create mode 100644 scripts/internal/census/guest/device.c
+ create mode 100644 scripts/internal/census/guest/device_start.S
+ create mode 100644 scripts/internal/census/guest/guest.S
+ create mode 100644 scripts/internal/census/guest/link.ld
+ create mode 100755 scripts/internal/census/guest/run.sh
+
+diff --git a/crates/reims-vgpu-c/src/census.rs b/crates/reims-vgpu-c/src/census.rs
+index c1fdaafa..3a85dfcf 100644
+--- a/crates/reims-vgpu-c/src/census.rs
++++ b/crates/reims-vgpu-c/src/census.rs
+@@ -54,12 +54,7 @@ pub type RvgCensusUnmappedFn =
+ ///
+ /// Thread: the task's that made it. May call: nothing of this header.
+ pub type RvgCensusUsedFn = Option<
+-    unsafe extern "C-unwind" fn(
+-        ctx: *mut c_void,
+-        mapping_id: u32,
+-        usage: u64,
+-        storage_mode: u64,
+-    ),
++    unsafe extern "C-unwind" fn(ctx: *mut c_void, mapping_id: u32, usage: u64, storage_mode: u64),
+ >;
+ 
+ /// `presented(ctx, mapping_id)`: a frame was presented; 0 for a kernel task's backing.
+diff --git a/crates/reims-vgpu-c/tests/c/harness.c b/crates/reims-vgpu-c/tests/c/harness.c
+index 3766f310..2f060d5b 100644
+--- a/crates/reims-vgpu-c/tests/c/harness.c
++++ b/crates/reims-vgpu-c/tests/c/harness.c
+@@ -176,6 +176,8 @@ static void check_status_and_log(void) {
+     CHECK(strcmp(rvg_status_message(RVG_ERR_FRAME_STATE + 1), "unknown status") == 0);
+     rvg_log_set_handler(on_log, NULL, RVG_LOG_TRACE);
+     rvg_log_set_handler(NULL, NULL, RVG_LOG_OFF);
++
++    CHECK_STATUS(rvg_census_set_callbacks(NULL), RVG_ERR_INVALID_ARGUMENT);
+     CHECK(RVG_MAX_DISPLAY_PORTS == 8 && RVG_DEVICE_MMIO_SIZE == 0x4000);
+     CHECK(RVG_PCI_VENDOR_ID == 0x106b && RVG_PCI_DEVICE_ID == 0xeeee);
+     CHECK(RVG_PCI_BAR_MMIO == 0 && RVG_PCI_MSI_VECTORS == 1);
+diff --git a/crates/reims-vgpu-c/tests/c_harness.rs b/crates/reims-vgpu-c/tests/c_harness.rs
+index 2600858e..8e7b6e3e 100644
+--- a/crates/reims-vgpu-c/tests/c_harness.rs
++++ b/crates/reims-vgpu-c/tests/c_harness.rs
+@@ -111,7 +111,7 @@ fn c_harness_calls_every_function() {
+             Some(&rest[..end])
+         })
+         .collect();
+-    assert_eq!(declared.len(), 47, "{declared:?}");
++    assert_eq!(declared.len(), 48, "{declared:?}");
+     let missing: Vec<&str> = declared
+         .iter()
+         .copied()
+diff --git a/crates/reims-vgpu-core/src/resources/manager/texture.rs b/crates/reims-vgpu-core/src/resources/manager/texture.rs
+index 5e5052ca..65d83a0c 100644
+--- a/crates/reims-vgpu-core/src/resources/manager/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/manager/texture.rs
+@@ -1335,7 +1335,11 @@ pub(crate) fn create_mapper_ref_texture<P: Platform, E: CreateEnv<P>>(
+         }
+     };
+     if let Some(sink) = crate::census::sink() {
+-        sink.used(mapping_id.low_u32(), texture.usage(), texture.storage_mode());
++        sink.used(
++            mapping_id.low_u32(),
++            texture.usage(),
++            texture.storage_mode(),
++        );
+     }
+     let resource = match env.new_mapper_ref_texture_resource(mapping_id, texture) {
+         Ok(resource) => resource,
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+index 9b9fe2a2..c3609449 100644
+--- a/scripts/internal/census/census_report.py
++++ b/scripts/internal/census/census_report.py
+@@ -9,6 +9,10 @@
+ A mark is one line in <dir>/mark ("motionbench"), which the census reads within 50 ms. "every 1"
+ there sets the re-arm period instead. A page counts once a window: touches/frame cannot exceed
+ pages/window divided by the window's frames, so read `touched windows` with `every`.
++
++pages R were only read in their window and pages W were caught writing. pages R|W were read, then
++opened when a write hit some page held from an earlier read: at least one of them was written,
++and KVM does not say which. `sat` counts windows the saturation fuse cut short.
+ """
+ 
+ import argparse
+@@ -91,7 +95,7 @@ def fmt(s):
+ def table(surfaces, per, frames, windows, every, rw):
+     print(f"frames {frames}, windows {windows}" + (f", one window every {every} frames" if every else ""))
+     print(f"{'surface':>7} {'facts':<44} {'present':>7} {'traps':>8} {'/frame':>8} {'win':>6}"
+-          f" {'pages R':>8} {'pages W':>8} {'sat':>4} {'upg':>5} {'k/u':>9}  top RIPs")
++          f" {'pages R':>8} {'pages W':>8} {'R|W':>8} {'sat':>4} {'k/u':>9}  top RIPs")
+     rows = []
+     for serial, p in per.items():
+         rows.append((p["traps"], serial, p))
+@@ -99,9 +103,11 @@ def table(surfaces, per, frames, windows, every, rw):
+         s = surfaces.get(serial, {})
+         top = sorted(p["rips"].items(), key=lambda kv: -kv[1])[:3]
+         rate = p["traps"] / frames if frames else 0
++        caught = max(p["pages_w"] - p["upgrades"], 0)  # pages_w holds every page a write opened
+         print(f"{serial:>7} {fmt(s):<44.44} {p['presents']:>7} {p['traps']:>8} {rate:>8.2f}"
+               f" {p['windows_touched']:>6} {p['pages_r']:>8}"
+-              f" {p['pages_w'] if rw else '-':>8} {p['windows_saturated']:>4} {p['upgrades']:>5}"
++              f" {caught if rw else '-':>8} {p['upgrades'] if rw else '-':>8}"
++              f" {p['windows_saturated']:>4}"
+               f" {p['cpl0']:>4}/{p['cpl3']:<4}  " + " ".join(f"{r}:{n}" for r, n in top))
+     armed = [s for s in surfaces.values() if s.get("armed_pages")]
+     untouched = len(armed) - sum(1 for serial in per if surfaces.get(serial, {}).get("armed_pages"))
+diff --git a/scripts/internal/census/guest/device.c b/scripts/internal/census/guest/device.c
+new file mode 100644
+index 00000000..1408b8cb
+--- /dev/null
++++ b/scripts/internal/census/guest/device.c
+@@ -0,0 +1,107 @@
++/* A multiboot guest that drives the real IOSurface device, as macOS's mapper driver does, over
++ * PCI: real Reims map and unmap commands reach the census, and this guest's own loads and stores
++ * trap. 32-bit protected mode, paging off. Exit code (stage << 1) | 1: 0x11 passes.
++ * CMOS byte 0x34 counts boots: the first boot resets the machine with a surface armed. */
++#include <stdint.h>
++#define RING 0x01000000u
++#define TABLE 0x01001000u
++#define DPAGE 0x01002000u
++#define ROOT 0x01010000u
++#define SURF 0x20000000u
++#define PAGES 1024u
++#define ID 5u
++#define HOST_ONLY_ID 6u
++#define PG 4096u
++
++static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0,%1" : : "a"(v), "Nd"(p)); }
++static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(p)); return v; }
++static inline void outl(uint16_t p, uint32_t v) { __asm__ volatile("outl %0,%1" : : "a"(v), "Nd"(p)); }
++static inline uint32_t inl(uint16_t p) { uint32_t v; __asm__ volatile("inl %1,%0" : "=a"(v) : "Nd"(p)); return v; }
++static void die(int stage) { outb(0xf4, stage); for (;;) __asm__("hlt"); }
++#define R32(a) (*(volatile uint32_t *)(uintptr_t)(a))
++#define R64(a) (*(volatile uint64_t *)(uintptr_t)(a))
++static uint32_t cfg(int d, int r) { outl(0xcf8, 0x80000000u | d << 11 | r); return inl(0xcfc); }
++static void cfgw(int d, int r, uint32_t v) { outl(0xcf8, 0x80000000u | d << 11 | r); outl(0xcfc, v); }
++
++static uint32_t bar, wr;
++static uint32_t pte(uint32_t pa) { return (pa >> 12) << 2 | 1; }
++
++static int cmd(uint32_t c, uint32_t id) {
++    uint32_t at = RING + (wr % 256) * 16;
++    R32(at) = c; R32(at + 4) = id; R32(at + 8) = 0x5555;
++    wr++;
++    R32(bar + 0x1018) = wr;
++    for (uint32_t n = 0; R32(bar + 0x1020) != wr; n++)
++        if (n > 400000000u) die(0x30);
++    return R32(at + 8);
++}
++static void descriptor(uint32_t id, int host_only) {
++    uint32_t d = DPAGE + id * 0x400;
++    for (uint32_t i = 0; i < 0x400; i += 4) R32(d + i) = 0;
++    R32(d) = pte(ROOT);
++    R32(d + 4) = 0x42475241;
++    R64(d + 0x18) = PAGES * PG;
++    R64(d + 0x20) = 1024;
++    R64(d + 0x28) = 1024;
++    R64(d + 0x30) = 4096;
++    *(volatile uint16_t *)(d + 0x38) = 4;
++    *(volatile uint8_t *)(d + 0x3c) = 1;
++    *(volatile uint8_t *)(d + 0x3d) = 1;
++    *(volatile uint8_t *)(d + 0x3f) = 0; /* address_format */
++    *(volatile uint8_t *)(d + 0x40) = 0; /* compression_type */
++    *(volatile uint8_t *)(d + 0x41) = host_only ? 2 : 0;
++    /* protection_options stays 0: Linux refuses it over guest pages. */
++}
++static uint32_t page(uint32_t i) { return SURF + 2 * i * PG; } /* scattered, as a surface's are */
++
++void main_c(void) {
++    uint8_t boots;
++    outb(0x70, 0x34); boots = inb(0x71); outb(0x70, 0x34); outb(0x71, boots + 1);
++
++    for (int d = 0; d < 32 && !bar; d++)
++        if (cfg(d, 0) == (0xeeefu << 16 | 0x106b)) {
++            bar = cfg(d, 0x10) & ~0xfu;
++            cfgw(d, 4, cfg(d, 4) | 6);
++        }
++    if (!bar) die(0x31);
++    for (uint32_t i = 0; i < 16; i++) R32(TABLE + 4 * i) = pte(DPAGE + i * PG);
++    for (uint32_t i = 0; i < PAGES; i++) R32(ROOT + 4 * i) = pte(page(i));
++    R32(bar + 0x1030) = 1;
++    R32(bar + 0x1000) = RING;
++    R32(bar + 0x1008) = 256;
++    R32(bar + 0x1010) = TABLE;
++    wr = R32(bar + 0x1020);
++    if (boots) {
++        /* The second boot: the surface left armed is gone, and a map works again. */
++        descriptor(ID, 0);
++        if (cmd(1, ID)) die(0x32);
++        for (uint32_t i = 0; i < PAGES; i++) R32(page(i)) = i;
++        if (cmd(2, ID)) die(0x33);
++        die(0x11);
++    }
++    descriptor(ID, 0);
++    if (cmd(1, ID)) die(0x34);
++    for (uint32_t round = 1; round <= 300; round++) {
++        volatile uint32_t sink = 0;
++        for (uint32_t i = 0; i < PAGES; i++) sink += R32(page(i) + 8);
++        for (uint32_t i = 0; i < PAGES / 2; i++) R32(page(i) + 8) = round + i;
++        for (uint32_t i = 0; i < PAGES / 2; i++)
++            if (R32(page(i) + 8) != round + i) die(0x35);
++        for (uint32_t n = 0; n < 300000; n++) __asm__("pause");
++    }
++    /* The host's own write, through the main mapping and the surface's view: the guest must read
++     * it through a marker. The test command writes each 8-byte word its own offset. */
++    if (cmd(3, ID)) die(0x36);
++    for (uint32_t i = 0; i < PAGES; i++)
++        if (R32(page(i) + 8) != i * PG + 8) die(0x37);
++    if (cmd(2, ID)) die(0x38);
++    for (uint32_t i = 0; i < PAGES; i++) R32(page(i) + 8) = 7; /* free pages, no trap */
++    descriptor(HOST_ONLY_ID, 1);
++    if (cmd(1, HOST_ONLY_ID)) die(0x39);
++    if (cmd(2, HOST_ONLY_ID)) die(0x3a);
++    descriptor(ID, 0);
++    if (cmd(1, ID)) die(0x3b);
++    for (uint32_t i = 0; i < PAGES; i++) (void)R32(page(i));
++    outb(0xcf9, 0x06); /* reset with the surface mapped, armed and held */
++    for (;;) __asm__("hlt");
++}
+diff --git a/scripts/internal/census/guest/device_start.S b/scripts/internal/census/guest/device_start.S
+new file mode 100644
+index 00000000..d1eaf8e9
+--- /dev/null
++++ b/scripts/internal/census/guest/device_start.S
+@@ -0,0 +1,15 @@
++    .set MB_MAGIC, 0x1badb002
++    .set MB_FLAGS, 0x00010000
++    .section .multiboot, "a"
++    .align 4
++header:
++    .long MB_MAGIC, MB_FLAGS, -(MB_MAGIC + MB_FLAGS)
++    .long header, header, _edata, _end, _start
++    .text
++    .globl _start
++_start:
++    cli
++    movl $0x00f00000, %esp
++    call main_c
++1:  hlt
++    jmp 1b
+diff --git a/scripts/internal/census/guest/guest.S b/scripts/internal/census/guest/guest.S
+new file mode 100644
+index 00000000..cdd2ab1a
+--- /dev/null
++++ b/scripts/internal/census/guest/guest.S
+@@ -0,0 +1,101 @@
++/* A multiboot guest for the census's boot test: runs in 32-bit protected mode with paging off,
++ * walks the armed range reading, writing and with rep movs, then resets the machine once through
++ * port 0xcf9 and, on the second boot, leaves through isa-debug-exit. CMOS byte 0x34 counts boots. */
++    .set MB_MAGIC, 0x1badb002
++    .set MB_FLAGS, 0x00010000
++    .section .multiboot, "a"
++    .align 4
++header:
++    .long MB_MAGIC, MB_FLAGS, -(MB_MAGIC + MB_FLAGS)
++    .long header, header, _edata, _end, _start
++    .text
++    .code32
++    .globl _start
++_start:
++    cli
++    movl $0x00f00000, %esp
++    movb $0x34, %al
++    outb %al, $0x70
++    inb $0x71, %al
++    movb %al, %bl          /* boots so far */
++    incb %al
++    movb %al, %cl
++    movb $0x34, %al
++    outb %al, $0x70
++    movb %cl, %al
++    outb %al, $0x71
++
++    movl $200, %ebp        /* rounds */
++1:  movl $0x20000000, %esi /* armed: 16 MiB at 512 MiB */
++    movl $4096, %ecx
++2:  movl (%esi), %eax      /* read every page */
++    addl $4096, %esi
++    loop 2b
++    movl $0x20000000, %edi
++    movl $2048, %ecx
++3:  movl %ebp, (%edi)      /* write half of them */
++    addl $4096, %edi
++    loop 3b
++    movl $0x20400000, %esi /* rep movs across pages, armed to armed */
++    movl $0x20800000, %edi
++    movl $0x4000, %ecx
++    rep movsl
++    /* the guest's pages are the truth: read back what it wrote */
++    movl $0x20000000, %edi
++    movl $2048, %ecx
++4:  cmpl %ebp, (%edi)
++    jne fail
++    addl $4096, %edi
++    loop 4b
++    movl $20000, %ecx      /* some time for the windows to turn */
++5:  pause
++    loop 5b
++    decl %ebp
++    jnz 1b
++
++    cmpb $0, %bl
++    jne done
++    movb $0x06, %al        /* reset with the surface armed */
++    movw $0xcf9, %dx
++    outb %al, %dx
++6:  hlt
++    jmp 6b
++done:
++    movb $0x11, %al        /* qemu exits 35: the pass, soon after this */
++    outb %al, $0xf4
++10: hlt
++    jmp 10b
++fail:
++    movl (%edi), %esi      /* what the guest read, again */
++    movl %ebp, %eax
++    call hex
++    movl %edi, %eax
++    call hex
++    movl %esi, %eax
++    call hex
++    movl %ecx, %eax
++    call hex
++    movzbl %bl, %eax
++    call hex
++    movl %edi, %esi        /* the same word through the next read of a neighbour */
++    movl -4(%esi), %eax
++    call hex
++    movb $0x22, %al        /* qemu exits 69 */
++    outb %al, $0xf4
++7:  hlt
++    jmp 7b
++hex:                       /* %eax to the debug console, as 8 digits and a space */
++    movl %eax, %edx
++    movl $8, %ecx
++8:  roll $4, %edx
++    movb %dl, %al
++    andb $15, %al
++    addb $48, %al
++    cmpb $58, %al
++    jb 9f
++    addb $39, %al
++9:  outb %al, $0xe9
++    loop 8b
++    movb $32, %al
++    outb %al, $0xe9
++    ret
+diff --git a/scripts/internal/census/guest/link.ld b/scripts/internal/census/guest/link.ld
+new file mode 100644
+index 00000000..bae0ebdc
+--- /dev/null
++++ b/scripts/internal/census/guest/link.ld
+@@ -0,0 +1,9 @@
++ENTRY(_start)
++SECTIONS {
++    . = 0x200000;
++    .multiboot : { *(.multiboot) }
++    .text : { *(.text) }
++    _edata = .;
++    .bss : { *(.bss) }
++    _end = .;
++}
+diff --git a/scripts/internal/census/guest/run.sh b/scripts/internal/census/guest/run.sh
+new file mode 100755
+index 00000000..ec129251
+--- /dev/null
++++ b/scripts/internal/census/guest/run.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++# run.sh <name> <guest.elf> <gfx: 0|1> [ENV=VALUE]...: boots a guest in the run image, own container,
++# as macos-vm does, under taskset 8-19, on lavapipe: no GPU, no disk. Output in
++# /srv/warm/census/out/<name>. Exit 35 is the guest's pass.
++#
++#   gcc -m32 -c guest.S -o guest.o && ld -m elf_i386 -T link.ld -o guest.elf guest.o
++#   gcc -m32 -O1 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -mno-sse -nostdlib -static \
++#     -c device.c -o device.o && gcc -m32 -c device_start.S -o device_start.o \
++#     && ld -m elf_i386 -T link.ld -o device.elf device_start.o device.o
++#   run.sh on $PWD/guest.elf 0 REIMS_VGPU_CENSUS=/srv/warm/census/out/on \
++#     REIMS_VGPU_CENSUS_SELFTEST=20000000:1000000
++#   run.sh dev $PWD/device.elf 1 REIMS_VGPU_CENSUS=/srv/warm/census/out/dev REIMS_VGPU_WINDOW=0
++name=$1 elf=$2 gfx=$3; shift 3
++Q=/srv/data/macos-vm/home/.local/share/reims-ctl/qemu/${CENSUS_BUILD:-20261031-220217-2e0d4d1-census}
++O=/srv/warm/census/out/$name
++rm -rf "$O"; mkdir -p "$O"
++args=()
++for e in "$@"; do args+=(-e "$e"); done
++dev=()
++[ "$gfx" = 1 ] && dev=(-device apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays=1,resolution=1280x720 -device apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6)
++timeout ${LIMIT:-60} docker run -i --rm --name census-boot-$name --init \
++  --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/kvm \
++  -e HOME=/srv/warm/census/home -e VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
++  -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json -e RUST_LOG=${RUST_LOG:-warn} "${args[@]}" \
++  -v /srv/data/macos-vm/home/.local/share/reims-ctl/qemu:/srv/data/macos-vm/home/.local/share/reims-ctl/qemu:ro \
++  -v /srv/warm/census:/srv/warm/census macos-vm:run2 \
++  sh -c 'echo cap $(grep CapEff /proc/self/status) >&2; exec taskset -c 8-19 "$@"' sh $Q/bin/qemu-system-x86_64 -L $Q/share/qemu \
++    -accel kvm -cpu host -smp 2 -machine q35,memory-backend=ram -display none -vga none \
++    -object memory-backend-memfd,id=ram,size=1G,share=on \
++    -device isa-debug-exit,iobase=0xf4,iosize=1 -chardev file,id=dbg,path=$O/console -device isa-debugcon,iobase=0xe9,chardev=dbg -serial none -monitor ${MON:-none} \
++    -kernel "$elf" "${dev[@]}" ${EXTRA:-}
++echo "exit $?"

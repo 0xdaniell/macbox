@@ -1,0 +1,1223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 01:11:17 +0000
+Subject: [PATCH 11/25] trap-coherent surfaces, hooks and tests
+
+rvg_coherent_* joins QEMU's page states to metal2vulkan's shadow_coherent, the
+unmap of a surface with work running is Busy, and the display samples the
+surface's own image. coherent_test.c runs the pages on a real KVM guest; the
+census report prints the per-present cost against eager copies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                    |   1 +
+ crates/reims-vgpu-c/Cargo.toml                |   4 +-
+ crates/reims-vgpu-c/include/reims_vgpu.h      |  45 ++
+ crates/reims-vgpu-c/src/census.rs             |   8 +
+ crates/reims-vgpu-c/src/coherent.rs           | 258 ++++++++++
+ crates/reims-vgpu-c/src/lib.rs                |   1 +
+ crates/reims-vgpu-c/tests/c/harness.c         |   8 +
+ crates/reims-vgpu-c/tests/c_harness.rs        |   2 +-
+ crates/reims-vgpu-core/src/census.rs          |  10 +
+ crates/reims-vgpu-core/src/display/frame.rs   |   4 +-
+ crates/reims-vgpu-core/src/iosurface/table.rs |  24 +-
+ .../reims-vgpu-core/src/platform/resource.rs  |  10 +-
+ crates/reims-vgpu-vulkan/src/gpu/resource.rs  |  14 +-
+ docs/api.md                                   |   1 +
+ scripts/internal/census/census_report.py      |  41 +-
+ scripts/internal/census/census_test.c         |  13 +-
+ scripts/internal/census/coherent_test.c       | 483 ++++++++++++++++++
+ 17 files changed, 906 insertions(+), 21 deletions(-)
+ create mode 100644 crates/reims-vgpu-c/src/coherent.rs
+ create mode 100644 scripts/internal/census/coherent_test.c
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c82d6926..a9d888f1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -595,6 +595,7 @@ version = "0.1.0"
+ dependencies = [
+  "libc",
+  "log",
++ "metal2vulkan-runtime",
+  "objc2",
+  "objc2-foundation",
+  "parking_lot",
+diff --git a/crates/reims-vgpu-c/Cargo.toml b/crates/reims-vgpu-c/Cargo.toml
+index 235b1dd4..9a063ca9 100644
+--- a/crates/reims-vgpu-c/Cargo.toml
++++ b/crates/reims-vgpu-c/Cargo.toml
+@@ -21,10 +21,12 @@ macos-sdl = ["reims-vgpu/macos-sdl"]
+ # The Vulkan platform's proof of concept (architecture 11.1): every handle is made on
+ # `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
+ # `cargo xtask dist --platform vulkan` builds the dist tree with it.
+-vulkan = ["reims-vgpu/vulkan"]
++vulkan = ["reims-vgpu/vulkan", "dep:metal2vulkan-runtime"]
+ 
+ [dependencies]
+ reims-vgpu.workspace = true
++# LOCAL (Atlas): the trap-coherent surfaces' exports (`src/coherent.rs`).
++metal2vulkan-runtime = { workspace = true, optional = true }
+ # The platform trait's associated types (the unit tests' testkit platform stands where
+ # MetalPlatform stands in the product), and the log hook.
+ reims-vgpu-core.workspace = true
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index 705af8c0..3adaf431 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -342,6 +342,8 @@ typedef struct {
+   uint32_t compression_type;
+   bool read_only;
+   bool host_only;
++  uint64_t base_address;
++  uint64_t base_offset;
+ } RvgCensusSurface;
+ 
+ // `mapped(ctx, surface, pages, page_count, page_size)`: a surface was mapped, with each guest
+@@ -373,6 +375,29 @@ typedef void (*RvgCensusUsedFn)(void *ctx,
+ // this header.
+ typedef void (*RvgCensusPresentedFn)(void *ctx, uint64_t mapping_id);
+ 
++// What marks a trap-coherent surface's pages (metal2vulkan's `shadow_coherent.rs`). Addresses are
++// the library's mapping of the surface, whole pages, ascending, one surface to a call.
++//
++// Thread: any library thread, a vCPU's in `rvg_coherent_fault` among them, under the surface's
++// lock. May call: nothing of this header.
++typedef struct {
++  // sizeof(RvgCoherentHooks) as the host was compiled.
++  uint32_t struct_size;
++  void *ctx;
++  // Every page of the surface held from now on: whether it can be.
++  bool (*track)(void *ctx, uint64_t start, uint64_t len);
++  void (*untrack)(void *ctx, uint64_t start);
++  // Held pages armed. Into up to `room` of `refused`, those a CPU reached as their markers moved,
++  // left held: how many.
++  size_t (*arm)(void *ctx, const uint64_t *addrs, size_t n, uint64_t *refused, size_t room);
++  // Into up to `room` of `came`, the pages a CPU reached as their markers moved: how many.
++  size_t (*hold)(void *ctx, const uint64_t *addrs, size_t n, bool open_too, uint64_t *came,
++                 size_t room);
++  void (*open)(void *ctx, uint64_t addr);
++  void (*freeze)(void *ctx, const uint64_t *addrs, size_t n);
++  void (*thaw)(void *ctx, const uint64_t *addrs, size_t n);
++} RvgCoherentHooks;
++
+ // The touch census's callbacks.
+ typedef struct {
+   // sizeof(RvgCensusCallbacks) as the host was compiled.
+@@ -963,6 +988,26 @@ void rvg_log_set_handler(RvgLogFn handler, void *ctx, RvgLogLevel max_level);
+ // `callbacks` is NULL or a live table. Its functions and `ctx` live as long as the process.
+ RvgStatus rvg_census_set_callbacks(const RvgCensusCallbacks *callbacks);
+ 
++// Installs what marks the pages of trap-coherent surfaces, once, before the first device.
++// RVG_ERR_INVALID_ARGUMENT for NULL, RVG_ERR_UNSUPPORTED on a platform without them.
++RvgStatus rvg_coherent_set_hooks(const RvgCoherentHooks *hooks);
++// The guest touched the page at `addr` of a surface's mapping: returns with its bytes current,
++// and, for a write, open. Takes the surface's lock: call it holding no lock `hooks` takes.
++void rvg_coherent_fault(uint64_t addr, bool write);
++// From the access's stop to its rerun, for the report.
++void rvg_coherent_timed(uint64_t addr, uint64_t ns);
++// A write hit a held page no one can name: every held page armed, so the rerun names it.
++void rvg_coherent_probe(void);
++// Every surface catches up and stops being tracked: the markers go now.
++void rvg_coherent_abandon(void);
++// The guest resets: every surface is forgotten, with vCPUs stopped.
++void rvg_coherent_reset(void);
++// The surface over `len` bytes from `start` was unmapped, and its pages are the guest's to reuse.
++void rvg_coherent_unmapped(uint64_t start, uint64_t len);
++// One JSON line a surface under `label` into `out`, up to `room` bytes: the bytes they took,
++// which may exceed `room`.
++size_t rvg_coherent_report(const char *label, char *out, size_t room);
++
+ // A new device. Refusals, checked in this order: RVG_ERR_INVALID_ARGUMENT for the config
+ // itself (the files behind its memory map's ranges among it), RVG_ERR_UNSUPPORTED,
+ // RVG_ERR_DISPLAY_PORT_COUNT, RVG_ERR_NO_METAL_DEVICE, RVG_ERR_MEMORY_CONFLICT,
+diff --git a/crates/reims-vgpu-c/src/census.rs b/crates/reims-vgpu-c/src/census.rs
+index 3a85dfcf..13179db0 100644
+--- a/crates/reims-vgpu-c/src/census.rs
++++ b/crates/reims-vgpu-c/src/census.rs
+@@ -28,6 +28,8 @@ pub struct RvgCensusSurface {
+     pub compression_type: u32,
+     pub read_only: bool,
+     pub host_only: bool,
++    pub base_address: u64,
++    pub base_offset: u64,
+ }
+ 
+ /// `mapped(ctx, surface, pages, page_count, page_size)`: a surface was mapped, with each guest
+@@ -107,6 +109,8 @@ impl Sink for HostSink {
+             compression_type: facts.compression_type,
+             read_only: facts.read_only,
+             host_only: facts.host_only,
++            base_address: facts.base_address,
++            base_offset: facts.base_offset,
+         };
+         let (ctx, at, count) = (self.0.ctx, pages.as_ptr(), pages.len());
+         // SAFETY: the host's function, given its context and what lives across the call.
+@@ -115,6 +119,10 @@ impl Sink for HostSink {
+         });
+     }
+ 
++    fn unmapping(&self, start: u64, len: u64) -> bool {
++        crate::coherent::unmapping(start, len)
++    }
++
+     fn unmapped(&self, mapping_id: u32) {
+         let Some(unmapped) = self.0.unmapped else {
+             return;
+diff --git a/crates/reims-vgpu-c/src/coherent.rs b/crates/reims-vgpu-c/src/coherent.rs
+new file mode 100644
+index 00000000..d8f6e9ad
+--- /dev/null
++++ b/crates/reims-vgpu-c/src/coherent.rs
+@@ -0,0 +1,258 @@
++//! LOCAL (Atlas): trap-coherent surfaces' exports: QEMU's census view marks the pages of the
++//! surfaces metal2vulkan leaves ahead in their images (its `shadow_coherent.rs`), and tells of each
++//! touch here. On a platform without them, nothing here does anything.
++
++use std::ffi::{CStr, c_char, c_void};
++
++use crate::ffi;
++use crate::sized::{self, HostStruct};
++#[cfg(not(feature = "vulkan"))]
++use crate::status::RVG_ERR_UNSUPPORTED;
++#[cfg(feature = "vulkan")]
++use crate::status::RVG_OK;
++use crate::status::{RVG_ERR_INVALID_ARGUMENT, RvgStatus};
++
++/// What marks a trap-coherent surface's pages. See the header.
++#[repr(C)]
++#[derive(Clone, Copy)]
++#[expect(
++    missing_docs,
++    reason = "the fields' names say what they hold, as the header shows them"
++)]
++pub struct RvgCoherentHooks {
++    /// sizeof(RvgCoherentHooks) as the host was compiled.
++    pub struct_size: u32,
++    pub ctx: *mut c_void,
++    pub track: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, start: u64, len: u64) -> bool>,
++    pub untrack: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, start: u64)>,
++    pub arm: Option<
++        unsafe extern "C-unwind" fn(
++            ctx: *mut c_void,
++            addrs: *const u64,
++            n: usize,
++            refused: *mut u64,
++            room: usize,
++        ) -> usize,
++    >,
++    pub hold: Option<
++        unsafe extern "C-unwind" fn(
++            ctx: *mut c_void,
++            addrs: *const u64,
++            n: usize,
++            open_too: bool,
++            came: *mut u64,
++            room: usize,
++        ) -> usize,
++    >,
++    pub open: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addr: u64)>,
++    pub freeze: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addrs: *const u64, n: usize)>,
++    pub thaw: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addrs: *const u64, n: usize)>,
++}
++
++// SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
++unsafe impl HostStruct for RvgCoherentHooks {}
++
++#[cfg(feature = "vulkan")]
++mod on {
++    use super::RvgCoherentHooks;
++    use metal2vulkan_runtime::shadow_coherent::Pages;
++
++    pub(super) use metal2vulkan_runtime::shadow_coherent as runtime;
++
++    /// The host's hooks, as the runtime's marks.
++    pub(super) struct HostPages(pub(super) RvgCoherentHooks);
++
++    // SAFETY: the host's contract: its functions run on any of the library's threads.
++    unsafe impl Send for HostPages {}
++    // SAFETY: as above.
++    unsafe impl Sync for HostPages {}
++
++    impl Pages for HostPages {
++        fn track(&self, start: u64, len: u64) -> bool {
++            // SAFETY: the host's function, given its context.
++            self.0.track.is_some_and(|track| unsafe { track(self.0.ctx, start, len) })
++        }
++
++        fn untrack(&self, start: u64) {
++            if let Some(untrack) = self.0.untrack {
++                // SAFETY: as above.
++                unsafe { untrack(self.0.ctx, start) };
++            }
++        }
++
++        fn arm(&self, pages: &[u64]) -> Vec<u64> {
++            let mut refused = vec![0; pages.len()];
++            let Some(arm) = self.0.arm else {
++                return Vec::new();
++            };
++            let (at, count, to) = (pages.as_ptr(), pages.len(), refused.as_mut_ptr());
++            // SAFETY: as above, with what lives across the call.
++            let found = unsafe { arm(self.0.ctx, at, count, to, count) };
++            refused.truncate(found);
++            refused
++        }
++
++        fn hold(&self, pages: &[u64], open_too: bool) -> Vec<u64> {
++            let mut came = vec![0; pages.len()];
++            let Some(hold) = self.0.hold else {
++                return Vec::new();
++            };
++            let (at, count, to) = (pages.as_ptr(), pages.len(), came.as_mut_ptr());
++            // SAFETY: as above.
++            let found = unsafe { hold(self.0.ctx, at, count, open_too, to, count) };
++            came.truncate(found);
++            came
++        }
++
++        fn open(&self, page: u64) {
++            if let Some(open) = self.0.open {
++                // SAFETY: as above.
++                unsafe { open(self.0.ctx, page) };
++            }
++        }
++
++        fn freeze(&self, pages: &[u64]) {
++            if let Some(freeze) = self.0.freeze {
++                // SAFETY: as above, with what lives across the call.
++                unsafe { freeze(self.0.ctx, pages.as_ptr(), pages.len()) };
++            }
++        }
++
++        fn thaw(&self, pages: &[u64]) {
++            if let Some(thaw) = self.0.thaw {
++                // SAFETY: as above, with what lives across the call.
++                unsafe { thaw(self.0.ctx, pages.as_ptr(), pages.len()) };
++            }
++        }
++    }
++}
++
++/// Before an unmap of the surface over `len` bytes from `start`: whether it may go on.
++pub(crate) fn unmapping(start: u64, len: u64) -> bool {
++    #[cfg(feature = "vulkan")]
++    return on::runtime::unmapping(start..start.wrapping_add(len));
++    #[cfg(not(feature = "vulkan"))]
++    {
++        let _ = (start, len);
++        true
++    }
++}
++
++/// Installs what marks the pages of trap-coherent surfaces. See the header.
++///
++/// # Safety
++/// `hooks` is NULL or a live table, whose functions and `ctx` live as long as the process.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_coherent_set_hooks(hooks: *const RvgCoherentHooks) -> RvgStatus {
++    ffi::export(|| {
++        // SAFETY: the caller's contract.
++        let table = match unsafe { sized::read(hooks) } {
++            Ok(Some(table)) => table,
++            Ok(None) => return RVG_ERR_INVALID_ARGUMENT,
++            Err(status) => return status,
++        };
++        #[cfg(feature = "vulkan")]
++        {
++            let pages = std::sync::Arc::new(on::HostPages(table));
++            on::runtime::set_pages(Some(pages));
++            RVG_OK
++        }
++        #[cfg(not(feature = "vulkan"))]
++        {
++            let _ = table;
++            RVG_ERR_UNSUPPORTED
++        }
++    })
++}
++
++/// A page was touched. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_fault(addr: u64, write: bool) {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::fault(addr, write);
++        #[cfg(not(feature = "vulkan"))]
++        let _ = (addr, write);
++    });
++}
++
++/// How long an access stood. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_timed(addr: u64, ns: u64) {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::timed(addr, ns);
++        #[cfg(not(feature = "vulkan"))]
++        let _ = (addr, ns);
++    });
++}
++
++/// A write no one can name. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_probe() {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::probe();
++    });
++}
++
++/// Every surface back in its pages. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_abandon() {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::abandon();
++    });
++}
++
++/// The guest resets. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_reset() {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::reset();
++    });
++}
++
++/// A surface went. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_unmapped(start: u64, len: u64) {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::runtime::unmapped(start..start.wrapping_add(len));
++        #[cfg(not(feature = "vulkan"))]
++        let _ = (start, len);
++    });
++}
++
++/// The report. See the header.
++///
++/// # Safety
++/// `label` is a C string or NULL, and `out` holds `room` bytes.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_coherent_report(
++    label: *const c_char,
++    out: *mut c_char,
++    room: usize,
++) -> usize {
++    ffi::export(|| {
++        if label.is_null() {
++            return 0;
++        }
++        // SAFETY: the caller's contract.
++        let label = unsafe { CStr::from_ptr(label) }.to_string_lossy();
++        #[cfg(feature = "vulkan")]
++        let text = on::runtime::report(&label);
++        #[cfg(not(feature = "vulkan"))]
++        let text = {
++            let _ = &label;
++            String::new()
++        };
++        let count = text.len().min(room);
++        if count > 0 && !out.is_null() {
++            // SAFETY: the caller's contract; `count` is within `room`.
++            unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out.cast(), count) };
++        }
++        count
++    })
++}
+diff --git a/crates/reims-vgpu-c/src/lib.rs b/crates/reims-vgpu-c/src/lib.rs
+index 50b2c78b..dcbf4cc8 100644
+--- a/crates/reims-vgpu-c/src/lib.rs
++++ b/crates/reims-vgpu-c/src/lib.rs
+@@ -28,6 +28,7 @@ pub mod status;
+ pub mod log;
+ 
+ pub mod census;
++pub mod coherent;
+ pub mod device;
+ pub mod display;
+ pub mod frame;
+diff --git a/crates/reims-vgpu-c/tests/c/harness.c b/crates/reims-vgpu-c/tests/c/harness.c
+index 2f060d5b..639e4aff 100644
+--- a/crates/reims-vgpu-c/tests/c/harness.c
++++ b/crates/reims-vgpu-c/tests/c/harness.c
+@@ -178,6 +178,14 @@ static void check_status_and_log(void) {
+     rvg_log_set_handler(NULL, NULL, RVG_LOG_OFF);
+ 
+     CHECK_STATUS(rvg_census_set_callbacks(NULL), RVG_ERR_INVALID_ARGUMENT);
++    CHECK_STATUS(rvg_coherent_set_hooks(NULL), RVG_ERR_INVALID_ARGUMENT);
++    rvg_coherent_fault(0, false);
++    rvg_coherent_timed(0, 0);
++    rvg_coherent_probe();
++    rvg_coherent_abandon();
++    rvg_coherent_reset();
++    rvg_coherent_unmapped(0, 0);
++    CHECK(rvg_coherent_report("", NULL, 0) == 0);
+     CHECK(RVG_MAX_DISPLAY_PORTS == 8 && RVG_DEVICE_MMIO_SIZE == 0x4000);
+     CHECK(RVG_PCI_VENDOR_ID == 0x106b && RVG_PCI_DEVICE_ID == 0xeeee);
+     CHECK(RVG_PCI_BAR_MMIO == 0 && RVG_PCI_MSI_VECTORS == 1);
+diff --git a/crates/reims-vgpu-c/tests/c_harness.rs b/crates/reims-vgpu-c/tests/c_harness.rs
+index 8e7b6e3e..7b4c7053 100644
+--- a/crates/reims-vgpu-c/tests/c_harness.rs
++++ b/crates/reims-vgpu-c/tests/c_harness.rs
+@@ -111,7 +111,7 @@ fn c_harness_calls_every_function() {
+             Some(&rest[..end])
+         })
+         .collect();
+-    assert_eq!(declared.len(), 48, "{declared:?}");
++    assert_eq!(declared.len(), 56, "{declared:?}");
+     let missing: Vec<&str> = declared
+         .iter()
+         .copied()
+diff --git a/crates/reims-vgpu-core/src/census.rs b/crates/reims-vgpu-core/src/census.rs
+index 5d3ac435..291bcfcd 100644
+--- a/crates/reims-vgpu-core/src/census.rs
++++ b/crates/reims-vgpu-core/src/census.rs
+@@ -34,6 +34,10 @@ pub struct SurfaceFacts {
+     pub read_only: bool,
+     /// `hostOnly`: the surface has no guest pages.
+     pub host_only: bool,
++    /// The host address of the surface's bytes in the library's mapping of them.
++    pub base_address: u64,
++    /// That address's offset in its first page.
++    pub base_offset: u64,
+ }
+ 
+ /// Who hears of the surfaces.
+@@ -41,6 +45,12 @@ pub trait Sink: Send + Sync {
+     /// A surface was mapped. `pages` is each guest page's host address, none for a host-only one.
+     /// On the IOSurface device's queue, under its state's lock.
+     fn mapped(&self, facts: &SurfaceFacts, pages: &[u64], page_size: u64);
++    /// The guest asks to unmap the surface over `len` bytes from the host address `start`, and
++    /// nothing was checked yet: whether it may go on, else it answers busy. What it held of the
++    /// surface it lets go of.
++    fn unmapping(&self, _start: u64, _len: u64) -> bool {
++        true
++    }
+     /// The surface at `mapping_id` goes. Called before the unmap returns to the guest, and
+     /// returns only when no trap remains on its pages, which the guest may reuse at once.
+     fn unmapped(&self, mapping_id: u32);
+diff --git a/crates/reims-vgpu-core/src/display/frame.rs b/crates/reims-vgpu-core/src/display/frame.rs
+index e28a308e..551e03d8 100644
+--- a/crates/reims-vgpu-core/src/display/frame.rs
++++ b/crates/reims-vgpu-core/src/display/frame.rs
+@@ -74,9 +74,7 @@ impl<P: Platform> DisplayCore<P> {
+         completion: Box<dyn FnOnce() + Send>,
+     ) -> RaiseResult<()> {
+         // LOCAL (Atlas): before the display's lock, as this may commit a command buffer.
+-        if let Some(frame) = &frame {
+-            frame.presented();
+-        }
++        let frame = frame.map(|frame| frame.presented().unwrap_or(frame));
+         let mut g = self.display_mutex.lock();
+         // present: frames in flight, waited for next
+         crate::trace::event(
+diff --git a/crates/reims-vgpu-core/src/iosurface/table.rs b/crates/reims-vgpu-core/src/iosurface/table.rs
+index 4c1ac55b..f0fcf652 100644
+--- a/crates/reims-vgpu-core/src/iosurface/table.rs
++++ b/crates/reims-vgpu-core/src/iosurface/table.rs
+@@ -85,6 +85,8 @@ fn census_facts(
+         compression_type: u32::from(base.compression_type),
+         read_only: base.read_only(),
+         host_only: base.host_only(),
++        base_address: 0,
++        base_offset: 0,
+     }
+ }
+ 
+@@ -162,11 +164,12 @@ impl<P: Platform> HostDeviceCore<P> {
+             slot.pages = Vec::new();
+         }
+         if made && let Some(sink) = crate::census::sink() {
+-            sink.mapped(
+-                &census_facts(mapping_id, &descriptor),
+-                &slot.pages,
+-                self.page_size(),
+-            );
++            let mut facts = census_facts(mapping_id, &descriptor);
++            if let Some(surface) = &slot.surface {
++                facts.base_address = surface.base_address().addr() as u64;
++                facts.base_offset = slot.base_offset;
++            }
++            sink.mapped(&facts, &slot.pages, self.page_size());
+         }
+         if let Some(s) = st.slots.get_mut(index) {
+             *s = slot;
+@@ -306,6 +309,17 @@ impl<P: Platform> HostDeviceCore<P> {
+             return IoReturn::BadArgument;
+         }
+         let index = mapping_id.to_usize();
++        if let Some(sink) = crate::census::sink()
++            && let Some(slot) = st.slots.get(index)
++            && let Some(surface) = &slot.surface
++        {
++            let start = (surface.base_address().addr() as u64).wrapping_sub(slot.base_offset);
++            let len = slot.page_count.wrapping_mul(self.page_size());
++            if !sink.unmapping(start, len) {
++                log::debug!("unmap: surface {mapping_id} has GPU work running in its image");
++                return IoReturn::Busy;
++            }
++        }
+         let Some(retain_count) = st
+             .slots
+             .get(index)
+diff --git a/crates/reims-vgpu-core/src/platform/resource.rs b/crates/reims-vgpu-core/src/platform/resource.rs
+index ca6f92c6..b8a42032 100644
+--- a/crates/reims-vgpu-core/src/platform/resource.rs
++++ b/crates/reims-vgpu-core/src/platform/resource.rs
+@@ -83,8 +83,14 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
+ pub trait Texture<P: Platform>: GpuResource<P> {
+     /// LOCAL (Atlas): not a Metal call. The display is about to show the texture's bytes, for a
+     /// platform that leaves a surface's writes out of them until then (metal2vulkan's
+-    /// `shadow_lazy.rs`).
+-    fn presented(&self) {}
++    /// `shadow_lazy.rs`). Under `surface_coherent`, the texture to show in its place, which holds
++    /// those bytes ahead of them (`shadow_coherent.rs`).
++    fn presented(&self) -> Option<Self>
++    where
++        Self: Sized,
++    {
++        None
++    }
+     /// sel: arrayLength
+     fn array_length(&self) -> u64;
+     /// sel: depth
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+index 546fcd99..30b1a129 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+@@ -1274,8 +1274,18 @@ fn at(index: u64) -> rt::IdPlacement {
+ }
+ 
+ impl Texture<VulkanPlatform> for VulkanTexture {
+-    fn presented(&self) {
+-        plain(|| self.raw.surface_presented());
++    fn presented(&self) -> Option<Self> {
++        let raw = plain(|| self.raw.surface_presented())?;
++        Some(Obj::new(TextureObject {
++            raw,
++            device: self.device.clone_ref(),
++            surface: self.surface.clone(),
++            plane: self.plane,
++            under: None,
++            private_usage: self.private_usage,
++            space: self.space.clone(),
++            gpu_read_only: self.gpu_read_only,
++        }))
+     }
+ 
+     fn array_length(&self) -> u64 {
+diff --git a/docs/api.md b/docs/api.md
+index 2ddabe01..900d4255 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -703,6 +703,7 @@ The header's 47 functions, in its order. "May" is the header's mark "may call ba
+ | 40 | `rvg_video_device_invalidate` | | a reset's first phase: the session sends the guest nothing more |
+ | 41 | `rvg_video_device_reset` | | both phases: the session's work drains and it ends |
+ | 42a | `rvg_census_set_callbacks` | | LOCAL (Atlas): the touch census's news of surfaces and presents (`reims_vgpu_core::census`); no calls without it |
++| 42b | `rvg_coherent_set_hooks`, `rvg_coherent_fault`, `rvg_coherent_timed`, `rvg_coherent_probe`, `rvg_coherent_abandon`, `rvg_coherent_reset`, `rvg_coherent_unmapped`, `rvg_coherent_report` | | LOCAL (Atlas): trap-coherent surfaces (metal2vulkan's `shadow_coherent.rs`): QEMU's census view marks their pages, and tells of each touch; no effect without the live switch `surface_coherent` |
+ | 42 | `rvg_scaler_device_create` | | the M2 scaler device (106b:1a0b), from an `RvgScalerDeviceConfig`, made on every host: transforming with the library's own kernel on the GPU it draws with (Metal's on macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included), and with none where that opens no device or the device refuses the kernel |
+ | 43 | `rvg_scaler_device_release` | | drops the host's reference; the last one drops its accelerator and ends its guest-memory table |
+ | 44 | `rvg_scaler_device_scales` | | whether the device has a GPU to transform on; where it has not, the host refuses the guest's features (FEATURES_OK), so the guest's driver does without the device |
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+index c3609449..b13d5aeb 100644
+--- a/scripts/internal/census/census_report.py
++++ b/scripts/internal/census/census_report.py
+@@ -5,9 +5,12 @@
+   census_report.py <dir> --mark LABEL        between the mark LABEL and the next mark
+   census_report.py <dir> --marks             the marks in the timeline, and each span's totals
+   census_report.py <dir> --disasm N          the top N RIPs, disassembled with objdump
++  census_report.py <dir> --coherent [LABEL]  the trap-coherent surfaces at a mark ("exit", the last)
+ 
+-A mark is one line in <dir>/mark ("motionbench"), which the census reads within 50 ms. "every 1"
+-there sets the re-arm period instead. A page counts once a window: touches/frame cannot exceed
++A mark is one line of <dir>/mark ("motionbench"), which the census reads within 50 ms; append with
++>>, so that one mark never overwrites another. A line "every 1" sets the re-arm period instead.
++Under REIMS_VGPU_COHERENT=1 each mark and the exit write one report per surface to coherent.jsonl.
++A page counts once a window: touches/frame cannot exceed
+ pages/window divided by the window's frames, so read `touched windows` with `every`.
+ 
+ pages R were only read in their window and pages W were caught writing. pages R|W were read, then
+@@ -132,6 +135,35 @@ def life(surfaces):
+               f" {e['writes']:>7} {e['windows']:>6} {e['windows_touched']:>7}")
+ 
+ 
++def coherent(directory, wanted):
++    """The last report of each surface at the mark `wanted`, or at the last mark."""
++    rows = list(lines(os.path.join(directory, "coherent.jsonl")))
++    label = wanted or (rows[-1].get("label") if rows else None)
++    if label is None:
++        sys.exit(f"{directory}: no coherent.jsonl")
++    found = {}
++    for r in rows:
++        if r.get("label") == label or r.get("label") == "closed":
++            found[r["at"]] = r
++    print(f"mark {label}: per present in us (detect + sync + fetch against what eager copies would"
++          " have cost)")
++    print(f"{'surface':>12} {'size':>10} {'present':>7} {'traps':>7} {'/s':>7} {'pages':>6}"
++          f" {'regions':>7} {'MiB':>7} {'sync ms':>8} {'trap us':>8} {'demote':>6} {'writes':>6}"
++          f" {'detect':>7} {'sync':>7} {'fetch':>7} {'total':>7} {'eager':>8} pays")
++    for r in sorted(found.values(), key=lambda r: -r["traps"]):
++        cost = r["per_present_ns"]
++        trap = r["trap_ns"] / r["resumes"] / 1e3 if r["resumes"] else 0
++        print(f"{r['at']:>12} {str(r['w']) + 'x' + str(r['h']):>10} {r['presents']:>7} {r['traps']:>7}"
++              f" {r['traps_per_s']:>7.1f} {r['unique_pages']:>6} {r['regions']:>7}"
++              f" {r['bytes_detiled'] / 2 ** 20:>7.1f} {r['sync_ns'] / 1e6:>8.1f} {trap:>8.1f}"
++              f" {r['demotions']:>6} {r['writes']:>6} {cost['detect'] / 1e3:>7.1f}"
++              f" {cost['sync'] / 1e3:>7.1f} {cost['fetch'] / 1e3:>7.1f} {cost['total'] / 1e3:>7.1f}"
++              f" {cost['eager_would'] / 1e3:>8.1f} {'yes' if r['pays'] else 'NO'}")
++    bad = [r for r in found.values() if r["sync_errors"] or r["overwrite_risk"]]
++    for r in bad:
++        print(f"surface {r['at']}: sync_errors {r['sync_errors']}, overwrite_risk {r['overwrite_risk']}")
++
++
+ def disasm(directory, count, timeline):
+     bytes_at = {r["rip"]: r for r in lines(os.path.join(directory, "rips.jsonl"))}
+     totals = {}
+@@ -159,6 +191,7 @@ def main():
+     a.add_argument("--mark")
+     a.add_argument("--marks", action="store_true")
+     a.add_argument("--disasm", type=int, default=0)
++    a.add_argument("--coherent", nargs="?", const="", default=None)
+     args = a.parse_args()
+     header, surfaces, timeline = read(args.dir)
+     if not header:
+@@ -170,7 +203,9 @@ def main():
+         print(f"census pid {header.get('pid')}: traps {h['traps']}, writes {h['writes']},"
+               f" upgrades {h['upgrades']}, spurious {h['spurious']}, dropped {h['dropped']},"
+               f" errors {h['errors']}, off by fuse: {'YES' if h['dead'] else 'no'}")
+-    if args.disasm:
++    if args.coherent is not None:
++        coherent(args.dir, args.coherent)
++    elif args.disasm:
+         disasm(args.dir, args.disasm, timeline)
+     elif args.marks:
+         for label, start, end in spans(timeline):
+diff --git a/scripts/internal/census/census_test.c b/scripts/internal/census/census_test.c
+index 2f9b7d7d..de2d48ba 100644
+--- a/scripts/internal/census/census_test.c
++++ b/scripts/internal/census/census_test.c
+@@ -483,10 +483,8 @@ static void t_cost(struct vcpu *c) {
+     free(list);
+ }
+ 
+-int main(int argc, char **argv) {
+-    setvbuf(stdout, 0, _IOLBF, 0);
+-    if (argc < 2) return 2;
+-    uint64_t mib = argc > 2 ? atol(argv[2]) : 512;
++// A VM, its slots on the census's view, and vCPU `c`: what every test here starts from.
++static void setup(char **argv, uint64_t mib) {
+     setenv(CENSUS_ENV, argv[1], 1);
+     setenv("REIMS_VGPU_CENSUS_MIN_PIXELS", "1", 1);
+     setenv("REIMS_VGPU_CENSUS_WINDOW_MS", "100000", 1);
+@@ -525,7 +523,13 @@ int main(int argc, char **argv) {
+     sigset_t bus;
+     sigemptyset(&bus); sigaddset(&bus, SIGBUS);
+     pthread_sigmask(SIG_BLOCK, &bus, 0);
++}
+ 
++#ifndef CENSUS_TEST_NO_MAIN
++int main(int argc, char **argv) {
++    setvbuf(stdout, 0, _IOLBF, 0);
++    if (argc < 2) return 2;
++    setup(argv, argc > 2 ? atol(argv[2]) : 512);
+     struct vcpu c;
+     vcpu_init(&c, 0);
+     t_classify(&c);
+@@ -546,3 +550,4 @@ int main(int argc, char **argv) {
+     printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
+     return failures != 0;
+ }
++#endif
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+new file mode 100644
+index 00000000..3cb7eca5
+--- /dev/null
++++ b/scripts/internal/census/coherent_test.c
+@@ -0,0 +1,483 @@
++// coherent_test.c: the coherent pages of QEMU's accel/kvm/census.c on a real KVM guest, with no
++// QEMU and no library: this file plays the library's surface (an image, a lock, syncs at faults),
++// census_test.c plays kvm-all.c, and the guest's instructions run in CPL0 on real pages, so
++// `rep movsb` and the emulator's accesses are the ones the kernel copies run.
++//   gcc -O2 -g -Wall -D_GNU_SOURCE -I$QEMU/include coherent_test.c $QEMU/accel/kvm/census.c -lpthread
++//   ./a.out <empty output dir> [slot_mib]
++#define CENSUS_TEST_NO_MAIN
++#include "census_test.c"
++
++#include <stdatomic.h>
++
++#define PAGES 16
++#define WORDS (PG / 8)
++
++// One surface: the "image" holds each page's current word, and a page is ahead while `ahead`.
++static struct {
++    pthread_mutex_t lock;
++    uint64_t base, off;
++    uint32_t id;
++    uint64_t image[PAGES];
++    uint8_t ahead[PAGES];
++    int probing, faults, syncs, writes, probes, resets, abandons;
++    uint64_t came, refused, probed_at;
++    int beside;     // A sync leaves the first word of each page: the rectangle stops short of it.
++    uint32_t dirty; // Pages the guest may have written, as the library would know.
++} s = {.lock = PTHREAD_MUTEX_INITIALIZER};
++
++static uint64_t page_at(int i) { return s.base + i * PG; }
++
++static void note(const uint64_t *pages, size_t n) {
++    for (size_t i = 0; i < n; i++) s.dirty |= 1u << ((pages[i] - s.base) / PG);
++}
++
++static void list_all(uint64_t *out) {
++    for (int i = 0; i < PAGES; i++) out[i] = page_at(i);
++}
++
++static void sync_all_locked(void) {
++    uint64_t list[PAGES], came[PAGES];
++    int n = 0;
++
++    for (int i = 0; i < PAGES; i++) {
++        if (s.ahead[i]) {
++            uint64_t *to = (uint64_t *)page_at(i);
++
++            for (uint64_t w = s.beside; w < WORDS; w++) to[w] = s.image[i];
++            s.ahead[i] = 0;
++            list[n++] = page_at(i);
++            s.syncs++;
++        }
++    }
++    if (n) {
++        size_t found = census_coh_hold(list, n, false, came, PAGES);
++
++        s.came += found;
++        note(came, found);
++    }
++}
++
++static void on_fault(void *ctx, uint64_t addr, bool write) {
++    uint64_t page = addr & ~(PG - 1);
++
++    pthread_mutex_lock(&s.lock);
++    s.faults++;
++    sync_all_locked();
++    if (s.probing && (now_ns() - s.probed_at > 1000000 || (write && s.probing == 1))) {
++        uint64_t list[PAGES], came[PAGES];
++
++        s.probing = 0;
++        list_all(list);
++        size_t found = census_coh_hold(list, PAGES, false, came, PAGES);
++        s.came += found;
++        note(came, found);
++    } else if (write && s.probing) {
++        s.probing--;
++    }
++    census_coh_hold(&page, 1, false, NULL, 0);
++    if (write) {
++        census_coh_open(page);
++        note(&page, 1);
++        s.writes++;
++    }
++    pthread_mutex_unlock(&s.lock);
++}
++
++static void on_timed(void *ctx, uint64_t addr, uint64_t ns) {}
++
++static void on_probe(void *ctx) {
++    uint64_t list[PAGES];
++
++    pthread_mutex_lock(&s.lock);
++    s.probing++;
++    s.probed_at = now_ns();
++    s.probes++;
++    list_all(list);
++    size_t found = census_coh_arm(list, PAGES, list, PAGES);
++    s.came += found;
++    note(list, found);
++    pthread_mutex_unlock(&s.lock);
++}
++
++static void on_abandon(void *ctx) {
++    pthread_mutex_lock(&s.lock);
++    sync_all_locked();
++    s.abandons++;
++    census_coh_untrack(s.base);
++    pthread_mutex_unlock(&s.lock);
++}
++
++static void on_reset(void *ctx) { s.resets++; }
++
++static size_t on_report(void *ctx, const char *label, char *out, size_t room) { return 0; }
++
++static const CensusCoherentOps ops = {
++    .fault = on_fault, .timed = on_timed, .probe = on_probe, .abandon = on_abandon,
++    .reset = on_reset, .report = on_report,
++};
++
++static void surface(uint32_t id, uint64_t off) {
++    uint64_t list[PAGES];
++
++    for (uint64_t i = 0; i < PAGES; i++) list[i] = (uint64_t)main_map + off + i * PG;
++    CensusSurface f = {.mapping_id = id, .width = 2000, .height = 2000, .pixel_format = 0x42475241,
++                       .alloc_size = PAGES * PG, .bytes_per_row = 8000,
++                       .base_address = (uint64_t)main_map + off};
++    census_surface_mapped(&f, list, PAGES, PG);
++    s.id = id; s.off = off; s.base = (uint64_t)main_map + off;
++    memset(s.ahead, 0, sizeof s.ahead);
++    s.probing = 0;
++    if (!census_coh_track(s.base, PAGES * PG)) DIE("track");
++}
++
++// The GPU wrote `word` over the pages `mask` holds, and the command buffer completed.
++static void completed(uint32_t mask, uint64_t word) {
++    uint64_t list[PAGES];
++    int n = 0;
++
++    pthread_mutex_lock(&s.lock);
++    for (int i = 0; i < PAGES; i++) {
++        if (mask >> i & 1) {
++            s.image[i] = word;
++            s.ahead[i] = 1;
++            list[n++] = page_at(i);
++        }
++    }
++    size_t refused = census_coh_arm(list, n, list, PAGES);
++    if (refused) {
++        // As the library: no trap will come, and no one has heard yet.
++        s.refused += refused;
++        sync_all_locked();
++        note(list, refused);
++    }
++    pthread_mutex_unlock(&s.lock);
++}
++
++static int state(int page) { return census_page_state(main_map + s.off + page * PG); }
++static uint64_t gpa(int page) { return DATA_GPA + s.off + page * PG; }
++
++static void t_read(struct vcpu *c) {
++    printf("[read] the guest reads a page the image is ahead of\n");
++    surface(1, 0x100000);
++    CHECK(state(0) == 2, "tracked: held");
++    completed(1, 0x1111);
++    CHECK(state(0) == 1, "completion arms it");
++    setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO && getr(c).rax == 0x1111, "the read gets the image's word");
++    CHECK(state(0) == 2, "held after the sync");
++    int faults = s.faults;
++    setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
++    run_guest(c, 0);
++    CHECK(s.faults == faults, "a second read is free");
++    census_surface_unmapped(1);
++}
++
++static void t_write(struct vcpu *c) {
++    printf("[write] a write to a held page names its page, with no read before it\n");
++    surface(2, 0x200000);
++    int probes = s.probes;
++    setr(c, STUB(g_write), 0x2222, gpa(3), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "the write ran");
++    CHECK(s.probes == probes + 1, "by one probe");
++    CHECK(state(3) == 3 && state(2) == 2 && state(4) == 2, "that page alone is open");
++    CHECK(*(uint64_t *)(main_map + s.off + 3 * PG) == 0x2222, "the guest's word is in the page");
++    setr(c, STUB(g_write), 0x3333, gpa(3), 0, 0, 0, 0);
++    run_guest(c, 0);
++    CHECK(s.probes == probes + 1, "an open page takes writes free");
++
++    printf("[write] a read that traps, then a write of the page at the same instruction\n");
++    completed(1 << 5, 0x4444);
++    setr(c, STUB(g_lock), 0, gpa(5), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "lock incq ran");
++    CHECK(*(uint64_t *)(main_map + s.off + 5 * PG) == 0x4445, "over the synced word");
++    CHECK(state(5) == 3, "and the page is open");
++    census_surface_unmapped(2);
++}
++
++static void t_frozen(struct vcpu *c) {
++    printf("[frozen] a page poisoned while open stops the guest until it thaws\n");
++    surface(3, 0x300000);
++    setr(c, STUB(g_write), 0x55, gpa(1), 0, 0, 0, 0);
++    run_guest(c, 0);
++    uint64_t page = page_at(1);
++    census_coh_freeze(&page, 1);
++    CHECK(state(1) == 7, "frozen");
++    setr(c, STUB(g_read), 0, gpa(1), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO && getr(c).rax == 0x55, "the read waited and got the word");
++    CHECK(state(1) == 3, "open again");
++    census_surface_unmapped(3);
++}
++
++static void t_kernel_copy(struct vcpu *c) {
++    printf("[rep movsb] a CPL0 copy over armed pages, as the kernel's at 0xffffff8005901092\n");
++    surface(4, 0x400000);
++    completed(0xff, 0x6666);
++    int syncs = s.syncs;
++    uint64_t to = DATA_GPA + 0x500000;
++    setr(c, STUB(g_repmovs), 0, 0, 8 * PG, 0, gpa(0), to);
++    CHECK(run_guest(c, 0) == RUN_IO, "the copy ran");
++    CHECK(*(uint64_t *)(main_map + 0x500000) == 0x6666 &&
++          *(uint64_t *)(main_map + 0x500000 + 8 * PG - 8) == 0x6666, "every byte is the image's");
++    CHECK(s.syncs == syncs + 8, "one sync brought all eight pages");
++    census_surface_unmapped(4);
++
++    printf("[rep movsb] a CPL0 copy into held pages\n");
++    surface(5, 0x400000);
++    memset(main_map + 0x500000, 0x77, 4 * PG);
++    setr(c, STUB(g_repmovs), 0, 0, 4 * PG, 0, DATA_GPA + 0x500000, gpa(2));
++    CHECK(run_guest(c, 0) == RUN_IO, "the copy ran");
++    CHECK(state(2) == 3 && state(5) == 3 && state(6) == 2, "the pages it wrote are open");
++    CHECK(*(uint64_t *)(main_map + s.off + 5 * PG) == 0x7777777777777777ULL, "with its bytes");
++    census_surface_unmapped(5);
++}
++
++static void t_emulator_read(struct vcpu *c) {
++    printf("[emulator] QEMU's own access to an armed page faults like the guest's\n");
++    surface(6, 0x600000);
++    completed(1, 0x8888);
++    census_coherent_access(main_map + s.off, 8, false);
++    CHECK(state(0) == 2 && *(uint64_t *)(main_map + s.off) == 0x8888, "a device's read syncs");
++    census_coherent_access(main_map + s.off + PG, 8, true);
++    CHECK(state(1) == 3, "a device's write opens the page");
++    census_surface_unmapped(6);
++}
++
++static void t_unmap_reset(struct vcpu *c) {
++    printf("[unmap] armed, held and open pages all come off\n");
++    surface(7, 0x700000);
++    completed(0xf, 1);
++    setr(c, STUB(g_write), 9, gpa(8), 0, 0, 0, 0);
++    run_guest(c, 0);
++    census_surface_unmapped(7);
++    int plain = 1;
++    for (int i = 0; i < PAGES; i++) plain &= state(i) == 6;
++    CHECK(plain, "no marker left");
++    setr(c, STUB(g_write), 3, gpa(0), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO && *(uint64_t *)(main_map + s.off) == 3, "the guest reuses the page");
++    printf("[reset] the guest resets\n");
++    surface(8, 0x700000);
++    completed(0xf, 1);
++    int resets = s.resets;
++    census_reset();
++    CHECK(s.resets == resets + 1, "the library heard");
++    setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "and a read after it passes");
++}
++
++// The guest reads, and must see every word whose completion it could have heard of.
++static atomic_uint_fast64_t done_word;
++static atomic_int race_stop;
++struct guest { struct vcpu c; int fatal, stale, id; uint64_t rounds; };
++static void *reader(void *p) {
++    struct guest *g = p;
++
++    while (!atomic_load(&race_stop) && !g->fatal) {
++        uint64_t known = atomic_load(&done_word);
++        int page = g->rounds++ % 8;
++
++        setr(&g->c, STUB(g_read), 0, gpa(page), 0, 0, 0, 0);
++        g->fatal = run_guest(&g->c, 0) != RUN_IO;
++        uint64_t got = getr(&g->c).rax;
++        if (got < known && g->stale++ < 3) printf("    read page %d: %lu, known %lu state %d\n", page, got, known, state(page));
++    }
++    return 0;
++}
++// Writes its own page and reads it back through the main mapping: nothing may lose it.
++static void *writer(void *p) {
++    struct guest *g = p;
++    uint64_t *own = (uint64_t *)(main_map + s.off + (8 + g->id) * PG);
++
++    while (!atomic_load(&race_stop) && !g->fatal) {
++        uint64_t word = ++g->rounds;
++
++        setr(&g->c, STUB(g_write), word, gpa(8 + g->id), 0, 0, 0, 0);
++        g->fatal = run_guest(&g->c, 0) != RUN_IO;
++        if (*own != word && g->stale++ < 3) printf("    wrote %lu, own %lu state %d rip %llx\n", word, *own, state(8 + g->id), getr(&g->c).rip);
++    }
++    return 0;
++}
++
++static void t_coherent_race(uint64_t mib) {
++    printf("[race] %lu MiB: 2 readers and 2 writers, armed and held again every 100 us\n", mib);
++    enum { R = 2, W = 2 };
++    struct guest g[R + W];
++    pthread_t th[R + W];
++    CensusCounts a, b;
++
++    surface(9, 0x800000);
++    census_counts(&a);
++    atomic_store(&done_word, 0);
++    atomic_store(&race_stop, 0);
++    for (int i = 0; i < R + W; i++) {
++        memset(&g[i], 0, sizeof g[i]);
++        vcpu_init(&g[i].c, 20 + i);
++        g[i].id = i - R;
++        pthread_create(&th[i], 0, i < R ? reader : writer, &g[i]);
++    }
++    uint64_t t0 = now_ns(), word = 0;
++    for (int i = 0; i < 30000; i++) {
++        completed(0xff, ++word);
++        // Only now could the guest have heard: its next read must see this word.
++        atomic_store(&done_word, word);
++        if (i % 7 == 0) {
++            uint64_t list[PAGES], came[PAGES];
++
++            list_all(list);
++            pthread_mutex_lock(&s.lock);
++            sync_all_locked();
++            s.came += census_coh_hold(list + 8, 8, true, came, PAGES);
++            pthread_mutex_unlock(&s.lock);
++        }
++        usleep(100);
++    }
++    atomic_store(&race_stop, 1);
++    int fatal = 0, stale = 0;
++    uint64_t reads = 0, writes = 0;
++    for (int i = 0; i < R + W; i++) {
++        pthread_join(th[i], 0);
++        fatal |= g[i].fatal;
++        stale += g[i].stale;
++        *(i < R ? &reads : &writes) += g[i].rounds;
++    }
++    census_counts(&b);
++    CHECK(!fatal, "no vCPU died in %.1f s: %lu reads, %lu writes, %lu traps, %lu probes, %lu spurious",
++          (now_ns() - t0) / 1e9, reads, writes, b.traps - a.traps, b.upgrades - a.upgrades,
++          b.spurious - a.spurious);
++    CHECK(!stale, "no read older than the last completion, no write lost (%d)", stale);
++    CHECK(b.errors == 0 && !b.dead, "no uffd error, fuse not blown (errors %lu)", b.errors);
++    printf("    pages reached as their markers moved: %lu held, %lu armed\n", s.came, s.refused);
++    census_surface_unmapped(9);
++}
++
++// Writes the first word of a page again and again, beside the rectangles the GPU leaves in it.
++static void *beside_writer(void *p) {
++    struct guest *g = p;
++
++    while (!atomic_load(&race_stop) && !g->fatal) {
++        setr(&g->c, STUB(g_write), ++g->rounds, gpa(0), 0, 0, 0, 0);
++        g->fatal = run_guest(&g->c, 0) != RUN_IO;
++    }
++    return 0;
++}
++
++static void t_arm_window(void) {
++    printf("[arming] a write as a page's markers move is in the page and the library knows it\n");
++    struct guest g;
++    pthread_t th;
++
++    surface(12, 0xe00000);
++    s.beside = 1;
++    s.dirty = 0;
++    atomic_store(&race_stop, 0);
++    memset(&g, 0, sizeof g);
++    vcpu_init(&g.c, 30);
++    pthread_create(&th, 0, beside_writer, &g);
++    volatile uint64_t *word = (uint64_t *)main_map + s.off / 8;
++    uint64_t known = 0, unseen = 0, seen = 0, list[PAGES], came[PAGES];
++    list_all(list);
++    for (int i = 0; i < 60000 && !g.fatal; i++) {
++        completed(1, i);
++        for (int spin = 0; spin < 200; spin++) __asm__("pause");
++        pthread_mutex_lock(&s.lock);
++        sync_all_locked();
++        size_t found = census_coh_hold(list, 1, true, came, PAGES);
++        note(came, found);
++        // Held: no write gets by from here to the arm.
++        uint64_t now = *word;
++        if (now != known && !(s.dirty & 1)) unseen++;
++        seen += now != known;
++        known = now;
++        s.dirty = 0;
++        pthread_mutex_unlock(&s.lock);
++    }
++    atomic_store(&race_stop, 1);
++    pthread_join(th, 0);
++    CHECK(!g.fatal && !unseen, "%lu writes in the rounds, %lu the library did not hear of", seen, unseen);
++    s.beside = 0;
++    census_surface_unmapped(12);
++}
++
++static void t_coherent_cost(struct vcpu *c) {
++    printf("[cost] trap to resume of a read whose sync moves one page\n");
++    surface(10, 0xc00000);
++    enum { N = 2000 };
++    uint64_t total = 0;
++    for (int i = 0; i < N; i++) {
++        completed(1, i + 1);
++        setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
++        uint64_t t0 = now_ns();
++        run_guest(c, 0);
++        total += now_ns() - t0;
++    }
++    printf("    %.2f us a read, the page's arm before it apart\n", total / 1e3 / N);
++    uint64_t t0 = now_ns();
++    for (int i = 0; i < N; i++) completed(1, 0), sync_all_locked();
++    printf("    %.2f us to arm and hold a page\n", (now_ns() - t0) / 1e3 / N);
++    census_surface_unmapped(10);
++
++    printf("[cost] arming and holding a surface's run of pages, nothing touching them\n");
++    static uint64_t list[3600], refused[3600], came[3600];
++    uint32_t id = 13;
++    for (size_t n = 937; n <= 3516; n += 2579, id++) {
++        uint64_t off = 0x10000000;
++
++        for (size_t i = 0; i < n; i++) list[i] = (uint64_t)main_map + off + i * PG;
++        CensusSurface f = {.mapping_id = id, .width = 2000, .height = 2000, .pixel_format = 0x42475241,
++                           .alloc_size = n * PG, .bytes_per_row = 8000,
++                           .base_address = (uint64_t)main_map + off};
++        census_surface_mapped(&f, list, n, PG);
++        census_coh_track(list[0], n * PG);
++        uint64_t armed = 0, held = 0;
++        for (int i = 0; i < 300; i++) {
++            uint64_t t0 = now_ns();
++            census_coh_arm(list, n, refused, 3600);
++            uint64_t t1 = now_ns();
++            census_coh_hold(list, n, false, came, 3600);
++            armed += t1 - t0;
++            held += now_ns() - t1;
++        }
++        printf("    %zu pages: arm %.1f us, hold %.1f us\n", n, armed / 300e3, held / 300e3);
++        census_surface_unmapped(id);
++    }
++}
++
++static void t_fuse_coherent(struct vcpu *c) {
++    printf("[fuse] an -EFAULT nothing explains: everything lands, markers off\n");
++    surface(11, 0xd00000);
++    completed(1, 0x9999);
++    int abandons = s.abandons;
++    census_fuse_test();
++    CHECK(s.abandons == abandons + 1, "the library caught up first");
++    CHECK(*(uint64_t *)(main_map + s.off) == 0x9999, "with the image's word");
++    int plain = 1, faults = s.faults;
++    for (int i = 0; i < PAGES; i++) {
++        setr(c, STUB(g_write), i, gpa(i), 0, 0, 0, 0);
++        plain &= run_guest(c, 0) == RUN_IO && *(uint64_t *)(main_map + s.off + i * PG) == (uint64_t)i;
++    }
++    CHECK(plain && s.faults == faults, "and the guest writes every page with no marker left");
++}
++
++int main(int argc, char **argv) {
++    setvbuf(stdout, 0, _IOLBF, 0);
++    if (argc < 2) return 2;
++    uint64_t mib = argc > 2 ? atol(argv[2]) : 512;
++    setenv("REIMS_VGPU_COHERENT", "1", 1);
++    setup(argv, mib);
++    CHECK(census_coherent(), "coherent is on");
++    census_coherent_set_ops(&ops);
++    struct vcpu c;
++    vcpu_init(&c, 0);
++    t_read(&c);
++    t_write(&c);
++    t_frozen(&c);
++    t_kernel_copy(&c);
++    t_emulator_read(&c);
++    t_unmap_reset(&c);
++    t_coherent_race(mib);
++    t_arm_window();
++    t_coherent_cost(&c);
++    t_fuse_coherent(&c);
++    census_flush();
++    printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
++    return failures != 0;
++}

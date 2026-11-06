@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 01:25:54 +0000
+Subject: [PATCH 14/25] only a sink that holds unmaps is asked
+
+The hook read the surface's base for every sink, and a test's call log heard it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/src/census.rs             |  4 ++++
+ crates/reims-vgpu-core/src/census.rs          |  4 ++++
+ crates/reims-vgpu-core/src/iosurface/table.rs | 10 +++++++++-
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu-c/src/census.rs b/crates/reims-vgpu-c/src/census.rs
+index 13179db0..cb9ce227 100644
+--- a/crates/reims-vgpu-c/src/census.rs
++++ b/crates/reims-vgpu-c/src/census.rs
+@@ -119,6 +119,10 @@ impl Sink for HostSink {
+         });
+     }
+ 
++    fn holds_unmaps(&self) -> bool {
++        true
++    }
++
+     fn unmapping(&self, start: u64, len: u64) -> bool {
+         crate::coherent::unmapping(start, len)
+     }
+diff --git a/crates/reims-vgpu-core/src/census.rs b/crates/reims-vgpu-core/src/census.rs
+index 291bcfcd..87fa5653 100644
+--- a/crates/reims-vgpu-core/src/census.rs
++++ b/crates/reims-vgpu-core/src/census.rs
+@@ -45,6 +45,10 @@ pub trait Sink: Send + Sync {
+     /// A surface was mapped. `pages` is each guest page's host address, none for a host-only one.
+     /// On the IOSurface device's queue, under its state's lock.
+     fn mapped(&self, facts: &SurfaceFacts, pages: &[u64], page_size: u64);
++    /// Whether [`unmapping`](Self::unmapping) has anything to say.
++    fn holds_unmaps(&self) -> bool {
++        false
++    }
+     /// The guest asks to unmap the surface over `len` bytes from the host address `start`, and
+     /// nothing was checked yet: whether it may go on, else it answers busy. What it held of the
+     /// surface it lets go of.
+diff --git a/crates/reims-vgpu-core/src/iosurface/table.rs b/crates/reims-vgpu-core/src/iosurface/table.rs
+index f0fcf652..ade7fcaa 100644
+--- a/crates/reims-vgpu-core/src/iosurface/table.rs
++++ b/crates/reims-vgpu-core/src/iosurface/table.rs
+@@ -310,6 +310,7 @@ impl<P: Platform> HostDeviceCore<P> {
+         }
+         let index = mapping_id.to_usize();
+         if let Some(sink) = crate::census::sink()
++            && sink.holds_unmaps()
+             && let Some(slot) = st.slots.get(index)
+             && let Some(surface) = &slot.surface
+         {
+@@ -503,6 +504,11 @@ mod tests {
+             let r = rig();
+             r.mapped_v2(3, 2);
+             let d = v2(2, ROOT);
++            let heard = take_mine();
++            let base_address = heard.iter().find_map(|heard| match heard {
++                Heard::Mapped(facts, ..) => Some(facts.base_address),
++                _ => None,
++            });
+             let facts = SurfaceFacts {
+                 mapping_id: 3,
+                 pixel_format: d.base.pixel_format,
+@@ -515,10 +521,12 @@ mod tests {
+                 compression_type: u32::from(d.base.compression_type),
+                 read_only: false,
+                 host_only: false,
++                base_address: base_address.unwrap_or_default(),
++                base_offset: 0,
+             };
+             let pages = vec![r.host(SURF), r.host(SURF + PAGE)];
+             assert!(
+-                take_mine().contains(&Heard::Mapped(facts, pages, PAGE)),
++                heard.contains(&Heard::Mapped(facts, pages, PAGE)),
+                 "the guest's pages"
+             );
+             let held = r.held(3);

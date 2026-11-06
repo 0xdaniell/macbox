@@ -1,7 +1,7 @@
-From 01eeb65c8a9a24ee722f693bab9eef66b917373f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 16:46:17 +0200
-Subject: [PATCH] :new: Let a VM's settings turn video acceleration off
+Subject: [PATCH 25/25] new: Let a VM's settings turn video acceleration off
 
 A user asked to be able to turn off the VideoToolbox and M2 scaler devices
 that 054ac2080 gave every VM on reims-vgpu, the host's hardware video decode,
@@ -27,7 +27,7 @@ is unchanged: with the devices off, its video kexts match nothing.
  6 files changed, 166 insertions(+), 20 deletions(-)
 
 diff --git a/crates/reims-ctl/src/cli.rs b/crates/reims-ctl/src/cli.rs
-index b3e414e..1942034 100644
+index b3e414e7..1942034f 100644
 --- a/crates/reims-ctl/src/cli.rs
 +++ b/crates/reims-ctl/src/cli.rs
 @@ -337,6 +337,10 @@ pub struct SetArgs {
@@ -70,7 +70,7 @@ index b3e414e..1942034 100644
          c.logs.enabled = b;
      }
 diff --git a/crates/reims-ctl/src/create.rs b/crates/reims-ctl/src/create.rs
-index 1326c6d..4c42384 100644
+index 1326c6d5..4c423841 100644
 --- a/crates/reims-ctl/src/create.rs
 +++ b/crates/reims-ctl/src/create.rs
 @@ -291,6 +291,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
@@ -82,7 +82,7 @@ index 1326c6d..4c42384 100644
          gpu: spec.gpu.clone(),
          audio: Audio {
 diff --git a/crates/reims-ctl/src/qemu.rs b/crates/reims-ctl/src/qemu.rs
-index 08e0d7c..8dc4958 100644
+index 08e0d7c6..8dc49580 100644
 --- a/crates/reims-ctl/src/qemu.rs
 +++ b/crates/reims-ctl/src/qemu.rs
 @@ -57,6 +57,8 @@
@@ -182,7 +182,7 @@ index 08e0d7c..8dc4958 100644
      #[test]
      fn a_disk_on_nvme_has_a_controller_of_its_own() {
 diff --git a/crates/reims-ctl/src/tui.rs b/crates/reims-ctl/src/tui.rs
-index 0385757..5785e5d 100644
+index 03857573..5785e5dd 100644
 --- a/crates/reims-ctl/src/tui.rs
 +++ b/crates/reims-ctl/src/tui.rs
 @@ -1442,7 +1442,8 @@ impl App {
@@ -291,7 +291,7 @@ index 0385757..5785e5d 100644
      fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
          let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
 diff --git a/crates/reims-ctl/src/vm.rs b/crates/reims-ctl/src/vm.rs
-index c6351ea..9922617 100644
+index c6351ea5..99226175 100644
 --- a/crates/reims-ctl/src/vm.rs
 +++ b/crates/reims-ctl/src/vm.rs
 @@ -32,6 +32,11 @@ pub struct VmConfig {
@@ -353,7 +353,7 @@ index c6351ea..9922617 100644
      /// gives.
      #[test]
 diff --git a/docs/qemu.md b/docs/qemu.md
-index 19b62da..c5c3615 100644
+index 19b62da1..c5c36152 100644
 --- a/docs/qemu.md
 +++ b/docs/qemu.md
 @@ -160,7 +160,8 @@ discrete ones first, where that GPU is a software rasterizer or offers

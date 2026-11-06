@@ -1,0 +1,1910 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 00:34:16 +0000
+Subject: [PATCH 34/34] coherent: writes reach held batches past later command
+ buffers; no waits on held records
+
+- Records carry their part end and publish per completed batch (completing_parts);
+  failed command buffers drop their records and leave the planned set.
+- A later command buffer's take keeps the guest area and snapshots for a held batch
+  (held_guest/held_snapshots); the join no longer drops a missing side (joined, not bounding).
+  Done records merge into the pages before the stash.
+- Held batches with no record are seen through late_waiters.
+- Encoder takes and reader copy backs never wait on a record held for an event
+  (wait_settled skip_held); host readers still wait, bounded.
+- A reader whose commit-time copy back was not made copies back at its planning
+  (copy_back_at_plan, from atlas/coh-d-lane3 f5239ecf); a plan-time copy back is left
+  where stashed snapshots hold CPU writes.
+- An ordered take passes over a write count only when Beside kept every write (plain).
+- done records stay bounded (join of records no copy back left behind).
+- Exit guard: host image copy entry points and the image read inside the guard.
+- Lanes: 5 new held-batch lanes; reproductions un-ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/completion.rs          |  12 +-
+ .../src/command_buffer/mod.rs                 |  18 +-
+ .../src/command_buffer/submit.rs              |   7 +-
+ crates/metal2vulkan-runtime/src/device/mod.rs |  64 +--
+ .../metal2vulkan-runtime/src/device/prime.rs  |  94 ++++-
+ crates/metal2vulkan-runtime/src/exit_guard.rs |  84 ++--
+ crates/metal2vulkan-runtime/src/shadow.rs     |  42 +-
+ .../src/shadow_coherent.rs                    | 266 +++++++++++--
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  98 +++--
+ .../src/tests/exit_guard.rs                   |  13 +-
+ crates/metal2vulkan-runtime/src/texture.rs    |  12 +
+ .../src/texture/host_copy.rs                  |   8 +-
+ .../src/runtime_lane/surface_coherent.rs      | 365 +++++++++++++++++-
+ 13 files changed, 947 insertions(+), 136 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index e0335c15..eae39133 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -216,6 +216,8 @@ pub(crate) struct Submitted {
+     pub(crate) buffer: Hold<CommandBufferShared>,
+     /// It ends its command buffer: finishing it completes the command buffer.
+     pub(crate) last: bool,
++    /// Exact parts attributed to this submission; absent on synthetic failure completions.
++    pub(crate) parts: Option<std::ops::Range<usize>>,
+     /// The fence its submission signals after the work, when it ends its command buffer where
+     /// the driver needs one, or its queue's failures are relayed: the command buffer finishes
+     /// once it is signaled ([`fences`](super::fences)).
+@@ -404,6 +406,14 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+     else {
+         return true;
+     };
++    // Publish each completed batch before its signals are made visible to the guest.
++    if crate::shadow_lazy::ahead() {
++        for (_, batch) in &finished {
++            if let (Some(id), Some(parts)) = (batch.buffer.shadow_carry_id(), batch.parts.clone()) {
++                crate::shadow_lazy::completing_parts(id, parts);
++            }
++        }
++    }
+     // The holds of the batches that end no command buffer go first, their work completed: a
+     // detach that sees one of their signals detaches what only they held (`detach.rs`).
+     for (_, batch) in &mut finished {
+@@ -415,7 +425,7 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+     // anything, their signals among them, can tell the guest the work ended
+     // (`shadow_coherent.rs`); the command buffer's own completion finds them armed.
+     if crate::shadow_lazy::ahead() {
+-        for (_, batch) in finished.iter().filter(|(_, batch)| batch.last) {
++        for (_, batch) in finished.iter().filter(|(_, batch)| batch.last && batch.parts.is_some()) {
+             if let Some(id) = batch.buffer.shadow_carry_id() {
+                 crate::shadow_lazy::completing(id);
+             }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 63c7c0b1..e553cecf 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2579,8 +2579,17 @@ impl CommandBuffer {
+                         .collect();
+                     crate::shadow_lazy::met_by(&summaries, &bytes)
+                 };
++                // LOCAL (Atlas): a trapping surface whose records all ran unplanned leaves the
++                // copy back to this command buffer's planning (`ShadowCarry::plans_copy_back`).
++                let mut at_plan = false;
+                 for surface in met {
+-                    surface.flush(crate::shadow_coherent::SyncBy::GpuReader);
++                    let flushed = surface.flush(crate::shadow_coherent::SyncBy::GpuReader);
++                    at_plan |= flushed.is_none() && surface.coherent().is_some();
++                }
++                if at_plan {
++                    if let Some(carry) = self.state().shadow_carry.as_mut() {
++                        carry.copy_back_at_plan();
++                    }
+                 }
+             }
+             {
+@@ -4254,6 +4263,7 @@ impl CommandBufferShared {
+                 value: values[vk_queue],
+                 buffer: self.hold(),
+                 last: true,
++                parts: None,
+                 fence,
+                 signals: Vec::new(),
+                 holds: Vec::new(),
+@@ -4404,7 +4414,11 @@ impl CommandBufferShared {
+         // completed (`shadow_coherent.rs`).
+         if crate::shadow_lazy::ahead() {
+             if let Some(id) = self.shadow_carry_id() {
+-                crate::shadow_lazy::completing(id);
++                if result.is_ok() && lock(&self.state).failure.is_none() {
++                    crate::shadow_lazy::completing(id);
++                } else {
++                    crate::shadow_lazy::failed(id);
++                }
+             }
+         }
+         {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 3b0831a6..bfed8d1c 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -460,7 +460,8 @@ impl CommandBufferShared {
+             .map_err(|error| recording_error(device, error))?;
+         // LOCAL (Atlas): what trapping surfaces' records left in their images since the commit's
+         // copy back, then what the CPU wrote of them before the signal it waited for.
+-        let waited = (state.shadow_carry.as_ref()).is_some_and(|carry| carry.waited_before(range.end));
++        let waited =
++            (state.shadow_carry.as_ref()).is_some_and(|carry| carry.plans_copy_back(range.end));
+         if waited {
+             self.record_copies_back_before(&mut state, range.clone())?;
+         }
+@@ -1110,6 +1111,7 @@ impl CommandBufferShared {
+                 value: at.value,
+                 buffer: self.hold(),
+                 last,
++                parts: Some(range.clone()),
+                 fence,
+                 signals: kept
+                     .into_iter()
+@@ -1226,6 +1228,9 @@ impl CommandBufferShared {
+         if copies.is_empty() {
+             return Ok(());
+         }
++        if let Some(carry) = state.shadow_carry.as_mut() {
++            carry.copied_back_at_plan();
++        }
+         let device = &self.device;
+         let mut uses = Vec::new();
+         let mut planned = Vec::new();
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index acc27e6b..4814fae2 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -1448,6 +1448,32 @@ impl Device {
+             depth_bias: depth_bias_command,
+             sized_index_bind,
+         };
++        // The host image copy functions, where the device enabled `hostImageCopy` and copies to
++        // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
++        // extension's, which the device then enabled.
++        // SAFETY: `physical` belongs to `instance`, created at Vulkan 1.2 or later.
++        let general = host_image_copy
++            && unsafe { crate::texture::host_copy::reaches_general(&instance.raw, physical) };
++        let host_copies = general.then(|| {
++            // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put
++            // back.
++            unsafe { loader_word.restore() };
++            let handle = raw.handle();
++            ash::ext::host_image_copy::DeviceFn::load(|name| {
++                let bytes = name.to_bytes();
++                let core = std::ffi::CString::new(bytes.strip_suffix(b"EXT").unwrap_or(bytes))
++                    .unwrap_or_default();
++                // SAFETY: the device is live; a name it does not serve answers null.
++                let function = unsafe {
++                    (instance.raw.get_device_proc_addr(handle, core.as_ptr()))
++                        .or_else(|| instance.raw.get_device_proc_addr(handle, name.as_ptr()))
++                };
++                function.map_or(std::ptr::null(), |function| {
++                    function as *const std::ffi::c_void
++                })
++            })
++        });
++
+         // Before the exit hook is registered for this device (below): the first call of each
+         // entry point of the exit guard's table (`prime.rs`).
+         // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
+@@ -1469,6 +1495,13 @@ impl Device {
+                 &queues,
+                 Sharing::new(&queue_families),
+                 drawn.has(prime::Has {
++                    host_image_copy: host_copies.is_some() && unsafe {
++                        instance.raw.get_physical_device_image_format_properties(
++                            physical, vk::Format::R8G8B8A8_UNORM, vk::ImageType::TYPE_2D,
++                            vk::ImageTiling::OPTIMAL, vk::ImageUsageFlags::HOST_TRANSFER_EXT,
++                            vk::ImageCreateFlags::empty(),
++                        ).is_ok()
++                    },
+                     timestamps: timestamp_bits > 0,
+                     // A device the runtime created enables it (`enables.rs`).
+                     host_query_reset: owned,
+@@ -1490,6 +1523,7 @@ impl Device {
+                 calibrated,
+                 drawn,
+                 ycbcr_formats.primer(),
++                host_copies.as_ref(),
+             )
+         } {
+             scheduler.stop();
+@@ -1556,31 +1590,6 @@ impl Device {
+                 dma_buf_images,
+             )
+         };
+-        // The host image copy functions, where the device enabled `hostImageCopy` and copies to
+-        // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
+-        // extension's, which the device then enabled.
+-        // SAFETY: `physical` belongs to `instance`, created at Vulkan 1.2 or later.
+-        let general = host_image_copy
+-            && unsafe { crate::texture::host_copy::reaches_general(&instance.raw, physical) };
+-        let host_copies = general.then(|| {
+-            // SAFETY: as above; the loader serves `vkGetDeviceProcAddr` once the word is put
+-            // back.
+-            unsafe { loader_word.restore() };
+-            let handle = raw.handle();
+-            ash::ext::host_image_copy::DeviceFn::load(|name| {
+-                let bytes = name.to_bytes();
+-                let core = std::ffi::CString::new(bytes.strip_suffix(b"EXT").unwrap_or(bytes))
+-                    .unwrap_or_default();
+-                // SAFETY: the device is live; a name it does not serve answers null.
+-                let function = unsafe {
+-                    (instance.raw.get_device_proc_addr(handle, core.as_ptr()))
+-                        .or_else(|| instance.raw.get_device_proc_addr(handle, name.as_ptr()))
+-                };
+-                function.map_or(std::ptr::null(), |function| {
+-                    function as *const std::ffi::c_void
+-                })
+-            })
+-        });
+         // The mesh draw commands, which exist where `meshShader` is enabled (it needs
+         // `VK_EXT_mesh_shader`).
+         let mesh_draws = if enabled
+@@ -1691,6 +1700,11 @@ impl Device {
+             .flat_map(|uuid| uuid.chunks(8))
+             .map(|half| u64::from_le_bytes(half.try_into().unwrap_or_default()))
+             .chain(functions.entry_points().iter().copied())
++            .chain(host_copies.iter().flat_map(|f| [
++                f.transition_image_layout_ext as usize as u64,
++                f.copy_memory_to_image_ext as usize as u64,
++                f.copy_image_to_memory_ext as usize as u64,
++            ]))
+             .collect();
+         exit_guard::register_device(identity);
+         let in_process = properties.kind == DeviceKind::Cpu;
+diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
+index 4b85356b..942dc897 100644
+--- a/crates/metal2vulkan-runtime/src/device/prime.rs
++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
+@@ -72,7 +72,7 @@
+ use crate::draw_source::SizedIndexBind;
+ use crate::dynamic_state::{ColorWriteMasks, ExtendedDynamicState};
+ use crate::error::{vulkan, Error};
+-use crate::exit_guard::Call;
++use crate::exit_guard::{Call, CallBits};
+ use crate::generated_commands::{
+     Commands, ExecutionSetCreateInfo, ExecutionSetPipelineInfo, ExecutionSetToken,
+     LayoutCreateInfo, LayoutToken, EXECUTION_SET_PIPELINES, INDIRECT_BINDABLE, TOKEN_DISPATCH,
+@@ -110,6 +110,11 @@ pub(crate) const UNPRIMED: [Call; 9] = [
+     Call::GetImageSubresourceLayout,
+ ];
+ 
++/// Host copies on an image format the primer can make.
++pub(crate) const HOST_IMAGE_COPY_CALLS: [Call; 3] = [
++    Call::TransitionImageLayout, Call::CopyMemoryToImage, Call::CopyImageToMemory,
++];
++
+ /// The table's entry points a queue family that writes no timestamps (`timestampValidBits` 0)
+ /// never calls, nor primes: a command buffer's GPU times (`gpu_time.rs`).
+ pub(crate) const TIMESTAMP_CALLS: [Call; 3] = [
+@@ -368,6 +373,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
+ /// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
+ #[derive(Clone, Copy)]
+ pub(crate) struct Has {
++    pub(crate) host_image_copy: bool,
+     pub(crate) timestamps: bool,
+     pub(crate) host_query_reset: bool,
+     pub(crate) device_addresses: bool,
+@@ -438,6 +444,7 @@ pub(super) unsafe fn prime(
+     calibration: Option<Calibration>,
+     drawn: PrimedDraws,
+     ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
++    host_copies: Option<&ash::ext::host_image_copy::DeviceFn>,
+ ) -> Result<(), Error> {
+     let mut primer = Primer {
+         device,
+@@ -448,7 +455,7 @@ pub(super) unsafe fn prime(
+         drawn,
+         // SAFETY: the caller's.
+         memory: unsafe { instance.get_physical_device_memory_properties(physical) },
+-        calls: 0,
++        calls: CallBits::EMPTY,
+         held: Vec::new(),
+     };
+     // SAFETY: the caller's.
+@@ -462,6 +469,10 @@ pub(super) unsafe fn prime(
+             })
+             .and_then(|()| primer.sparse(queues, has.sparse_binding))
+             .and_then(|()| primer.ycbcr(ycbcr))
++            .and_then(|()| match host_copies {
++                Some(functions) => primer.host_image_copy(instance, physical, functions),
++                None => Ok(()),
++            })
+     };
+     // SAFETY: the submission completed, or was never made, or the device is lost; nothing else
+     // uses the objects held.
+@@ -494,13 +505,14 @@ pub(super) unsafe fn prime(
+ /// [`COLOR_WRITE_MASK_CALLS`], [`DEPTH_BIAS_CALLS`] and [`SIZED_INDEX_BIND_CALLS`] where it has
+ /// not their commands, and those of [`YCBCR_CONVERSION_CALLS`] where it converts no YCbCr format,
+ /// that `calls` (one bit each) does not hold.
+-pub(crate) fn missing(calls: u128, has: Has) -> Vec<Call> {
++pub(crate) fn missing(calls: CallBits, has: Has) -> Vec<Call> {
+     Call::ALL
+         .iter()
+         .copied()
+         .filter(|&call| {
+-            calls & call.bit() == 0
++            (calls & call.bit()).is_empty()
+                 && !UNPRIMED.contains(&call)
++                && (has.host_image_copy || !HOST_IMAGE_COPY_CALLS.contains(&call))
+                 && (has.timestamps || !TIMESTAMP_CALLS.contains(&call))
+                 && ((has.timestamps && has.host_query_reset)
+                     || !HOST_QUERY_RESET_CALLS.contains(&call))
+@@ -553,12 +565,81 @@ struct Primer<'a> {
+     drawn: PrimedDraws,
+     memory: vk::PhysicalDeviceMemoryProperties,
+     /// The table's entry points called, one bit each.
+-    calls: u128,
++    calls: CallBits,
+     /// What was made, released last first.
+     held: Vec<Release>,
+ }
+ 
+ impl Primer<'_> {
++    /// Prime host image copy where an RGBA host-transfer image can be made. If the format is
++    /// unsupported, the calls stay unprimed and their first section registers the hook again.
++    unsafe fn host_image_copy(
++        &mut self,
++        instance: &ash::Instance,
++        physical: vk::PhysicalDevice,
++        functions: &ash::ext::host_image_copy::DeviceFn,
++    ) -> Result<(), Error> {
++        let format = vk::Format::R8G8B8A8_UNORM;
++        let usage = vk::ImageUsageFlags::HOST_TRANSFER_EXT;
++        if unsafe {
++            instance.get_physical_device_image_format_properties(
++                physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL,
++                usage, vk::ImageCreateFlags::empty(),
++            )
++        }.is_err() {
++            return Ok(());
++        }
++        let info = vk::ImageCreateInfo::default()
++            .image_type(vk::ImageType::TYPE_2D)
++            .format(format)
++            .extent(vk::Extent3D { width: 2, height: 1, depth: 1 })
++            .mip_levels(1).array_layers(1)
++            .samples(vk::SampleCountFlags::TYPE_1)
++            .tiling(vk::ImageTiling::OPTIMAL).usage(usage)
++            .initial_layout(vk::ImageLayout::UNDEFINED);
++        let device = self.device;
++        let image = unsafe { device.create_image(&info, None) }.map_err(vulkan)?;
++        let requirements = unsafe { device.get_image_memory_requirements(image) };
++        let memory = match unsafe { self.allocate(requirements, vk::MemoryPropertyFlags::empty(), false) } {
++            Ok(memory) => memory,
++            Err(error) => {
++                unsafe { release::object(device, image) };
++                return Err(error);
++            }
++        };
++        self.hold(image);
++        unsafe { device.bind_image_memory(image, memory, 0) }.map_err(vulkan)?;
++        let subresource = vk::ImageSubresourceLayers::default()
++            .aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
++        let transition = vk::HostImageLayoutTransitionInfoEXT::default()
++            .image(image).old_layout(vk::ImageLayout::UNDEFINED)
++            .new_layout(vk::ImageLayout::GENERAL)
++            .subresource_range(vk::ImageSubresourceRange::default()
++                .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1));
++        unsafe { (functions.transition_image_layout_ext)(device.handle(), 1, &transition) }
++            .result().map_err(vulkan)?;
++        self.made(Call::TransitionImageLayout);
++        let input = [0u32; 2];
++        let region = vk::MemoryToImageCopyEXT::default()
++            .host_pointer(input.as_ptr().cast()).image_subresource(subresource)
++            .image_extent(vk::Extent3D { width: 2, height: 1, depth: 1 });
++        let write = vk::CopyMemoryToImageInfoEXT::default().dst_image(image)
++            .dst_image_layout(vk::ImageLayout::GENERAL).regions(std::slice::from_ref(&region));
++        unsafe { (functions.copy_memory_to_image_ext)(device.handle(), &write) }
++            .result().map_err(vulkan)?;
++        self.made(Call::CopyMemoryToImage);
++        let mut output = [0u32; 2];
++        let region = vk::ImageToMemoryCopyEXT::default()
++            .host_pointer(output.as_mut_ptr().cast()).image_subresource(subresource)
++            .image_extent(vk::Extent3D { width: 2, height: 1, depth: 1 });
++        let read = vk::CopyImageToMemoryInfoEXT::default().src_image(image)
++            .src_image_layout(vk::ImageLayout::GENERAL).regions(std::slice::from_ref(&region));
++        unsafe { (functions.copy_image_to_memory_ext)(device.handle(), &read) }
++            .result().map_err(vulkan)?;
++        self.made(Call::CopyImageToMemory);
++        Ok(())
++    }
++
+     /// `call` was made.
+     fn made(&mut self, call: Call) {
+         self.calls |= call.bit();
+@@ -962,6 +1043,9 @@ impl Primer<'_> {
+                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                 .map_err(vulkan)?;
+             self.made(Call::MapMemory);
++            let range = vk::MappedMemoryRange::default().memory(memory).offset(0).size(vk::WHOLE_SIZE);
++            device.invalidate_mapped_memory_ranges(&[range]).map_err(vulkan)?;
++            self.made(Call::InvalidateMappedMemoryRanges);
+             if device_addresses {
+                 let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+                 device.get_buffer_device_address(&info);
+diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
+index e0efb3be..fb7093ba 100644
+--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
+@@ -267,33 +267,48 @@ static SECTIONS: AtomicU64 = AtomicU64::new(0);
+ /// The entry points ([`Call`]) called in sections that ended since the hook was last registered
+ /// at a device after a load of a shared object ([`register_device`], they were the process's), one
+ /// bit each.
+-static CALLED: CalledWord = CalledWord([AtomicU64::new(0), AtomicU64::new(0)]);
+-
+-/// One bit per entry point of the table ([`Call::bit`]), as two atomic halves: the table
+-/// outgrew 64 bits with the render host step's entry points.
+-struct CalledWord([AtomicU64; 2]);
++static CALLED: CalledWord = CalledWord([const { AtomicU64::new(0) }; 4]);
++
++/// A bit per entry point. Kept in two halves so the table may grow beyond 128 calls.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(crate) struct CallBits(pub(crate) [u128; 2]);
++impl CallBits {
++    pub(crate) const EMPTY: Self = Self([0, 0]);
++    pub(crate) fn is_empty(self) -> bool { self == Self::EMPTY }
++    #[cfg(test)]
++    pub(crate) fn count_ones(self) -> u32 { self.0[0].count_ones() + self.0[1].count_ones() }
++}
++impl std::ops::BitOr for CallBits {
++    type Output = Self;
++    fn bitor(self, rhs: Self) -> Self { Self([self.0[0] | rhs.0[0], self.0[1] | rhs.0[1]]) }
++}
++impl std::ops::BitOrAssign for CallBits {
++    fn bitor_assign(&mut self, rhs: Self) { *self = *self | rhs; }
++}
++impl std::ops::BitAnd for CallBits {
++    type Output = Self;
++    fn bitand(self, rhs: Self) -> Self { Self([self.0[0] & rhs.0[0], self.0[1] & rhs.0[1]]) }
++}
++impl std::ops::Not for CallBits {
++    type Output = Self;
++    fn not(self) -> Self { Self([!self.0[0], !self.0[1]]) }
++}
+ 
++struct CalledWord([AtomicU64; 4]);
+ impl CalledWord {
+-    /// Set `calls`; the bits set before.
+-    fn fetch_or(&self, calls: u128) -> u128 {
+-        let low = self.0[0].fetch_or(calls as u64, Ordering::Relaxed);
+-        let high = self.0[1].fetch_or((calls >> 64) as u64, Ordering::Relaxed);
+-        u128::from(low) | (u128::from(high) << 64)
++    fn fetch_or(&self, calls: CallBits) -> CallBits {
++        let halves = [calls.0[0] as u64, (calls.0[0] >> 64) as u64,
++                      calls.0[1] as u64, (calls.0[1] >> 64) as u64];
++        let old = std::array::from_fn::<_, 4, _>(|i| self.0[i].fetch_or(halves[i], Ordering::Relaxed));
++        CallBits([u128::from(old[0]) | (u128::from(old[1]) << 64),
++                  u128::from(old[2]) | (u128::from(old[3]) << 64)])
+     }
+-
+-    /// Clear every bit: a load of a shared object since (a driver or layer loaded again makes
+-    /// its statics again at each entry point's first call).
+-    fn clear(&self) {
+-        self.0[0].store(0, Ordering::Relaxed);
+-        self.0[1].store(0, Ordering::Relaxed);
+-    }
+-
+-    /// The bits set.
++    fn clear(&self) { for word in &self.0 { word.store(0, Ordering::Relaxed); } }
+     #[cfg(test)]
+-    fn load(&self) -> u128 {
+-        let low = self.0[0].load(Ordering::Relaxed);
+-        let high = self.0[1].load(Ordering::Relaxed);
+-        u128::from(low) | (u128::from(high) << 64)
++    fn load(&self) -> CallBits {
++        let old = std::array::from_fn::<_, 4, _>(|i| self.0[i].load(Ordering::Relaxed));
++        CallBits([u128::from(old[0]) | (u128::from(old[1]) << 64),
++                  u128::from(old[2]) | (u128::from(old[3]) << 64)])
+     }
+ }
+ 
+@@ -513,6 +528,10 @@ calls! {
+     CmdDrawMeshTasksIndirectCount => c"vkCmdDrawMeshTasksIndirectCountEXT",
+     CmdExecuteGeneratedCommands => c"vkCmdExecuteGeneratedCommandsEXT",
+     CmdPreprocessGeneratedCommands => c"vkCmdPreprocessGeneratedCommandsEXT",
++    InvalidateMappedMemoryRanges => c"vkInvalidateMappedMemoryRanges",
++    TransitionImageLayout => c"vkTransitionImageLayoutEXT",
++    CopyMemoryToImage => c"vkCopyMemoryToImageEXT",
++    CopyImageToMemory => c"vkCopyImageToMemoryEXT",
+ }
+ 
+ /// The entry points a host step may call (`CommandBufferShared::host_step`): what a dispatch
+@@ -610,11 +629,12 @@ pub(crate) const HOST_STEP: &[Call] = &[
+ ];
+ 
+ impl Call {
+-    /// Its bit. The table fills 113 of the word's 128 (widened from 64): when it next outgrows the
+-    /// word, widen the word (here, [`CALLED`], `PENDING` and the priming's calls); do not add a
+-    /// second table.
+-    pub(crate) fn bit(self) -> u128 {
+-        1 << self as u32
++    /// The unique bit for this entry point.
++    pub(crate) fn bit(self) -> CallBits {
++        let n = self as usize;
++        let mut bits = CallBits::EMPTY;
++        bits.0[n / 128] = 1_u128 << (n % 128);
++        bits
+     }
+ }
+ 
+@@ -622,7 +642,7 @@ thread_local! {
+     /// The sections in progress on this thread (of every guard).
+     static OWN: Cell<usize> = const { Cell::new(0) };
+     /// The entry points ([`Call`]) this thread called since its last section ended.
+-    static PENDING: Cell<u128> = const { Cell::new(0) };
++    static PENDING: Cell<CallBits> = const { Cell::new(CallBits::EMPTY) };
+     /// This thread is one of the runtime's own ([`spawn`]).
+     static RUNTIME: Cell<bool> = const { Cell::new(false) };
+     /// The program's code this thread is running ([`program`]).
+@@ -793,10 +813,10 @@ impl Drop for Busy<'_> {
+             // After the section's Vulkan calls, which may have registered a destructor.
+             let calls = PENDING.with(|pending| {
+                 let calls = pending.get();
+-                pending.set(0);
++                pending.set(CallBits::EMPTY);
+                 calls
+             });
+-            let first = calls & !CALLED.fetch_or(calls) != 0;
++            let first = !(calls & !CALLED.fetch_or(calls)).is_empty();
+             let ended = SECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+             if (first || ended.is_power_of_two()) && !self.guard.is_closed() {
+                 register_again();
+@@ -1523,5 +1543,5 @@ pub(crate) fn sections() -> u64 {
+ /// Whether a section that ended called `call`.
+ #[cfg(test)]
+ pub(crate) fn was_called(call: Call) -> bool {
+-    CALLED.load() & call.bit() != 0
++    !(CALLED.load() & call.bit()).is_empty()
+ }
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 73e5c02e..ca2a7c3e 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -2255,6 +2255,7 @@ impl<M> ShadowSync<M> {
+             left: self.carry.left,
+             late: std::mem::take(&mut self.carry.late),
+             noted: std::mem::take(&mut self.carry.noted),
++            copy_back_at_plan: self.carry.copy_back_at_plan,
+         };
+         carry.entries.append(&mut self.carry.entries);
+         for entry in &self.entries {
+@@ -2336,6 +2337,11 @@ pub(super) struct ShadowCarry {
+     /// LOCAL (Atlas): its writes through other imports of trapping surfaces whose parts are not
+     /// all recorded yet ([`parts_recorded`](Self::parts_recorded)).
+     noted: super::shadow_lazy::Noted,
++    /// LOCAL (Atlas): its commit's copy back of a trapping surface it reads through another
++    /// import (`shadow_lazy::met_by`) was not made, every record running then not planned yet
++    /// (`shadow_coherent::Coherent::before_flush`): its first batch that meets the bytes copies
++    /// back as it is planned, as a late batch does ([`plans_copy_back`](Self::plans_copy_back)).
++    copy_back_at_plan: bool,
+ }
+ 
+ /// LOCAL (Atlas): the trapping surfaces (`shadow_coherent.rs`) whose standing an encoder took
+@@ -2360,7 +2366,7 @@ pub(super) struct LateCopies {
+     waited_from: Option<usize>,
+     /// Each surface noted, with the part of the wait it was noted after, whether an earlier
+     /// encoder of the command buffer had left writes ahead in its image then, and the count of
+-    /// writes of its bytes its standing was taken at (`shadow_lazy::Lazy::taken_written`).
++    /// writes of its bytes its standing was taken at (`shadow_lazy::Lazy::take`).
+     shadows: Vec<(usize, bool, u64, Arc<ShadowCopies>)>,
+ }
+ 
+@@ -2374,6 +2380,7 @@ impl Default for ShadowCarry {
+             left: false,
+             late: LateCopies::default(),
+             noted: Vec::new(),
++            copy_back_at_plan: false,
+         }
+     }
+ }
+@@ -2420,6 +2427,7 @@ impl ShadowCarry {
+     /// LOCAL (Atlas): its encoders so far recorded all their parts before `end`
+     /// (`command_buffer::State::recorded`): their writes through other imports lie before it.
+     pub(super) fn parts_recorded(&mut self, end: usize) {
++        super::shadow_lazy::coherent_parts_recorded(self.id, end);
+         if !self.noted.is_empty() {
+             super::shadow_lazy::parts_recorded(&mut self.noted, self.id, end);
+         }
+@@ -2431,6 +2439,29 @@ impl ShadowCarry {
+         self.entries.clear();
+     }
+ 
++    /// LOCAL (Atlas): its commit's copy back was left to the scheduler's planning
++    /// ([`ShadowCarry::copy_back_at_plan`]).
++    pub(super) fn copy_back_at_plan(&mut self) {
++        self.copy_back_at_plan = true;
++    }
++
++    /// LOCAL (Atlas): whether its next batch that meets a trapping surface's bytes copies back
++    /// what runs as it is planned (`shadow_lazy::before_late_batch`): its work waits for a shared
++    /// event before the batch's end, or its commit left the copy back to it. A commit's copy back
++    /// is planned when the scheduler takes it, after every command buffer committed before it,
++    /// so a record whose command buffer the scheduler had not taken in yet is left out though
++    /// nothing holds it; as this batch is planned, under the scheduler's lock, each such record
++    /// is planned or held for an event, which it keeps (lane
++    /// `surface_coherent_an_import_read_past_a_held_batch_sees_a_planned_write`).
++    pub(super) fn plans_copy_back(&self, end: usize) -> bool {
++        self.copy_back_at_plan || self.waited_before(end)
++    }
++
++    /// LOCAL (Atlas): a batch of it recorded the copy back its commit left to it.
++    pub(super) fn copied_back_at_plan(&mut self) {
++        self.copy_back_at_plan = false;
++    }
++
+     /// LOCAL (Atlas): whether work before part `end` waits for a shared event: a batch ending there
+     /// is planned after the wait, past its commit (`shadow_lazy::before_late_batch`).
+     pub(super) fn waited_before(&self, end: usize) -> bool {
+@@ -2508,22 +2539,25 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                 // earlier encoder left is taken after the wait too (`Lazy::take`): its copy in is
+                 // the batch's alone, which takes the texels the CPU changed where any write the
+                 // pages lack meets them (`shadow_coherent::Coherent::taking_late`).
+-                if let (Some(_), Some(lazy), Some(since)) = (&lazily, &copies.lazy, self.carry.late.since) {
++                let ordered_take = lazily.as_ref().is_some_and(|(_, _, deferred, _)| *deferred);
++                if let (Some((_, _, _, written)), Some(lazy)) = (&lazily, &copies.lazy) {
++                    let since = self.carry.late.since.unwrap_or(0);
+                     let late = &mut self.carry.late.shadows;
+                     if lazy.whole_image()
++                        && (self.carry.late.since.is_some() || ordered_take)
+                         && !(late.iter()).any(|(from, _, _, known)| {
+                             *from == since && known.shadow_key == copies.shadow_key
+                         })
+                     {
+                         let left = lazy.left_open_by(self.carry.id);
+-                        late.push((since, left, lazy.taken_written(), Arc::clone(copies)));
++                        late.push((since, left, *written, Arc::clone(copies)));
+                     }
+                 }
+                 let only_read = lazily.is_some() && (copies.lazy.as_ref())
+                     .is_some_and(|lazy| lazy.whole_image());
+                 let (standing, held, stale) = match (&carried, lazily) {
+                     (Some(carried), _) => (Standing::Current, carried.held, carried.stale),
+-                    (None, Some((held, stale))) => (Standing::Current, held, stale),
++                    (None, Some((held, stale, _, _))) => (Standing::Current, held, stale),
+                     (None, None) => (Standing::Unread, None, None),
+                 };
+                 self.entries.push(Entry {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 91af0e1f..7cbcbee4 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -87,7 +87,7 @@ impl Rehearsal {
+             std::thread::sleep(running);
+             self.0.completing(id);
+         }
+-        if let Some(stale) = take.then(|| self.0.taking(false)).flatten() {
++        if let Some(stale) = take.then(|| self.0.taking(0, false)).flatten() {
+             self.0.copied_in(texels(stale));
+         }
+         self.0.presented();
+@@ -101,7 +101,7 @@ const SWITCH: &str = "surface_coherent";
+ const DISPLAY: &str = "surface_coherent_display";
+ pub(crate) const PAGE: u64 = 4096;
+ const HOLD_MAX_S: u64 = 30;
+-/// Records apart at most: past it the done ones join, as the image holds every texel between.
++/// Armed rectangles kept separately before the arm cache is cleared.
+ const RECORDS: usize = 8;
+ const PROBE_GIVEN_UP: Duration = Duration::from_millis(1);
+ const DEFAULT_WAIT_MS: u64 = 50;
+@@ -476,6 +476,15 @@ impl Layout {
+     }
+ }
+ 
++/// The rectangle bounding both, where either may be none (`bounding` wants both).
++fn joined(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
++    match (a, b) {
++        (Some(_), Some(_)) => bounding(a, b),
++        (a, None) => a,
++        (None, b) => b,
++    }
++}
++
+ fn meet(a: [u32; 4], b: [u32; 4]) -> bool {
+     a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+ }
+@@ -491,10 +500,16 @@ fn texels(area: [u32; 4]) -> u64 {
+ /// One write left in the image.
+ #[derive(Clone, Copy, Debug)]
+ struct Record {
+-    /// The command buffer's identity (`shadow::ShadowCarry::id`), 0 once several joined.
++    /// The command buffer's identity (`shadow::ShadowCarry::id`).
+     id: u64,
++    /// Experimental: stable identity of this encoder's write group, unique within the surface.
++    /// Tickets must use this identity rather than the legacy commit-order sequence.
++    #[allow(dead_code)]
++    write_id: u64,
+     /// Its place among records committed: what a GPU copy back moved it by.
+     seq: u64,
++    /// Encoder parts through which this write was recorded; MAX until the encoder ends.
++    part_end: usize,
+     area: [u32; 4],
+ }
+ 
+@@ -596,6 +611,8 @@ struct State {
+     /// A GPU copy back in flight, up to this sequence: 0 for none.
+     flushing: u64,
+     seq: u64,
++    /// Last identity allocated; never reused while this surface exists.
++    next_write_id: u64,
+     /// Rectangles whose pages are armed: nothing to do for what one holds.
+     armed: Vec<[u32; 4]>,
+     /// A probe armed every held page: the next fault holds them again.
+@@ -607,6 +624,16 @@ struct State {
+     guest: Option<[u32; 4]>,
+     /// Each open page, as it was before the guest's write.
+     snapshots: BTreeMap<u64, Box<[u8]>>,
++    /// LOCAL (Atlas): a copy of `guest`/`snapshots` kept for a held batch that is pending
++    /// (an entry in `owed`), so its `taking_late` still finds them after a later command
++    /// buffer's encoder took the image's standing (`Coherent::taking`).
++    held_guest: Option<[u32; 4]>,
++    /// LOCAL (Atlas): command buffers whose encoder took this surface after a wait for a shared
++    /// event (a late note, `shadow::LateCopies`), until their late copy in is made: a held
++    /// batch may leave no record (it only reads, or its defer was refused), and a later
++    /// command buffer's `taking` must still keep the guest area for it.
++    late_waiters: Vec<u64>,
++    held_snapshots: BTreeMap<u64, Box<[u8]>>,
+     /// The pages of `snapshots` are open: a write reaches them with no trap.
+     opened: bool,
+     frozen: Vec<u64>,
+@@ -784,12 +811,17 @@ impl Coherent {
+         }
+         let whole = self.layout.whole();
+         let area = area.unwrap_or(whole);
+-        match state.open.iter_mut().find(|record| record.id == id) {
++        match state.open.iter_mut().find(|record| record.id == id && record.part_end == usize::MAX) {
+             Some(record) => {
+                 let joined = bounding(Some(record.area), Some(area));
+                 record.area = joined.unwrap_or(whole);
+             }
+-            None => state.open.push(Record { id, seq: 0, area }),
++            None => {
++                state.next_write_id = state.next_write_id.checked_add(1)
++                    .expect("coherent write identity exhausted");
++                let write_id = state.next_write_id;
++                state.open.push(Record { id, write_id, seq: 0, part_end: usize::MAX, area });
++            }
+         }
+         self.counts.defers.fetch_add(1, Ordering::Relaxed);
+         let bytes = texels(area) * self.layout.texel;
+@@ -852,8 +884,8 @@ impl Coherent {
+     /// The commit of `id` returned: its record may go back by a copy ordered after it.
+     pub(crate) fn committed(&self, id: u64) {
+         let mut state = self.lock();
+-        if let Some(at) = state.open.iter().position(|record| record.id == id) {
+-            let mut record = state.open.swap_remove(at);
++        while let Some(at) = state.open.iter().position(|record| record.id == id) {
++            let mut record = state.open.remove(at);
+             state.seq += 1;
+             record.seq = state.seq;
+             state.running.push(record);
+@@ -861,9 +893,60 @@ impl Coherent {
+         self.settle_pending(&state);
+     }
+ 
++    /// Attach the completed encoder's parts to the records it left during encoding.
++    pub(crate) fn parts_recorded(&self, id: u64, end: usize) {
++        let mut state = self.lock();
++        for record in &mut state.open {
++            if record.id == id && record.part_end == usize::MAX {
++                record.part_end = end;
++            }
++        }
++    }
++
++    /// Publish only writes from submitted parts whose batch has completed.
++    pub(crate) fn completing_parts(&self, id: u64, parts: std::ops::Range<usize>) {
++        let mut state = self.lock();
++        let belongs = |record: &Record| record.id == id
++            && record.part_end > parts.start && record.part_end <= parts.end;
++        while let Some(at) = state.running.iter().position(&belongs) {
++            let record = state.running.remove(at);
++            if record.seq > state.flushed_to || state.kept.contains(&record.seq) {
++                self.finish_record(&mut state, record);
++            }
++            self.moved.notify_all();
++        }
++        // Completion can beat the post-commit bookkeeping.
++        while let Some(at) = state.open.iter().position(&belongs) {
++            let mut record = state.open.remove(at);
++            state.seq += 1;
++            record.seq = state.seq;
++            self.finish_record(&mut state, record);
++            self.moved.notify_all();
++        }
++        self.settle_pending(&state);
++    }
++
++    /// Drop uncompleted records after a failed command buffer; never publish future writes.
++    pub(crate) fn failed(&self, id: u64) {
++        let mut state = self.lock();
++        state.late_waiters.retain(|&waiter| waiter != id);
++        let lost: Vec<u64> = state.running.iter().filter(|record| record.id == id)
++            .map(|record| record.seq).collect();
++        state.open.retain(|record| record.id != id);
++        state.running.retain(|record| record.id != id);
++        state.kept.retain(|seq| !lost.contains(seq));
++        state.owed.retain(|owed| owed.0 != id);
++        let owed_before = state.owed_in.len();
++        state.owed_in.retain(|owed| owed.0 != id);
++        OWED_IN.fetch_sub((owed_before - state.owed_in.len()) as u64, Ordering::Relaxed);
++        self.moved.notify_all();
++        self.settle_pending(&state);
++    }
++
+     /// The command buffer `id` is done, before anything tells the guest: its pages trap from here.
+     pub(crate) fn completing(&self, id: u64) {
+         let mut state = self.lock();
++        state.late_waiters.retain(|&waiter| waiter != id);
+         // LOCAL (Atlas): a copy back its batch carried landed with it.
+         if state.owed.iter().any(|owed| owed.0 == id) {
+             let (mine, kept): (Vec<_>, Vec<_>) = state.owed.iter().partition(|owed| owed.0 == id);
+@@ -875,7 +958,7 @@ impl Coherent {
+             }
+             state = self.lock();
+         }
+-        let found = match state.running.iter().position(|record| record.id == id) {
++        while let Some(found) = match state.running.iter().position(|record| record.id == id) {
+             Some(at) => Some(state.running.swap_remove(at)),
+             // Its commit has not returned yet.
+             None => (state.open.iter().position(|record| record.id == id)).map(|at| {
+@@ -884,8 +967,8 @@ impl Coherent {
+                 record.seq = state.seq;
+                 record
+             }),
+-        };
+-        if let Some(record) = found {
++        } {
++            let record = found;
+             if record.seq > state.flushed_to || state.kept.contains(&record.seq) {
+                 self.finish_record(&mut state, record);
+             }
+@@ -898,16 +981,27 @@ impl Coherent {
+         if state.closed || !state.tracked {
+             return;
+         }
+-        if state.done.len() >= RECORDS {
+-            let mut joined = record;
+-            for other in state.done.drain(..) {
+-                joined.area = bounding(Some(joined.area), Some(other.area)).unwrap_or(joined.area);
+-                joined.seq = joined.seq.max(other.seq);
+-                joined.id = 0;
++        // Experimental: retain each identity until its write is actually settled. Bounding
++        // rectangles here discarded identities needed for exact copy-back accounting.
++        state.done.push(record);
++        if state.done.len() > RECORDS {
++            // Join the records no copy back left behind: the join's seq is the latest, so a
++            // copy back drops it only once it covered all of them (`flushed`).
++            let kept = std::mem::take(&mut state.kept);
++            let (keep, join): (Vec<Record>, Vec<Record>) =
++                std::mem::take(&mut state.done).into_iter().partition(|r| kept.contains(&r.seq));
++            state.kept = kept;
++            state.done = keep;
++            if let Some(first) = join.first().copied() {
++                let joined = join.iter().skip(1).fold(first, |mut joined, other| {
++                    joined.area = bounding(Some(joined.area), Some(other.area)).unwrap_or(joined.area);
++                    joined.seq = joined.seq.max(other.seq);
++                    joined.part_end = joined.part_end.max(other.part_end);
++                    joined.id = 0;
++                    joined
++                });
++                state.done.push(joined);
+             }
+-            state.done.push(joined);
+-        } else {
+-            state.done.push(record);
+         }
+         let Some(pages_mark) = pages() else {
+             return;
+@@ -961,9 +1055,21 @@ impl Coherent {
+         let start = Instant::now();
+         let done = std::mem::take(&mut state.done);
+         state.kept.retain(|seq| !done.iter().any(|record| record.seq == *seq));
+-        let mut list = Vec::new();
++        // Collapse only the copy operation, after taking the complete set of identities. A
++        // pending ticket still needs individual records until this point.
++        let mut areas = Vec::new();
+         for record in &done {
+-            let area = record.area;
++            if areas.len() >= RECORDS {
++                let joined = areas.drain(..).fold(Some(record.area), |area, other| {
++                    bounding(area, Some(other))
++                });
++                areas.push(joined.unwrap_or(record.area));
++            } else {
++                areas.push(record.area);
++            }
++        }
++        let mut list = Vec::new();
++        for area in areas {
+             let copying = Instant::now();
+             let moved = match state.snapshots.is_empty() {
+                 true => self.detile(area),
+@@ -1095,10 +1201,17 @@ impl Coherent {
+         &'a self,
+         mut state: MutexGuard<'a, State>,
+         area: Option<[u32; 4]>,
++        skip_held: bool,
+     ) -> (MutexGuard<'a, State>, bool) {
+         let until = Instant::now() + Duration::from_millis(knob("surface_coherent_wait_ms", DEFAULT_WAIT_MS));
+         loop {
+-            let overlaps = |area| state.running.iter().any(|record| meet(record.area, area));
++            // With `skip_held`, a record held for an event is not waited for: on the command
++            // thread (an encoder's take, a reader's copy back) its signal comes from the guest
++            // later, so a wait only stalls. A host reader on another thread waits (the signal may
++            // be on its way). Callers that copy over a held record's area count the risk.
++            let overlaps = |area| (state.running.iter()).any(|record| {
++                meet(record.area, area) && !(skip_held && Self::held_for_event(&state, record.id))
++            });
+             let busy = state.flushing != 0 || !state.owed.is_empty() || area.is_some_and(overlaps);
+             if !busy {
+                 return (state, true);
+@@ -1154,7 +1267,7 @@ impl Coherent {
+     fn wrote(&self, state: MutexGuard<'_, State>, mark: Option<Arc<dyn Pages>>) {
+         // A running write needs no wait: the merge at its completion keeps this one. A GPU copy
+         // back already on its way cannot merge.
+-        let (settled, clear) = self.wait_settled(state, None);
++        let (settled, clear) = self.wait_settled(state, None, false);
+         let mut state = settled;
+         self.sync_done(&mut state, SyncBy::Trap);
+         if !clear {
+@@ -1197,7 +1310,7 @@ impl Coherent {
+         let mut state = state;
+         self.sync_done(&mut state, SyncBy::HostRead);
+         if !state.running.is_empty() {
+-            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()));
++            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()), false);
+             state = settled;
+             self.sync_done(&mut state, SyncBy::HostRead);
+         }
+@@ -1225,7 +1338,7 @@ impl Coherent {
+         }
+         self.sync_done(&mut state, SyncBy::Unmap);
+         if !state.running.is_empty() {
+-            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()));
++            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()), false);
+             state = settled;
+             self.sync_done(&mut state, SyncBy::Unmap);
+         }
+@@ -1248,10 +1361,38 @@ impl Coherent {
+         true
+     }
+ 
++    pub(crate) fn needs_ordered_take(&self, id: u64) -> bool {
++        let state = self.lock();
++        Self::other_held(&state, id)
++    }
++
++    /// Another command buffer than `id` is held for an event with work on this surface: a
++    /// running record, or a late note still to be made.
++    fn other_held(state: &State, id: u64) -> bool {
++        (state.running.iter().map(|record| record.id).chain(state.late_waiters.iter().copied()))
++            .any(|other| other != id && super::shadow_lazy::unplanned(other))
++    }
++
++    /// The command buffer `id` waits for a shared event before work on this surface, its batch
++    /// not planned: it completes only after the guest signals. (`unplanned` alone also holds a
++    /// command buffer just committed that the scheduler has not reached yet.)
++    fn held_for_event(state: &State, id: u64) -> bool {
++        state.late_waiters.contains(&id) && super::shadow_lazy::unplanned(id)
++    }
++
++    /// LOCAL (Atlas): an encoder of the command buffer `id` took this surface after a wait for
++    /// a shared event: its batch makes a late copy in ([`taking_late`](Self::taking_late)).
++    pub(crate) fn late_noted(&self, id: u64) {
++        let mut state = self.lock();
++        if !state.late_waiters.contains(&id) {
++            state.late_waiters.push(id);
++        }
++    }
++
+     /// An encoder is about to use the image: where the guest wrote is stale in it, and comes back
+     /// for this command's copy in. With no standing (`whole`) the copy in reads every texel. The
+     /// pages hold everything done first, and are held before the copy in can read them.
+-    pub(crate) fn taking(&self, whole: bool) -> Option<[u32; 4]> {
++    pub(crate) fn taking(&self, id: u64, whole: bool) -> Option<[u32; 4]> {
+         let mut state = self.lock();
+         if !state.tracked {
+             return None;
+@@ -1268,13 +1409,50 @@ impl Coherent {
+             // write's texels must reach the pages first. Over no CPU write, a refused standing's
+             // copy back (`shadow_lazy::met_by`) does that without a wait.
+             if !state.snapshots.is_empty() {
+-                let (settled, clear) = self.wait_settled(state, Some(area));
++                let (settled, clear) = self.wait_settled(state, Some(area), true);
+                 state = settled;
+-                if !clear {
++                let held_over = (state.running.iter()).any(|record| {
++                    record.id != id && meet(record.area, area)
++                        && Self::held_for_event(&state, record.id)
++                });
++                if !clear || held_over {
+                     self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+                 }
+             }
+-            self.take_guest(&mut state);
++            // LOCAL (Atlas): if a held batch is still pending for this surface (an entry in
++            // `owed`, or a copy back in flight), keep a copy of the guest area and snapshots for
++            // its `taking_late`, which runs later, after this encoder took the standing. Without
++            // this the held batch finds `guest == None` and copies nothing in, and a CPU write
++            // that lands before its signal is lost from the image.
++            // A held batch is a command buffer that committed and still runs: its record is in
++            // `running` (another one's, since this encoder is not committed yet). Its late note
++            // needs the guest area and the snapshots this encoder is about to take.
++            let held_pending = !state.owed.is_empty()
++                || state.flushing != 0
++                || state.running.iter().any(|record| record.id != id)
++                || state.late_waiters.iter().any(|&other| other != id);
++            if held_pending {
++                // Move, not clone: `wrote` already copied every page into `snapshots`, and a
++                // surface can be many megabytes.
++                // Done records reach the pages first, merged against the snapshots, so a CPU
++                // write under a done record's rectangle survives (`take_guest` does the same).
++                self.sync_done(&mut state, SyncBy::CopyIn);
++                let list: Vec<u64> = state.snapshots.keys().copied().collect();
++                state.held_guest = joined(state.held_guest, state.guest);
++                for (page, snapshot) in std::mem::take(&mut state.snapshots) {
++                    state.held_snapshots.entry(page).or_insert(snapshot);
++                }
++                if let Some(mark) = pages() {
++                    let came = mark.hold(&list, true);
++                    state.guest = None;
++                    self.note_came(&mut state, came);
++                }
++                state.opened = false;
++            } else {
++                state.held_guest = None;
++                state.held_snapshots.clear();
++                self.take_guest(&mut state);
++            }
+             if whole {
+                 state.guest = None;
+             }
+@@ -1314,10 +1492,22 @@ impl Coherent {
+     /// writes ahead before the wait (`left`): the rest of its writes run after the copy.
+     pub(crate) fn taking_late(&self, id: u64, left: bool, cut: bool) -> Vec<[u32; 4]> {
+         let mut state = self.lock();
++        state.late_waiters.retain(|&waiter| waiter != id);
+         if !state.tracked || state.closed {
+             return Vec::new();
+         }
++        // LOCAL (Atlas): restore a stashed guest area/snapshots a later command buffer's
++        // `taking` kept for this held batch.
++        if state.held_guest.is_some() {
++            state.guest = joined(state.guest, state.held_guest.take());
++            // The oldest snapshot is the baseline for every write before this batch.
++            for (page, snapshot) in std::mem::take(&mut state.held_snapshots) {
++                state.snapshots.insert(page, snapshot);
++            }
++        }
+         let Some(area) = state.guest else {
++            state.held_guest = None;
++            state.held_snapshots.clear();
+             return Vec::new();
+         };
+         let ahead = |state: &State, rects: &[[u32; 4]]| {
+@@ -1362,6 +1552,8 @@ impl Coherent {
+             self.counts.late_copies.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyIn);
+         }
++        state.held_guest = None;
++        state.held_snapshots.clear();
+         rects
+     }
+ 
+@@ -1547,9 +1739,16 @@ impl Coherent {
+         if state.running.is_empty() {
+             return None;
+         }
++        // Nothing a copy back could cover: every running record is held for an event, or its
++        // command buffer is not taken in by the scheduler yet. A reader's commit then leaves the
++        // copy back to its own batch's planning (`shadow::ShadowCarry::plans_copy_back`).
++        if state.running.iter().all(|record| super::shadow_lazy::unplanned(record.id)) {
++            count(Fallback::FlushHeldBack);
++            return None;
++        }
+         if !state.snapshots.is_empty() {
+             let area = state.guest.unwrap_or(self.layout.whole());
+-            let (settled, clear) = self.wait_settled(state, Some(area));
++            let (settled, clear) = self.wait_settled(state, Some(area), true);
+             state = settled;
+             self.sync_done(&mut state, by);
+             if state.running.is_empty() {
+@@ -1597,7 +1796,9 @@ impl Coherent {
+         if !state.running.iter().any(|record| others(&record)) {
+             return late;
+         }
+-        if !state.snapshots.is_empty() {
++        // Open snapshots, or ones kept for a held batch (`held_snapshots`): the pages hold CPU
++        // writes the image lacks, which a copy back would put the image's older texels over.
++        if !state.snapshots.is_empty() || !state.held_snapshots.is_empty() || state.held_guest.is_some() {
+             count(match writes {
+                 Writes::None => Fallback::PlanLeft,
+                 _ => Fallback::PlanLeftPlanned,
+@@ -1740,6 +1941,9 @@ impl Coherent {
+         }
+         state.done.clear();
+         state.snapshots.clear();
++        state.held_snapshots.clear();
++        state.held_guest = None;
++        state.late_waiters.clear();
+         state.frozen.clear();
+         self.moved.notify_all();
+         if self.counts.defers.load(Ordering::Relaxed) + self.counts.traps.load(Ordering::Relaxed) > 0 {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 602ef013..f0cce7be 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -326,6 +326,7 @@ pub(crate) fn remapped(bytes: Range<usize>) {
+             if let Some(coherent) = lazy.coherent() {
+                 coherent.abandon();
+             }
++            lazy.plain.fetch_add(1, Ordering::Relaxed);
+             lazy.written.fetch_add(1, Ordering::Relaxed);
+         }
+     }
+@@ -347,6 +348,7 @@ pub(crate) fn cpu_wrote(bytes: impl Fn() -> Option<Range<usize>>) {
+     };
+     for lazy in surfaces() {
+         if lazy.over(&bytes) {
++            lazy.plain.fetch_add(1, Ordering::Relaxed);
+             lazy.written.fetch_add(1, Ordering::Relaxed);
+         }
+     }
+@@ -360,6 +362,7 @@ pub(crate) fn guest_wrote(lazy: &Lazy) {
+     };
+     for other in surfaces() {
+         if !std::ptr::eq(Arc::as_ptr(&other), lazy) && other.over(pages) {
++            other.plain.fetch_add(1, Ordering::Relaxed);
+             other.written.fetch_add(1, Ordering::Relaxed);
+         }
+     }
+@@ -435,6 +438,40 @@ pub(crate) fn completing(id: u64) {
+     }
+ }
+ 
++/// Associate the records left by the ended encoder with its last recorded part.
++pub(crate) fn coherent_parts_recorded(id: u64, end: usize) {
++    if crate::shadow_coherent::surfaces_tracked() {
++        for lazy in surfaces() {
++            if let Some(coherent) = lazy.coherent() {
++                coherent.parts_recorded(id, end);
++            }
++        }
++    }
++}
++
++/// A batch's parts are complete; later parts of its command buffer may still be waiting.
++pub(crate) fn completing_parts(id: u64, parts: std::ops::Range<usize>) {
++    if crate::shadow_coherent::surfaces_tracked() {
++        for lazy in surfaces() {
++            if let Some(coherent) = lazy.coherent() {
++                coherent.completing_parts(id, parts.clone());
++            }
++        }
++    }
++}
++
++pub(crate) fn failed(id: u64) {
++    // Its batches will never be planned: it must not stay in `unplanned` (whose bound clears all).
++    planned(id);
++    if crate::shadow_coherent::surfaces_tracked() {
++        for lazy in surfaces() {
++            if let Some(coherent) = lazy.coherent() {
++                coherent.failed(id);
++            }
++        }
++    }
++}
++
+ /// Whether any surface is lazy, one atomic read: while none is, a commit does nothing here.
+ pub(crate) fn active() -> bool {
+     ANY.load(Ordering::Relaxed)
+@@ -475,6 +512,8 @@ pub(super) fn note_writes(uses: &[Use<ResourceKey>], id: u64, noted: &mut Noted)
+                 let count = lazy.written.fetch_add(1, Ordering::Relaxed) + 1;
+                 if lazy.note_beside(count, id, used) {
+                     noted.push((Arc::downgrade(&lazy), count));
++                } else {
++                    lazy.plain.fetch_add(1, Ordering::Relaxed);
+                 }
+             }
+         }
+@@ -926,6 +965,8 @@ struct Stood {
+     held: Option<[u32; 4]>,
+     stale: Option<[u32; 4]>,
+     written: u64,
++    /// [`Lazy::plain`] as the encoder left it.
++    plain: u64,
+     epoch: u64,
+ }
+ 
+@@ -1031,6 +1072,7 @@ struct BesideWrite {
+     /// open ([`parts_recorded`]).
+     part: usize,
+     area: Option<[u32; 4]>,
++    copied: bool,
+ }
+ 
+ const BESIDE_KEPT: usize = 256;
+@@ -1039,10 +1081,11 @@ const BESIDE_KEPT: usize = 256;
+ pub(crate) struct Lazy {
+     truth: OnceLock<(ResourceKey, Option<ResourceKey>, UseRange)>,
+     written: AtomicU64,
++    /// LOCAL (Atlas): the writes counted in [`Lazy::written`] that left no [`Beside`] entry
++    /// (CPU writes, remaps, writes it did not keep): an ordered take may not pass over them.
++    plain: AtomicU64,
+     /// LOCAL (Atlas): [`Beside`], of a trapping surface.
+     beside: Mutex<Beside>,
+-    /// LOCAL (Atlas): [`Lazy::written`] as the last standing taken found it.
+-    taken_written: AtomicU64,
+     stood: Mutex<Option<Stood>>,
+     resynced: Mutex<Instant>,
+     /// The [`Device`] its queue comes from.
+@@ -1087,8 +1130,8 @@ impl Lazy {
+             Arc::new(Lazy {
+                 truth: OnceLock::new(),
+                 written: AtomicU64::new(0),
++                plain: AtomicU64::new(0),
+                 beside: Mutex::default(),
+-                taken_written: AtomicU64::new(0),
+                 stood: Mutex::new(None),
+                 resynced: Mutex::new(Instant::now()),
+                 device: Arc::new(device.clone()),
+@@ -1426,6 +1469,7 @@ impl Lazy {
+             held,
+             stale,
+             written: self.written.load(Ordering::Relaxed),
++            plain: self.plain.load(Ordering::Relaxed),
+             epoch: EPOCH.load(Ordering::Relaxed),
+         });
+     }
+@@ -1443,7 +1487,8 @@ impl Lazy {
+     }
+ 
+     /// Where the image stands for an encoder that met `touched`, of a command buffer of identity
+-    /// `id`: `Some((held, stale))` where it needs no copy in (the module docs).
++    /// `id`: `Some((held, stale, deferred, written))` where it can reuse the standing (the
++    /// module docs). `written` belongs to this particular take, not to a shared last-take slot.
+     ///
+     /// LOCAL (Atlas): with `waited` (the command buffer waits for a shared event before this
+     /// encoder, `shadow::LateCopies`), a trapping surface's standing its own earlier encoder left
+@@ -1456,21 +1501,26 @@ impl Lazy {
+         id: u64,
+         touched: u64,
+         waited: bool,
+-    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
++    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>, bool, u64)> {
+         // Tracked from here: nothing its copy in reads can change unseen.
+         let coherent = self.coherent().filter(|coherent| coherent.tracks());
+         if coherent.is_none() {
+             self.seal_beside();
+         }
++        if let Some(coherent) = coherent.filter(|_| waited) {
++            coherent.late_noted(id);
++        }
+         let own = waited && coherent.is_some() && self.stood_by(id);
+-        let taken = self.take_standing(id, touched, coherent.is_some(), own);
++        let ordered = coherent.is_some_and(|coherent| coherent.needs_ordered_take(id));
++        let taken = self.take_standing(id, touched, coherent.is_some(), own, ordered);
++        let deferred = taken.is_some() && ordered;
+         match coherent {
+-            Some(_) if own => taken,
++            Some(_) if own || deferred => taken.map(|(held, stale, written)| (held, stale, deferred, written)),
+             Some(coherent) => {
+-                let stale = coherent.taking(taken.is_none());
+-                taken.map(|(held, was)| (held, bounding_stale(was, stale)))
++                let stale = coherent.taking(id, taken.is_none());
++                taken.map(|(held, was, written)| (held, bounding_stale(was, stale), false, written))
+             }
+-            None => taken,
++            None => taken.map(|(held, stale, written)| (held, stale, false, written)),
+         }
+     }
+ 
+@@ -1519,7 +1569,7 @@ impl Lazy {
+                 beside.lost = beside.lost.max(gone.count);
+             }
+         }
+-        beside.writes.push_back(BesideWrite { count, id, part: usize::MAX, area });
++        beside.writes.push_back(BesideWrite { count, id, part: usize::MAX, area, copied: false });
+         true
+     }
+ 
+@@ -1565,12 +1615,12 @@ impl Lazy {
+         if self.written.load(Ordering::Relaxed) == written {
+             return Vec::new();
+         }
+-        let beside = self.beside.lock().unwrap();
++        let mut beside = self.beside.lock().unwrap();
+         let mut unknown = beside.lost > written;
+         let (mut held, mut uncommitted) = (false, false);
+         let mut areas: Vec<[u32; 4]> = Vec::new();
+-        for write in beside.writes.iter().copied() {
+-            if write.count <= written || write.id == id {
++        for write in beside.writes.iter_mut() {
++            if write.count <= written || write.id == id || write.copied {
+                 continue;
+             }
+             match ordered(write.id, write.part) {
+@@ -1589,6 +1639,7 @@ impl Lazy {
+                 }
+             }
+             let area = write.area.unwrap_or_else(|| coherent.whole());
++            write.copied = true;
+             if !areas.contains(&area) {
+                 areas.push(area);
+             }
+@@ -1606,10 +1657,11 @@ impl Lazy {
+         areas
+     }
+ 
+-    /// LOCAL (Atlas): [`Lazy::written`] as the last standing taken found it, for its note
+-    /// (`shadow::LateCopies`).
+-    pub(super) fn taken_written(&self) -> u64 {
+-        self.taken_written.load(Ordering::Relaxed)
++    /// LOCAL (Atlas): every write of its bytes since `stood` was taken is kept in [`Beside`], for
++    /// a held batch's late copy in to take: none is a plain one, and none fell out of the list.
++    fn beside_covers(&self, stood: &Stood) -> bool {
++        stood.plain == self.plain.load(Ordering::Relaxed)
++            && self.beside.lock().unwrap().lost <= stood.written
+     }
+ 
+     /// Whether its standing is one an encoder of the command buffer `id` left.
+@@ -1623,7 +1675,8 @@ impl Lazy {
+         touched: u64,
+         tracked: bool,
+         own: bool,
+-    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
++        ordered: bool,
++    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>, u64)> {
+         report();
+         let Some(stood) = *self.stood.lock().unwrap() else {
+             REFUSED_BY[Refused::NoStanding as usize].fetch_add(1, Ordering::Relaxed);
+@@ -1631,7 +1684,9 @@ impl Lazy {
+         };
+         let refused = if stood.touched != touched {
+             Some(Refused::Touched)
+-        } else if stood.written != self.written.load(Ordering::Relaxed) {
++        } else if stood.written != self.written.load(Ordering::Relaxed)
++            && !(ordered && self.beside_covers(&stood))
++        {
+             Some(Refused::Written)
+         } else if stood.epoch != EPOCH.load(Ordering::Relaxed) {
+             Some(Refused::Epoch)
+@@ -1667,9 +1722,8 @@ impl Lazy {
+                 return None;
+             }
+         }
+-        self.taken_written.store(stood.written, Ordering::Relaxed);
+         TAKEN.fetch_add(1, Ordering::Relaxed);
+         self.taken.fetch_add(1, Ordering::Relaxed);
+-        Some((stood.held, stood.stale))
++        Some((stood.held, stood.stale, stood.written))
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/tests/exit_guard.rs b/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
+index d1867621..b3b929be 100644
+--- a/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/tests/exit_guard.rs
+@@ -5,7 +5,7 @@
+ //! it (Linux). Each test uses a guard of its own; only the fork tests use the process's, which
+ //! nothing here closes.
+ 
+-use crate::exit_guard::{self, hook, Busy, Call, Guard, InProcess, InProcessDevices};
++use crate::exit_guard::{self, hook, Busy, Call, CallBits, Guard, InProcess, InProcessDevices};
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{mpsc, Arc, Barrier, Mutex, Weak};
+ use std::time::{Duration, Instant};
+@@ -639,11 +639,11 @@ fn a_forked_child_s_exit_does_not_wait_for_its_parent_s_sections() {
+ /// Each entry point has a bit of its own.
+ #[test]
+ fn every_entry_point_has_a_bit_of_its_own() {
+-    let mut bits = 0_u128;
++    let mut bits = CallBits::EMPTY;
+     for &call in Call::ALL {
+         let bit = call.bit();
+         assert_eq!(bit.count_ones(), 1, "{call:?} has no bit of the word");
+-        assert_eq!(bits & bit, 0, "{call:?} shares a bit");
++        assert_eq!(bits & bit, CallBits::EMPTY, "{call:?} shares a bit");
+         bits |= bit;
+     }
+ }
+@@ -2090,6 +2090,7 @@ fn the_priming_check_names_what_was_not_made() {
+         SIZED_INDEX_BIND_CALLS, SPARSE_CALLS, TIMESTAMP_CALLS, UNPRIMED, YCBCR_CONVERSION_CALLS,
+     };
+     let has = |timestamps, device_addresses| Has {
++        host_image_copy: true,
+         timestamps,
+         host_query_reset: true,
+         device_addresses,
+@@ -2105,15 +2106,15 @@ fn the_priming_check_names_what_was_not_made() {
+         sized_index_bind: true,
+         ycbcr_conversion: true,
+     };
+-    let all = Call::ALL.iter().fold(0, |bits, call| bits | call.bit());
++    let all = Call::ALL.iter().fold(CallBits::EMPTY, |bits, call| bits | call.bit());
+     assert!(missing(all, has(true, true)).is_empty());
+     let made = Call::ALL
+         .iter()
+         .filter(|call| !UNPRIMED.contains(call))
+-        .fold(0, |bits, call| bits | call.bit());
++        .fold(CallBits::EMPTY, |bits, call| bits | call.bit());
+     assert!(missing(made, has(true, true)).is_empty());
+     assert_eq!(
+-        missing(0, has(true, true)).len(),
++        missing(CallBits::EMPTY, has(true, true)).len(),
+         Call::ALL.len() - UNPRIMED.len()
+     );
+     for &call in Call::ALL {
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 4e722b99..f8ac72a6 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2969,6 +2969,18 @@ impl Device {
+         // SAFETY: `raw` is a live image of this device.
+         let requirements = unsafe { raw_device.get_image_memory_requirements(raw) };
+         let mut requirements = shared.textures.placement().place(requirements);
++        // A trapping image may be invalidated by the host while other images occupy the same
++        // memory block. Reserve whole non-coherent atoms for it so that invalidating its entire
++        // placement never includes another placement's bytes. Vulkan limits the atom size to 256.
++        if host_reads && plan.usage.contains(ImageUsageFlags::HOST_TRANSFER) {
++            let Some(size) = requirements.size.checked_next_multiple_of(256) else {
++                // SAFETY: the image was just created and is not bound or in use.
++                unsafe { release::object(raw_device, raw) };
++                return Err(Error::OutOfMemory(MemoryKind::Device));
++            };
++            requirements.size = size;
++            requirements.alignment = requirements.alignment.max(256);
++        }
+         // Its host copies read and write through the host's mapping of its memory, which the
+         // host reads slowly where it does not cache it: such memory of the class where the
+         // device has it, else `Shared` memory's with unified memory
+diff --git a/crates/metal2vulkan-runtime/src/texture/host_copy.rs b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+index a5f6e1c8..e55672d5 100644
+--- a/crates/metal2vulkan-runtime/src/texture/host_copy.rs
++++ b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+@@ -62,7 +62,7 @@
+ use super::{Image, Owner};
+ use crate::device::lock;
+ use crate::error::{vulkan, Error};
+-use crate::exit_guard;
++use crate::exit_guard::{self, Call};
+ use ash::ext::host_image_copy::DeviceFn;
+ use ash::vk;
+ use metal2vulkan::error::RuntimeDriverDefect;
+@@ -166,6 +166,7 @@ pub(super) unsafe fn transition(
+             layer_count: vk::REMAINING_ARRAY_LAYERS,
+         });
+     // SAFETY: the caller's contract; the image is in `UNDEFINED`, which the move leaves.
++    if exit_guard::in_section() { exit_guard::called(Call::TransitionImageLayout); }
+     unsafe { (functions.transition_image_layout_ext)(device, 1, &transition) }
+         .result()
+         .map_err(vulkan)
+@@ -200,6 +201,7 @@ unsafe fn write(
+         .dst_image_layout(vk::ImageLayout::GENERAL)
+         .regions(&regions);
+     // SAFETY: the caller's contract.
++    if exit_guard::in_section() { exit_guard::called(Call::CopyMemoryToImage); }
+     unsafe { (functions.copy_memory_to_image_ext)(device, &info) }
+         .result()
+         .map_err(vulkan)
+@@ -307,6 +309,7 @@ impl Image {
+         to: *mut u8,
+         row: u32,
+     ) -> Result<bool, Error> {
++        let Some(_busy) = exit_guard::enter() else { return Ok(false); };
+         let shared = self.device.shared();
+         let Some(functions) = shared.host_copies.as_ref() else {
+             return Ok(false);
+@@ -346,6 +349,7 @@ impl Image {
+             .regions(std::slice::from_ref(&region));
+         // SAFETY: the caller's contract; the image is live and in `GENERAL` since it was made, and
+         // the lock keeps its own `VkImage` presented.
++        if exit_guard::in_section() { exit_guard::called(Call::CopyImageToMemory); }
+         unsafe { (functions.copy_image_to_memory_ext)(device, &info) }
+             .result()
+             .map_err(vulkan)?;
+@@ -412,6 +416,7 @@ impl Image {
+             .offset(start)
+             .size((end - start).next_multiple_of(atom));
+         // SAFETY: the memory is mapped whole for its life, and the range lies in the image's.
++        exit_guard::called(Call::InvalidateMappedMemoryRanges);
+         unsafe { shared.vk().invalidate_mapped_memory_ranges(&[range]) }.map_err(vulkan)
+     }
+ 
+@@ -447,6 +452,7 @@ impl Image {
+             .regions(std::slice::from_ref(&region));
+         // SAFETY: as `host_write`'s; the copy writes within `bytes`, which the caller sized to
+         // its layout.
++        if exit_guard::in_section() { exit_guard::called(Call::CopyImageToMemory); }
+         unsafe { (functions.copy_image_to_memory_ext)(device, &info) }
+             .result()
+             .map_err(vulkan)?;
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index ec44be05..693a9fd8 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -19,11 +19,10 @@ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor
+ use metal2vulkan_runtime::shadow_coherent::{self, Pages};
+ use metal2vulkan_runtime::shadow_lazy;
+ use metal2vulkan_runtime::{
+-    live, Buffer, CommandBuffer, CommandQueue, CpuCacheMode, Device, HazardTrackingMode,
+-    HostMemory, IoSurfacePlane, LoadAction, PipelineOptions, RenderPassDescriptor,
+-    RenderPipelineState, ResourceOptions, ScissorRect, SharedEvent, SharedEventListener,
+-    StorageMode, StoreAction, Texture,
+-    TextureDescriptor,
++    live, BlitOption, Buffer, CommandBuffer, CommandQueue, CpuCacheMode, Device,
++    HazardTrackingMode, HostMemory, IoSurfacePlane, LoadAction, Origin, PipelineOptions, Region,
++    RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, SharedEvent,
++    SharedEventListener, Size, StorageMode, StoreAction, Texture, TextureDescriptor,
+ };
+ use std::collections::BTreeMap;
+ use std::sync::{Arc, Mutex};
+@@ -2221,7 +2220,6 @@ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part_e
+ /// buffer of the same queue, over the surface, is committed after the write and before the
+ /// signal.
+ #[test]
+-#[ignore = "fails on f17fa833: write lost, fix pending (lane A)"]
+ fn surface_coherent_a_cpu_write_reaches_a_held_batch_past_a_later_command_buffer_of_its_queue() {
+     on_surface(true, |case| {
+         case.draw(RED, None);
+@@ -2247,3 +2245,358 @@ fn surface_coherent_a_cpu_write_reaches_a_held_batch_past_a_later_command_buffer
+     });
+ }
+ 
++/// A GPU write through another import invalidates the standing before a later command buffer
++/// of the held batch's queue is encoded. Both writes precede the held batch's signal.
++#[test]
++fn surface_coherent_a_cpu_write_reaches_a_held_batch_when_the_later_standing_was_invalidated() {
++    on_surface(true, |case| {
++        let other_buffer = case.other_import();
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        case.write(9, 100, [1, 2, 3, 4]);
++        let other = case.device.new_command_queue().unwrap();
++        let writer = other.command_buffer().unwrap();
++        let source = staged(case.device, &[9u8, 8, 7, 6]);
++        let mut blit = writer.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&source, 0, &other_buffer, 200 * ROW + 9 * 4, 4).unwrap();
++        blit.end_encoding().unwrap();
++        writer.commit().unwrap();
++        writer.wait_until_completed_for(SOON).unwrap();
++        let after = case.queue.command_buffer().unwrap();
++        case.pass(&after, GREEN, scissor(0, 7, 64, 1));
++        after.commit().unwrap();
++        hold.set_signaled_value(1);
++        waiting.wait_until_completed_for(SOON).unwrap();
++        after.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "CPU write under the blend");
++        assert_eq!(case.read(9, 200), [9, 8, 7, 0], "other import under the blend");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the later draw");
++    });
++}
++
++/// Another import must reach a held blend even when no guest CPU write opened the pages.
++#[test]
++fn surface_coherent_a_gpu_write_reaches_a_held_batch_past_a_later_command_buffer() {
++    on_surface(true, |case| {
++        let other_buffer = case.other_import();
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let writer = other.command_buffer().unwrap();
++        let source = staged(case.device, &[9u8, 8, 7, 6]);
++        let mut blit = writer.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&source, 0, &other_buffer, 200 * ROW + 9 * 4, 4).unwrap();
++        blit.end_encoding().unwrap();
++        writer.commit().unwrap();
++        writer.wait_until_completed_for(SOON).unwrap();
++        let after = case.queue.command_buffer().unwrap();
++        case.pass(&after, GREEN, scissor(0, 7, 64, 1));
++        after.commit().unwrap();
++        hold.set_signaled_value(1);
++        waiting.wait_until_completed_for(SOON).unwrap();
++        after.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(9, 200), [9, 8, 7, 0], "import write under the blend");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "untouched blend");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "later draw");
++    });
++}
++
++/// Two CPU writes before the signal must both reach the held blend.
++#[test]
++fn surface_coherent_two_cpu_writes_reach_a_held_batch_past_a_later_command_buffer() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        case.write(9, 100, [1, 2, 3, 4]);
++        let after = case.queue.command_buffer().unwrap();
++        case.pass(&after, GREEN, scissor(0, 7, 64, 1));
++        after.commit().unwrap();
++        case.write(10, 100, [5, 6, 7, 8]);
++        hold.set_signaled_value(1);
++        waiting.wait_until_completed_for(SOON).unwrap();
++        after.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "first CPU write under the blend");
++        assert_eq!(case.read(10, 100), [5, 6, 7, 0], "second CPU write under the blend");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "later draw");
++    });
++}
++
++/// The event separates the GPU write from a CPU write that restores its original value.
++#[test]
++fn surface_coherent_a_cpu_write_restoring_the_old_value_after_a_gpu_signal_is_visible() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_hold_s", Some("0"));
++        live::set("surface_coherent_demote", Some("0"));
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let old = [1, 2, 3, 4];
++        case.write(9, 100, old);
++        let signal = case.device.new_shared_event().unwrap();
++        let hold = case.device.new_shared_event().unwrap();
++        let command = case.queue.command_buffer().unwrap();
++        let deferred = shadow_lazy::ahead_counts().deferred;
++        case.pass(&command, GREEN, scissor(9, 100, 1, 1));
++        assert!(shadow_lazy::ahead_counts().deferred > deferred, "GPU write must stay in the shadow");
++        command.encode_signal_event((&signal).into(), 1).unwrap();
++        blend_after(&case, &command, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        command.commit().unwrap();
++        assert!(signal.wait_until_signaled_value(1, SOON), "GPU write reached the signal");
++        case.write(9, 100, old);
++        hold.set_signaled_value(1);
++        command.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the later CPU write under the blend");
++    });
++}
++
++/// The bytes at `at` of a `Shared` buffer no command uses now.
++fn shared_texel(buffer: &Buffer, at: usize) -> [u8; 4] {
++    // SAFETY: a `Shared` buffer of at least `at + 4` bytes, no command using it.
++    let bytes = unsafe { std::slice::from_raw_parts(buffer.contents().unwrap().as_ptr(), at + 4) };
++    bytes[at..at + 4].try_into().unwrap()
++}
++
++/// A held batch whose encoder left no record: a CPU write just before it, within the hold, makes
++/// the surface keep and merge instead of deferring (`Coherent::wants_merge`; else
++/// `Fallback::DeferWrote`), so the blend copies back as it goes. A
++/// second CPU write made while the batch waits, then a later command buffer of its queue over
++/// another row, committed before the signal: the blend sees both writes, under it, not lost to
++/// the eager copy back or to the later command buffer's take.
++#[test]
++fn surface_coherent_a_cpu_write_reaches_a_held_batch_whose_blend_left_no_record() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        case.write(9, 100, [1, 2, 3, 4]);
++        let defers = case.count("defers");
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        let records = case.count("defers") - defers;
++        case.write(9, 101, [5, 6, 7, 8]);
++        let after = case.queue.command_buffer().unwrap();
++        case.pass(&after, GREEN, scissor(8, 7, 1, 1));
++        after.commit().unwrap();
++        hold.set_signaled_value(1);
++        for command_buffer in [&waiting, &after] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        eprintln!(
++            "NO-RECORD records {records} (9,100)={:?} (9,101)={:?} (8,7)={:?}",
++            case.read(9, 100),
++            case.read(9, 101),
++            case.read(8, 7)
++        );
++        assert_eq!(records, 0, "the write within the hold left the blend no record");
++        assert_eq!(case.read(9, 101), [5, 6, 7, 0], "the write while held, under the blend");
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the write before, under the blend");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "the older texels, blended");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the later draw");
++    });
++}
++
++/// A done record whose rectangle bounds texels it never wrote: one encoder on another queue
++/// draws at (0,100) and (20,100), the CPU wrote (9,100) before. A held command buffer of that
++/// queue keeps a record of its own running, so the next take on the first queue (a draw at
++/// (8,7)) syncs the done record while another batch is held: its copy back of the rectangle must
++/// not put the image's older bytes over the CPU write between the two draws.
++#[test]
++fn surface_coherent_a_cpu_write_survives_a_done_record_synced_by_a_later_take() {
++    on_surface(true, |case| {
++        // Defer at once, a CPU write just before or not: the draws leave records.
++        live::set("surface_coherent_hold_s", Some("0"));
++        live::set("surface_coherent_demote", Some("0"));
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        case.write(9, 100, [1, 2, 3, 4]);
++        let other = case.device.new_command_queue().unwrap();
++        let green = staged(case.device, &floats4(GREEN));
++        let two = other.command_buffer().unwrap();
++        let mut descriptor = RenderPassDescriptor::new();
++        let attachment = &mut descriptor.color_attachments[0];
++        attachment.texture = case.texture.clone();
++        attachment.load_action = LoadAction::Load;
++        attachment.store_action = StoreAction::Store;
++        let mut encoder = two.render_command_encoder(&descriptor).unwrap();
++        encoder.set_render_pipeline_state(&case.opaque).unwrap();
++        encoder.set_fragment_buffer(Some(&green), 0, 0).unwrap();
++        encoder.set_vertex_buffer(Some(&case.rect), 0, 0).unwrap();
++        for x in [0, 20] {
++            encoder.set_scissor_rect(ScissorRect { x, y: 100, width: 1, height: 1 }).unwrap();
++            encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0).unwrap();
++        }
++        encoder.end_encoding().unwrap();
++        two.commit().unwrap();
++        two.wait_until_completed_for(SOON).unwrap();
++        let gate = case.device.new_shared_event().unwrap();
++        let held = other.command_buffer().unwrap();
++        held.encode_wait_for_event((&gate).into(), 1).unwrap();
++        case.pass(&held, GREEN, scissor(0, 200, 16, 1));
++        held.commit().unwrap();
++        let later = case.queue.command_buffer().unwrap();
++        case.pass(&later, GREEN, scissor(8, 7, 1, 1));
++        later.commit().unwrap();
++        gate.set_signaled_value(1);
++        for command_buffer in [&held, &later] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        eprintln!(
++            "DONE-RECORD (9,100)={:?} behind={:?} (0,100)={:?} (20,100)={:?}",
++            case.read(9, 100),
++            case.behind(9, 100),
++            case.read(0, 100),
++            case.read(20, 100)
++        );
++        assert_eq!(case.read(9, 100), [1, 2, 3, 4], "the CPU write between the two draws");
++        assert_eq!(case.read(0, 100), GREEN_TEXEL, "the first draw");
++        assert_eq!(case.read(20, 100), GREEN_TEXEL, "the second draw");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the later take's draw");
++        assert_eq!(case.read(9, 200), GREEN_TEXEL, "the held draw");
++    });
++}
++
++/// A read through another import, on another queue, of a texel a draw of that queue wrote just
++/// before, while a batch of the first queue is held for an event with a blend over the surface:
++/// nothing waits for the held batch, so the read completes before the signal and sees the draw.
++/// The planned write's copy back must not wait behind, or be lost to, the held record.
++#[test]
++fn surface_coherent_an_import_read_past_a_held_batch_sees_a_planned_write() {
++    on_surface(true, |case| {
++        let other_buffer = case.other_import();
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, None);
++        waiting.commit().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let drawn = other.command_buffer().unwrap();
++        case.pass(&drawn, GREEN, scissor(0, 7, 1, 1));
++        let staging = case.device.new_buffer(4, ResourceOptions::shared()).unwrap();
++        let reader = other.command_buffer().unwrap();
++        let mut blit = reader.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&other_buffer, 7 * ROW, &staging, 0, 4).unwrap();
++        blit.end_encoding().unwrap();
++        drawn.commit().unwrap();
++        reader.commit().unwrap();
++        let before_signal = reader.wait_until_completed_for(SOON).is_ok();
++        let read = shared_texel(&staging, 0);
++        hold.set_signaled_value(1);
++        for command_buffer in [&drawn, &reader, &waiting] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        eprintln!("IMPORT-READ before_signal={before_signal} staging={read:?}");
++        assert!(before_signal, "the read waits for nothing held");
++        assert_eq!(read, GREEN_TEXEL, "the read saw the draw before it on its queue");
++        assert_eq!(case.read(0, 7), [0, 255, 0, 0], "the blend after the signal, over the draw");
++        assert_eq!(case.read(1, 7), [0, 0, 255, 0], "the older texels, blended");
++    });
++}
++
++/// A held batch's blend has a record running; then the standing is refused for a reason other
++/// than a write (`shadow_lazy`'s `EPOCH` moved: a CPU upload into an unrelated texture, the
++/// switch `surface_lazy_scoped` off), with a CPU write open. The next encoder of the queue copies
++/// in the whole surface: it must neither wait out the held record (a bounded wait of ~50 ms)
++/// nor lose the blend or the CPU write (the guest area kept for the held batch, `held_guest`).
++#[test]
++fn surface_coherent_a_refused_standing_past_a_held_batch_keeps_its_blend() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        case.write(9, 100, [1, 2, 3, 4]);
++        // Refuse the standing by the epoch: an upload into a texture over no surface, unscoped.
++        let unrelated = case
++            .device
++            .new_texture(&TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, 4, 4, false))
++            .unwrap();
++        live::set("surface_lazy_scoped", None);
++        unrelated.replace_region(Region::new_2d(0, 0, 1, 1), 0, 0, &[7u8; 4], 4, 0).unwrap();
++        live::set("surface_lazy_scoped", Some("1"));
++        let green = staged(case.device, &floats4(GREEN));
++        let rects = std::slice::from_ref(&case.rect);
++        let after = case.queue.command_buffer().unwrap();
++        let start = Instant::now();
++        pass(&after, case.texture(), &case.opaque, rects, &green, scissor(0, 7, 64, 1));
++        after.commit().unwrap();
++        let spent = start.elapsed();
++        hold.set_signaled_value(1);
++        for command_buffer in [&waiting, &after] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        eprintln!(
++            "REFUSED-PAST-HELD spent={spent:?} (9,100)={:?} (0,100)={:?} (8,7)={:?} report {}",
++            case.read(9, 100),
++            case.read(0, 100),
++            case.read(8, 7),
++            shadow_coherent::report("refused")
++        );
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the CPU write, under the blend");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "the held blend");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the later draw");
++        assert!(spent < Duration::from_millis(25), "the later encoder waited {spent:?}");
++    });
++}
++
++/// A take is ordered (`Coherent::needs_ordered_take`) while a batch of another queue is held with
++/// a record over the surface: the standing is taken though a write came since, and its copy in
++/// is left to the batch. A CPU write made after that held batch was committed, then a command
++/// buffer of the first queue whose encoder (a blit of the texture) reuses the standing: what it
++/// reads holds the CPU write, which Metal shows to any command buffer committed after it.
++#[test]
++fn surface_coherent_a_cpu_write_after_a_standing_is_not_hidden_by_an_ordered_take() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let waiting = other.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        case.write(9, 7, [1, 2, 3, 4]);
++        let staging = case.device.new_buffer(4, ResourceOptions::shared()).unwrap();
++        let reader = case.queue.command_buffer().unwrap();
++        let mut blit = reader.blit_command_encoder().unwrap();
++        blit.copy_from_texture_to_buffer(
++            case.texture(),
++            0,
++            0,
++            Origin::new(9, 7, 0),
++            Size::new(1, 1, 1),
++            &staging,
++            0,
++            4,
++            4,
++            BlitOption::None,
++        )
++        .unwrap();
++        blit.end_encoding().unwrap();
++        reader.commit().unwrap();
++        let before_signal = reader.wait_until_completed_for(SOON).is_ok();
++        let read = shared_texel(&staging, 0);
++        hold.set_signaled_value(1);
++        for command_buffer in [&reader, &waiting] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        eprintln!("ORDERED-TAKE before_signal={before_signal} staging={read:?}");
++        assert!(before_signal, "the read waits for nothing held");
++        assert_eq!(read, [1, 2, 3, 4], "the CPU write, in what the blit read");
++        assert_eq!(case.read(9, 7), [1, 2, 3, 4], "the CPU write, in the pages");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "the held blend");
++    });
++}

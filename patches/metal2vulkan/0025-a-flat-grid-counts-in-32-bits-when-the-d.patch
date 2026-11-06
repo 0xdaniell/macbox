@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 08:43:11 +0000
+Subject: [PATCH 25/34] a flat grid counts in 32 bits when the
+ dispatch fits
+
+The flat variant's invocation index and its divisions by the grid were 64-bit for every
+dispatch. Intel GPUs have no 64-bit integer divider, so each of the six 64-bit div/mod became
+a long software sequence per invocation. The Simulator's masked blit (SimStreamProcessorObjects
+blit_texture_to_texture_with_mask, 1206 x 2622 in 32 x 32 threadgroups, one per frame) spent
+about 3.6 of its 4.9 ms there on Arrow Lake.
+
+Now a dispatch-uniform test (nx*ny*nz*N <= 2^32, each product checked before the next can
+wrap) selects a 32-bit arm; past it the previous 64-bit arm runs unchanged. Lab on ARL
+(Mesa 26.2.4): the captured kernel 4.85 -> 1.13 ms, Apple's metallib through the runtime
+p50 5.0-5.6 -> 1.6-2.0 ms with byte-identical outputs.
+
+New lane: a ragged direct dispatch (the 1206 x 2622 screen, 3-D grids) runs on the flat
+variant and each thread runs once at its own position, checked against a CPU expectation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 9dbcffd80ced40c59040562a792145df7fa92cce)
+---
+ .../src/runtime_lane/indirect_dispatches.rs   |  58 +++++++++
+ crates/metal2vulkan/src/lower/dispatch.rs     | 112 +++++++++++++-----
+ 2 files changed, 140 insertions(+), 30 deletions(-)
+
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/indirect_dispatches.rs b/crates/metal2vulkan-validation/src/runtime_lane/indirect_dispatches.rs
+index 403185c5..49fcfac2 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/indirect_dispatches.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/indirect_dispatches.rs
+@@ -707,3 +707,61 @@ fn an_indirect_threadgroup_dispatch_runs_on_the_gpu() {
+         );
+     });
+ }
++
++/// A direct `dispatchThreads:` of a ragged grid runs on the flat variant (one dispatch, no split)
++/// and each of Metal's threads runs once, at its own position: the Simulator's 1206 x 2622 screen
++/// in 32 x 32 threadgroups (its masked blit's dispatch, 3.16 M threads, the flat count's 32-bit
++/// form), and ragged 3-D grids. The expectation is computed here, not by another dispatch.
++#[test]
++fn a_ragged_direct_dispatch_runs_each_thread_once_on_the_flat_variant() {
++    on_device(|device, messages| {
++        let kernel = flat_state(device);
++        for (grid, group) in [
++            ([1206u32, 2622, 1], [32u32, 32, 1]),
++            ([1206, 2622, 1], [32, 8, 1]),
++            ([37, 19, 5], [4, 4, 2]),
++            ([1000, 3, 2], [64, 1, 1]),
++        ] {
++            let slots = u64::from(grid[0] * grid[1] * grid[2]);
++            let params = buffer_with(device, &bytes(&[1000])).unwrap();
++            let out = buffer_with(device, &vec![0; slots as usize * 4]).unwrap();
++            let queue = device.new_command_queue().unwrap();
++            let command_buffer = queue.command_buffer().unwrap();
++            let mut encoder = command_buffer.compute_command_encoder().unwrap();
++            encoder.set_compute_pipeline_state(&kernel).unwrap();
++            encoder.set_buffer(Some(&params), 0, 0).unwrap();
++            encoder.set_buffer(Some(&out), 0, 1).unwrap();
++            encoder.dispatch_threads(size(grid), size(group)).unwrap();
++            encoder.end_encoding().unwrap();
++            complete(&command_buffer, &format!("ragged {grid:?} {group:?}"));
++            let flat = command_buffer
++                .executions()
++                .iter()
++                .any(|execution| match execution.pipeline() {
++                    ExecutedPipeline::Compute(pipeline) => pipeline
++                        .dependencies
++                        .iter()
++                        .any(|dependency| dependency.fact == RuntimeFact::FlatGrid),
++                    ExecutedPipeline::Render(_) => false,
++                });
++            assert!(flat, "{grid:?} {group:?}: not on the flat variant");
++            let words = read_buffer(&out, 0, slots * 4).unwrap();
++            let [gx, gy, gz] = grid;
++            let common = 1000 + 11 * gx + 13 * gy + 17 * gz;
++            let mut wrong = 0u64;
++            let mut first = None;
++            for (i, w) in words.as_chunks::<4>().0.iter().enumerate() {
++                let i = i as u32;
++                let (x, y, z) = (i % gx, (i / gx) % gy, i / (gx * gy));
++                let want = common + 3 * x + 5 * y + 7 * z;
++                let got = u32::from_le_bytes(*w);
++                if got != want {
++                    wrong += 1;
++                    first.get_or_insert((x, y, z, got, want));
++                }
++            }
++            assert_eq!(wrong, 0, "{grid:?} {group:?}: first wrong {first:?}");
++        }
++        let _ = messages.take_notices();
++    });
++}
+diff --git a/crates/metal2vulkan/src/lower/dispatch.rs b/crates/metal2vulkan/src/lower/dispatch.rs
+index e4161ffe..6a89003d 100644
+--- a/crates/metal2vulkan/src/lower/dispatch.rs
++++ b/crates/metal2vulkan/src/lower/dispatch.rs
+@@ -1267,8 +1267,15 @@ impl KernelDecl {
+     /// A flat grid's thread position in the grid (a `uvec3`) and whether the invocation is inside
+     /// the grid: its index `((wz · ny + wy) · nx + wx) · N + LocalInvocationIndex` over the
+     /// dispatch, with `N = sx·sy·sz`, counted over `threads_per_grid` (`region[1].xyz`) `x`
+-    /// fastest, all in 64 bits. Inside the grid each axis's position is below its size, so it fits
+-    /// its `u32`; past it the position is unused.
++    /// fastest. Inside the grid each axis's position is below its size, so it fits its `u32`;
++    /// past it the position is unused.
++    ///
++    /// The count is exact in 32 bits when the dispatch has at most 2^32 invocations
++    /// (`nx · ny · nz · N <= 2^32`, so every index is below 2^32): then the index and its
++    /// divisions are 32-bit; otherwise 64-bit. The test reads only dispatch-uniform values, so
++    /// every invocation takes the same arm. Devices without a 64-bit divider (Intel's) lower each
++    /// 64-bit division to a long software sequence: on Arrow Lake the Simulator's 1206 x 2622
++    /// masked blit ran 4.85 ms with the 64-bit form and 1.13 ms with the 32-bit one.
+     fn flat(
+         &self,
+         fb: &mut FunctionBuilder<'_>,
+@@ -1278,42 +1285,87 @@ impl KernelDecl {
+             width: 64,
+             signed: false,
+         })?;
+-        let wide = |fb: &mut FunctionBuilder<'_>, v: SValue, axis: u32| -> BResult<SValue> {
+-            let x = fb.composite_extract(v, &[axis])?;
+-            fb.convert(ConvOp::UConvert, x, u64_)
+-        };
++        let u32_ = fb.module().ty(Type::Int {
++            width: 32,
++            signed: false,
++        })?;
+         let wg = self.load(fb, self.workgroup_id)?;
+         let groups = self.load(fb, self.num_workgroups)?;
+         let lin = self.load(fb, self.local_index)?;
+-        let lin = fb.convert(ConvOp::UConvert, lin, u64_)?;
+         let s = self.size3(fb)?;
+         let n = Self::volume(fb, s)?;
+-        let n = fb.convert(ConvOp::UConvert, n, u64_)?;
+-        let [wx, wy, wz] = [wide(fb, wg, 0)?, wide(fb, wg, 1)?, wide(fb, wg, 2)?];
+-        let [nx, ny] = [wide(fb, groups, 0)?, wide(fb, groups, 1)?];
+-        let group = fb.binary(BinOp::IMul, wz, ny)?;
+-        let group = fb.binary(BinOp::IAdd, group, wy)?;
+-        let group = fb.binary(BinOp::IMul, group, nx)?;
+-        let group = fb.binary(BinOp::IAdd, group, wx)?;
+-        let first = fb.binary(BinOp::IMul, group, n)?;
+-        let index = fb.binary(BinOp::IAdd, first, lin)?;
+         let r = region(fb)?;
+         let grid = fb.composite_extract(r, &[1])?;
+-        let [gx, gy, gz] = [wide(fb, grid, 0)?, wide(fb, grid, 1)?, wide(fb, grid, 2)?];
+-        let x = fb.binary(BinOp::UMod, index, gx)?;
+-        let row = fb.binary(BinOp::UDiv, index, gx)?;
+-        let y = fb.binary(BinOp::UMod, row, gy)?;
+-        let z = fb.binary(BinOp::UDiv, row, gy)?;
+-        let inside = fb.binary(BinOp::ULessThan, z, gz)?;
+-        let u32_ = fb.module().ty(Type::Int {
+-            width: 32,
+-            signed: false,
++        let part = |fb: &mut FunctionBuilder<'_>, v: SValue| -> BResult<[SValue; 3]> {
++            Ok([
++                fb.composite_extract(v, &[0])?,
++                fb.composite_extract(v, &[1])?,
++                fb.composite_extract(v, &[2])?,
++            ])
++        };
++        let [wx, wy, wz] = part(fb, wg)?;
++        let [nx, ny, nz] = part(fb, groups)?;
++        let [gx, gy, gz] = part(fb, grid)?;
++        // Whether every invocation's index fits in 32 bits: `a = nx·ny`, `b = a·nz`, `c = b·N`
++        // in 64 bits, each at most 2^32. While `a` and `b` are, the next product cannot wrap
++        // (`nz`, `N` < 2^32); a product past a failed test is not read.
++        let w = |fb: &mut FunctionBuilder<'_>, v: SValue| fb.convert(ConvOp::UConvert, v, u64_);
++        let limit = fb.module().constant(Constant::Scalar {
++            ty: u64_,
++            bits: ConstBits(1 << 32),
+         })?;
+-        let mut axes = [x, y, z];
+-        for a in &mut axes {
+-            *a = fb.convert(ConvOp::UConvert, *a, u32_)?;
+-        }
+-        let pos = fb.composite_construct(self.uvec3, &axes)?;
++        let limit = fb.module().const_value(limit)?;
++        let (nx64, ny64, nz64, n64) = (w(fb, nx)?, w(fb, ny)?, w(fb, nz)?, w(fb, n)?);
++        let a = fb.binary(BinOp::IMul, nx64, ny64)?;
++        let b = fb.binary(BinOp::IMul, a, nz64)?;
++        let c = fb.binary(BinOp::IMul, b, n64)?;
++        let fa = fb.binary(BinOp::ULessThanEqual, a, limit)?;
++        let fbb = fb.binary(BinOp::ULessThanEqual, b, limit)?;
++        let fc = fb.binary(BinOp::ULessThanEqual, c, limit)?;
++        let fits = fb.binary(BinOp::LogicalAnd, fa, fbb)?;
++        let fits = fb.binary(BinOp::LogicalAnd, fits, fc)?;
++        let narrow: ArmFn<'_, ()> = Box::new(move |fb, _| {
++            let group = fb.binary(BinOp::IMul, wz, ny)?;
++            let group = fb.binary(BinOp::IAdd, group, wy)?;
++            let group = fb.binary(BinOp::IMul, group, nx)?;
++            let group = fb.binary(BinOp::IAdd, group, wx)?;
++            let first = fb.binary(BinOp::IMul, group, n)?;
++            let index = fb.binary(BinOp::IAdd, first, lin)?;
++            let x = fb.binary(BinOp::UMod, index, gx)?;
++            let row = fb.binary(BinOp::UDiv, index, gx)?;
++            let y = fb.binary(BinOp::UMod, row, gy)?;
++            let z = fb.binary(BinOp::UDiv, row, gy)?;
++            let inside = fb.binary(BinOp::ULessThan, z, gz)?;
++            Ok(ArmEnd::FallThrough(vec![x, y, z, inside]))
++        });
++        let wide: ArmFn<'_, ()> = Box::new(move |fb, _| {
++            let w = |fb: &mut FunctionBuilder<'_>, v: SValue| fb.convert(ConvOp::UConvert, v, u64_);
++            let (wx, wy, wz) = (w(fb, wx)?, w(fb, wy)?, w(fb, wz)?);
++            let (nx, ny, n, lin) = (w(fb, nx)?, w(fb, ny)?, w(fb, n)?, w(fb, lin)?);
++            let (gx, gy, gz) = (w(fb, gx)?, w(fb, gy)?, w(fb, gz)?);
++            let group = fb.binary(BinOp::IMul, wz, ny)?;
++            let group = fb.binary(BinOp::IAdd, group, wy)?;
++            let group = fb.binary(BinOp::IMul, group, nx)?;
++            let group = fb.binary(BinOp::IAdd, group, wx)?;
++            let first = fb.binary(BinOp::IMul, group, n)?;
++            let index = fb.binary(BinOp::IAdd, first, lin)?;
++            let x = fb.binary(BinOp::UMod, index, gx)?;
++            let row = fb.binary(BinOp::UDiv, index, gx)?;
++            let y = fb.binary(BinOp::UMod, row, gy)?;
++            let z = fb.binary(BinOp::UDiv, row, gy)?;
++            let inside = fb.binary(BinOp::ULessThan, z, gz)?;
++            let x = fb.convert(ConvOp::UConvert, x, u32_)?;
++            let y = fb.convert(ConvOp::UConvert, y, u32_)?;
++            let z = fb.convert(ConvOp::UConvert, z, u32_)?;
++            Ok(ArmEnd::FallThrough(vec![x, y, z, inside]))
++        });
++        let merged = fb.if_(&mut (), fits, narrow, Some(wide))?.0;
++        let [x, y, z, inside] = merged[..] else {
++            return Err(crate::spirv::error::BuildError::Dangling(
++                crate::spirv::error::Dangling::Value(SValue::new(u32::MAX)),
++            ));
++        };
++        let pos = fb.composite_construct(self.uvec3, &[x, y, z])?;
+         Ok((pos, inside))
+     }
+ 

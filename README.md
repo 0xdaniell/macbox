@@ -9,11 +9,10 @@ own. One command, `macbox`, sets it up and runs it.
 **Website and guides:** [tuna-nope.github.io/macbox](https://tuna-nope.github.io/macbox/): macOS, Xcode and
 the iOS Simulator on Linux, Expo apps, the GPU path, and AI coding agents with T3 Code.
 
-![The macOS desktop in macbox, with two iOS 26.5 Simulators: a Liquid Glass benchmark at 1x and Safari](docs/images/hero.jpg)
+![The macOS 26 desktop in macbox on Linux: Simulator.app shows an iPhone 17 Pro running Nimbus, a weather app, next to Nimbus's website in Safari](docs/images/hero.jpg)
 
-<sub>macOS 26 Tahoe's desktop in macbox on an Intel iGPU, with two of its iOS 26.5 Simulators in front
-(their screens composited onto the desktop's screenshot): GlassBench, a Liquid Glass load, and
-Safari.</sub>
+<sub>macOS 26 Tahoe's desktop in macbox on an Intel iGPU, captured as it is: Simulator.app with an
+iPhone 17 Pro on iOS 26.5 running Nimbus, a weather app, beside its website in Safari.</sub>
 
 ```
 Linux host (KVM + a Vulkan GPU + Docker)
@@ -28,8 +27,8 @@ Linux host (KVM + a Vulkan GPU + Docker)
 - **macOS draws on your GPU.** [Reims vGPU](https://github.com/steelbrain/reims-vgpu) gives QEMU
   Apple's paravirtual GPU, and macOS's own driver talks to it, so Metal works with no guest
   driver. [metal2vulkan](https://github.com/steelbrain/metal2vulkan) runs Metal's work on Vulkan.
-  macbox builds both, with patches that roughly doubled the iOS Simulator's frame rate on the
-  GPU it was measured on (see [Performance](#performance)).
+  macbox builds both, with patches that took a 3x iOS Simulator from 17 to 50 fps on the GPU it
+  was measured on, and to 70 with the experimental Coherent switch (see [Performance](#performance)).
 - **The screen** opens in a window on your Linux desktop, or in a browser tab (Selkies: H.264 on
   the GPU, its bitrate following the link). Agents can see it and click and type into it
   (`macbox screenshot`, `click`, `type`), so an agent can drive the macOS installer too.
@@ -91,19 +90,32 @@ floating glass toolbar, counted at the simulator's own screen (frames per second
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/fps-dark.svg">
-  <img alt="iOS Simulator frame rate, Liquid Glass benchmark: 1x 53.5 to 94.2 fps, 2x 33.5 to 64.2, 3x 17.2 to 39.0, Reims as upstream shipped it vs the macbox build" src="docs/images/fps-light.svg" width="760">
+  <img alt="iOS Simulator at 3x, Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 with the cohwl build, 70.0 with Coherent on" src="docs/images/fps-light.svg" width="760">
 </picture>
 
-| | Reims 2ce3209, as upstream shipped it on 2026-10-26 | macbox build |
-|---|---|---|
-| iOS Simulator 1x (402x874), glass | 53.5 | **95.8 / 92.5** |
-| iOS Simulator 2x (804x1748), glass | 33.5 | **67.8 / 60.5** |
-| iOS Simulator 3x (1206x2622, an iPhone's pixels), glass | 17.2 | **38.5 / 39.5** |
-| Safari at 3x, a page with a blurred floating bar | n/a | 66.4 / 64.2 |
-| macOS desktop, Genie minimize at 3440x1440 (frames per animation) | ~12 | 19.5 |
+| iOS Simulator at 3x (1206x2622, an iPhone's pixels), glass | fps |
+|---|---|
+| Reims 2ce3209, as upstream shipped it on 2026-10-26 | 17.2 |
+| macbox, 2026-10-28: rendering guest-RAM textures in place | 38.5 / 39.5 |
+| **macbox build now** (cohwl, 2026-11-05) | **50.6** (p95 21 ms) |
+| macbox build with `MACBOX_COHERENT=on` (experimental) | **70.0** (p95 18 ms) |
 
-The GPU is the limit: a 3x simulator keeps this iGPU 96 to 98% busy. On a faster GPU every number
-moves up. [docs/performance.md](docs/performance.md) has what the patches do, the method, what
+| | Reims 2ce3209 | macbox, 2026-10-28 | macbox now, Coherent on |
+|---|---|---|---|
+| iOS Simulator 1x (402x874), glass | 53.5 | 95.8 / 92.5 | not measured yet |
+| iOS Simulator 2x (804x1748), glass | 33.5 | 67.8 / 60.5 | not measured yet |
+| macOS desktop, dragging a window (presents/s) | | 105 (Coherent off) | 130 |
+| macOS desktop, Safari scrolling (presents/s) | | 75–79 (Coherent off) | 110 |
+| macOS desktop, Genie minimize at 3440x1440 (frames per animation) | ~12 | 19.5 | 29.5 / 30.5 |
+
+Coherent keeps the GPU's image of the simulator's and the desktop's surfaces ahead of guest RAM,
+and syncs a page only when the guest's CPU touches it: the copies that were left are gone, and the
+GPU drops from 97% to 70% busy at 3x. It is off by default for now: it hung the GPU once on its
+first day of daily use (the next boot came up without it, as designed), and the cause isn't
+settled. [docs/performance.md](docs/performance.md#coherent-experimental-off-by-default) has the details.
+
+The GPU is the limit: without Coherent a 3x simulator keeps this iGPU 96 to 98% busy. On a faster
+GPU every number moves up. [docs/performance.md](docs/performance.md) has what the patches do, the method, what
 didn't help, and the known limits (an idle macOS display gets no vblank from its driver, so an
 animation starts about 0.1 s late: [reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141)).
 
@@ -177,7 +189,7 @@ issue or PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for a few simple guidelines.
 | [docs/agents.md](docs/agents.md) | the agent tools, the skill, the instructions to give agents |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | when something doesn't work |
 | [guest/README.md](guest/README.md) | what runs inside macOS |
-| [patches/README.md](patches/README.md) | the patch series on Reims vGPU and metal2vulkan |
+| [patches/README.md](patches/README.md) | the patch series on Reims vGPU, metal2vulkan and QEMU |
 | [site/](site/README.md) | the website's source: the guides at https://tuna-nope.github.io/macbox/guides/ |
 
 ## Credits
@@ -194,7 +206,8 @@ purpose: yourself, a hobby, research, teaching, a school, a charity, a public bo
 needs the author's permission**: open an issue to ask.
 
 The patches in `patches/` modify Reims vGPU and metal2vulkan, and stay under those projects' terms,
-`GPL-2.0-or-later OR LGPL-3.0-or-later` ([patches/README.md](patches/README.md)). Everything macbox
+`GPL-2.0-or-later OR LGPL-3.0-or-later`; those in `patches/qemu` modify QEMU and are
+`GPL-2.0-or-later` ([patches/README.md](patches/README.md)). Everything macbox
 builds or downloads keeps its own license ([CREDITS.md](CREDITS.md)).
 
 ## Disclaimer

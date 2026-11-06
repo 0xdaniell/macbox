@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 21:27:12 +0000
+Subject: [PATCH 05/25] REIMS_VGPU_VBLANK_HZ sets the ticks'
+ rate apart from the modes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/display/guest_display/vblank.rs         | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/vblank.rs b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+index 5c708185..df45dc39 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+@@ -17,6 +17,8 @@
+ //!   client goes, and while the guest display is paused or restoring; the ticks start again with
+ //!   the next present after it.
+ //! - **The period** is the host's modes' highest refresh rate, 24 to 240 Hz, else 60 Hz.
++//!   `REIMS_VGPU_VBLANK_HZ`, 24 to 1000, replaces it and leaves the modes as they are, so the
++//!   ticks can run faster than the rate the guest was told.
+ //! - **A late tick** (the thread was not run on time) raises once and goes on from the newest due
+ //!   point: no burst.
+ //!
+@@ -37,6 +39,8 @@ use crate::sync::{Condvar, Mutex};
+ 
+ /// The variable: `1` turns the ticks on.
+ pub const ENV_VAR: &str = "REIMS_VGPU_VBLANK";
++/// The variable: the ticks' rate in Hz, instead of the modes' (module doc).
++pub const HZ_ENV_VAR: &str = "REIMS_VGPU_VBLANK_HZ";
+ 
+ /// The refresh rate without a usable mode.
+ const DEFAULT_HZ: f64 = 60.0;
+@@ -44,6 +48,8 @@ const DEFAULT_HZ: f64 = 60.0;
+ const MIN_HZ: f64 = 24.0;
+ /// The highest refresh rate taken from a mode.
+ const MAX_HZ: f64 = 240.0;
++/// The highest rate [`HZ_ENV_VAR`] takes.
++const MAX_ENV_HZ: f64 = 1000.0;
+ /// The ticker thread's stack.
+ const STACK: usize = 128 * 1024;
+ 
+@@ -53,6 +59,15 @@ pub(crate) fn enabled_by_env() -> bool {
+     *ON.get_or_init(|| std::env::var_os(ENV_VAR).is_some_and(|v| v == "1"))
+ }
+ 
++/// The rate [`HZ_ENV_VAR`] sets, if it is a number from 24 to 1000 (read once).
++fn env_hz() -> Option<f64> {
++    static HZ: OnceLock<Option<f64>> = OnceLock::new();
++    *HZ.get_or_init(|| {
++        let hz: f64 = std::env::var(HZ_ENV_VAR).ok()?.parse().ok()?;
++        (MIN_HZ..=MAX_ENV_HZ).contains(&hz).then_some(hz)
++    })
++}
++
+ /// Whether the first tick of the process was logged.
+ static FIRST_TICK_LOGGED: AtomicBool = AtomicBool::new(false);
+ 
+@@ -119,7 +134,7 @@ impl Vblank {
+ 
+     /// The modes' highest refresh rate sets the period (module doc).
+     pub(crate) fn set_refresh_hz(&self, hz: f64) {
+-        let period = nanos(period_of(hz));
++        let period = env_hz().map_or_else(|| nanos(period_of(hz)), |hz| nanos(Duration::from_secs_f64(1.0 / hz)));
+         let mut s = self.state.lock();
+         if s.period_ns != period {
+             s.period_ns = period;

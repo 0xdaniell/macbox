@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 08:39:47 +0000
+Subject: [PATCH 20/25] census: readback, a content check on a guest
+
+Renders, reads and writes real pixels through one texture, a second texture, a
+second process and an event between queues, and compares them. It found the
+second image's staleness that no lane had.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/readback.swift | 229 +++++++++++++++++++++++++
+ 1 file changed, 229 insertions(+)
+ create mode 100644 scripts/internal/census/readback.swift
+
+diff --git a/scripts/internal/census/readback.swift b/scripts/internal/census/readback.swift
+new file mode 100644
+index 00000000..a118e062
+--- /dev/null
++++ b/scripts/internal/census/readback.swift
+@@ -0,0 +1,229 @@
++// readback.swift: on a guest, swiftc -O readback.swift -o readback && ./readback. RB_PAUSE_MS waits after each CPU write.
++// readback: GPU render, CPU read and write, and GPU read, through each way macOS reaches a surface.
++// Every step compares real pixels with what must be there.
++import Foundation
++import Metal
++import IOSurface
++
++let W = 1206, H = 2622
++let source = """
++#include <metal_stdlib>
++using namespace metal;
++struct V { float4 p [[position]]; float2 uv; };
++vertex V vs(uint i [[vertex_id]]) { float2 a[3] = {{-1,-1},{3,-1},{-1,3}}; V o; o.p = float4(a[i],0,1); o.uv = (a[i]+1)/2; o.uv.y = 1-o.uv.y; return o; }
++fragment float4 grad(V i [[stage_in]], constant float4 &c [[buffer(0)]]) { return float4(i.uv.x*c.x, i.uv.y*c.y, c.z, c.w); }
++fragment float4 copy(V i [[stage_in]], texture2d<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return t.sample(s, i.uv); }
++"""
++let dev = MTLCopyAllDevices().first!
++let lib = try! dev.makeLibrary(source: source, options: nil)
++func pipe(_ f: String) -> MTLRenderPipelineState {
++    let d = MTLRenderPipelineDescriptor()
++    d.vertexFunction = lib.makeFunction(name: "vs"); d.fragmentFunction = lib.makeFunction(name: f)
++    d.colorAttachments[0].pixelFormat = .bgra8Unorm
++    return try! dev.makeRenderPipelineState(descriptor: d)
++}
++let gradP = pipe("grad"), copyP = pipe("copy")
++let queue = dev.makeCommandQueue()!
++
++func makeSurface() -> IOSurface {
++    IOSurface(properties: [.width: W, .height: H, .bytesPerElement: 4, .pixelFormat: 0x42475241,
++                           IOSurfacePropertyKey(rawValue: "IOSurfaceIsGlobal"): true])!
++}
++func texture(_ s: IOSurface) -> MTLTexture {
++    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: W, height: H, mipmapped: false)
++    d.usage = [.renderTarget, .shaderRead]; d.storageMode = .managed
++    return dev.makeTexture(descriptor: d, iosurface: s, plane: 0)!
++}
++func gradient(_ t: MTLTexture, _ c: [Float]) {
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = t
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let b = queue.makeCommandBuffer()!, e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(gradP); var c = c; e.setFragmentBytes(&c, length: 16, index: 0)
++    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
++    b.commit(); b.waitUntilCompleted()
++}
++/// Samples `t` into a new surface and answers with that surface: the GPU's view of `t`.
++func viaGPU(_ t: MTLTexture) -> IOSurface {
++    let out = makeSurface(), o = texture(out)
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = o
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let b = queue.makeCommandBuffer()!, e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(copyP); e.setFragmentTexture(t, index: 0)
++    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
++    b.commit(); b.waitUntilCompleted()
++    return out
++}
++func px(_ s: IOSurface, _ x: Int, _ y: Int) -> [UInt8] {
++    let p = (s.baseAddress + y * s.bytesPerRow + x * 4).assumingMemoryBound(to: UInt8.self)
++    return [p[0], p[1], p[2], p[3]]
++}
++/// BGRA of the gradient `c` at x, y.
++func want(_ c: [Float], _ x: Int, _ y: Int) -> [UInt8] {
++    let u = (Float(x) + 0.5) / Float(W), v = (Float(y) + 0.5) / Float(H)
++    let f = [c[2], v * c[1], u * c[0], c[3]]
++    return f.map { UInt8(max(0, min(255, ($0 * 255).rounded()))) }
++}
++var failed = 0
++func check(_ name: String, _ s: IOSurface, _ expect: (Int, Int) -> [UInt8]) {
++    s.lock(options: .readOnly, seed: nil)
++    var bad = 0, total = 0, first = ""
++    for y in stride(from: 3, to: H, by: 97) {
++        for x in stride(from: 5, to: W, by: 61) {
++            let g = px(s, x, y), e = expect(x, y)
++            total += 1
++            if zip(g, e).contains(where: { abs(Int($0) - Int($1)) > 2 }) {
++                bad += 1
++                if first.isEmpty { first = "(\(x),\(y)) got \(g) want \(e)" }
++            }
++        }
++    }
++    s.unlock(options: .readOnly, seed: nil)
++    print(bad == 0 ? "  ok  " : "  BAD ", name, "\(total - bad)/\(total)", first)
++    if bad != 0 { failed += 1 }
++}
++/// Sets alpha to 0xff on every texel, as vImageOverwriteChannels does.
++let pauseMs = UInt32(ProcessInfo.processInfo.environment["RB_PAUSE_MS"] ?? "0")!
++func settle() { if pauseMs > 0 { usleep(pauseMs * 1000) } }
++func cpuAlpha(_ s: IOSurface) {
++    defer { settle() }
++    s.lock(options: [], seed: nil)
++    for y in 0..<H {
++        let row = (s.baseAddress + y * s.bytesPerRow).assumingMemoryBound(to: UInt8.self)
++        for x in 0..<W { row[x * 4 + 3] = 255 }
++    }
++    s.unlock(options: [], seed: nil)
++}
++func cpuFill(_ s: IOSurface, _ v: UInt32) {
++    defer { settle() }
++    s.lock(options: [], seed: nil)
++    for y in 0..<H {
++        let row = (s.baseAddress + y * s.bytesPerRow).assumingMemoryBound(to: UInt32.self)
++        for x in 0..<W { row[x] = v }
++    }
++    s.unlock(options: [], seed: nil)
++}
++
++if CommandLine.arguments.count > 2, CommandLine.arguments[1] == "reader" {
++    // A second process: the compositor. "read": samples the surface and prints its corners' texels.
++    let s = IOSurfaceLookup(UInt32(CommandLine.arguments[2])!)! as IOSurface
++    let t = texture(s)
++    while let line = readLine() {
++        if line == "quit" { break }
++        let o = viaGPU(t)
++        o.lock(options: .readOnly, seed: nil)
++        let a = px(o, 5, 3), b = px(o, 1200, 2600), c = px(o, 600, 1300)
++        o.unlock(options: .readOnly, seed: nil)
++        print("\(a) \(b) \(c)"); fflush(stdout)
++    }
++    exit(0)
++}
++
++let A: [Float] = [1, 1, 0.25, 0.5], B: [Float] = [0.5, 1, 0.75, 1]
++print("device:", dev.name, "unified:", dev.hasUnifiedMemory)
++
++print("[1] GPU render, CPU read")
++do { let s = makeSurface(), t = texture(s); gradient(t, A); check("pixels", s) { want(A, $0, $1) } }
++
++print("[2] GPU render, CPU alpha fill, GPU read through the same texture")
++do {
++    let s = makeSurface(), t = texture(s)
++    gradient(t, B); gradient(t, A); cpuAlpha(s)
++    let expect: (Int, Int) -> [UInt8] = { var w = want(A, $0, $1); w[3] = 255; return w }
++    check("the CPU's view", s, expect)
++    check("the GPU's view", viaGPU(t), expect)
++}
++
++print("[3] the same, read through a second texture used before it all")
++do {
++    let s = makeSurface(), t = texture(s), other = texture(s)
++    gradient(t, B); _ = viaGPU(other)
++    gradient(t, A); cpuAlpha(s)
++    let expect: (Int, Int) -> [UInt8] = { var w = want(A, $0, $1); w[3] = 255; return w }
++    check("the second texture's view", viaGPU(other), expect)
++    check("then the first's", viaGPU(t), expect)
++}
++
++print("[4] a surface the GPU drew, filled by the CPU alone, read by both textures")
++do {
++    let s = makeSurface(), t = texture(s), other = texture(s)
++    gradient(t, B); _ = viaGPU(other); _ = viaGPU(t)
++    cpuFill(s, 0xff336699)
++    check("the CPU's view", s) { _, _ in [0x99, 0x66, 0x33, 0xff] }
++    check("the first texture's view", viaGPU(t)) { _, _ in [0x99, 0x66, 0x33, 0xff] }
++    check("the second's", viaGPU(other)) { _, _ in [0x99, 0x66, 0x33, 0xff] }
++}
++
++print("[5] another process's texture, used before it all")
++do {
++    let s = makeSurface(), t = texture(s)
++    gradient(t, B)
++    let p = Process(), to = Pipe(), from = Pipe()
++    p.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
++    p.arguments = ["reader", String(IOSurfaceGetID(s))]
++    p.standardInput = to; p.standardOutput = from
++    try! p.run()
++    func ask() -> String {
++        to.fileHandleForWriting.write("read\n".data(using: .utf8)!)
++        var line = Data()
++        while true { let b = from.fileHandleForReading.readData(ofLength: 1); if b.isEmpty || b[0] == 10 { break }; line.append(b) }
++        return String(data: line, encoding: .utf8)!
++    }
++    func expectLine(_ c: (Int, Int) -> [UInt8]) -> String { "\(c(5, 3)) \(c(1200, 2600)) \(c(600, 1300))" }
++    func same(_ a: String, _ b: String) -> Bool {
++        let n = { (s: String) in s.split(whereSeparator: { !$0.isNumber }).map { Int($0)! } }
++        return zip(n(a), n(b)).allSatisfy { abs($0 - $1) <= 2 } && n(a).count == n(b).count
++    }
++    func look(_ name: String, _ c: @escaping (Int, Int) -> [UInt8]) {
++        let got = ask(), e = expectLine(c), ok = same(got, e)
++        print(ok ? "  ok  " : "  BAD ", name, ok ? "" : "got \(got) want \(e)")
++        if !ok { failed += 1 }
++    }
++    look("after the first render") { want(B, $0, $1) }
++    gradient(t, A)
++    let aa: (Int, Int) -> [UInt8] = { want(A, $0, $1) }
++    look("after a second render", aa)
++    gradient(t, B); cpuAlpha(s)
++    look("render, CPU alpha fill") { var w = want(B, $0, $1); w[3] = 255; return w }
++    cpuFill(s, 0xff336699)
++    look("CPU fill alone") { _, _ in [0x99, 0x66, 0x33, 0xff] }
++    gradient(t, A); cpuAlpha(s); _ = viaGPU(t)
++    look("render, fill, the writer reads, then this one") { var w = want(A, $0, $1); w[3] = 255; return w }
++    to.fileHandleForWriting.write("quit\n".data(using: .utf8)!)
++    p.waitUntilExit()
++}
++func heavyGradient(_ b: MTLCommandBuffer, _ t: MTLTexture, _ c: [Float], _ draws: Int) {
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = t
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(gradP); var c = c; e.setFragmentBytes(&c, length: 16, index: 0)
++    for _ in 0..<draws { e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3) }
++    e.endEncoding()
++}
++func eventRead(_ q: MTLCommandQueue, _ t: MTLTexture, _ out: MTLTexture, _ ev: MTLSharedEvent, _ value: UInt64) -> MTLCommandBuffer {
++    let b = q.makeCommandBuffer()!
++    b.encodeWaitForEvent(ev, value: value)
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = out
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(copyP); e.setFragmentTexture(t, index: 0)
++    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
++    return b
++}
++let q2 = dev.makeCommandQueue()!
++for (name, firstReader, draws) in [("read commits before the write", true, 1), ("read commits as the write runs", false, 400)] {
++    print("[6] two queues, an event orders the read after the write:", name)
++    for second in [false, true] {
++        let s = makeSurface(), t = texture(s), other = texture(s), out = makeSurface(), o = texture(out)
++        gradient(t, B); _ = viaGPU(t); _ = viaGPU(other)
++        usleep(5000)
++        let ev = dev.makeSharedEvent()!
++        let reader = eventRead(q2, second ? other : t, o, ev, 1)
++        let writer = queue.makeCommandBuffer()!
++        heavyGradient(writer, t, A, draws)
++        writer.encodeSignalEvent(ev, value: 1)
++        if firstReader { reader.commit(); usleep(2000); writer.commit() } else { writer.commit(); reader.commit() }
++        writer.waitUntilCompleted(); reader.waitUntilCompleted()
++        check(second ? "through the second texture" : "through the same texture", out) { want(A, $0, $1) }
++    }
++}
++print(failed == 0 ? "ALL MATCH" : "\(failed) MISMATCHED")

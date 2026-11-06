@@ -10,29 +10,60 @@ work the translation adds per frame (Metal → Vulkan).
 Before macbox's patches, most of that added work was copies: macOS's framebuffer and the
 simulator's display surface lie in guest RAM, and metal2vulkan copied each into a GPU image and back
 around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67%
-with the desktop. Patch 0004 renders those textures in place ([patches/README.md](../patches/README.md)).
+with the desktop. Patch 0004 renders those textures in place, and Coherent (patches 0009 onwards,
+with QEMU's census) removes most of the copies left ([patches/README.md](../patches/README.md)).
 
 ## Measurements
 
 The reference host: Intel Core Ultra 7 265 (Arrow Lake iGPU), 128 GB DDR5 at 4400 MT/s, Mesa 26.2.4,
 a NVMe disk; the VM had 8 vCPUs and 12 GB, macOS 26.7.1, iOS 26.5, one simulator booted at a time.
 
-iOS Simulator, GlassBench (a table scrolling under Liquid Glass bars and a floating glass toolbar),
-frames per second counted at the simulator's own screen, no encoding; two runs each:
+### iOS Simulator at 3x, step by step
 
-| | Reims 2ce3209 (2026-10-26) | Reims 7198fe6 | 7198fe6 + facts + colour writes | **macbox build** |
+GlassBench (a table scrolling under Liquid Glass bars and a floating glass toolbar) on an iPhone 17
+Pro at 3x (1206x2622), frames per second counted at the simulator's own screen:
+
+| Build | fps | GPU |
+|---|---|---|
+| Reims 2ce3209 as upstream shipped it (2026-10-26) | 17.2 | |
+| macbox, 2026-10-28 (in place rendering, 0004) | 38.5 / 39.5 | 25.0 ms/frame |
+| macbox cohwl, Coherent off (flat32) | **50.6** (p95 21.4 ms, p99 25.8 ms) | 97% busy |
+| macbox cohwl, `MACBOX_COHERENT=on` | **70.0** (p95 17.7 ms, p99 22.0 ms); 63–66 in a later run | 70% busy |
+
+The last two rows are one A/B in one window on 2026-11-05: fresh headless boots, a quiet gate
+before each round (guest background CPU and `mediaanalysisd` low), means of the valid rounds. The
+first two are earlier days, on the same host but not in the same window. With Coherent, QEMU's CPU
+use rises by about 1.6 cores (333% to 491%): the GPU waits less, the CPU traps more.
+
+flat32 also has an A/B of its own against the build before it: 41.6 → 48–50 fps at 3x.
+
+### Earlier measurements, the 2026-10-28 build
+
+| | Reims 2ce3209 (2026-10-26) | Reims 7198fe6 | 7198fe6 + facts + colour writes | macbox, 2026-10-28 |
 |---|---|---|---|---|
-| 1x (402x874) | 53.5 | 57.0 | 63.7 | **95.8 / 92.5** (GPU 8.0 ms/frame) |
-| 2x (804x1748) | 33.5 | 37.6 | 38.8 | **67.8 / 60.5** (14.1–14.9 ms) |
-| 3x (1206x2622) | 17.2 | 19.2 | 21.9 | **38.5 / 39.5** (25.0 ms) |
-| Safari at 3x, blurred floating bar | n/a | 39.5 | 44.5 | **66.4 / 64.2** |
+| 1x (402x874) | 53.5 | 57.0 | 63.7 | 95.8 / 92.5 (GPU 8.0 ms/frame) |
+| 2x (804x1748) | 33.5 | 37.6 | 38.8 | 67.8 / 60.5 (14.1–14.9 ms) |
+| 3x (1206x2622) | 17.2 | 19.2 | 21.9 | 38.5 / 39.5 (25.0 ms) |
+| Safari at 3x, blurred floating bar | n/a | 39.5 | 44.5 | 66.4 / 64.2 |
 
-macOS desktop at 3440x1440, a Genie minimize of a 2400x1100 window: about 12 frames per
-animation before, 19.5 with the macbox build (a 0.5 s animation at 60 Hz would be 30).
+1x and 2x haven't been measured again on cohwl.
 
-Disk, inside macOS, emulated SATA → NVMe: a warm 4K random read 0.54 → 0.36 ms, an app's process
-start 250–430 → 140–250 ms. Moving the VM's disk from a ZFS SATA SSD to an XFS NVMe halved the cold
-read latency again.
+### The macOS desktop
+
+| 3440x1440 desktop | Coherent off | Coherent on |
+|---|---|---|
+| dragging a 600x400 window (presents per second) | 105–107 | 129–130 |
+| Safari scrolling a local page (presents per second) | 75–79 | 110 |
+| Genie minimize of a 2400x1100 window (frames per animation; ~12 upstream) | 19.5 (the 10-28 build) | 29.5 / 30.5 |
+
+The first two rows are the same A/B as above. The Genie number with Coherent comes from a smoke
+check, not a matched A/B. A 0.5 s animation at 60 Hz would be 30 frames.
+
+### Disk
+
+Inside macOS, emulated SATA → NVMe: a warm 4K random read 0.54 → 0.36 ms, an app's process start
+250–430 → 140–250 ms. Moving the VM's disk from a ZFS SATA SSD to an XFS NVMe halved the cold read
+latency again.
 
 How they were measured:
 - `simfps` (in `guest/bench`, if present) counts the frames a simulator's screen produces through
@@ -55,7 +86,9 @@ How they were measured:
   blur work. It changes nothing inside the simulator.
 - **CPU pinning** (`MACBOX_CPUSET`): on a hybrid CPU, keep QEMU on the performance cores.
 - **The disk:** NVMe in the VM (`macbox disk nvme`) and the VM's disk on an SSD or NVMe on the host.
-  `MACBOX_DISK_CACHE=unsafe` is faster still, at the risk spelled out in the config.
+  The default `MACBOX_DISK_CACHE=none`: with `writeback`, macOS's NVMe driver panicked under heavy
+  swap (an `IONVMeController` flush timeout), and `none` passed the same 11 GB test.
+  `unsafe` is faster still, at the risk spelled out in the config.
 
 ## GPU tuning switches
 
@@ -65,6 +98,7 @@ With the macbox build (`MACBOX_GPU_TUNING=auto`, the default), `macbox up` sets:
 |---|---|
 | `M2V_LIVE=$MACBOX_HOME/run/live.conf` | metal2vulkan's live switches (patch 0003). The file holds `host_rt_in_place=1` |
 | `M2V_ARL_FACTS=<11 facts>` | only on an Arrow Lake GPU (PCI ids 7d67, 7dd1, 7d41, 7d51, 7d45) |
+| `REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1` | skips a new Private texture's first page-up (Reims patch 0013) |
 
 `host_rt_in_place` is read when a texture is made: change it in `live.conf`, then remake the
 surfaces (change the resolution, or restart the VM). `MACBOX_GPU_TUNING=off` turns all of it off.
@@ -72,6 +106,26 @@ surfaces (change the resolution, or restart the VM). `MACBOX_GPU_TUNING=off` tur
 On another GPU, in place rendering still runs its device check per memory kind and falls back where
 the check fails; it has only been measured on Arrow Lake. Measure your own GPU before and after:
 the facts list is specific to Arrow Lake and is never set elsewhere.
+
+### Coherent (experimental, off by default)
+
+`MACBOX_COHERENT=on` in the config, then `macbox down && macbox up`. macbox then also sets
+`REIMS_VGPU_CENSUS=$MACBOX_HOME/run/coherent`, `REIMS_VGPU_COHERENT=1` and a report a minute, and
+adds `surface_lazy=1`, `surface_lazy_scoped=1` and `surface_coherent=1` to `live.conf`.
+`MACBOX_COHERENT=off` removes them all again.
+
+It is off by default because it isn't settled yet:
+- **One GPU hang with it on.** On 2026-11-05, the day it went into daily use, i915
+  reset the GPU's render engine and QEMU stopped. The guard did its job: the next boot came up without
+  coherent pages. A later hang with Coherent off, on a newer development build, has the same error
+  code, so the cause is open, not pinned on Coherent.
+- **A write-loss risk the counters flagged once,** during a test that killed Safari mid-frame
+  (`overwrite_risk` 1 in the census report), and that hasn't been reproduced or ruled out since.
+
+If a coherent run crashes, `$MACBOX_HOME/run/coherent/coherent.running` stays behind and every later
+start boots without coherent pages. `macbox coherent status` says so; `macbox coherent reset`
+(VM stopped) allows the next try. It needs a kernel with `UFFD_USER_MODE_ONLY` (Linux 5.11 or
+later), which works with `vm.unprivileged_userfaultfd=0`.
 
 ## Tried, no gain
 
@@ -85,6 +139,14 @@ the facts list is specific to Arrow Lake and is never set elsewhere.
 | 2 MiB hugepages or transparent hugepages for guest RAM | impossible: Reims maps guest RAM in 16 KiB views |
 | another vCPU model (`kvm-pv-unhalt`, no IBRS) | within noise |
 | QEMU's VNC | 2 to 3 frames a second: it reads every frame back from the GPU |
+| `surface_lazy` without trapping, or presenting every surface | a stale desktop |
+| keeping paged textures' buffers (`REIMS_VGPU_PAGED_BUFFER_CACHE`) | no reuse in practice |
+| grouping submissions (`submit_grouped`) | 0.2 ms a frame or less |
+| a faster idle tick (`REIMS_VGPU_VBLANK_HZ` 240 vs 480) | no gain; macOS never enables the interrupt it re-raises |
+| udmabuf imports, pooled staging buffers | no gain |
+| a reaper for deleted textures | Safari 5–8 fps slower, and Genie breaks |
+| executing the FIFO from its own thread (fifoexec) | a GPU hang on its first day; rolled back |
+| merging adjacent page runs of a mapping | negligible: 49 merges in 629,632 pages of a real trace |
 
 ## Known limits
 
@@ -92,7 +154,7 @@ the facts list is specific to Arrow Lake and is never set elsewhere.
   sends no vblank while nothing is presenting, so the first frame of an animation waits a median
   114 ms for display timing (8 ms when something already animates).
   [steelbrain/reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141).
-- **3x is GPU-bound** at about 35 to 40 fps on this iGPU in heavy Liquid Glass scenes.
+- **3x is GPU-bound** at about 50 fps on this iGPU in heavy Liquid Glass scenes (70 with Coherent).
 - **x86-64 macOS ends with macOS 26.** iOS 27 simulators are arm64 only.
 - **Recording** uses `simctl io recordVideo`, H.264 in software in the VM: about 50 fps with one
   simulator animating, 18 each with three. `sim-fps` counts what the simulator wrote, and it writes

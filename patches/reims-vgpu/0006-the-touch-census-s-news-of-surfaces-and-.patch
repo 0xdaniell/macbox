@@ -1,0 +1,1179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 21:48:57 +0000
+Subject: [PATCH 06/25] the touch census's news of surfaces and
+ presents
+
+rvg_census_set_callbacks gives QEMU's census each surface's pages and facts at map, its unmap
+before the guest sees it, textures and presents. Without it, one atomic load per event.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/include/reims_vgpu.h      |  62 ++
+ crates/reims-vgpu-c/src/census.rs             | 215 +++++++
+ crates/reims-vgpu-c/src/lib.rs                |   1 +
+ crates/reims-vgpu-core/src/census.rs          |  64 ++
+ .../src/display/guest_display/present.rs      |   6 +
+ crates/reims-vgpu-core/src/iosurface/table.rs | 115 ++++
+ crates/reims-vgpu-core/src/lib.rs             |   1 +
+ .../src/resources/manager/texture.rs          |   3 +
+ docs/api.md                                   |   1 +
+ scripts/internal/census/census_test.c         | 548 ++++++++++++++++++
+ 10 files changed, 1016 insertions(+)
+ create mode 100644 crates/reims-vgpu-c/src/census.rs
+ create mode 100644 crates/reims-vgpu-core/src/census.rs
+ create mode 100644 scripts/internal/census/census_test.c
+
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index f0b07f49..705af8c0 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -329,6 +329,61 @@ typedef struct {
+   size_t range_count;
+ } RvgMemoryMap;
+ 
++// What a surface's descriptor says of it.
++typedef struct {
++  uint32_t mapping_id;
++  uint32_t pixel_format;
++  uint64_t width;
++  uint64_t height;
++  uint64_t bytes_per_row;
++  uint64_t alloc_size;
++  uint64_t protection_options;
++  uint32_t address_format;
++  uint32_t compression_type;
++  bool read_only;
++  bool host_only;
++} RvgCensusSurface;
++
++// `mapped(ctx, surface, pages, page_count, page_size)`: a surface was mapped, with each guest
++// page's host address.
++//
++// Thread: the IOSurface device's own, under its state's lock. May call: nothing of this header.
++typedef void (*RvgCensusMappedFn)(void *ctx,
++                                  const RvgCensusSurface *surface,
++                                  const uint64_t *pages,
++                                  uintptr_t page_count,
++                                  uint64_t page_size);
++
++// `unmapped(ctx, mapping_id)`: the surface goes, and its pages may be reused when this returns.
++//
++// Thread: the IOSurface device's own, under its state's lock. May call: nothing of this header.
++typedef void (*RvgCensusUnmappedFn)(void *ctx, uint32_t mapping_id);
++
++// `used(ctx, mapping_id, usage, storage_mode)`: a texture was made over the surface.
++//
++// Thread: the task's that made it. May call: nothing of this header.
++typedef void (*RvgCensusUsedFn)(void *ctx,
++                                uint32_t mapping_id,
++                                uint64_t usage,
++                                uint64_t storage_mode);
++
++// `presented(ctx, mapping_id)`: a frame was presented; 0 for a kernel task's backing.
++//
++// Thread: the present's, under the guest display's mutex: it must not wait. May call: nothing of
++// this header.
++typedef void (*RvgCensusPresentedFn)(void *ctx, uint64_t mapping_id);
++
++// The touch census's callbacks.
++typedef struct {
++  // sizeof(RvgCensusCallbacks) as the host was compiled.
++  uint32_t struct_size;
++  void *ctx;
++  RvgCensusMappedFn mapped;
++  RvgCensusUnmappedFn unmapped;
++  RvgCensusUsedFn used;
++  RvgCensusPresentedFn presented;
++} RvgCensusCallbacks;
++
+ // `destroy(ctx)`: the last call of a callback table (see the preamble).
+ typedef void (*RvgDestroyFn)(void *ctx);
+ 
+@@ -901,6 +956,13 @@ const char *rvg_status_message(RvgStatus status);
+ // the rest of the process.
+ void rvg_log_set_handler(RvgLogFn handler, void *ctx, RvgLogLevel max_level);
+ 
++// Registers the touch census's callbacks, the process's one set, before the first device. Without
++// it the library makes none of these calls. RVG_ERR_INVALID_ARGUMENT for NULL or a second set.
++//
++// # Safety
++// `callbacks` is NULL or a live table. Its functions and `ctx` live as long as the process.
++RvgStatus rvg_census_set_callbacks(const RvgCensusCallbacks *callbacks);
++
+ // A new device. Refusals, checked in this order: RVG_ERR_INVALID_ARGUMENT for the config
+ // itself (the files behind its memory map's ranges among it), RVG_ERR_UNSUPPORTED,
+ // RVG_ERR_DISPLAY_PORT_COUNT, RVG_ERR_NO_METAL_DEVICE, RVG_ERR_MEMORY_CONFLICT,
+diff --git a/crates/reims-vgpu-c/src/census.rs b/crates/reims-vgpu-c/src/census.rs
+new file mode 100644
+index 00000000..c1fdaafa
+--- /dev/null
++++ b/crates/reims-vgpu-c/src/census.rs
+@@ -0,0 +1,215 @@
++//! LOCAL (Atlas): the touch census's news of the guest's surfaces, [`RvgCensusCallbacks`], and
++//! `rvg_census_set_callbacks`. See `reims_vgpu_core::census`.
++
++use std::ffi::c_void;
++
++use reims_vgpu_core::census::{self, Sink, SurfaceFacts};
++
++use crate::ffi;
++use crate::sized::{self, HostStruct};
++use crate::status::{RVG_ERR_INVALID_ARGUMENT, RVG_OK, RvgStatus};
++
++/// What a surface's descriptor says of it.
++#[repr(C)]
++#[derive(Clone, Copy)]
++#[expect(
++    missing_docs,
++    reason = "the fields' names say what they hold, as the header shows them"
++)]
++pub struct RvgCensusSurface {
++    pub mapping_id: u32,
++    pub pixel_format: u32,
++    pub width: u64,
++    pub height: u64,
++    pub bytes_per_row: u64,
++    pub alloc_size: u64,
++    pub protection_options: u64,
++    pub address_format: u32,
++    pub compression_type: u32,
++    pub read_only: bool,
++    pub host_only: bool,
++}
++
++/// `mapped(ctx, surface, pages, page_count, page_size)`: a surface was mapped, with each guest
++/// page's host address.
++///
++/// Thread: the IOSurface device's own, under its state's lock. May call: nothing of this header.
++pub type RvgCensusMappedFn = Option<
++    unsafe extern "C-unwind" fn(
++        ctx: *mut c_void,
++        surface: *const RvgCensusSurface,
++        pages: *const u64,
++        page_count: usize,
++        page_size: u64,
++    ),
++>;
++
++/// `unmapped(ctx, mapping_id)`: the surface goes, and its pages may be reused when this returns.
++///
++/// Thread: the IOSurface device's own, under its state's lock. May call: nothing of this header.
++pub type RvgCensusUnmappedFn =
++    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, mapping_id: u32)>;
++
++/// `used(ctx, mapping_id, usage, storage_mode)`: a texture was made over the surface.
++///
++/// Thread: the task's that made it. May call: nothing of this header.
++pub type RvgCensusUsedFn = Option<
++    unsafe extern "C-unwind" fn(
++        ctx: *mut c_void,
++        mapping_id: u32,
++        usage: u64,
++        storage_mode: u64,
++    ),
++>;
++
++/// `presented(ctx, mapping_id)`: a frame was presented; 0 for a kernel task's backing.
++///
++/// Thread: the present's, under the guest display's mutex: it must not wait. May call: nothing of
++/// this header.
++pub type RvgCensusPresentedFn =
++    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, mapping_id: u64)>;
++
++/// The touch census's callbacks.
++#[repr(C)]
++#[derive(Clone, Copy)]
++#[expect(
++    missing_docs,
++    reason = "the fields' names say what they hold, as the header shows them"
++)]
++pub struct RvgCensusCallbacks {
++    /// sizeof(RvgCensusCallbacks) as the host was compiled.
++    pub struct_size: u32,
++    pub ctx: *mut c_void,
++    pub mapped: RvgCensusMappedFn,
++    pub unmapped: RvgCensusUnmappedFn,
++    pub used: RvgCensusUsedFn,
++    pub presented: RvgCensusPresentedFn,
++}
++
++// SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
++unsafe impl HostStruct for RvgCensusCallbacks {}
++
++/// The host's callbacks, as the core's sink.
++struct HostSink(RvgCensusCallbacks);
++
++// SAFETY: the host's contract: its functions run on any of the library's threads, with its `ctx`.
++unsafe impl Send for HostSink {}
++// SAFETY: as above.
++unsafe impl Sync for HostSink {}
++
++impl Sink for HostSink {
++    fn mapped(&self, facts: &SurfaceFacts, pages: &[u64], page_size: u64) {
++        let Some(mapped) = self.0.mapped else { return };
++        let surface = RvgCensusSurface {
++            mapping_id: facts.mapping_id,
++            pixel_format: facts.pixel_format,
++            width: facts.width,
++            height: facts.height,
++            bytes_per_row: facts.bytes_per_row,
++            alloc_size: facts.alloc_size,
++            protection_options: facts.protection_options,
++            address_format: facts.address_format,
++            compression_type: facts.compression_type,
++            read_only: facts.read_only,
++            host_only: facts.host_only,
++        };
++        let (ctx, at, count) = (self.0.ctx, pages.as_ptr(), pages.len());
++        // SAFETY: the host's function, given its context and what lives across the call.
++        ffi::host_call("census.mapped", || unsafe {
++            mapped(ctx, &raw const surface, at, count, page_size);
++        });
++    }
++
++    fn unmapped(&self, mapping_id: u32) {
++        let Some(unmapped) = self.0.unmapped else {
++            return;
++        };
++        let ctx = self.0.ctx;
++        // SAFETY: the host's function, given its context.
++        ffi::host_call("census.unmapped", || unsafe { unmapped(ctx, mapping_id) });
++    }
++
++    fn used(&self, mapping_id: u32, usage: u64, storage_mode: u64) {
++        let Some(used) = self.0.used else { return };
++        let ctx = self.0.ctx;
++        // SAFETY: the host's function, given its context.
++        ffi::host_call("census.used", || unsafe {
++            used(ctx, mapping_id, usage, storage_mode);
++        });
++    }
++
++    fn presented(&self, mapping_id: u64) {
++        let Some(presented) = self.0.presented else {
++            return;
++        };
++        let ctx = self.0.ctx;
++        // SAFETY: the host's function, given its context.
++        ffi::host_call("census.presented", || unsafe { presented(ctx, mapping_id) });
++    }
++}
++
++/// Registers the touch census's callbacks, the process's one set, before the first device. Without
++/// it the library makes none of these calls. RVG_ERR_INVALID_ARGUMENT for NULL or a second set.
++///
++/// # Safety
++/// `callbacks` is NULL or a live table. Its functions and `ctx` live as long as the process.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_census_set_callbacks(
++    callbacks: *const RvgCensusCallbacks,
++) -> RvgStatus {
++    ffi::export(|| {
++        // SAFETY: the caller's contract.
++        let table = match unsafe { sized::read(callbacks) } {
++            Ok(Some(table)) => table,
++            Ok(None) => return RVG_ERR_INVALID_ARGUMENT,
++            Err(status) => return status,
++        };
++        if census::register(Box::new(HostSink(table))) {
++            RVG_OK
++        } else {
++            RVG_ERR_INVALID_ARGUMENT
++        }
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::status::RVG_ERR_UNSUPPORTED;
++
++    /// A table the host wrote is taken once; NULL, a short table and one past the library's are
++    /// refused and take no place.
++    #[test]
++    fn the_callbacks_are_taken_once() {
++        let zeroed = RvgCensusCallbacks {
++            struct_size: 0,
++            ctx: std::ptr::null_mut(),
++            mapped: None,
++            unmapped: None,
++            used: None,
++            presented: None,
++        };
++        let size = u32::try_from(size_of::<RvgCensusCallbacks>()).unwrap();
++        // SAFETY: NULL, and tables that live across each call.
++        unsafe {
++            assert_eq!(
++                rvg_census_set_callbacks(std::ptr::null()),
++                RVG_ERR_INVALID_ARGUMENT
++            );
++            assert_eq!(rvg_census_set_callbacks(&zeroed), RVG_ERR_INVALID_ARGUMENT);
++            let mut long = [0u8; 256];
++            long[..4].copy_from_slice(&255u32.to_ne_bytes());
++            long[254] = 1;
++            assert_eq!(
++                rvg_census_set_callbacks(long.as_ptr().cast()),
++                RVG_ERR_UNSUPPORTED
++            );
++            let table = RvgCensusCallbacks {
++                struct_size: size,
++                ..zeroed
++            };
++            assert_eq!(rvg_census_set_callbacks(&table), RVG_OK);
++            assert_eq!(rvg_census_set_callbacks(&table), RVG_ERR_INVALID_ARGUMENT);
++        }
++    }
++}
+diff --git a/crates/reims-vgpu-c/src/lib.rs b/crates/reims-vgpu-c/src/lib.rs
+index 4bf0da5a..50b2c78b 100644
+--- a/crates/reims-vgpu-c/src/lib.rs
++++ b/crates/reims-vgpu-c/src/lib.rs
+@@ -27,6 +27,7 @@ pub mod status;
+ 
+ pub mod log;
+ 
++pub mod census;
+ pub mod device;
+ pub mod display;
+ pub mod frame;
+diff --git a/crates/reims-vgpu-core/src/census.rs b/crates/reims-vgpu-core/src/census.rs
+new file mode 100644
+index 00000000..5d3ac435
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/census.rs
+@@ -0,0 +1,64 @@
++//! LOCAL (Atlas): what the touch census hears of the guest's surfaces: QEMU's
++//! `accel/kvm/census.c` traps the guest CPU's first touch of a page of a large IOSurface, and
++//! needs to know which pages those are, what the guest said of them, and when a frame went by.
++//!
++//! The census is the host's: it registers a [`Sink`] once, before the first device, and only when
++//! it runs. Nothing registered costs one atomic load per map, unmap, texture and present, and
++//! the library's behaviour is the same with one registered: a sink keeps no reference, and answers
++//! nothing. A sink's calls never reach the GPU, and `presented` takes no lock.
++
++use std::sync::OnceLock;
++
++/// What a surface's descriptor says of it.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct SurfaceFacts {
++    /// The mapping id.
++    pub mapping_id: u32,
++    /// The IOSurface pixel format.
++    pub pixel_format: u32,
++    /// The width in pixels.
++    pub width: u64,
++    /// The height in pixels.
++    pub height: u64,
++    /// Bytes per row.
++    pub bytes_per_row: u64,
++    /// The allocation's size.
++    pub alloc_size: u64,
++    /// `protection_options`.
++    pub protection_options: u64,
++    /// `address_format`.
++    pub address_format: u32,
++    /// `compression_type`.
++    pub compression_type: u32,
++    /// `readOnly`.
++    pub read_only: bool,
++    /// `hostOnly`: the surface has no guest pages.
++    pub host_only: bool,
++}
++
++/// Who hears of the surfaces.
++pub trait Sink: Send + Sync {
++    /// A surface was mapped. `pages` is each guest page's host address, none for a host-only one.
++    /// On the IOSurface device's queue, under its state's lock.
++    fn mapped(&self, facts: &SurfaceFacts, pages: &[u64], page_size: u64);
++    /// The surface at `mapping_id` goes. Called before the unmap returns to the guest, and
++    /// returns only when no trap remains on its pages, which the guest may reuse at once.
++    fn unmapped(&self, mapping_id: u32);
++    /// A texture was made over the surface at `mapping_id`.
++    fn used(&self, mapping_id: u32, usage: u64, storage_mode: u64);
++    /// A frame was presented: the surface's mapping id, 0 for a kernel task's backing.
++    fn presented(&self, mapping_id: u64);
++}
++
++static SINK: OnceLock<Box<dyn Sink>> = OnceLock::new();
++
++/// Registers `sink`, the process's one: false if there is one already.
++pub fn register(sink: Box<dyn Sink>) -> bool {
++    SINK.set(sink).is_ok()
++}
++
++/// The registered sink.
++#[inline]
++pub fn sink() -> Option<&'static dyn Sink> {
++    SINK.get().map(|sink| &**sink)
++}
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/present.rs b/crates/reims-vgpu-core/src/display/guest_display/present.rs
+index 0a2582b7..e5df74d5 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/present.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/present.rs
+@@ -227,6 +227,9 @@ impl<P: Platform> GuestDisplay<P> {
+                 self.present_surface_held(Hold::of(held), held, l, client, surface, gamma)
+             })
+         })?;
++        if let Some(sink) = crate::census::sink() {
++            sink.presented(0);
++        }
+         let p = self.page(l);
+         p.bump64(sp::PRESENT_COUNT);
+         self.page(l).w32(sp::PRESENTED_SURFACE, surface);
+@@ -506,6 +509,9 @@ impl<P: Platform> GuestDisplay<P> {
+ 
+     /// Counts a mapped present in the page, after its pool and holder have ended.
+     pub(super) fn presented_mapped_surface(&self, l: &GuestDisplayLocked<P>, surface: u64) {
++        if let Some(sink) = crate::census::sink() {
++            sink.presented(surface);
++        }
+         let p = self.page(l);
+         p.bump64(sp::PRESENT_COUNT);
+         self.page(l).w64(sp::PRESENTED_MAPPING_ID, surface);
+diff --git a/crates/reims-vgpu-core/src/iosurface/table.rs b/crates/reims-vgpu-core/src/iosurface/table.rs
+index 49c9aa56..4c1ac55b 100644
+--- a/crates/reims-vgpu-core/src/iosurface/table.rs
++++ b/crates/reims-vgpu-core/src/iosurface/table.rs
+@@ -67,6 +67,27 @@ impl<P: Platform> SurfaceSlot<P> {
+     }
+ }
+ 
++/// What the census hears of a surface from its descriptor.
++fn census_facts(
++    mapping_id: u32,
++    descriptor: &IoSurfaceDeviceDescriptor2,
++) -> crate::census::SurfaceFacts {
++    let base = &descriptor.base;
++    crate::census::SurfaceFacts {
++        mapping_id,
++        pixel_format: base.pixel_format,
++        width: base.width,
++        height: base.height,
++        bytes_per_row: base.bytes_per_row,
++        alloc_size: base.alloc_size,
++        protection_options: base.protection_options,
++        address_format: u32::from(base.address_format),
++        compression_type: u32::from(base.compression_type),
++        read_only: base.read_only(),
++        host_only: base.host_only(),
++    }
++}
++
+ /// The debug line of a surface `IOSurfaceCreate` refused, describing its properties through
+ /// `surfaces` only when the line is logged.
+ fn log_refused_spec<P: Platform>(surfaces: &dyn IoSurfaces<P>, spec: &SurfaceSpec) {
+@@ -140,6 +161,13 @@ impl<P: Platform> HostDeviceCore<P> {
+         if !made {
+             slot.pages = Vec::new();
+         }
++        if made && let Some(sink) = crate::census::sink() {
++            sink.mapped(
++                &census_facts(mapping_id, &descriptor),
++                &slot.pages,
++                self.page_size(),
++            );
++        }
+         if let Some(s) = st.slots.get_mut(index) {
+             *s = slot;
+         }
+@@ -321,6 +349,9 @@ impl<P: Platform> HostDeviceCore<P> {
+             let word = at.read_u32(0, site);
+             at.write_u32(0, word & !Entry::MAPPED, site);
+         });
++        if let Some(sink) = crate::census::sink() {
++            sink.unmapped(mapping_id);
++        }
+         let page_size = self.page_size();
+         if let Some(slot) = st.slots.get_mut(index) {
+             slot.surface = None;
+@@ -381,6 +412,9 @@ impl<P: Platform> HostDeviceCore<P> {
+                     surface.retain_count()
+                 );
+             }
++            if let Some(sink) = crate::census::sink() {
++                sink.unmapped(i.to_u64().low_u32());
++            }
+             drop(surface);
+             if slot.host_only {
+                 host_only = host_only.wrapping_sub(slot.page_count.wrapping_mul(page));
+@@ -407,6 +441,87 @@ mod tests {
+     use crate::testkit::platform::FakePlatform;
+     use crate::testkit::script::Step;
+ 
++    /// The census's sink hears of a map with the guest's pages, of an unmap before it returns and
++    /// only when it succeeds, and of each surface a teardown drops. The process has one sink, and
++    /// other tests' rigs run beside this one, so it keeps what this thread does.
++    mod census {
++        use std::thread::ThreadId;
++
++        use super::*;
++        use crate::census::{Sink, SurfaceFacts};
++
++        #[derive(Debug, Clone, PartialEq, Eq)]
++        enum Heard {
++            Mapped(SurfaceFacts, Vec<u64>, u64),
++            Unmapped(u32),
++        }
++
++        static HEARD: parking_lot::Mutex<Vec<(ThreadId, Heard)>> =
++            parking_lot::Mutex::new(Vec::new());
++
++        struct Recorder;
++
++        impl Sink for Recorder {
++            fn mapped(&self, facts: &SurfaceFacts, pages: &[u64], page_size: u64) {
++                let heard = Heard::Mapped(*facts, pages.to_vec(), page_size);
++                HEARD.lock().push((std::thread::current().id(), heard));
++            }
++            fn unmapped(&self, mapping_id: u32) {
++                let heard = Heard::Unmapped(mapping_id);
++                HEARD.lock().push((std::thread::current().id(), heard));
++            }
++            fn used(&self, _: u32, _: u64, _: u64) {}
++            fn presented(&self, _: u64) {}
++        }
++
++        fn take_mine() -> Vec<Heard> {
++            let me = std::thread::current().id();
++            let mut heard = HEARD.lock();
++            let mine = heard.iter().filter(|h| h.0 == me).map(|h| h.1.clone());
++            let mine = mine.collect();
++            heard.retain(|h| h.0 != me);
++            mine
++        }
++
++        #[test]
++        fn a_sink_hears_the_maps_and_unmaps_the_guest_sees() {
++            crate::census::register(Box::new(Recorder));
++            let r = rig();
++            r.mapped_v2(3, 2);
++            let d = v2(2, ROOT);
++            let facts = SurfaceFacts {
++                mapping_id: 3,
++                pixel_format: d.base.pixel_format,
++                width: d.base.width,
++                height: d.base.height,
++                bytes_per_row: d.base.bytes_per_row,
++                alloc_size: d.base.alloc_size,
++                protection_options: d.base.protection_options,
++                address_format: u32::from(d.base.address_format),
++                compression_type: u32::from(d.base.compression_type),
++                read_only: false,
++                host_only: false,
++            };
++            let pages = vec![r.host(SURF), r.host(SURF + PAGE)];
++            assert!(
++                take_mine().contains(&Heard::Mapped(facts, pages, PAGE)),
++                "the guest's pages"
++            );
++            let held = r.held(3);
++            assert_eq!(r.unmap(3), IoReturn::Busy);
++            assert_eq!(take_mine(), [], "a busy unmap keeps the surface");
++            drop(held);
++            assert_eq!(r.unmap(3), IoReturn::Success);
++            assert_eq!(take_mine(), [Heard::Unmapped(3)]);
++            assert_eq!(r.unmap(3), IoReturn::Success);
++            assert_eq!(take_mine(), [], "an empty slot is nothing to hear");
++            r.mapped_v2(4, 1);
++            take_mine();
++            r.teardown();
++            assert_eq!(take_mine(), [Heard::Unmapped(4)]);
++        }
++    }
++
+     mod map {
+         use super::*;
+ 
+diff --git a/crates/reims-vgpu-core/src/lib.rs b/crates/reims-vgpu-core/src/lib.rs
+index a81d9ea8..36d4d149 100644
+--- a/crates/reims-vgpu-core/src/lib.rs
++++ b/crates/reims-vgpu-core/src/lib.rs
+@@ -32,6 +32,7 @@
+ // `deserializer/deserializer.rs`.
+ #![allow(clippy::module_inception)]
+ 
++pub mod census;
+ pub mod collections;
+ pub mod deserializer;
+ pub mod device;
+diff --git a/crates/reims-vgpu-core/src/resources/manager/texture.rs b/crates/reims-vgpu-core/src/resources/manager/texture.rs
+index 85ace4c5..5e5052ca 100644
+--- a/crates/reims-vgpu-core/src/resources/manager/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/manager/texture.rs
+@@ -1334,6 +1334,9 @@ pub(crate) fn create_mapper_ref_texture<P: Platform, E: CreateEnv<P>>(
+             return Err(raised);
+         }
+     };
++    if let Some(sink) = crate::census::sink() {
++        sink.used(mapping_id.low_u32(), texture.usage(), texture.storage_mode());
++    }
+     let resource = match env.new_mapper_ref_texture_resource(mapping_id, texture) {
+         Ok(resource) => resource,
+         Err(raised) => {
+diff --git a/docs/api.md b/docs/api.md
+index 171b6c64..2ddabe01 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -702,6 +702,7 @@ The header's 47 functions, in its order. "May" is the header's mark "may call ba
+ | 39 | `rvg_video_device_deliver` | may | one message of queue 0: its `subs` surfaces held while the session needs them, the session's status answered; `RVG_VIDEO_INVALID_SESSION` with no session; `RVG_VIDEO_ALLOCATION_FAILED` for a message over `RVG_VIDEO_MAX_MESSAGE_SIZE`, which the session never sees |
+ | 40 | `rvg_video_device_invalidate` | | a reset's first phase: the session sends the guest nothing more |
+ | 41 | `rvg_video_device_reset` | | both phases: the session's work drains and it ends |
++| 42a | `rvg_census_set_callbacks` | | LOCAL (Atlas): the touch census's news of surfaces and presents (`reims_vgpu_core::census`); no calls without it |
+ | 42 | `rvg_scaler_device_create` | | the M2 scaler device (106b:1a0b), from an `RvgScalerDeviceConfig`, made on every host: transforming with the library's own kernel on the GPU it draws with (Metal's on macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included), and with none where that opens no device or the device refuses the kernel |
+ | 43 | `rvg_scaler_device_release` | | drops the host's reference; the last one drops its accelerator and ends its guest-memory table |
+ | 44 | `rvg_scaler_device_scales` | | whether the device has a GPU to transform on; where it has not, the host refuses the guest's features (FEATURES_OK), so the guest's driver does without the device |
+diff --git a/scripts/internal/census/census_test.c b/scripts/internal/census/census_test.c
+new file mode 100644
+index 00000000..2f9b7d7d
+--- /dev/null
++++ b/scripts/internal/census/census_test.c
+@@ -0,0 +1,548 @@
++// census_test.c: the touch census on a real KVM guest, with no QEMU: links QEMU's accel/kvm/census.c
++// as it ships, and plays kvm-all.c's part. The slot is on the census's view, armed by the census's
++// own calls; the guest is a minimal long-mode program, as in the study's probe.
++//   gcc -O2 -g -Wall -D_GNU_SOURCE -I$QEMU/include census_test.c $QEMU/accel/kvm/census.c -lpthread
++//   ./a.out <empty output dir> [slot_mib]
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/kvm.h>
++#include <pthread.h>
++#include <setjmp.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "system/kvm_census.h"
++
++#define PG 4096UL
++#define S0_SIZE (2UL << 20)
++#define CODE 0x10000UL
++#define STACK 0x1f0000UL
++#define DATA_GPA (4UL << 30)
++
++// clang-format off
++__asm__(
++".pushsection .rodata\n.code64\n"
++"g_start:\n"
++"g_read:     mov (%rbx),%rax\n          out %al,$0x10\n"
++"g_write:    mov %rax,(%rbx)\n          out %al,$0x10\n"
++"g_lock:     lock incq (%rbx)\n         out %al,$0x10\n"
++"g_avx:      vmovdqu (%rbx),%ymm0\n     out %al,$0x10\n"
++"g_repmovs:  rep movsb\n                out %al,$0x10\n"
++"g_outs:     mov $0x11,%dx\n rep outsb\n out %al,$0x10\n"
++"g_loop:     mov (%rbx),%rax\n add %rdx,%rbx\n dec %rcx\n jnz g_loop\n out %al,$0x10\n"
++"g_wloop:    mov %rax,(%rbx)\n add %rdx,%rbx\n dec %rcx\n jnz g_wloop\n out %al,$0x10\n"
++"g_end:\n"
++".popsection\n");
++// clang-format on
++extern const char g_start[], g_end[], g_read[], g_write[], g_lock[], g_avx[], g_repmovs[], g_outs[],
++    g_loop[], g_wloop[];
++#define STUB(s) (CODE + (uint64_t)((s) - g_start))
++
++#define DIE(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, " (%s)\n", strerror(errno)); exit(1); } while (0)
++
++static int kvmfd, run_sz, vmfd, failures;
++static char *s0, *main_map;
++static uint64_t mem_len;
++static struct kvm_cpuid2 *cpuid;
++
++struct vcpu { int fd; struct kvm_run *run; CensusVcpu *vc; };
++
++#define CHECK(cond, ...) do { \
++    int ok_ = (cond); printf("  %s ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); \
++    failures += !ok_; } while (0)
++
++static inline uint64_t now_ns(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000000000ULL + t.tv_nsec;
++}
++
++// What kvm-all.c's SIGBUS path holds between the signal and KVM_RUN's return.
++static __thread void *pending_addr;
++static __thread int pending;
++static void on_bus(int s, siginfo_t *i, void *u) {
++    (void)s; (void)u;
++    if (i->si_code != BUS_MCEERR_AR) { signal(SIGBUS, SIG_DFL); raise(SIGBUS); }
++    pending_addr = i->si_addr; pending = 1;
++}
++
++static void read_gpa(void *opaque, uint64_t gpa, void *buf, unsigned len) {
++    (void)opaque;
++    if (gpa + len <= S0_SIZE) memcpy(buf, s0 + gpa, len);
++}
++
++static void vcpu_init(struct vcpu *c, int id) {
++    c->fd = ioctl(vmfd, KVM_CREATE_VCPU, id);
++    if (c->fd < 0) DIE("vcpu");
++    c->run = mmap(0, run_sz, PROT_READ | PROT_WRITE, MAP_SHARED, c->fd, 0);
++    if (ioctl(c->fd, KVM_SET_CPUID2, cpuid)) DIE("cpuid");
++    struct kvm_sregs s;
++    ioctl(c->fd, KVM_GET_SREGS, &s);
++    struct kvm_segment cs = {.base = 0, .limit = 0xffffffff, .selector = 8, .type = 11, .present = 1,
++                             .dpl = 0, .db = 0, .s = 1, .l = 1, .g = 1};
++    struct kvm_segment ds = {.base = 0, .limit = 0xffffffff, .selector = 16, .type = 3, .present = 1,
++                             .dpl = 0, .db = 1, .s = 1, .l = 0, .g = 1};
++    s.cs = cs; s.ds = s.es = s.fs = s.gs = s.ss = ds;
++    s.cr3 = 0x1000;
++    s.cr4 = (1 << 5) | (1 << 9) | (1 << 10) | (1 << 18);
++    s.cr0 = 0x80000033;
++    s.efer = (1 << 8) | (1 << 10);
++    if (ioctl(c->fd, KVM_SET_SREGS, &s)) DIE("sregs");
++    struct kvm_xcrs x = {.nr_xcrs = 1};
++    x.xcrs[0].xcr = 0; x.xcrs[0].value = 7;
++    if (ioctl(c->fd, KVM_SET_XCRS, &x)) DIE("xcrs");
++    c->vc = census_vcpu(id, c->fd, NULL, read_gpa);
++}
++
++static void setr(struct vcpu *c, uint64_t rip, uint64_t rax, uint64_t rbx, uint64_t rcx, uint64_t rdx,
++                 uint64_t rsi, uint64_t rdi) {
++    struct kvm_regs r = {.rip = rip, .rflags = 2, .rsp = STACK, .rax = rax, .rbx = rbx, .rcx = rcx,
++                         .rdx = rdx, .rsi = rsi, .rdi = rdi};
++    if (ioctl(c->fd, KVM_SET_REGS, &r)) DIE("set regs");
++}
++static struct kvm_regs getr(struct vcpu *c) {
++    struct kvm_regs r;
++    ioctl(c->fd, KVM_GET_REGS, &r);
++    return r;
++}
++
++enum { RUN_IO, RUN_MMIO, RUN_FATAL };
++// kvm_cpu_exec's loop for what the census changes. On an MMIO exit it completes the access through
++// the main mapping, as address_space_rw does. Unblocks SIGBUS only inside KVM_RUN, as QEMU's
++// KVM_SET_SIGNAL_MASK does.
++static int run_guest(struct vcpu *c, int *mmio_exits) {
++    sigset_t bus, old;
++    sigemptyset(&bus); sigaddset(&bus, SIGBUS);
++    for (;;) {
++        alarm(60);
++        pthread_sigmask(SIG_UNBLOCK, &bus, &old);
++        int r = ioctl(c->fd, KVM_RUN, 0);
++        int e = r < 0 ? errno : 0;
++        pthread_sigmask(SIG_BLOCK, &bus, 0);
++        if (pending) {
++            pending = 0;
++            if (census_on_sigbus(c->vc, &pending_addr) == CENSUS_HANDLED) {
++                if (e == EINTR) continue;
++            } else {
++                return RUN_FATAL;
++            }
++        }
++        if (r < 0) {
++            if (e == EINTR) continue;
++            if (e == EFAULT && census_on_efault(c->vc)) continue;
++            return RUN_FATAL;
++        }
++        if (c->run->exit_reason == KVM_EXIT_IO) return RUN_IO;
++        if (c->run->exit_reason == KVM_EXIT_MMIO) {
++            uint64_t off = c->run->mmio.phys_addr - DATA_GPA;
++            if (mmio_exits) (*mmio_exits)++;
++            if (c->run->mmio.is_write) memcpy(main_map + off, c->run->mmio.data, c->run->mmio.len);
++            else memcpy(c->run->mmio.data, main_map + off, c->run->mmio.len);
++            continue;
++        }
++        printf("  exit %u\n", c->run->exit_reason);
++        return RUN_FATAL;
++    }
++}
++
++static void arm(uint32_t id, uint64_t off, uint64_t pages) {
++    uint64_t *list = malloc(pages * 8);
++    for (uint64_t i = 0; i < pages; i++) list[i] = (uint64_t)main_map + off + i * PG;
++    CensusSurface f = {.mapping_id = id, .width = 2000, .height = 2000, .pixel_format = 0x42475241,
++                       .alloc_size = pages * PG, .bytes_per_row = 8000};
++    census_surface_mapped(&f, list, pages, PG);
++    free(list);
++}
++
++static void t_classify(struct vcpu *c) {
++    printf("[classify] one page: touch, read or write, resumed, data intact\n");
++    uint64_t off = 0x100000, gpa = DATA_GPA + off;
++    CensusCounts a, b;
++    arm(1, off, 64);
++    CHECK(census_page_state(main_map + off) == 1, "armed at map");
++    census_counts(&a);
++    *(uint64_t *)(main_map + off) = 0x1111;
++    setr(c, STUB(g_read), 0, gpa, 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO && getr(c).rax == 0x1111, "read sees what the main mapping holds");
++    census_counts(&b);
++    CHECK(b.traps == a.traps + 1 && b.writes == a.writes, "one trap, no write");
++    CHECK(census_page_state(main_map + off) == 2, "held after a read");
++    setr(c, STUB(g_read), 0, gpa, 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "a second read is free");
++    census_counts(&a);
++    CHECK(a.traps == b.traps, "no trap on it");
++
++    setr(c, STUB(g_write), 0x4444, gpa + PG, 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "write resumes");
++    CHECK(*(uint64_t *)(main_map + off + PG) == 0x4444, "the write reached the main mapping");
++    census_counts(&b);
++    CHECK(b.traps == a.traps + 1 && b.writes == a.writes + 1, "one trap, one write");
++    CHECK(census_page_state(main_map + off + PG) == 3, "open after a write");
++
++    setr(c, STUB(g_lock), 0, gpa + 2 * PG, 0, 0, 0, 0);
++    *(uint64_t *)(main_map + off + 2 * PG) = 41;
++    CHECK(run_guest(c, 0) == RUN_IO && *(uint64_t *)(main_map + off + 2 * PG) == 42, "lock inc");
++    census_counts(&a);
++    CHECK(a.writes == b.writes + 1, "a locked increment is a write");
++
++    *(uint64_t *)(main_map + off + 3 * PG + 8) = 0xabcd;
++    setr(c, STUB(g_avx), 0, gpa + 3 * PG + 8, 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "vmovdqu load resumes");
++    census_counts(&b);
++    CHECK(b.writes == a.writes && b.traps == a.traps + 1, "and is a read");
++
++    for (int i = 0; i < 3 * (int)PG; i++) main_map[off + 0x10000 + i] = (char)(i * 7);
++    setr(c, STUB(g_repmovs), 0, 0, 3 * PG, 0, gpa + 0x10000, gpa + 0x20000);
++    CHECK(run_guest(c, 0) == RUN_IO, "rep movsb across armed pages resumes");
++    CHECK(!memcmp(main_map + off + 0x10000, main_map + off + 0x20000, 3 * PG), "copy byte-correct");
++    census_counts(&a);
++    CHECK(a.writes == b.writes + 3 && a.traps == b.traps + 6, "3 reads, 3 writes (got %lu traps %lu writes)",
++          a.traps - b.traps, a.writes - b.writes);
++    census_surface_unmapped(1);
++    CHECK(census_page_state(main_map + off) == 6 && census_page_state(main_map + off + PG) == 6,
++          "unmap leaves every page stale");
++}
++
++static void t_upgrade(struct vcpu *c) {
++    printf("[upgrade] a write to a page held since an earlier read: bare EFAULT, no pending page\n");
++    uint64_t off = 0x200000, gpa = DATA_GPA + off;
++    CensusCounts a, b;
++    arm(2, off, 8);
++    setr(c, STUB(g_read), 0, gpa, 0, 0, 0, 0);
++    run_guest(c, 0);
++    setr(c, STUB(g_read), 0, gpa + PG, 0, 0, 0, 0);
++    run_guest(c, 0);
++    census_counts(&a);
++    setr(c, STUB(g_write), 0x77, gpa, 0, 0, 0, 0);
++    CHECK(run_guest(c, 0) == RUN_IO, "resumes");
++    CHECK(*(uint64_t *)(main_map + off) == 0x77, "the write landed");
++    census_counts(&b);
++    CHECK(b.upgrades == a.upgrades + 1, "one upgrade");
++    CHECK(census_page_state(main_map + off + PG) == 3, "every held page opened");
++    census_surface_unmapped(2);
++}
++
++static void t_rearm(struct vcpu *c) {
++    printf("[rearm] the window's end arms touched pages again, read and written alike\n");
++    uint64_t off = 0x300000, gpa = DATA_GPA + off;
++    CensusCounts a, b;
++    arm(3, off, 16);
++    for (int round = 0; round < 3; round++) {
++        census_counts(&a);
++        setr(c, STUB(g_read), 0, gpa, 0, 0, 0, 0);
++        run_guest(c, 0);
++        setr(c, STUB(g_write), round, gpa + PG, 0, 0, 0, 0);
++        run_guest(c, 0);
++        census_counts(&b);
++        CHECK(b.traps == a.traps + 2 && b.writes == a.writes + 1, "round %d: 2 traps, 1 write", round);
++        census_close_window();
++        CHECK(census_page_state(main_map + off) == 1 && census_page_state(main_map + off + PG) == 1,
++              "round %d: armed again", round);
++    }
++    census_surface_unmapped(3);
++}
++
++static void t_emulator(struct vcpu *c) {
++    printf("[emulator] KVM's own access to an armed page: an MMIO exit, completed on the main mapping\n");
++    uint64_t off = 0x400000, gpa = DATA_GPA + off;
++    int mmio = 0;
++    arm(4, off, 4);
++    memset(main_map + off, 0x5a, PG);
++    setr(c, STUB(g_outs), 0, 0, 8, 0, gpa, 0);
++    int r = run_guest(c, &mmio);
++    CHECK(r == RUN_IO && c->run->io.count >= 1, "rep outsb from an armed page exits with data, %d MMIO exits", mmio);
++    if (c->run->exit_reason == KVM_EXIT_IO)
++        printf("    data %#x (port %#x, count %u)\n", *((uint8_t *)c->run + c->run->io.data_offset),
++               c->run->io.port, c->run->io.count);
++    census_surface_unmapped(4);
++}
++
++static void t_unknown_sigbus(struct vcpu *c) {
++    printf("[fatal] a fault outside the armed set stays fatal, in a child\n");
++    fflush(stdout);
++    uint64_t off = 0x500000;
++    CensusCounts a;
++    void *in_view = census_hva(main_map + off);
++    census_counts(&a);
++    void *addr = in_view;
++    CHECK(census_on_sigbus(c->vc, &addr) == CENSUS_NOT_OURS, "a page never armed is not ours");
++    CHECK(addr == main_map + off, "and goes on with the main mapping's address");
++    int x;
++    addr = &x;
++    CHECK(census_on_sigbus(c->vc, &addr) == CENSUS_NOT_OURS && addr == &x, "nor an address outside the view");
++    arm(5, off, 2);
++    census_surface_unmapped(5);
++    addr = in_view;
++    CHECK(census_on_sigbus(c->vc, &addr) == CENSUS_HANDLED, "a stale page reruns once");
++    int fatal = 0;
++    for (int i = 0; i < 200000 && !fatal; i++) {
++        addr = in_view;
++        fatal = census_on_sigbus(c->vc, &addr) == CENSUS_NOT_OURS;
++    }
++    CHECK(fatal && addr == main_map + off, "real poison on a stale page ends fatal, not in a loop");
++
++}
++
++// Last: it ends the census. A genuine bare EFAULT with nothing held, on a slot with no memory behind
++// it: the fuse turns the census off, and the path to QEMU's fatal error must end.
++static void t_fuse(struct vcpu *c) {
++    printf("[fuse] an EFAULT nothing explains: markers dropped, then fatal as before\n");
++    struct kvm_userspace_memory_region m = {.slot = 9, .guest_phys_addr = DATA_GPA + (64UL << 30),
++                                            .memory_size = PG,
++                                            .userspace_addr = (uint64_t)mmap(0, PG, PROT_NONE,
++                                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)};
++    if (ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &m)) DIE("slot 9");
++    arm(6, 0x600000, 4);
++    setr(c, STUB(g_read), 0, DATA_GPA + (64UL << 30), 0, 0, 0, 0);
++    int r = run_guest(c, 0);
++    CensusCounts k;
++    census_counts(&k);
++    CHECK(r == RUN_FATAL, "reaches the fatal path");
++    CHECK(k.dead, "the census is off");
++    CHECK(census_page_state(main_map + 0x600000) == 6, "with no marker left");
++}
++
++static void t_overlap(void) {
++    printf("[overlap] two surfaces over one page: armed once, each unmap clears its own\n");
++    uint64_t off = 0x700000;
++    CensusCounts a, b;
++    census_counts(&a);
++    arm(7, off, 4);
++    arm(8, off + 2 * PG, 4);
++    census_counts(&b);
++    CHECK(b.overlaps == a.overlaps + 2, "two pages overlap");
++    census_surface_unmapped(7);
++    CHECK(census_page_state(main_map + off) == 6 && census_page_state(main_map + off + 4 * PG) == 1,
++          "the second surface keeps its own pages");
++    census_surface_unmapped(8);
++    census_surface_unmapped(8);
++    census_surface_unmapped(9);
++    CHECK(census_page_state(main_map + off + 4 * PG) == 6, "unmap twice, or of nothing, is harmless");
++}
++
++static void t_reset(struct vcpu *c) {
++    printf("[reset] a guest reset drops every marker, with surfaces armed and pages held\n");
++    uint64_t off = 0x800000, gpa = DATA_GPA + off;
++    arm(10, off, 8);
++    setr(c, STUB(g_read), 0, gpa, 0, 0, 0, 0);
++    run_guest(c, 0);
++    census_reset();
++    setr(c, STUB(g_wloop), 7, gpa, 8, PG, 0, 0);
++    CensusCounts a, b;
++    census_counts(&a);
++    CHECK(run_guest(c, 0) == RUN_IO, "writes run after the reset");
++    census_counts(&b);
++    CHECK(b.traps == a.traps && b.writes == a.writes && b.upgrades == a.upgrades, "with no trap");
++}
++
++// Several vCPUs race for the same pages, while the census's thread re-arms under them.
++struct racer { struct vcpu c; uint64_t off; int rounds, fatal, id; };
++static void *race_thread(void *p) {
++    struct racer *r = p;
++    for (int i = 0; i < r->rounds && !r->fatal; i++) {
++        if (i & 1) setr(&r->c, STUB(g_wloop), r->id + i, DATA_GPA + r->off, 16, PG, 0, 0);
++        else setr(&r->c, STUB(g_loop), 0, DATA_GPA + r->off, 16, PG, 0, 0);
++        r->fatal = run_guest(&r->c, 0) != RUN_IO;
++    }
++    return 0;
++}
++// A loop of writes, each followed by a look through the main mapping, with arming under it: the
++// census must never lose a write or show a stale byte.
++struct writer { struct vcpu c; uint64_t off; volatile int stop; int fatal, bad; uint64_t rounds; };
++static void *write_thread(void *p) {
++    struct writer *w = p;
++    for (uint64_t i = 1; !w->stop && !w->fatal; i++, w->rounds++) {
++        setr(&w->c, STUB(g_wloop), i, DATA_GPA + w->off, 16, PG, 0, 0);
++        w->fatal = run_guest(&w->c, 0) != RUN_IO;
++        for (int k = 0; k < 16; k++)
++            w->bad += *(uint64_t *)(main_map + w->off + k * PG) != i;
++        setr(&w->c, STUB(g_read), 0, DATA_GPA + w->off + (i % 16) * PG, 0, 0, 0, 0);
++        w->fatal |= run_guest(&w->c, 0) != RUN_IO;
++        w->bad += getr(&w->c).rax != i;
++    }
++    return 0;
++}
++static void t_truth(void) {
++    printf("[truth] the guest's pages stay the truth, armed again every 100 us\n");
++    struct writer w;
++    pthread_t th;
++    uint64_t off = 0xa00000;
++    memset(&w, 0, sizeof w);
++    vcpu_init(&w.c, 7);
++    w.off = off;
++    arm(12, off, 16);
++    pthread_create(&th, 0, write_thread, &w);
++    for (int i = 0; i < 5000 && !w.fatal; i++) {
++        census_close_window();
++        usleep(100);
++    }
++    w.stop = 1;
++    pthread_join(th, 0);
++    census_surface_unmapped(12);
++    CHECK(!w.fatal && !w.bad, "%lu rounds, %d wrong bytes seen", w.rounds, w.bad);
++}
++
++static void t_race(void) {
++    printf("[race] 4 vCPUs on one surface, reads and writes, armed again under them, then an unmap\n");
++    enum { N = 4 };
++    struct racer r[N];
++    pthread_t th[N];
++    uint64_t off = 0x900000;
++    CensusCounts a, b;
++    arm(11, off, 16);
++    census_counts(&a);
++    for (int i = 0; i < N; i++) {
++        memset(&r[i], 0, sizeof r[i]);
++        vcpu_init(&r[i].c, i + 1);
++        r[i].off = off; r[i].rounds = 40000; r[i].id = i;
++        pthread_create(&th[i], 0, race_thread, &r[i]);
++    }
++    uint64_t t0 = now_ns();
++    for (int i = 0; i < 4000; i++) {
++        census_close_window();
++        usleep(100);
++        if (i % 16 == 0) { census_surface_unmapped(11); arm(11, off, 16); }
++    }
++    int fatal = 0;
++    for (int i = 0; i < N; i++) r[i].rounds = 0;
++    for (int i = 0; i < N; i++) { pthread_join(th[i], 0); fatal |= r[i].fatal; }
++    census_surface_unmapped(11);
++    census_counts(&b);
++    CHECK(!fatal, "no vCPU died in %.1f s: %lu traps, %lu writes, %lu upgrades, %lu spurious", (now_ns() - t0) / 1e9,
++          b.traps - a.traps, b.writes - a.writes, b.upgrades - a.upgrades, b.spurious - a.spurious);
++    CHECK(b.errors == 0 && !b.dead, "no uffd error, fuse not blown (errors %lu)", b.errors);
++    for (uint64_t i = 0; i < 16; i++)
++        if (census_page_state(main_map + off + i * PG) != 6) { CHECK(0, "page %lu state %d", i, census_page_state(main_map + off + i * PG)); }
++}
++
++// What registering the view costs a page the census never armed. The WP registration makes read
++// faults map read-only, so a read then a write of a fresh page takes one more host fault.
++static double first_touch(struct vcpu *c, uint64_t gpa, uint64_t pages) {
++    uint64_t t0 = now_ns();
++    setr(c, STUB(g_loop), 0, gpa, pages, PG, 0, 0);
++    run_guest(c, 0);
++    setr(c, STUB(g_wloop), 0, gpa, pages, PG, 0, 0);
++    run_guest(c, 0);
++    return (now_ns() - t0) / 1e3 / pages;
++}
++static void t_plain_fault(struct vcpu *c) {
++    enum { P = 20000 };
++    uint64_t plain_gpa = DATA_GPA + (32UL << 30), off = 0x4000000;
++    int fd = memfd_create("plain", MFD_CLOEXEC);
++    if (ftruncate(fd, P * PG)) DIE("plain");
++    char *m = mmap(0, P * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    struct kvm_userspace_memory_region r = {.slot = 8, .guest_phys_addr = plain_gpa, .memory_size = P * PG,
++                                            .userspace_addr = (uint64_t)m};
++    if (ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &r)) DIE("slot 8");
++    memset(m, 1, P * PG); // both page caches filled, EPT and the view's PTEs empty
++    memset(main_map + off, 1, P * PG);
++    printf("[plain] read then write of a fresh page, never armed: %.2f us on a plain mapping, %.2f us on the view\n",
++           first_touch(c, plain_gpa, P), first_touch(c, DATA_GPA + off, P));
++}
++
++static void t_cost(struct vcpu *c) {
++    printf("[cost] a guest loop over 2000 pages, trap to resume\n");
++    uint64_t off = 0x1000000, gpa = DATA_GPA + off;
++    enum { N = 2000 };
++    uint64_t t0, t1, t2, t3;
++    setr(c, STUB(g_loop), 0, gpa, N, PG, 0, 0);
++    run_guest(c, 0);
++    setr(c, STUB(g_loop), 0, gpa, N, PG, 0, 0);
++    t0 = now_ns(); run_guest(c, 0); t1 = now_ns();
++    uint64_t base = t1 - t0;
++    for (int kind = 0; kind < 2; kind++) {
++        arm(20, off, N);
++        setr(c, STUB(kind ? g_wloop : g_loop), 0, gpa, N, PG, 0, 0);
++        t2 = now_ns(); run_guest(c, 0); t3 = now_ns();
++        printf("    %s: %.2f us a page, trap included, against %.3f us untrapped\n", kind ? "write" : "read",
++               (t3 - t2 - base) / 1e3 / N, base / 1e3 / N);
++        t0 = now_ns();
++        census_surface_unmapped(20);
++        printf("    unmap of %d pages, each touched: %.0f us\n", N, (now_ns() - t0) / 1e3);
++    }
++    t0 = now_ns(); arm(20, off, N); t1 = now_ns();
++    printf("    arm %d contiguous pages: %.0f us\n", N, (t1 - t0) / 1e3);
++    census_surface_unmapped(20);
++    // Scattered, as a surface's 16 KiB ranges lie: 1400 ranges of 4 pages.
++    uint64_t *list = malloc(1400 * 4 * 8);
++    for (int i = 0; i < 1400; i++) list[i] = (uint64_t)main_map + off + (i * 8UL) * PG;
++    CensusSurface f = {.mapping_id = 21, .width = 3200, .height = 1800};
++    t0 = now_ns();
++    census_surface_mapped(&f, list, 1400, 4 * PG);
++    t1 = now_ns();
++    census_surface_unmapped(21);
++    t2 = now_ns();
++    printf("    a 3200x1800 surface, 1400 ranges of 16 KiB: arm %.2f ms, disarm %.2f ms\n", (t1 - t0) / 1e6, (t2 - t1) / 1e6);
++    free(list);
++}
++
++int main(int argc, char **argv) {
++    setvbuf(stdout, 0, _IOLBF, 0);
++    if (argc < 2) return 2;
++    uint64_t mib = argc > 2 ? atol(argv[2]) : 512;
++    setenv(CENSUS_ENV, argv[1], 1);
++    setenv("REIMS_VGPU_CENSUS_MIN_PIXELS", "1", 1);
++    setenv("REIMS_VGPU_CENSUS_WINDOW_MS", "100000", 1);
++    setenv("REIMS_VGPU_CENSUS_EVERY", "1000000", 1);
++    setenv("REIMS_VGPU_CENSUS_FLUSH_MS", "100", 1);
++    setenv("REIMS_VGPU_CENSUS_SATURATE", "100000", 1);
++    kvmfd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
++    if (kvmfd < 0) DIE("/dev/kvm");
++    run_sz = ioctl(kvmfd, KVM_GET_VCPU_MMAP_SIZE, 0);
++    vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
++    if (vmfd < 0) DIE("vm");
++    ioctl(vmfd, KVM_SET_TSS_ADDR, 0xfffbd000);
++    s0 = mmap(0, S0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++    memcpy(s0 + CODE, g_start, g_end - g_start);
++    uint64_t *pml4 = (uint64_t *)(s0 + 0x1000), *pdpt = (uint64_t *)(s0 + 0x2000);
++    pml4[0] = 0x2000 | 3;
++    for (uint64_t i = 0; i < 512; i++) pdpt[i] = (i << 30) | 0x83;
++    struct kvm_userspace_memory_region m0 = {.slot = 0, .memory_size = S0_SIZE, .userspace_addr = (uint64_t)s0};
++    if (ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &m0)) DIE("slot 0");
++    mem_len = mib << 20;
++    int memfd = memfd_create("census-test", MFD_CLOEXEC);
++    if (ftruncate(memfd, mem_len)) DIE("ftruncate");
++    main_map = mmap(0, mem_len, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
++    CHECK(census_wanted(), "the variable is read");
++    if (!census_start(memfd, 0, main_map, mem_len)) DIE("census_start");
++    CHECK(census_hva(main_map + 8192) != main_map + 8192, "memslots get the view");
++    CHECK(census_hva(&failures) == &failures, "an address outside RAM stays");
++    struct kvm_userspace_memory_region m1 = {.slot = 1, .guest_phys_addr = DATA_GPA, .memory_size = mem_len,
++                                             .userspace_addr = (uint64_t)census_hva(main_map)};
++    if (ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &m1)) DIE("slot 1");
++    cpuid = calloc(1, sizeof *cpuid + 256 * sizeof(struct kvm_cpuid_entry2));
++    cpuid->nent = 256;
++    if (ioctl(kvmfd, KVM_GET_SUPPORTED_CPUID, cpuid)) DIE("cpuid");
++    struct sigaction sa = {.sa_sigaction = on_bus, .sa_flags = SA_SIGINFO};
++    sigaction(SIGBUS, &sa, 0);
++    sigset_t bus;
++    sigemptyset(&bus); sigaddset(&bus, SIGBUS);
++    pthread_sigmask(SIG_BLOCK, &bus, 0);
++
++    struct vcpu c;
++    vcpu_init(&c, 0);
++    t_classify(&c);
++    t_upgrade(&c);
++    t_rearm(&c);
++    t_emulator(&c);
++    t_unknown_sigbus(&c);
++    t_overlap();
++    t_reset(&c);
++    t_race();
++    t_truth();
++    t_plain_fault(&c);
++    t_cost(&c);
++    t_fuse(&c);
++    census_presented(0);
++    census_flush();
++    usleep(200000);
++    printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
++    return failures != 0;
++}

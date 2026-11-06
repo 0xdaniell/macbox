@@ -1,0 +1,747 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 20:24:14 +0000
+Subject: [PATCH 04/25] REIMS_VGPU_VBLANK=1 re-raises an idle
+ display's present interrupt
+
+A guest display that has gone a whole refresh period without a present raises
+the present interrupt (2) again for the frame it presented last, once a period,
+phase-locked to that frame's completion, as a display scanning it out at each
+vblank would. Nothing else in the page changes (present count, presented
+surface, fieldfa4) and there is no GPU work. It starts with the first present,
+yields to every present, stops while the guest sleeps (bit 0), is paused or
+restoring, or loses its client, and starts again with the next present. The
+period is the host modes' highest refresh rate (24-240 Hz), else 60 Hz. Each
+tick is a trace event (vblank <k> <enabledInterrupts>); the first tick logs the
+guest's enabled interrupt bits. Off unless the variable is 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/display/guest_display.rs              |  28 ++
+ .../src/display/guest_display/present.rs      |   7 +
+ .../src/display/guest_display/settings.rs     |   9 +
+ .../src/display/guest_display/tests.rs        | 233 ++++++++++++
+ .../src/display/guest_display/vblank.rs       | 340 ++++++++++++++++++
+ 5 files changed, 617 insertions(+)
+ create mode 100644 crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+
+diff --git a/crates/reims-vgpu-core/src/display/guest_display.rs b/crates/reims-vgpu-core/src/display/guest_display.rs
+index fa75b3f3..c6d0714e 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display.rs
+@@ -62,6 +62,7 @@ mod present;
+ mod settings;
+ #[cfg(test)]
+ mod tests;
++mod vblank;
+ 
+ pub use cursor::CursorGlyphArgs;
+ 
+@@ -353,6 +354,8 @@ pub struct GuestDisplay<P: Platform> {
+     pub(crate) guest_display_mutex: Mutex<GuestDisplayLocked<P>>,
+     /// What is read without it.
+     pub(crate) unlocked: GuestDisplayUnlocked<P>,
++    /// LOCAL (Atlas): the idle vblank ticker, with `REIMS_VGPU_VBLANK=1` ([`vblank`]).
++    vblank: Option<Arc<vblank::Vblank>>,
+ }
+ 
+ /// The shared page, each access one volatile or atomic access of the field's width (D18).
+@@ -426,6 +429,23 @@ impl<P: Platform> GuestDisplay<P> {
+         device: Weak<DeviceCore<P>>,
+         port: u64,
+         shared_state_page: u32,
++    ) -> RaiseResult<Arc<Self>> {
++        Self::new_with_vblank(
++            platform,
++            device,
++            port,
++            shared_state_page,
++            vblank::enabled_by_env(),
++        )
++    }
++
++    /// [`GuestDisplay::new`], with the idle vblank ticker or without it ([`vblank`]).
++    pub(crate) fn new_with_vblank(
++        platform: Arc<P>,
++        device: Weak<DeviceCore<P>>,
++        port: u64,
++        shared_state_page: u32,
++        with_vblank: bool,
+     ) -> RaiseResult<Arc<Self>> {
+         // A gone device, or no mapping, gives a NULL address.
+         let mapping = match device.upgrade() {
+@@ -478,6 +498,7 @@ impl<P: Platform> GuestDisplay<P> {
+                 }),
+                 this: this.clone(),
+             },
++            vblank: with_vblank.then(vblank::Vblank::new),
+         });
+         log::info!("guest display on port {port} created");
+         {
+@@ -615,6 +636,9 @@ impl<P: Platform> GuestDisplay<P> {
+                 slot.display.is_none() || client.is_none(),
+                 DeathKind::ClientAlreadySet
+             );
++            if client.is_none() {
++                self.vblank_idle();
++            }
+             *slot = Client {
+                 display: client,
+                 core,
+@@ -801,6 +825,7 @@ impl<P: Platform> GuestDisplay<P> {
+         crate::fatal_unless!(!l.paused, DeathKind::PauseTwice);
+         l.paused = true;
+         self.unlocked.paused.store(true, Ordering::SeqCst);
++        self.vblank_idle();
+     }
+ 
+     /// Unpauses the guest display and runs the state machine. Only the device's unpause, an API
+@@ -891,6 +916,9 @@ impl<P: Platform> Drop for GuestDisplay<P> {
+     /// The guest display's end: the page's mapping (its unmap), the mode list, then the log. The
+     /// guest colour space goes with the fields.
+     fn drop(&mut self) {
++        if let Some(vb) = &self.vblank {
++            vb.stop();
++        }
+         let l = self.guest_display_mutex.get_mut();
+         drop(l.mapping.take());
+         drop(l.mode_list.take());
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/present.rs b/crates/reims-vgpu-core/src/display/guest_display/present.rs
+index d04efe7a..0a2582b7 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/present.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/present.rs
+@@ -133,6 +133,8 @@ impl<P: Platform> GuestDisplay<P> {
+                 {
+                     guest_display.poke();
+                 }
++                // LOCAL (Atlas): the idle vblank's schedule starts from this completion.
++                guest_display.vblank_presented();
+             }
+         })
+     }
+@@ -615,6 +617,11 @@ impl<P: Platform> GuestDisplay<P> {
+             });
+         }
+         l.asleep = asleep;
++        // LOCAL (Atlas): no idle vblank while the guest sleeps (bit 0, as the presents test it),
++        // until its next present.
++        if asleep & 1 != 0 {
++            self.vblank_idle();
++        }
+         // The raw byte.
+         self.page(l).w8(sp::ASLEEP, asleep);
+     }
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/settings.rs b/crates/reims-vgpu-core/src/display/guest_display/settings.rs
+index 215225e1..5c93acd4 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/settings.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/settings.rs
+@@ -161,6 +161,15 @@ impl<P: Platform> GuestDisplay<P> {
+             DeathKind::ModeCountTooLarge
+         );
+         let modes = list.get(..usize::from(sp::MAX_MODES)).unwrap_or(&*list);
++        // LOCAL (Atlas): the idle vblank's period, from the modes' highest refresh rate.
++        if let Some(vb) = &self.vblank {
++            vb.set_refresh_hz(
++                modes
++                    .iter()
++                    .map(|m| m.refresh_rate_in_hz)
++                    .fold(f64::NAN, f64::max),
++            );
++        }
+         let count16 = u16::try_from(modes.len()).unwrap_or(sp::MAX_MODES);
+         let mut changed = false;
+         if self.page(l).r16(sp::MODE_LIST_COUNT) != count16 {
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/tests.rs b/crates/reims-vgpu-core/src/display/guest_display/tests.rs
+index e602e806..851c7485 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/tests.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/tests.rs
+@@ -210,6 +210,23 @@ impl Fx {
+         Fx::with_port(0)
+     }
+ 
++    /// LOCAL (Atlas): a guest display on port 0 with the idle vblank ticker on.
++    fn with_vblank() -> Fx {
++        let td = guest_display_device();
++        let p = td.platform.clone();
++        let host = host_of(&td);
++        let guest_display =
++            GuestDisplay::new_with_vblank(p.clone(), Arc::downgrade(&host), 0, PAGE, true)
++                .unwrap();
++        p.call_log().clear();
++        Fx {
++            p,
++            _td: td,
++            host,
++            guest_display,
++        }
++    }
++
+     fn r8(&self, off: u64) -> u8 {
+         self.page().read_u8(off, ANY)
+     }
+@@ -2021,3 +2038,219 @@ mod handler_releases_the_display {
+         assert_eq!(*seen.lock(), vec!["pos=1 props=1"]);
+     }
+ }
++
++/// LOCAL (Atlas): `REIMS_VGPU_VBLANK=1`'s idle vblank (`vblank.rs`), on the virtual clock.
++mod vblank {
++    use super::*;
++    use crate::display::guest_display::vblank::{Vblank, period_of};
++
++    /// The real time a tick that is due may take to be raised.
++    const REAL: Duration = Duration::from_secs(10);
++    /// The real time given to a tick that must not come.
++    const SETTLE: Duration = Duration::from_millis(40);
++    const MS: Duration = Duration::from_millis(1);
++
++    /// The default period (no modes): 60 Hz.
++    fn period() -> Duration {
++        period_of(60.0)
++    }
++
++    fn vb(fx: &Fx) -> &Arc<Vblank> {
++        fx.guest_display.vblank.as_ref().unwrap()
++    }
++
++    /// A mapped present with no client: it completes at once (the completion raises 2).
++    fn present(fx: &Fx) {
++        let s = fx.p.fake_surfaces().make_simple(64, 32, FOURCC_BGRA, 4);
++        let task = fx.host.get_kernel_task(OnFault::Return).unwrap();
++        let mut l = fx.guest_display.guest_display_mutex.lock();
++        let keep = fx.guest_display.client_core();
++        present_mapped_with_surface(
++            Hold::NONE,
++            &fx.guest_display,
++            &mut l,
++            keep.as_ref(),
++            task,
++            Some(s),
++            5,
++            GammaTableArgs::default(),
++        )
++        .unwrap();
++    }
++
++    fn advance(fx: &Fx, d: Duration) {
++        fx.p.virtual_clock().advance(d);
++    }
++
++    /// Waits (real time) for `n` ticks raised in all.
++    fn raised_reaches(fx: &Fx, n: u64) -> u64 {
++        let mut left = REAL;
++        while vb(fx).raised() < n && !left.is_zero() {
++            std::thread::sleep(MS);
++            left = left.saturating_sub(MS);
++        }
++        vb(fx).raised()
++    }
++
++    /// The ticks raised once a tick that must not come has had its chance.
++    fn raised_after_settling(fx: &Fx) -> u64 {
++        std::thread::sleep(SETTLE);
++        vb(fx).raised()
++    }
++
++    /// Off without the switch: no ticker, and a present raises once
++    #[test]
++    fn off_without_the_switch() {
++        let fx = Fx::new();
++        assert!(fx.guest_display.vblank.is_none());
++        present(&fx);
++        fx.w32(sp::RAISED_INTERRUPTS, 0);
++        advance(&fx, period() * 5);
++        std::thread::sleep(SETTLE);
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), 0);
++    }
++
++    /// Starts after a period with no present, raises the present bit (poking an enabled port)
++    /// once a period, and leaves the page's present record alone
++    #[test]
++    fn starts_when_idle_and_keeps_the_period() {
++        let fx = Fx::with_vblank();
++        assert!(!vb(&fx).started());
++        fx.w32(sp::ENABLED_INTERRUPTS, INTERRUPT_PRESENT);
++        present(&fx);
++        assert!(vb(&fx).started());
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), INTERRUPT_PRESENT);
++        assert_eq!(fx.r64(sp::PRESENT_COUNT), 1);
++        fx.w32(sp::RAISED_INTERRUPTS, 0);
++        let pokes = fx.pokes();
++
++        // Not before a whole period.
++        advance(&fx, period() - MS);
++        assert_eq!(raised_after_settling(&fx), 0);
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), 0);
++
++        // At the period: one tick, as the completion raises it.
++        advance(&fx, MS);
++        assert_eq!(raised_reaches(&fx, 1), 1);
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), INTERRUPT_PRESENT);
++        assert_eq!(fx.pokes(), pokes + 1);
++        assert_eq!(fx.r64(sp::PRESENT_COUNT), 1);
++        assert_eq!(fx.r64(sp::PRESENTED_MAPPING_ID), 5);
++
++        // And one each period after.
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 2), 2);
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 3), 3);
++        assert_eq!(raised_after_settling(&fx), 3);
++        assert_eq!(fx.pokes(), pokes + 3);
++    }
++
++    /// The bit masked: the tick sets it and pokes nothing, as the completion does
++    #[test]
++    fn masked_bit_is_set_without_a_poke() {
++        let fx = Fx::with_vblank();
++        present(&fx);
++        fx.w32(sp::RAISED_INTERRUPTS, 0);
++        let pokes = fx.pokes();
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 1), 1);
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), INTERRUPT_PRESENT);
++        assert_eq!(fx.pokes(), pokes);
++    }
++
++    /// A late thread raises once, from the newest due point: no burst
++    #[test]
++    fn late_raises_once() {
++        let fx = Fx::with_vblank();
++        present(&fx);
++        advance(&fx, period() * 5 + MS);
++        assert_eq!(raised_reaches(&fx, 1), 1);
++        assert_eq!(raised_after_settling(&fx), 1);
++        // The next on the schedule: 6 periods after the present.
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 2), 2);
++        assert_eq!(raised_after_settling(&fx), 2);
++    }
++
++    /// Presents that come faster than the period get no tick; the schedule starts from the last
++    #[test]
++    fn stops_while_presents_come() {
++        let fx = Fx::with_vblank();
++        let half = period() / 2;
++        present(&fx);
++        for _ in 0..6 {
++            advance(&fx, half);
++            present(&fx);
++        }
++        advance(&fx, half);
++        assert_eq!(raised_after_settling(&fx), 0);
++        // A whole period after the last present.
++        advance(&fx, period() - half);
++        assert_eq!(raised_reaches(&fx, 1), 1);
++        // A present again: nothing until a period after it.
++        present(&fx);
++        advance(&fx, half);
++        assert_eq!(raised_after_settling(&fx), 1);
++        advance(&fx, period() - half);
++        assert_eq!(raised_reaches(&fx, 2), 2);
++    }
++
++    /// Sleep stops the ticks; a wake alone does not start them; the next present does
++    #[test]
++    fn respects_sleep() {
++        let fx = Fx::with_vblank();
++        present(&fx);
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 1), 1);
++
++        fx.guest_display.sleep_state(1);
++        advance(&fx, period() * 4);
++        assert_eq!(raised_after_settling(&fx), 1);
++        // A present while asleep: the tick finds the sleep and raises nothing.
++        present(&fx);
++        fx.w32(sp::RAISED_INTERRUPTS, 0);
++        advance(&fx, period() * 4);
++        assert_eq!(raised_after_settling(&fx), 1);
++        assert_eq!(fx.r32(sp::RAISED_INTERRUPTS), 0);
++
++        fx.guest_display.sleep_state(0);
++        advance(&fx, period() * 4);
++        assert_eq!(raised_after_settling(&fx), 1);
++
++        present(&fx);
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 2), 2);
++    }
++
++    /// Paused, the ticker leaves the page alone, and starts again with the next present
++    #[test]
++    fn paused_touches_nothing() {
++        let fx = Fx::with_vblank();
++        present(&fx);
++        fx.guest_display.pause();
++        advance(&fx, period() * 4);
++        assert_eq!(raised_after_settling(&fx), 0);
++        fx.guest_display.unpause().unwrap();
++        advance(&fx, period() * 4);
++        assert_eq!(raised_after_settling(&fx), 0);
++        present(&fx);
++        advance(&fx, period());
++        assert_eq!(raised_reaches(&fx, 1), 1);
++    }
++
++    /// The period is the host modes' highest refresh rate
++    #[test]
++    fn period_follows_the_modes() {
++        let fx = Fx::with_vblank();
++        assert_eq!(vb(&fx).period(), period_of(60.0));
++        fx.guest_display
++            .set_mode_list(
++                OnFault::Return,
++                Arc::from([mode(3440, 1440, 60.0), mode(1920, 1080, 120.0)]),
++            )
++            .unwrap();
++        assert!(sync_mode_list(&fx.guest_display));
++        assert_eq!(vb(&fx).period(), period_of(120.0));
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/vblank.rs b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+new file mode 100644
+index 00000000..5c708185
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+@@ -0,0 +1,340 @@
++//! LOCAL (Atlas): `REIMS_VGPU_VBLANK=1`, an idle display's vblank.
++//!
++//! Apple's framework gives a display the host's display timing; this library's Linux path has
++//! none, so a guest display raises its present interrupt only when a frame the guest presented is
++//! done. With the variable set to `1`, a guest display that has gone a whole refresh period
++//! without a present raises the present interrupt again, for the frame it presented last, once a
++//! period, on the schedule of that frame's completion (`t0 + k * period`, `k >= 1`), as a display
++//! that scanned the frame out again at each vblank would. It writes nothing else in the page: the
++//! present count, the presented surface and `fieldfa4` stay those of the guest's last present, and
++//! it does no GPU work.
++//!
++//! - **Starts** with the first present's completion, on a thread of its own (one per guest
++//!   display that presents).
++//! - **Yields** to the guest's presents: each one starts the schedule again from its completion,
++//!   so a guest presenting at the refresh rate or faster gets no tick at all.
++//! - **Stops** while the guest sleeps (bit 0 of its sleep byte, as the presents test it), when the
++//!   client goes, and while the guest display is paused or restoring; the ticks start again with
++//!   the next present after it.
++//! - **The period** is the host's modes' highest refresh rate, 24 to 240 Hz, else 60 Hz.
++//! - **A late tick** (the thread was not run on time) raises once and goes on from the newest due
++//!   point: no burst.
++//!
++//! The variable is read once per process; unset, or any other value than `1`, no guest display
++//! has a ticker and nothing here runs. Each tick is a trace event (`vblank <ticks since the last
++//! present> <guest's enabledInterrupts>`), and the first tick of the process logs the guest's
++//! enabled interrupt bits, so a run shows whether the guest takes the bit at all.
++
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, OnceLock, Weak};
++use std::time::Duration;
++
++use super::{GuestDisplay, INTERRUPT_PRESENT};
++use crate::display::page as sp;
++use crate::platform::Platform;
++use crate::platform::os::{Clock as _, Deadline, MonoTime};
++use crate::sync::{Condvar, Mutex};
++
++/// The variable: `1` turns the ticks on.
++pub const ENV_VAR: &str = "REIMS_VGPU_VBLANK";
++
++/// The refresh rate without a usable mode.
++const DEFAULT_HZ: f64 = 60.0;
++/// The lowest refresh rate taken from a mode.
++const MIN_HZ: f64 = 24.0;
++/// The highest refresh rate taken from a mode.
++const MAX_HZ: f64 = 240.0;
++/// The ticker thread's stack.
++const STACK: usize = 128 * 1024;
++
++/// Whether the variable turns the ticks on (read once).
++pub(crate) fn enabled_by_env() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os(ENV_VAR).is_some_and(|v| v == "1"))
++}
++
++/// Whether the first tick of the process was logged.
++static FIRST_TICK_LOGGED: AtomicBool = AtomicBool::new(false);
++
++/// The period of `hz`, or of 60 Hz outside 24-240 Hz (or not a number).
++pub(crate) fn period_of(hz: f64) -> Duration {
++    let hz = if (MIN_HZ..=MAX_HZ).contains(&hz) {
++        hz
++    } else {
++        DEFAULT_HZ
++    };
++    Duration::from_secs_f64(1.0 / hz)
++}
++
++/// What the ticker's thread and its guest display share, under [`Vblank::state`].
++#[derive(Debug)]
++struct State {
++    /// The thread was started.
++    started: bool,
++    /// The guest display ended: the thread leaves.
++    stopped: bool,
++    /// The monotonic time of the last present's completion, in nanoseconds; `None` before the
++    /// first, and after a sleep, a pause or the client's going until the next.
++    last_present: Option<u64>,
++    /// Counts the presents, so a tick decided before one is dropped.
++    epoch: u64,
++    /// The schedule points passed since the last present (the `k` of the last tick).
++    ticks: u64,
++    /// The period, in nanoseconds.
++    period_ns: u64,
++    /// Ticks raised, all told.
++    raised: u64,
++}
++
++/// A guest display's ticker (module doc).
++#[derive(Debug)]
++pub(crate) struct Vblank {
++    state: Mutex<State>,
++    cv: Condvar,
++}
++
++/// What a due tick hands the guest display.
++#[derive(Debug, Clone, Copy)]
++pub(crate) struct Tick {
++    epoch: u64,
++    k: u64,
++}
++
++impl Vblank {
++    /// A ticker at the default period, not started.
++    pub(crate) fn new() -> Arc<Vblank> {
++        Arc::new(Vblank {
++            state: Mutex::new(State {
++                started: false,
++                stopped: false,
++                last_present: None,
++                epoch: 0,
++                ticks: 0,
++                period_ns: nanos(period_of(DEFAULT_HZ)),
++                raised: 0,
++            }),
++            cv: Condvar::new(),
++        })
++    }
++
++    /// The modes' highest refresh rate sets the period (module doc).
++    pub(crate) fn set_refresh_hz(&self, hz: f64) {
++        let period = nanos(period_of(hz));
++        let mut s = self.state.lock();
++        if s.period_ns != period {
++            s.period_ns = period;
++            self.cv.notify_all();
++        }
++    }
++
++    /// The period now.
++    pub(crate) fn period(&self) -> Duration {
++        Duration::from_nanos(self.state.lock().period_ns)
++    }
++
++    /// A present completed at `now_ns`: the schedule starts again from it. Answers whether the
++    /// thread is to be started (the first present).
++    pub(crate) fn presented(&self, now_ns: u64) -> bool {
++        let mut s = self.state.lock();
++        s.last_present = Some(now_ns);
++        s.epoch = s.epoch.wrapping_add(1);
++        s.ticks = 0;
++        self.cv.notify_all();
++        let start = !s.started && !s.stopped;
++        s.started = true;
++        start
++    }
++
++    /// No ticks until the next present: the guest sleeps, the client went, or a pause.
++    pub(crate) fn idle(&self) {
++        let mut s = self.state.lock();
++        s.last_present = None;
++        s.epoch = s.epoch.wrapping_add(1);
++        self.cv.notify_all();
++    }
++
++    /// The guest display ended: the thread leaves.
++    pub(crate) fn stop(&self) {
++        self.state.lock().stopped = true;
++        self.cv.notify_all();
++    }
++
++    /// Whether `tick` is still the newest: no present, sleep or stop since it was decided.
++    fn current(&self, tick: Tick) -> bool {
++        let s = self.state.lock();
++        !s.stopped && s.epoch == tick.epoch
++    }
++
++    /// Counts a raised tick.
++    fn count(&self) -> u64 {
++        let mut s = self.state.lock();
++        s.raised = s.raised.wrapping_add(1);
++        s.raised
++    }
++
++    /// Ticks raised, all told (tests).
++    #[cfg(test)]
++    pub(crate) fn raised(&self) -> u64 {
++        self.state.lock().raised
++    }
++
++    /// Whether the thread was started (tests).
++    #[cfg(test)]
++    pub(crate) fn started(&self) -> bool {
++        self.state.lock().started
++    }
++
++    /// Waits for the next due tick on `clock`: `None` once stopped.
++    fn next_tick<C: crate::platform::os::Clock>(&self, clock: &C) -> Option<Tick> {
++        let mut s = self.state.lock();
++        loop {
++            if s.stopped {
++                return None;
++            }
++            let Some(t0) = s.last_present else {
++                clock.wait(&self.cv, &mut s);
++                continue;
++            };
++            let period = s.period_ns.max(1);
++            let k = s.ticks.saturating_add(1);
++            let due = t0.saturating_add(k.saturating_mul(period));
++            let now = clock.now_mono().as_nanos();
++            if now < due {
++                let _ = clock.wait_until(
++                    &self.cv,
++                    &mut s,
++                    Deadline::Mono(MonoTime::from_nanos(due)),
++                );
++                continue;
++            }
++            // Late: the newest due point, once.
++            let k = now
++                .saturating_sub(t0)
++                .checked_div(period)
++                .unwrap_or(k)
++                .max(k);
++            s.ticks = k;
++            return Some(Tick { epoch: s.epoch, k });
++        }
++    }
++}
++
++/// Nanoseconds of `d`, saturating.
++fn nanos(d: Duration) -> u64 {
++    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
++}
++
++impl<P: Platform> GuestDisplay<P> {
++    /// A present completed: the ticker's schedule starts again, and its thread with the first.
++    pub(super) fn vblank_presented(&self) {
++        let Some(vb) = &self.vblank else {
++            return;
++        };
++        let now = self.platform.clock().now_mono().as_nanos();
++        if vb.presented(now) {
++            self.start_vblank_thread(Arc::clone(vb));
++        }
++    }
++
++    /// No ticks until the next present.
++    pub(super) fn vblank_idle(&self) {
++        if let Some(vb) = &self.vblank {
++            vb.idle();
++        }
++    }
++
++    /// The ticker's thread: holds the guest display weakly, and leaves when it is gone or stopped.
++    fn start_vblank_thread(&self, vb: Arc<Vblank>) {
++        let this: Weak<GuestDisplay<P>> = self.unlocked.this.clone();
++        let platform = Arc::clone(&self.platform);
++        log::info!(
++            "guest display on port {}: vblank ticks on ({ENV_VAR}=1), every {:?} while idle",
++            self.port,
++            vb.period()
++        );
++        crate::rt::thread::spawn_named(
++            self.platform.threads(),
++            "reims-vgpu.vblank",
++            STACK,
++            Box::new(()),
++            move || {
++                while let Some(tick) = vb.next_tick(platform.clock()) {
++                    let Some(guest_display) = this.upgrade() else {
++                        return;
++                    };
++                    guest_display.vblank_tick(&vb, tick);
++                }
++            },
++        );
++    }
++
++    /// One tick: the present interrupt raised again, as the present's completion raises it,
++    /// unless the guest presented, slept or was paused since the tick was decided.
++    fn vblank_tick(&self, vb: &Vblank, tick: Tick) {
++        let l = self.guest_display_mutex.lock();
++        if l.paused || l.will_restore || l.asleep & 1 != 0 {
++            drop(l);
++            vb.idle();
++            return;
++        }
++        if !vb.current(tick) {
++            return;
++        }
++        let p = self.page(&l);
++        p.fetch_or(sp::RAISED_INTERRUPTS, INTERRUPT_PRESENT);
++        let enabled = p.load(sp::ENABLED_INTERRUPTS);
++        if enabled & INTERRUPT_PRESENT != 0 {
++            self.poke();
++        }
++        let raised = vb.count();
++        drop(l);
++        // vblank: schedule points since the last present, the guest's enabled interrupt bits
++        crate::trace::event("vblank", &[tick.k, u64::from(enabled)]);
++        if !FIRST_TICK_LOGGED.swap(true, Ordering::Relaxed) {
++            log::info!(
++                "guest display on port {}: first vblank tick ({raised} raised); the guest enables \
++                 interrupts {enabled:#x}, so the tick {} the port",
++                self.port,
++                if enabled & INTERRUPT_PRESENT != 0 {
++                    "pokes"
++                } else {
++                    "only sets the bit and does not poke"
++                }
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 60 Hz outside 24-240 Hz; the mode's rate inside
++    #[test]
++    fn period_follows_the_mode_within_bounds() {
++        assert_eq!(period_of(60.0), Duration::from_secs_f64(1.0 / 60.0));
++        assert_eq!(period_of(120.0), Duration::from_secs_f64(1.0 / 120.0));
++        assert_eq!(period_of(0.0), period_of(60.0));
++        assert_eq!(period_of(-1.0), period_of(60.0));
++        assert_eq!(period_of(f64::NAN), period_of(60.0));
++        assert_eq!(period_of(1000.0), period_of(60.0));
++    }
++
++    /// A present starts the thread once, and restarts the schedule
++    #[test]
++    fn presented_starts_once_and_restarts_the_schedule() {
++        let vb = Vblank::new();
++        assert!(vb.presented(10));
++        assert!(!vb.presented(20));
++        let s = vb.state.lock();
++        assert_eq!((s.last_present, s.epoch, s.ticks), (Some(20), 2, 0));
++    }
++
++    /// A stopped ticker starts no thread
++    #[test]
++    fn stopped_starts_no_thread() {
++        let vb = Vblank::new();
++        vb.stop();
++        assert!(!vb.presented(10));
++    }
++}

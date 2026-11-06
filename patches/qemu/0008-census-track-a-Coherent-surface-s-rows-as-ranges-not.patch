@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 05:49:11 +0000
+Subject: [PATCH 8/9] census: track a Coherent surface's rows as ranges, not
+ the whole surface
+
+A surface's pages past its texture rows (an IOSurface's trailing pages, a
+second plane) were armed and held with the rows, so a CPU or DMA touch
+there met no pending page, came back as a bare -EFAULT and fused the
+census (B1). census_coh_track(start, len) now tracks [start, start+len)
+as one of up to four ranges of the surface; pages outside every range
+stay OPEN, untrack frees one range, and touches outside the ranges pass
+straight through.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/census.c | 188 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 153 insertions(+), 35 deletions(-)
+
+diff --git a/accel/kvm/census.c b/accel/kvm/census.c
+index e9c87e06ce..40cb9ea0da 100644
+--- a/accel/kvm/census.c
++++ b/accel/kvm/census.c
+@@ -150,6 +150,18 @@ typedef struct Run {
+     uint32_t count;
+ } Run;
+ 
++/*
++ * One range a library's surface tracks: pages [lo, hi) of its census surface, in the surface's
++ * order. `writable`: a probe left its armed pages writable, and holding them must protect them
++ * again; a hold of the whole range ends that. Its bounds change only under census.lock, with
++ * every page of it ST_WORK or not yet marked, and a vCPU or a device reads them with no lock.
++ */
++#define COH_RANGES 4
++typedef struct CohRange {
++    _Atomic uint64_t lo, hi;
++    bool writable;
++} CohRange;
++
+ typedef struct RipCount {
+     uint64_t rip;
+     uint64_t count;
+@@ -185,8 +197,13 @@ typedef struct Surface {
+     uint64_t view_start;
+     /* Which of those pages a call of several means: such calls come under the surface's lock. */
+     uint64_t *wanted;
+-    /* A probe left armed pages writable: holding them must protect them again. */
+-    bool writable;
++    /*
++     * The ranges the library tracks, each a texture's rows (a plane of it), never two over one
++     * page: pages outside them stay open and unmarked, so neither a write there nor a device's
++     * touch reaches the library, which names no such page. `tracked` is whether any is.
++     */
++    CohRange ranges[COH_RANGES];
++    _Atomic uint32_t range_count;
+     bool tracked;
+     _Atomic uint64_t presents;
+     _Atomic uint32_t window_traps;
+@@ -594,9 +611,12 @@ int census_on_sigbus(CensusVcpu *vc, void **addr)
+  */
+ typedef void RunFn(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg);
+ 
+-static uint32_t take_pages(Surface *s, uint32_t id, uint32_t mask, bool wait, RunFn *fn, void *arg)
++/* take_pages over the pages [lo, hi) of the surface's order alone: a coherent range's. */
++static uint32_t take_pages_in(Surface *s, uint32_t id, uint64_t lo, uint64_t hi, uint32_t mask,
++                              bool wait, RunFn *fn, void *arg)
+ {
+     uint32_t taken = 0;
++    bool all = lo == 0 && hi == UINT64_MAX;
+ 
+     for (uint32_t i = 0; i < s->run_count; i++) {
+         uint64_t first = 0, count = 0;
+@@ -604,12 +624,13 @@ static uint32_t take_pages(Surface *s, uint32_t id, uint32_t mask, bool wait, Ru
+ 
+         for (uint64_t p = s->runs[i].first; p < s->runs[i].first + s->runs[i].count; p++) {
+             uint32_t w = atomic_load(&census.pg[p]);
++            bool in = all || (census.coh_index[p] >= lo && census.coh_index[p] < hi);
+ 
+-            while (wait && PW_ID(w) == id && PW_ST(w) == ST_WORK) {
++            while (in && wait && PW_ID(w) == id && PW_ST(w) == ST_WORK) {
+                 sched_yield();
+                 w = atomic_load(&census.pg[p]);
+             }
+-            if (PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
++            if (in && PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
+                 atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
+                 if (count && first + count != p) {
+                     fn(first, count, id, any_held, arg);
+@@ -633,6 +654,11 @@ static uint32_t take_pages(Surface *s, uint32_t id, uint32_t mask, bool wait, Ru
+     return taken;
+ }
+ 
++static uint32_t take_pages(Surface *s, uint32_t id, uint32_t mask, bool wait, RunFn *fn, void *arg)
++{
++    return take_pages_in(s, id, 0, UINT64_MAX, mask, wait, fn, arg);
++}
++
+ static void open_held(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
+ {
+     if (page_wp(first, count, false)) {
+@@ -814,6 +840,19 @@ static Surface *coh_surface(uint64_t addr, uint32_t *id, uint64_t *index)
+     return NULL;
+ }
+ 
++/* The range of s that holds its page `index`, or NULL. No lock: see CohRange. */
++static CohRange *coh_range(Surface *s, uint64_t index)
++{
++    uint32_t n = MIN(atomic_load(&s->range_count), COH_RANGES);
++
++    for (uint32_t r = 0; r < n; r++) {
++        if (index >= atomic_load(&s->ranges[r].lo) && index < atomic_load(&s->ranges[r].hi)) {
++            return &s->ranges[r];
++        }
++    }
++    return NULL;
++}
++
+ static void run_ends(RunFn *fn, uint64_t first, uint64_t *count, uint32_t id, bool *any_held, void *arg)
+ {
+     if (*count) {
+@@ -835,18 +874,23 @@ static void coh_runs(const uint64_t *addrs, size_t n, uint32_t mask, RunFn *fn,
+     uint32_t id = 0;
+     uint64_t index = 0, first = 0, count = 0;
+     Surface *s = n ? coh_surface(addrs[0], &id, &index) : NULL;
++    CohRange *range = s ? coh_range(s, index) : NULL;
++    uint64_t lo, hi;
+     bool any_held = false;
+ 
+-    if (!s) {
++    /* The addresses are one tracked range's: a page outside every range is no library's. */
++    if (!range) {
+         return;
+     }
++    lo = atomic_load(&range->lo);
++    hi = atomic_load(&range->hi);
+     /* One page needs no walk, and a vCPU's own call comes with no surface lock to share `wanted`. */
+     if (n == 1) {
+         uint64_t off = (addrs[0] - s->view_start) >> PG_SHIFT;
+         uint64_t p = off < s->page_total ? s->pages[off] : 0;
+         uint32_t w = off < s->page_total ? atomic_load(&census.pg[p]) : 0;
+ 
+-        if (off < s->page_total && PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
++        if (off >= lo && off < hi && PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
+             atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
+             first = p;
+             count = 1;
+@@ -858,7 +902,7 @@ static void coh_runs(const uint64_t *addrs, size_t n, uint32_t mask, RunFn *fn,
+     for (size_t i = 0; i < n; i++) {
+         uint64_t off = (addrs[i] - s->view_start) >> PG_SHIFT;
+ 
+-        if (off < s->page_total) {
++        if (off >= lo && off < hi && off < s->page_total) {
+             s->wanted[off / 64] |= 1ull << (off % 64);
+         }
+     }
+@@ -936,10 +980,20 @@ static void coh_arm_run(uint64_t first, uint64_t count, uint32_t id, bool any_he
+     }
+ }
+ 
+-/* ARMED or OPEN -> HELD: arg says whether open pages are among them, which alone need protecting. */
++/* What a hold's runs need to know: whether pages it moves may be writable. */
++typedef struct HeldArg {
++    /* Open pages are among them. */
++    bool open_too;
++    /* A probe left the range's armed pages writable. */
++    bool writable;
++} HeldArg;
++
++/* ARMED or OPEN -> HELD: open pages, or armed ones a probe made writable, need protecting. */
+ static void coh_held_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
+ {
+-    if ((arg && *(const bool *)arg) || census.surfaces[id].writable) {
++    const HeldArg *held = arg;
++
++    if (held->open_too || held->writable) {
+         if (page_wp(first, count, true)) {
+             count_error("read-only", first);
+         }
+@@ -974,9 +1028,10 @@ size_t census_coh_probe(const uint64_t *addrs, size_t n, uint64_t *refused, size
+     uint32_t id = 0;
+     uint64_t index = 0;
+     Surface *s = n ? coh_surface(addrs[0], &id, &index) : NULL;
++    CohRange *range = s ? coh_range(s, index) : NULL;
+ 
+-    if (s && !atomic_load(&census.dead)) {
+-        s->writable = true;
++    if (range && !atomic_load(&census.dead)) {
++        range->writable = true;
+         coh_runs(addrs, n, MASK(ST_HELD), coh_arm_run, &found);
+         coh_runs(addrs, n, MASK(ST_ARMED), coh_writable_run, NULL);
+     }
+@@ -988,10 +1043,12 @@ size_t census_coh_hold(const uint64_t *addrs, size_t n, bool open_too, uint64_t
+     uint32_t id = 0;
+     uint64_t index = 0;
+     Surface *s = n ? coh_surface(addrs[0], &id, &index) : NULL;
++    CohRange *range = s ? coh_range(s, index) : NULL;
++    HeldArg held = { open_too, range && range->writable };
+ 
+-    coh_runs(addrs, n, MASK(ST_ARMED) | (open_too ? MASK(ST_OPEN) : 0), coh_held_run, &open_too);
+-    if (s && n >= s->page_total) {
+-        s->writable = false;
++    coh_runs(addrs, n, MASK(ST_ARMED) | (open_too ? MASK(ST_OPEN) : 0), coh_held_run, &held);
++    if (range && n >= atomic_load(&range->hi) - atomic_load(&range->lo)) {
++        range->writable = false;
+     }
+     return 0;
+ }
+@@ -1047,30 +1104,70 @@ void census_coh_thaw(const uint64_t *addrs, size_t n)
+     coh_runs(addrs, n, MASK(ST_FROZEN), coh_thaw_run, NULL);
+ }
+ 
++/*
++ * Holds the pages of [start, start + len), whole pages of one census surface, and tracks them as
++ * a range of their own: pages of the surface outside every range stay open, unmarked. Refused
++ * where the range leaves the surface, meets one tracked already, or the surface has its ranges.
++ * The same range again is tracked already.
++ */
+ bool census_coh_track(uint64_t start, uint64_t len)
+ {
+-    uint32_t id;
+-    uint64_t index;
++    uint32_t id, slot = COH_RANGES;
++    uint64_t index, lo, hi;
+     Surface *s;
++    HeldArg held = { true, false };
++    bool ok = false;
+ 
+-    if (!census.active || !census.coherent || atomic_load(&census.dead)) {
++    if (!census.active || !census.coherent || atomic_load(&census.dead) || !len) {
+         return false;
+     }
+     pthread_mutex_lock(&census.lock);
+     s = coh_surface(start, &id, &index);
+     if (!s || s->overlaps || s->foreign) {
+-        pthread_mutex_unlock(&census.lock);
+-        return false;
++        goto out;
+     }
+-    if (!s->tracked) {
+-        bool open_too = true;
++    lo = (start - s->view_start) >> PG_SHIFT;
++    hi = (start + len - s->view_start + PG - 1) >> PG_SHIFT;
++    if (hi > s->page_total) {
++        goto out;
++    }
++    for (uint32_t r = 0; r < atomic_load(&s->range_count); r++) {
++        uint64_t rlo = atomic_load(&s->ranges[r].lo), rhi = atomic_load(&s->ranges[r].hi);
+ 
+-        s->tracked = true;
+-        atomic_fetch_add(&census_coherent_pages, s->page_total);
+-        take_pages(s, id, MASK(ST_OPEN), true, coh_held_run, &open_too);
++        if (rlo == rhi) {
++            slot = slot == COH_RANGES ? r : slot;
++            continue;
++        }
++        if (rlo == lo && rhi == hi) {
++            ok = true;
++            goto out;
++        }
++        if (rlo < hi && lo < rhi) {
++            goto out;
++        }
+     }
++    if (slot == COH_RANGES) {
++        if (atomic_load(&s->range_count) == COH_RANGES) {
++            goto out;
++        }
++        slot = atomic_load(&s->range_count);
++    }
++    s->ranges[slot].writable = false;
++    /* The bounds first, never a wrong range on the way, then the pages: a reader of the bounds
++     * finds them before any page is marked. */
++    atomic_store(&s->ranges[slot].hi, 0);
++    atomic_store(&s->ranges[slot].lo, lo);
++    atomic_store(&s->ranges[slot].hi, hi);
++    if (slot == atomic_load(&s->range_count)) {
++        atomic_store(&s->range_count, slot + 1);
++    }
++    s->tracked = true;
++    atomic_fetch_add(&census_coherent_pages, hi - lo);
++    take_pages_in(s, id, lo, hi, MASK(ST_OPEN), true, coh_held_run, &held);
++    ok = true;
++out:
+     pthread_mutex_unlock(&census.lock);
+-    return true;
++    return ok;
+ }
+ 
+ /* Every marker off the surface, its pages left open. */
+@@ -1081,29 +1178,50 @@ static void coh_free_run(uint64_t first, uint64_t count, uint32_t id, bool any_h
+     store_pages(first, count, ST_OPEN, id);
+ }
+ 
++/* One range's markers off, its pages open, and the range gone. */
++static void coh_untrack_range_locked(Surface *s, uint32_t id, CohRange *range)
++{
++    uint64_t lo = atomic_load(&range->lo), hi = atomic_load(&range->hi);
++
++    if (lo == hi) {
++        return;
++    }
++    take_pages_in(s, id, lo, hi, MASK(ST_ARMED) | MASK(ST_HELD) | MASK(ST_FROZEN), true,
++                  coh_free_run, NULL);
++    atomic_fetch_sub(&census_coherent_pages, hi - lo);
++    atomic_store(&range->hi, lo);
++    range->writable = false;
++    s->tracked = false;
++    for (uint32_t r = 0; r < atomic_load(&s->range_count); r++) {
++        s->tracked |= atomic_load(&s->ranges[r].lo) != atomic_load(&s->ranges[r].hi);
++    }
++}
++
+ static void coh_untrack_locked(Surface *s, uint32_t id)
+ {
+-    if (s->tracked) {
+-        s->tracked = false;
+-        atomic_fetch_sub(&census_coherent_pages, s->page_total);
+-        take_pages(s, id, MASK(ST_ARMED) | MASK(ST_HELD) | MASK(ST_FROZEN), true, coh_free_run,
+-                   NULL);
++    for (uint32_t r = 0; r < atomic_load(&s->range_count); r++) {
++        coh_untrack_range_locked(s, id, &s->ranges[r]);
+     }
++    atomic_store(&s->range_count, 0);
++    s->tracked = false;
+ }
+ 
++/* The range that holds start goes: another range of the surface, a plane beside it, stays. */
+ void census_coh_untrack(uint64_t start)
+ {
+     uint32_t id;
+     uint64_t index;
+     Surface *s;
++    CohRange *range;
+ 
+     if (!census.active || !census.coherent) {
+         return;
+     }
+     pthread_mutex_lock(&census.lock);
+     s = coh_surface(start, &id, &index);
+-    if (s) {
+-        coh_untrack_locked(s, id);
++    range = s ? coh_range(s, index) : NULL;
++    if (range) {
++        coh_untrack_range_locked(s, id, range);
+     }
+     pthread_mutex_unlock(&census.lock);
+ }
+@@ -1146,7 +1264,7 @@ void census_coherent_touch(void *main_ptr, uint64_t len, bool write)
+         atomic_fetch_add(&census.touches[st], 1);
+         /* Only these states hold a surface's id: a stale page's is not one. */
+         if ((st == ST_ARMED || st == ST_FROZEN || (write && st == ST_HELD)) &&
+-            census.surfaces[id].tracked) {
++            coh_range(&census.surfaces[id], census.coh_index[p])) {
+             census.ops.fault(census.ops.ctx, coh_addr(id, p), write);
+         }
+     }
+@@ -1348,7 +1466,7 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+     s->pages = NULL;
+     s->page_total = 0;
+     s->tracked = false;
+-    s->writable = false;
++    atomic_store(&s->range_count, 0);
+     if (census.coherent && page_count) {
+         s->pages = calloc(page_count, sizeof(*s->pages));
+         s->wanted = calloc(page_count / 64 + 1, sizeof(*s->wanted));

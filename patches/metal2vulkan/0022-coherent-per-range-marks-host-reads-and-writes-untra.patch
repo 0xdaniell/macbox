@@ -1,0 +1,1058 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 05:42:38 +0000
+Subject: [PATCH 22/34] coherent: per-range marks, host reads and writes,
+ untracked and cross-device readers, signals
+
+- Pages::track holds [start, start + len) as a range of its own (QEMU's census now does too, audit
+  B1); the lanes' Fake models ranges, and a touch past the rows leaves the surface trapping.
+- shadow_coherent::host_reads / host_writes: a host reader outside any command buffer (Reims'
+  video, scaler, JPEG) syncs first; a host writer opens the surface as a CPU write (audit P1).
+- met_by sees untracked uses (Summary::lazy_uses, audit P2) and a reader on another device by the
+  host bytes its buffers lie over.
+- A shared event's signal copies back what the command buffer's encoders left ahead first: a CPU
+  waiter reads the pages before the completion arms them.
+- A surface whose texture went retires (syncs, untracks) when a new texture over its pages comes,
+  so the new one traps instead of copying back per encoder for good.
+- flush: a copy back that finds nothing left after before_flush unmarks the copy in flight.
+- CoherentFallbackCounts in WorkCounts::coherent: every silent fallback and host access, counted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/mod.rs                 |  36 ++-
+ .../metal2vulkan-runtime/src/host_aliases.rs  |  11 +
+ .../src/shadow_coherent.rs                    | 242 ++++++++++++++-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  78 ++++-
+ crates/metal2vulkan-runtime/src/tracker.rs    |  36 +++
+ .../metal2vulkan-runtime/src/work_counts.rs   |   4 +
+ .../src/runtime_lane/surface_coherent.rs      | 275 +++++++++++++++++-
+ 7 files changed, 653 insertions(+), 29 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 4812e25c..9c8ff0e5 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2181,6 +2181,12 @@ impl CommandBuffer {
+     /// becomes at least `value`. Refused while an encoder is open (Metal asserts), after commit,
+     /// after an abandoned encoder, and for another device's event.
+     pub fn encode_signal_event(&self, event: EventRef<'_>, value: u64) -> Result<(), Error> {
++        // LOCAL (Atlas): a CPU waiter on a shared event reads the pages once it is signalled,
++        // before the command buffer completes: what its encoders left ahead in a surface's image
++        // goes back first, in the command buffer (`shadow_lazy::signalled_by`).
++        if matches!(event, EventRef::Shared(_)) && crate::shadow_lazy::ahead() {
++            self.copy_back_before_signal();
++        }
+         self.event_command("encode_signal_event", event, |batches, event| {
+             batches.signal(event, value);
+         })
+@@ -2313,6 +2319,26 @@ impl CommandBuffer {
+     }
+ 
+     /// Add an event wait or signal to the batches, after the checks Metal makes.
++    /// LOCAL (Atlas): a blit encoder of the copies back of what this command buffer's encoders
++    /// left ahead (`shadow_lazy::signalled_by`), where any did; one it may not open now is left
++    /// to the signal's own refusal.
++    fn copy_back_before_signal(&self) {
++        let Some(id) = self.state().shadow_carry.as_ref().map(ShadowCarry::id) else {
++            return;
++        };
++        let Some(copies) = crate::shadow_lazy::signalled_by(id) else {
++            return;
++        };
++        let Ok(mut blit) = self.blit_command_encoder() else {
++            return;
++        };
++        for (lazy, copy, holds) in copies {
++            let _own = lazy.own();
++            blit.surface_copy_back(&copy, holds);
++        }
++        let _ = blit.end_encoding();
++    }
++
+     fn event_command(
+         &self,
+         call: &'static str,
+@@ -2523,7 +2549,15 @@ impl CommandBuffer {
+                                 .chain(segments.map(|recording| &recording.summary))
+                         })
+                         .collect();
+-                    crate::shadow_lazy::met_by(&summaries)
++                    // A reader on another device names its own keys: the bytes they lie over meet.
++                    let aliases = &self.0.device.shared().aliases;
++                    let bytes: Vec<std::ops::Range<usize>> = (summaries.iter())
++                        .flat_map(|summary| summary.lazy_uses().map(|used| used.key))
++                        .collect::<std::collections::BTreeSet<_>>()
++                        .into_iter()
++                        .filter_map(|key| aliases.bytes_of(key))
++                        .collect();
++                    crate::shadow_lazy::met_by(&summaries, &bytes)
+                 };
+                 for surface in met {
+                     surface.flush(crate::shadow_coherent::SyncBy::GpuReader);
+diff --git a/crates/metal2vulkan-runtime/src/host_aliases.rs b/crates/metal2vulkan-runtime/src/host_aliases.rs
+index 330c0690..ad56158d 100644
+--- a/crates/metal2vulkan-runtime/src/host_aliases.rs
++++ b/crates/metal2vulkan-runtime/src/host_aliases.rs
+@@ -425,6 +425,17 @@ impl<I> HostAliases<I> {
+         self.changed();
+     }
+ 
++    /// LOCAL (Atlas): the host bytes the buffer of `key` lies over now, where it lies over any
++    /// (`shadow_lazy::met_by`).
++    pub(super) fn bytes_of(&self, key: ResourceKey) -> Option<std::ops::Range<usize>> {
++        if self.placed.load(Ordering::Relaxed) == 0 {
++            return None;
++        }
++        let inner = lock(&self.inner);
++        let &((start, len), _) = inner.placements.at.get(&key)?;
++        Some(start as usize..(start + len) as usize)
++    }
++
+     /// The buffer of `key` lies over no host bytes from now on (its bytes detached).
+     pub(super) fn unplace(&self, key: ResourceKey) {
+         let mut inner = lock(&self.inner);
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 624c304e..b312bc1f 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -117,9 +117,11 @@ const LEDGER_SPAN: Duration = Duration::from_secs(1);
+ /// What marks a surface's pages. Addresses are the surface's own mapping's, whole pages, ascending,
+ /// one surface to a call; each call comes under the surface's lock, which [`fault`] takes.
+ pub trait Pages: Send + Sync {
+-    /// Every page held from now on: whether it can be, this surface.
++    /// The pages of `[start, start + len)` held from now on, as one range of their own: whether
++    /// they can be. Pages of the same mapping outside it stay unmarked (a plane beside, the
++    /// allocation's tail past the rows), and a range over one tracked already is refused.
+     fn track(&self, start: u64, len: u64) -> bool;
+-    /// Every marker off the surface around `start`.
++    /// Every marker off the range [`track`](Self::track) gave that holds `start`; nothing else.
+     fn untrack(&self, start: u64);
+     /// Held pages armed: the next access traps. Others stay. The pages a CPU reached as their
+     /// markers moved come back, still held, and they may hold a write: the caller has them.
+@@ -142,6 +144,124 @@ pub trait Pages: Send + Sync {
+ 
+ static PAGES: RwLock<Option<Arc<dyn Pages>>> = RwLock::new(None);
+ 
++/// A silent fallback or a host access the surfaces' traps answer, counted process-wide
++/// ([`fallback_counts`]): a run counts each, where nothing else says it happened.
++#[derive(Clone, Copy)]
++pub(crate) enum Fallback {
++    /// A surface's first use found another live surface over its pages: it never traps, and its
++    /// texture copies back per encoder ([`Coherent::tracks`]).
++    ClosedByOverlap,
++    /// The marks refused the surface, or the switch was off at its first use.
++    ClosedByMarks,
++    /// A surface whose texture went was synced and untracked for a new one over its pages.
++    RetiredDead,
++    /// A fault named no surface's range: the marks there went ([`fault`]).
++    OrphanFault,
++    /// [`Coherent::defers`] said no: the surface no longer traps.
++    DeferClosed,
++    /// Said no: demoted, copying back per encoder for now.
++    DeferEager,
++    /// Said no: a CPU write came within the hold, and it keeps and merges.
++    DeferWrote,
++    /// `shadow_lazy`'s `defer` said no: no traps, and not presented under `surface_lazy_present`.
++    LazyDeferNotPresent,
++    /// Said no: another texture's image lies over the pages (`shadow_lazy`'s `SHARED`).
++    LazyDeferBeside,
++    /// Said no: what its copies back hold went.
++    LazyDeferKeepsGone,
++    /// Said no: no queue for its copies back.
++    LazyDeferNoQueue,
++    /// A surface was demoted.
++    Demotion,
++    /// A host reader outside any command buffer (Reims' video and scaler) read surface bytes.
++    HostRead,
++    /// Of those, the reads a trapping surface lay under, which it synced first.
++    HostReadSynced,
++    /// A host writer outside any command buffer wrote surface bytes.
++    HostWrite,
++    /// Of those, the writes a trapping surface lay under, which it took as a CPU write.
++    HostWriteOpened,
++    /// A copy back (`shadow_lazy`'s `flush`) found nothing left to copy after its surface had
++    /// marked a copy in flight: it is unmarked now, where it once stayed marked for good.
++    FlushNothingLeft,
++    /// A command buffer met a surface's bytes through an untracked use alone (`met_by`).
++    MetUntracked,
++}
++
++const FALLBACKS: usize = Fallback::MetUntracked as usize + 1;
++static FALLBACK: [AtomicU64; FALLBACKS] = [const { AtomicU64::new(0) }; FALLBACKS];
++
++pub(crate) fn count(what: Fallback) {
++    FALLBACK[what as usize].fetch_add(1, Ordering::Relaxed);
++}
++
++/// The process's counts of what [`Fallback`] names, in `WorkCounts::coherent`: every device's
++/// counts show the same, as surfaces trap across devices. Not part of the API.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct CoherentFallbackCounts {
++    /// Surfaces that never trapped: another live one lay over their pages.
++    pub closed_by_overlap: u64,
++    /// Surfaces that never trapped: the marks refused them, or the switch was off.
++    pub closed_by_marks: u64,
++    /// Surfaces whose texture went, synced and untracked for a new texture over their pages.
++    pub retired_dead: u64,
++    /// Faults that named no surface's range.
++    pub orphan_faults: u64,
++    /// Encoders' ends that copied back: their surface no longer traps.
++    pub defer_refused_closed: u64,
++    /// Encoders' ends that copied back: their surface was demoted.
++    pub defer_refused_eager: u64,
++    /// Encoders' ends that copied back: a CPU write came within the hold.
++    pub defer_refused_wrote: u64,
++    /// Lazy encoders' ends that copied back: no traps, not presented.
++    pub lazy_defer_refused_not_present: u64,
++    /// Lazy encoders' ends that copied back: another image over the pages.
++    pub lazy_defer_refused_beside: u64,
++    /// Lazy encoders' ends that copied back: what its copies hold went.
++    pub lazy_defer_refused_keeps_gone: u64,
++    /// Lazy encoders' ends that copied back: no queue.
++    pub lazy_defer_refused_no_queue: u64,
++    /// Demotions, every surface's.
++    pub demotions: u64,
++    /// Host reads of surface bytes outside any command buffer.
++    pub host_reads: u64,
++    /// Of those, over a trapping surface, which synced first.
++    pub host_reads_synced: u64,
++    /// Host writes of surface bytes outside any command buffer.
++    pub host_writes: u64,
++    /// Of those, over a trapping surface, taken as a CPU write.
++    pub host_writes_opened: u64,
++    /// Copies back that found nothing left after marking a copy in flight.
++    pub flush_nothing_left: u64,
++    /// Command buffers that met a surface through an untracked use alone.
++    pub met_untracked: u64,
++}
++
++/// The counts of [`CoherentFallbackCounts`] so far.
++pub fn fallback_counts() -> CoherentFallbackCounts {
++    let read = |what: Fallback| FALLBACK[what as usize].load(Ordering::Relaxed);
++    CoherentFallbackCounts {
++        closed_by_overlap: read(Fallback::ClosedByOverlap),
++        closed_by_marks: read(Fallback::ClosedByMarks),
++        retired_dead: read(Fallback::RetiredDead),
++        orphan_faults: read(Fallback::OrphanFault),
++        defer_refused_closed: read(Fallback::DeferClosed),
++        defer_refused_eager: read(Fallback::DeferEager),
++        defer_refused_wrote: read(Fallback::DeferWrote),
++        lazy_defer_refused_not_present: read(Fallback::LazyDeferNotPresent),
++        lazy_defer_refused_beside: read(Fallback::LazyDeferBeside),
++        lazy_defer_refused_keeps_gone: read(Fallback::LazyDeferKeepsGone),
++        lazy_defer_refused_no_queue: read(Fallback::LazyDeferNoQueue),
++        demotions: read(Fallback::Demotion),
++        host_reads: read(Fallback::HostRead),
++        host_reads_synced: read(Fallback::HostReadSynced),
++        host_writes: read(Fallback::HostWrite),
++        host_writes_opened: read(Fallback::HostWriteOpened),
++        flush_nothing_left: read(Fallback::FlushNothingLeft),
++        met_untracked: read(Fallback::MetUntracked),
++    }
++}
++
+ /// The last words of the surfaces that went since the last report.
+ fn ended() -> &'static Mutex<Vec<String>> {
+     static ENDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+@@ -285,9 +405,12 @@ pub(crate) enum SyncBy {
+     Demotion,
+     /// The surface leaves.
+     Unmap,
++    /// A host outside any command buffer reads the pages ([`host_reads`]).
++    HostRead,
+ }
+ 
+-const SYNC_BY: [&str; 7] = ["trap", "gpu_read", "cpu_read", "copy_in", "refused", "demotion", "unmap"];
++const SYNC_BY: [&str; 8] =
++    ["trap", "gpu_read", "cpu_read", "copy_in", "refused", "demotion", "unmap", "host_read"];
+ 
+ /// What trapping spent lately against what the copies it replaced would have, in ns.
+ #[derive(Default)]
+@@ -432,16 +555,27 @@ impl Coherent {
+             return true;
+         }
+         let range = self.range();
++        let meets = |one: &Arc<Coherent>| {
++            let other = one.range();
++            range.start < other.end && other.start < range.end
++        };
++        // A surface over these pages whose texture went keeps what it left ahead in its image,
++        // and its traps would bring that over what this one's copies write: it lands in the pages
++        // first and lets them go. Neither lock of `all` is held meanwhile, as `close` takes it.
++        let dead: Vec<Arc<Coherent>> = (all().read().unwrap().iter())
++            .filter(|one| meets(one) && one.lazy.strong_count() == 0)
++            .cloned()
++            .collect();
++        for one in dead {
++            one.retire();
++        }
+         // One image traps per surface: a trap reaches one, and that one would untrack the pages
+         // from under another. Any other stays lazy, its copies back keeping the pages.
+         {
+             let mut list = all().write().unwrap();
+-            let taken = |one: &Arc<Coherent>| {
+-                let other = one.range();
+-                range.start < other.end && other.start < range.end
+-            };
+-            if list.iter().any(taken) {
++            if list.iter().any(meets) {
+                 state.closed = true;
++                count(Fallback::ClosedByOverlap);
+                 return false;
+             }
+             list.push(self.clone());
+@@ -453,6 +587,7 @@ impl Coherent {
+             let me = Arc::as_ptr(self);
+             all().write().unwrap().retain(|other| !std::ptr::eq(Arc::as_ptr(other), me));
+             state.closed = true;
++            count(Fallback::ClosedByMarks);
+             return false;
+         }
+         state.tracked = true;
+@@ -476,12 +611,14 @@ impl Coherent {
+     pub(crate) fn defers(&self, id: u64, area: Option<[u32; 4]>) -> bool {
+         let mut state = self.lock();
+         if state.closed || !state.tracked {
++            count(Fallback::DeferClosed);
+             return false;
+         }
+         let now = Instant::now();
+         match state.eager_until {
+             Some(until) if now < until => {
+                 self.counts.eager.fetch_add(1, Ordering::Relaxed);
++                count(Fallback::DeferEager);
+                 return false;
+             }
+             Some(_) => {
+@@ -491,6 +628,7 @@ impl Coherent {
+             None => {}
+         }
+         if state.wrote_at.is_some_and(|at| at.elapsed() < self.hold()) {
++            count(Fallback::DeferWrote);
+             return false;
+         }
+         let whole = self.layout.whole();
+@@ -555,6 +693,7 @@ impl Coherent {
+         state.out_until = Some(until);
+         state.ledger = Ledger::default();
+         self.counts.demotions.fetch_add(1, Ordering::Relaxed);
++        count(Fallback::Demotion);
+         // What is pending goes now, and what is running at its completion.
+         self.sync_done(state, SyncBy::Demotion);
+     }
+@@ -844,10 +983,16 @@ impl Coherent {
+             return;
+         }
+         self.counts.writes.fetch_add(1, Ordering::Relaxed);
++        self.wrote(state, mark);
++    }
++
++    /// A CPU write is about to land in the pages, the guest's or a host's: the whole surface opens
++    /// and the image takes what changes, as the module docs say.
++    fn wrote(&self, state: MutexGuard<'_, State>, mark: Option<Arc<dyn Pages>>) {
+         // A running write needs no wait: the merge at its completion keeps this one. A GPU copy
+         // back already on its way cannot merge.
+         let (settled, clear) = self.wait_settled(state, None);
+-        state = settled;
++        let mut state = settled;
+         self.sync_done(&mut state, SyncBy::Trap);
+         if !clear {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+@@ -877,6 +1022,54 @@ impl Coherent {
+         }
+     }
+ 
++    /// A host outside any command buffer is about to read the pages (Reims' video encoder,
++    /// scaler, JPEG): what is done goes there first, and a write still running, which the guest
++    /// may have heard of by a shared event, is waited for a bounded time and goes too.
++    fn host_reads(&self) {
++        let state = self.lock();
++        if !state.tracked {
++            return;
++        }
++        count(Fallback::HostReadSynced);
++        let mut state = state;
++        self.sync_done(&mut state, SyncBy::HostRead);
++        if !state.running.is_empty() {
++            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()));
++            state = settled;
++            self.sync_done(&mut state, SyncBy::HostRead);
++        }
++    }
++
++    /// A host outside any command buffer is about to write the pages (Reims' video decoder,
++    /// scaler, JPEG): as a CPU write of the whole surface, so the next copy in takes it.
++    fn host_writes(&self) {
++        let state = self.lock();
++        if !state.tracked {
++            return;
++        }
++        count(Fallback::HostWriteOpened);
++        self.counts.writes.fetch_add(1, Ordering::Relaxed);
++        self.wrote(state, pages());
++    }
++
++    /// Its texture went, and another texture over the pages is about to track them: everything
++    /// done lands in the pages, and a write still running is waited for a bounded time, then the
++    /// marks go. What runs past the bound reaches the image alone, as for any surface untracked.
++    fn retire(&self) {
++        let mut state = self.lock();
++        if !state.tracked {
++            return;
++        }
++        self.sync_done(&mut state, SyncBy::Unmap);
++        if !state.running.is_empty() {
++            let (settled, _) = self.wait_settled(state, Some(self.layout.whole()));
++            state = settled;
++            self.sync_done(&mut state, SyncBy::Unmap);
++        }
++        count(Fallback::RetiredDead);
++        self.close(&mut state, true);
++    }
++
+     /// Another image over the surface is about to read it: open pages held, so it reads all the
+     /// guest wrote and the next write traps. Whether any was open.
+     pub(crate) fn seal(&self) -> bool {
+@@ -1191,6 +1384,7 @@ pub fn fault(addr: u64, write: bool) {
+     match find(addr) {
+         Some(surface) => surface.fault(page, write),
+         None => {
++            count(Fallback::OrphanFault);
+             if let Some(mark) = pages() {
+                 mark.untrack(addr);
+             }
+@@ -1198,6 +1392,36 @@ pub fn fault(addr: u64, write: bool) {
+     }
+ }
+ 
++/// A host outside any command buffer is about to read the bytes `bytes` of the library's mapping
++/// of a surface (Reims' video encoder, scaler, JPEG and the like read them so): each trapping
++/// surface over them brings them up to date first. Call it before the read, with no lock a GPU
++/// completion needs.
++pub fn host_reads(bytes: Range<u64>) {
++    count(Fallback::HostRead);
++    for surface in over(&bytes) {
++        surface.host_reads();
++    }
++}
++
++/// A host outside any command buffer is about to write the bytes `bytes` (Reims' video decoder,
++/// scaler, JPEG): each trapping surface over them takes it as a CPU write of the whole surface, so
++/// the next command that uses its image copies the bytes in. Call it before the write.
++pub fn host_writes(bytes: Range<u64>) {
++    count(Fallback::HostWrite);
++    for surface in over(&bytes) {
++        surface.host_writes();
++    }
++}
++
++/// The tracked surfaces whose pages meet `bytes`.
++fn over(bytes: &Range<u64>) -> Vec<Arc<Coherent>> {
++    if !surfaces_tracked() {
++        return Vec::new();
++    }
++    let meets = |s: &&Arc<Coherent>| s.range().start < bytes.end && bytes.start < s.range().end;
++    all().read().unwrap().iter().filter(meets).cloned().collect()
++}
++
+ /// From a stop at `addr` to the access's rerun.
+ pub fn timed(addr: u64, ns: u64) {
+     if let Some(surface) = find(addr) {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index ed44b544..a4340670 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -93,7 +93,7 @@ use super::device::Device;
+ use super::queue::CommandQueue;
+ use super::resource::ResourceKey;
+ use super::shadow::{bounding, CopyCause, ShadowCopies, ShadowCopy, Step};
+-use super::shadow_coherent::{Coherent, Layout, Reader, SyncBy};
++use super::shadow_coherent::{count, Coherent, Fallback, Layout, Reader, SyncBy};
+ use super::tracker::{Summary, Use, UseRange};
+ use crate::exit_guard;
+ use std::any::Any;
+@@ -392,24 +392,40 @@ pub(crate) fn ahead() -> bool {
+ }
+ 
+ /// The surfaces to copy back before the commit of a command buffer whose encoders' uses are
+-/// `summaries`: each that committed writes of lie ahead and that it uses the bytes of (the module
+-/// docs). A copy in is such a use, so its command buffer's own writes wait for its commit.
+-pub(crate) fn met_by(summaries: &[&Summary<ResourceKey>]) -> Vec<Arc<Lazy>> {
++/// `summaries`, its buffers lying over the host bytes `bytes`: each that committed writes of lie
++/// ahead and that it uses the bytes of (the module docs). A copy in is such a use, so its command
++/// buffer's own writes wait for its commit. The bytes find a reader on another device, whose keys
++/// are its own.
++pub(crate) fn met_by(summaries: &[&Summary<ResourceKey>], bytes: &[Range<usize>]) -> Vec<Arc<Lazy>> {
+     let mut met = Vec::new();
+     // Most surfaces stay ahead for good where the pages trap: their keys rule most of them out.
+     let keys: HashSet<ResourceKey> = (summaries.iter())
+-        .flat_map(|s| s.all_uses().iter().map(|used| used.key))
++        .flat_map(|s| s.lazy_uses().map(|used| used.key))
+         .collect();
+     for lazy in surfaces() {
+-        if !lazy.truth.get().is_some_and(|(key, alias, _)| {
++        let keyed = lazy.truth.get().is_some_and(|(key, alias, _)| {
+             keys.contains(key) || alias.is_some_and(|alias| keys.contains(&alias))
+-        }) {
++        });
++        let over = || bytes.iter().any(|bytes| lazy.over(bytes));
++        if !keyed && !over() {
+             continue;
+         }
+         let settled = (lazy.pending.lock().unwrap().as_ref())
+             .is_some_and(|left| left.settled.is_some());
+-        let used = || (summaries.iter()).any(|s| s.all_uses().iter().any(|u| lazy.meets(u)));
++        if !keyed {
++            if settled && !lazy.own_thread() {
++                met.push(lazy);
++            }
++            continue;
++        }
++        // An untracked use counts: the tracker orders nothing by it, but its reads are the
++        // pages' all the same, and a trapping surface has no clock to bring them later.
++        let used = || (summaries.iter()).any(|s| s.lazy_uses().any(|u| lazy.meets(u)));
+         if settled && !lazy.own_thread() && used() {
++            let tracked = || (summaries.iter()).any(|s| s.all_uses().iter().any(|u| lazy.meets(u)));
++            if !tracked() {
++                count(Fallback::MetUntracked);
++            }
+             met.push(lazy);
+         }
+     }
+@@ -469,6 +485,32 @@ pub(crate) fn deferred_by(id: u64) -> Vec<(Arc<Lazy>, ShadowCopy, Vec<Hold>)> {
+     left
+ }
+ 
++/// What the command buffer `id`'s encoders left ahead, for a copy back before it signals a shared
++/// event, whose CPU waiter reads the pages once it is signalled: `None` where they left nothing.
++/// A surface that does not trap copies back as the copies' encoder opens ([`deferred_by`]); one
++/// that traps keeps its record, which the copy repeats, so its pages trap again at completion.
++pub(crate) fn signalled_by<M>(id: u64) -> Option<Vec<(Arc<Lazy>, ShadowCopy<M>, Vec<Hold>)>> {
++    let mut copies = Vec::new();
++    let mut any = false;
++    for lazy in surfaces() {
++        let pending = lazy.pending.lock().unwrap();
++        let Some(ahead) = pending.as_ref() else {
++            continue;
++        };
++        let Some((_, area)) = ahead.open.iter().find(|(open, _)| *open == id) else {
++            continue;
++        };
++        any = true;
++        if lazy.coherent().is_some() {
++            let copy = copy_back_of(ahead.copies.clone(), *area);
++            let holds = ahead.holds.clone();
++            drop(pending);
++            copies.push((lazy, copy, holds));
++        }
++    }
++    any.then_some(copies)
++}
++
+ /// The copies back a command of the command buffer `id` needs before it, its uses `uses`: of what
+ /// that command buffer's earlier encoders left ahead in a trapping surface whose bytes it meets.
+ /// The record stays, whose texels the copy repeats, so what the record holds lasts the copy.
+@@ -888,6 +930,7 @@ impl Lazy {
+             && (!crate::live::on(PRESENT, false)
+                 || !(self.displayed.load(Ordering::Relaxed) || crate::live::on(PRESENT_ALL, false)))
+         {
++            count(Fallback::LazyDeferNotPresent);
+             return false;
+         }
+         // What it leaves ahead only hooks that find it can bring back, standing or not.
+@@ -895,18 +938,22 @@ impl Lazy {
+         // Another texture's image over these pages learns of a write through the copy back.
+         if self.beside_another() {
+             SHARED.fetch_add(1, Ordering::Relaxed);
++            count(Fallback::LazyDeferBeside);
+             return false;
+         }
+         let Some(holds) = self.keeps.get() else {
++            count(Fallback::LazyDeferKeepsGone);
+             return false;
+         };
+         let holds: Option<Vec<Hold>> = holds.iter().map(Weak::upgrade).collect();
+         let Some(holds) = holds else {
++            count(Fallback::LazyDeferKeepsGone);
+             return false;
+         };
+         if self.queue.get().is_none() {
+             let device = self.device.downcast_ref::<Device>();
+             let Some(queue) = device.and_then(|d| d.new_command_queue().ok()) else {
++                count(Fallback::LazyDeferNoQueue);
+                 return false;
+             };
+             let _ = self.queue.set(Arc::new(queue));
+@@ -982,10 +1029,17 @@ impl Lazy {
+             Some(coherent) => Some(coherent.before_flush(by)?),
+             None => None,
+         };
+-        let (area, copies, holds) = {
+-            let pending = self.pending.lock().unwrap();
+-            let left = pending.as_ref()?;
+-            (left.settled, left.copies.clone(), left.holds.clone())
++        let left = (self.pending.lock().unwrap().as_ref())
++            .map(|left| (left.settled, left.copies.clone(), left.holds.clone()));
++        // What ran may have completed and been synced since `before_flush` marked the copy in
++        // flight: the mark must go with it, or the surface's unmap answers busy for good and every
++        // wait for a settled surface runs to its bound.
++        let Some((area, copies, holds)) = left else {
++            if let Some(coherent) = &coherent {
++                count(Fallback::FlushNothingLeft);
++                coherent.flush_failed();
++            }
++            return None;
+         };
+         // The image's: `Pending`'s and this one, where neither texture nor command holds it. A
+         // trapping surface's pages stay the guest's until its unmap, whatever texture went.
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index f2eb5c80..5905bd90 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -1193,6 +1193,9 @@ struct Part<K> {
+     /// resources have one, held inline ([`Few`]), so a command's first use of a resource
+     /// allocates nothing of its own.
+     tracked: KeyMap<K, Few<Use<K>>>,
++    /// LOCAL (Atlas): the untracked uses, one per resource, its ranges' hull, kept only while a
++    /// lazy surface is registered (`shadow_lazy::met_by`): nothing orders by them.
++    untracked: Vec<Use<K>>,
+     stages: vk::PipelineStageFlags2,
+ }
+ 
+@@ -1200,11 +1203,26 @@ impl<K> Part<K> {
+     fn new() -> Part<K> {
+         Part {
+             tracked: KeyMap::default(),
++            untracked: Vec::new(),
+             stages: vk::PipelineStageFlags2::NONE,
+         }
+     }
+ }
+ 
++/// LOCAL (Atlas): `used` among `untracked`, one per resource, its range the hull of all of them.
++fn add_untracked<K: Copy + Ord>(untracked: &mut Vec<Use<K>>, used: &Use<K>) {
++    let found = untracked.iter_mut().find(|known| known.key == used.key);
++    if let Some(known) = found {
++        if let Some(range) = known.range.hull(&used.range) {
++            known.range = range;
++            known.read = known.read.union(used.read);
++            known.write = known.write.union(used.write);
++            return;
++        }
++    }
++    untracked.push(used.clone());
++}
++
+ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+     /// The uses of a new encoder, `ordered` when Metal runs its commands in encoded order.
+     pub(super) fn new(ordered: bool) -> EncoderUses<K> {
+@@ -1305,6 +1323,11 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+                 ranges.change_all(coalesce_uses);
+             }
+         }
++        if crate::shadow_lazy::active() {
++            for used in uses.iter().filter(|used| !used.tracked && !used.is_nothing()) {
++                add_untracked(&mut part.untracked, used);
++            }
++        }
+     }
+ 
+     /// Whether a command the encoder recorded so far writes memory one of `uses` reads: an
+@@ -1457,6 +1480,7 @@ impl<K: Copy + Ord + Hash> EncoderUses<K> {
+                 uses.sort_by_key(|used| used.key);
+                 Summary {
+                     uses,
++                    untracked: part.untracked,
+                     stages: part.stages,
+                     waits: Vec::new(),
+                     updates: Vec::new(),
+@@ -1766,6 +1790,8 @@ fn inside_uses<K: Copy + Ord + Hash>(
+ pub(super) struct Summary<K> {
+     /// The tracked uses, one per resource and range, sorted by resource.
+     uses: Vec<Use<K>>,
++    /// LOCAL (Atlas): the untracked uses, for `shadow_lazy::met_by` alone ([`Part`]'s).
++    untracked: Vec<Use<K>>,
+     /// Every stage the encoder's commands ran in.
+     stages: vk::PipelineStageFlags2,
+     /// The fences waited for before the encoder.
+@@ -1792,6 +1818,7 @@ impl<K: Copy + Ord> Summary<K> {
+         uses.sort_by_key(|used| used.key);
+         Summary {
+             uses,
++            untracked: Vec::new(),
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+             waits: Vec::new(),
+             updates: Vec::new(),
+@@ -1805,6 +1832,7 @@ impl<K: Copy + Ord> Summary<K> {
+         let every = |fence| FenceUse { fence, draws: None };
+         Summary {
+             uses: Vec::new(),
++            untracked: Vec::new(),
+             stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+             waits: waits.into_iter().map(every).collect(),
+             updates: updates.into_iter().map(every).collect(),
+@@ -1830,6 +1858,9 @@ impl<K: Copy + Ord> Summary<K> {
+     /// range into one of the same kind, which claims more and stays exact.
+     pub(super) fn join(&mut self, other: Summary<K>) {
+         self.stages |= other.stages;
++        for used in &other.untracked {
++            add_untracked(&mut self.untracked, used);
++        }
+         for used in other.uses {
+             if let Some(known) = self
+                 .uses
+@@ -1889,6 +1920,11 @@ impl<K> Summary<K> {
+         &self.uses
+     }
+ 
++    /// LOCAL (Atlas): the tracked uses and the untracked ones (`shadow_lazy::met_by`).
++    pub(super) fn lazy_uses(&self) -> impl Iterator<Item = &Use<K>> {
++        self.uses.iter().chain(&self.untracked)
++    }
++
+     /// The tracked uses.
+     #[cfg(test)]
+     pub(super) fn uses(&self) -> &[Use<K>] {
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index a288274a..aac9e4c2 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -2762,6 +2762,9 @@ pub struct WorkCounts {
+     /// names the copy behind a recorder's time on a driver that records each region as an
+     /// operation of its own (`row_copies.rs`).
+     pub copy_sites: [CopySite; 32],
++    /// LOCAL (Atlas): the trap-coherent surfaces' silent fallbacks and host accesses so far, the
++    /// process's (`shadow_coherent::fallback_counts`): the same on every device.
++    pub coherent: super::shadow_coherent::CoherentFallbackCounts,
+     /// The `vkCmdCopyBuffer` regions over 16 KiB whose size is no multiple of 4 KiB that the
+     /// device's functions recorded as two, the bytes up to the last whole multiple of 4 KiB and
+     /// the rest (`device/functions.rs`), as a driver may record such a region slowly (ANV).
+@@ -4722,6 +4725,7 @@ impl Device {
+             object_churn: churn.0,
+             shadow_keeps: churn.1,
+             copy_sites: self.shared().vk().copy_sites(),
++            coherent: super::shadow_coherent::fallback_counts(),
+             copy_regions_split: self.shared().vk().copy_regions_split(),
+             spare_command_pools_taken: counters.spare_command_pools_taken.load(Ordering::Relaxed),
+             spare_command_pools_reset: counters.spare_command_pools_reset.load(Ordering::Relaxed),
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 7594a5a9..ccd8299c 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -19,9 +19,10 @@ use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor
+ use metal2vulkan_runtime::shadow_coherent::{self, Pages};
+ use metal2vulkan_runtime::shadow_lazy;
+ use metal2vulkan_runtime::{
+-    live, Buffer, CommandBuffer, CommandQueue, Device, IoSurfacePlane, LoadAction, PipelineOptions,
+-    RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, StoreAction,
+-    Texture, TextureDescriptor,
++    live, Buffer, CommandBuffer, CommandQueue, CpuCacheMode, Device, HazardTrackingMode,
++    HostMemory, IoSurfacePlane, LoadAction, PipelineOptions, RenderPassDescriptor,
++    RenderPipelineState, ResourceOptions, ScissorRect, StorageMode, StoreAction, Texture,
++    TextureDescriptor,
+ };
+ use std::collections::BTreeMap;
+ use std::sync::{Arc, Mutex};
+@@ -46,10 +47,12 @@ enum Mark {
+     Frozen,
+ }
+ 
+-/// QEMU's page states, without the guest.
++/// QEMU's page states, without the guest: each track a range of its own, as the census holds them.
+ #[derive(Default)]
+ struct Fake {
+     pages: Mutex<BTreeMap<u64, Mark>>,
++    /// The ranges tracked: a page outside them has no mark.
++    ranges: Mutex<Vec<std::ops::Range<u64>>>,
+     /// Pages to answer as reached while their markers moved.
+     came: Mutex<Vec<u64>>,
+     /// Pages the next `arm` answers as reached, and leaves held.
+@@ -60,16 +63,29 @@ struct Fake {
+ 
+ impl Pages for Fake {
+     fn track(&self, start: u64, len: u64) -> bool {
++        let mut ranges = self.ranges.lock().unwrap();
++        let range = start..start + len;
++        if ranges.contains(&range) {
++            return true;
++        }
++        if ranges.iter().any(|other| other.start < range.end && range.start < other.end) {
++            return false;
++        }
+         let mut pages = self.pages.lock().unwrap();
+-        for page in (start..start + len).step_by(PAGE as usize) {
++        for page in range.clone().step_by(PAGE as usize) {
+             pages.entry(page).or_insert(Mark::Held);
+         }
++        ranges.push(range);
+         true
+     }
+ 
+     fn untrack(&self, start: u64) {
+-        let _ = start;
+-        self.pages.lock().unwrap().clear();
++        let mut ranges = self.ranges.lock().unwrap();
++        let Some(at) = ranges.iter().position(|range| range.contains(&start)) else {
++            return;
++        };
++        let range = ranges.swap_remove(at);
++        self.pages.lock().unwrap().retain(|page, _| !range.contains(page));
+     }
+ 
+     fn arm(&self, list: &[u64]) -> Vec<u64> {
+@@ -135,6 +151,12 @@ impl Fake {
+     fn armed_pages(&self) -> usize {
+         (self.pages.lock().unwrap().values()).filter(|mark| **mark == Mark::Armed).count()
+     }
++
++    /// QEMU's unmap of the surface: every mark goes (`census_surface_unmapped`).
++    fn unmapped(&self) {
++        self.pages.lock().unwrap().clear();
++        self.ranges.lock().unwrap().clear();
++    }
+ }
+ 
+ struct Case<'d> {
+@@ -1304,3 +1326,242 @@ impl Case<'_> {
+         run(&command_buffer);
+     }
+ }
++
++/// Audit B1, the library's side: QEMU holds a texture's rows alone, and a touch of a page past them
++/// names no surface. The marks it lets go of are that page's range's, none: the surface still traps.
++#[test]
++fn surface_coherent_a_touch_past_the_rows_leaves_the_surface_trapping() {
++    on_surface_of([WIDTH, 250, ROW], true, true, |case| {
++        case.draw(RED, None);
++        let past = case.base() + 250 * ROW;
++        assert!(past + PAGE <= case.base() + case.len as u64, "the mapping has pages past the rows");
++        assert_eq!(case.fake.mark(past), None, "the marks hold the rows' pages alone");
++        let armed = case.fake.armed_pages();
++        assert!(armed > 0);
++        let orphans = shadow_coherent::fallback_counts().orphan_faults;
++        shadow_coherent::fault(past, true);
++        assert_eq!(shadow_coherent::fallback_counts().orphan_faults, orphans + 1);
++        assert_eq!(case.fake.armed_pages(), armed, "the surface's pages stay armed");
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++        assert_eq!(case.count("traps"), 1);
++    });
++}
++
++/// Audit P1: a host reader outside any command buffer (Reims' video encoder, scaler, JPEG) reads
++/// the pages. Unasked, they are stale; asked first ([`shadow_coherent::host_reads`]), current.
++#[test]
++fn surface_coherent_a_host_reader_reads_the_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "the pages lack the write until asked");
++        let before = shadow_coherent::fallback_counts();
++        shadow_coherent::host_reads(case.range());
++        assert_eq!(case.behind(5, 5), RED_TEXEL);
++        assert_eq!(case.behind(WIDTH - 1, HEIGHT - 1), RED_TEXEL);
++        let after = shadow_coherent::fallback_counts();
++        assert_eq!(after.host_reads, before.host_reads + 1);
++        assert_eq!(after.host_reads_synced, before.host_reads_synced + 1);
++        assert_eq!(case.count("host_read"), 1);
++        assert_eq!(case.fake.armed_pages(), 0, "held after the sync");
++        case.draw(GREEN, None);
++        assert_eq!(case.read(5, 5), GREEN_TEXEL, "and a later write traps as ever");
++    });
++}
++
++/// A host read over pages no surface traps changes nothing, and counts.
++#[test]
++fn surface_coherent_a_host_reader_elsewhere_costs_nothing() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let before = shadow_coherent::fallback_counts();
++        let end = case.range().end;
++        shadow_coherent::host_reads(end..end + PAGE);
++        let after = shadow_coherent::fallback_counts();
++        assert_eq!(after.host_reads, before.host_reads + 1);
++        assert_eq!(after.host_reads_synced, before.host_reads_synced);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4]);
++    });
++}
++
++/// A host read while a write runs, which the guest may have heard of through a shared event: the
++/// read waits for it, a bounded time.
++#[test]
++fn surface_coherent_a_host_read_waits_for_a_write_in_flight() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        let hold = case.device.new_shared_event().unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        command_buffer.encode_wait_for_event((&hold).into(), 1).unwrap();
++        case.pass(&command_buffer, GREEN, None);
++        command_buffer.commit().unwrap();
++        let release = {
++            let hold = hold.clone();
++            std::thread::spawn(move || {
++                std::thread::sleep(Duration::from_millis(10));
++                hold.set_signaled_value(1);
++            })
++        };
++        shadow_coherent::host_reads(case.range());
++        assert_eq!(case.behind(5, 5), GREEN_TEXEL);
++        release.join().unwrap();
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++    });
++}
++
++/// Audit P1, the other way: a host writer (Reims' video decoder) writes the pages through its own
++/// mapping, no trap. Told first ([`shadow_coherent::host_writes`]), the next command takes it.
++#[test]
++fn surface_coherent_a_host_writer_reaches_the_image() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let before = shadow_coherent::fallback_counts();
++        shadow_coherent::host_writes(case.range());
++        assert_eq!(shadow_coherent::fallback_counts().host_writes_opened, before.host_writes_opened + 1);
++        case.mapping.write((7 * ROW + 7 * 4) as usize, &[1, 2, 3, 4]);
++        assert_eq!(case.through_image(7, 7), [1, 2, 3, 0], "the next command took it");
++        assert_eq!(case.through_image(8, 7), [0, 0, 255, 0], "and the GPU's texels around it");
++    });
++}
++
++/// Audit P2: a texture over the pages with untracked hazards, made apart from the image, reads them
++/// in place: its command buffer must bring what lies ahead first.
++#[test]
++fn surface_coherent_an_untracked_reader_reads_the_writes() {
++    on_surface(true, |case| {
++        let untracked = ResourceOptions::new(
++            StorageMode::Managed,
++            CpuCacheMode::DefaultCache,
++            HazardTrackingMode::Untracked,
++        );
++        // SAFETY: the mapping outlives the buffer (the case drops it first).
++        let memory = unsafe { HostMemory::new(case.mapping.pointer()) };
++        // SAFETY: as above.
++        let bytes = unsafe {
++            case.device.new_buffer_with_bytes_no_copy(memory, case.len as u64, untracked, None)
++        }
++        .unwrap();
++        let mut d = case.reader_descriptor(PixelFormat::BGRA8Unorm);
++        d.resource_options = untracked;
++        let plane = IoSurfacePlane::new(0, ROW, false);
++        let reader = bytes.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        let before = shadow_coherent::fallback_counts().met_untracked;
++        case.draw(RED, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], RED_TEXEL);
++        assert_eq!(shadow_coherent::fallback_counts().met_untracked, before + 1);
++        case.draw(GREEN, None);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], GREEN_TEXEL);
++    });
++}
++
++/// A CPU read after the GPU signalled a shared event past the write, before its command buffer
++/// completes: the signal promises the write (audit Q4).
++#[test]
++fn surface_coherent_a_cpu_read_after_a_signal_reads_the_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        let signal = case.device.new_shared_event().unwrap();
++        let hold = case.device.new_shared_event().unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        case.pass(&command_buffer, GREEN, None);
++        command_buffer.encode_signal_event((&signal).into(), 1).unwrap();
++        command_buffer.encode_wait_for_event((&hold).into(), 1).unwrap();
++        command_buffer.commit().unwrap();
++        assert!(signal.wait_until_signaled_value(1, SOON), "the GPU reached the signal");
++        let read = case.read(5, 5);
++        hold.set_signaled_value(1);
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(read, GREEN_TEXEL, "what the signal promised");
++    });
++}
++
++/// A texture made over the pages after the first one went with writes ahead: what holds those
++/// writes holds the first's image, which the new one binds (`surface_twin.rs`), and it reads them.
++#[test]
++fn surface_coherent_a_texture_made_after_the_first_went_reads_its_writes() {
++    on_surface(true, |mut case| {
++        case.draw(RED, None);
++        case.texture = None;
++        case.texture = Some(case.second_texture());
++        case.draw(GREEN, scissor(0, 0, 8, 8));
++        assert_eq!(case.read(100, 100), RED_TEXEL, "what the first left");
++        assert_eq!(case.read(1, 1), GREEN_TEXEL, "what the second drew");
++        case.draw(RED, scissor(0, 0, 4, 4));
++        assert_eq!(case.read(1, 1), RED_TEXEL);
++        assert_eq!(case.read(5, 5), GREEN_TEXEL);
++    });
++}
++
++/// A texture made over the pages after the first one went with nothing ahead, so that nothing holds
++/// its image: the first's surface stays tracked until the unmap, and the new one found it there and
++/// never trapped, copying back per encoder for good, and its image missed the guest's writes. Now
++/// the old one lets go of the pages, and the new one traps.
++#[test]
++fn surface_coherent_a_texture_made_after_the_first_went_traps() {
++    on_surface(true, |mut case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        case.texture = None;
++        case.texture = Some(case.second_texture());
++        let before = shadow_coherent::fallback_counts();
++        case.draw(GREEN, scissor(0, 0, 8, 8));
++        let after = shadow_coherent::fallback_counts();
++        assert_eq!(after.closed_by_overlap, before.closed_by_overlap, "the new one traps");
++        assert_eq!(after.retired_dead, before.retired_dead + 1, "the old one went");
++        assert!(case.fake.armed_pages() > 0, "and leaves its writes ahead");
++        assert_eq!(case.read(1, 1), GREEN_TEXEL);
++        assert_eq!(case.read(100, 100), RED_TEXEL);
++        case.write(9, 9, [1, 2, 3, 4]);
++        assert_eq!(case.through_image(9, 9), [1, 2, 3, 0], "its image takes the guest's writes");
++    });
++}
++
++/// Pages unmapped, then mapped again for a new surface: it traps, with no claim of the old.
++#[test]
++fn surface_coherent_pages_mapped_again_trap_for_the_new_surface() {
++    on_surface(true, |mut case| {
++        case.draw(RED, None);
++        assert!(shadow_coherent::unmapping(case.range()));
++        shadow_coherent::unmapped(case.range());
++        case.fake.unmapped();
++        case.texture = None;
++        case.mapping.fill(BEFORE);
++        let bytes = case.other_import();
++        let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        d.resource_options = bytes.resource_options();
++        let plane = IoSurfacePlane::new(0, ROW, false);
++        case.texture = Some(bytes.new_texture_with_iosurface_plane(&d, plane).unwrap());
++        let before = shadow_coherent::fallback_counts();
++        case.draw(GREEN, scissor(0, 0, 8, 8));
++        let after = shadow_coherent::fallback_counts();
++        assert_eq!(after.closed_by_overlap, before.closed_by_overlap, "the old one left no claim");
++        assert!(case.fake.armed_pages() > 0, "the new surface traps");
++        assert_eq!(case.read(1, 1), GREEN_TEXEL);
++        assert_eq!(case.read(100, 100), [BEFORE; 4], "and none of the old one's writes came back");
++    });
++}
++
++/// A reader of the pages on another device (another task's, as `device_lend` makes): its commit
++/// must bring what lies ahead, as one on the writer's device does.
++#[test]
++fn surface_coherent_a_reader_on_another_device_reads_the_writes() {
++    on_surface(true, |case| {
++        let cache = ScratchCache::new().unwrap();
++        let messages = Messages::default();
++        let other = validated_device_with(TEST_DEVICE, &messages, cache.path(), |o| {
++            o.policy.host_page_textures = HostPageTexturePolicy::InPlace;
++        })
++        .unwrap();
++        case.draw(RED, None);
++        let bytes = surface_buffer(&other, &case.mapping, case.len);
++        let queue = other.new_command_queue().unwrap();
++        assert_eq!(gpu_read(&queue, &bytes, 0..4), RED_TEXEL);
++        drop(bytes);
++        drop(queue);
++        drop(other);
++        let reported = messages.take();
++        assert!(reported.is_empty(), "the layer reported: {reported:#?}");
++    });
++}

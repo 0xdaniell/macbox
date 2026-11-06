@@ -1,7 +1,7 @@
-From 8808e19fccab471f8f967949b68c4db036432c43 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 14:39:45 +0000
-Subject: [PATCH 2/3] REIMS_VGPU_NON_APPLE_GPU takes a list of
+Subject: [PATCH 02/25] REIMS_VGPU_NON_APPLE_GPU takes a list of
  parts
 
 ---
@@ -9,14 +9,14 @@ Subject: [PATCH 2/3] REIMS_VGPU_NON_APPLE_GPU takes a list of
  1 file changed, 26 insertions(+), 21 deletions(-)
 
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/caps.rs b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
-index a785e63..2def509 100644
+index a785e63e..2def509c 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/caps.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
 @@ -181,21 +181,26 @@ const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
  /// The stand-ins: the Metal platform's answers on an Apple M3 Max, where no documented fact
  /// gives one (the module's table). The registry ID, which Metal answers at run time, is the
  /// OS's ([`crate::os::default_registry_id`]).
--/// macbox: `REIMS_VGPU_NON_APPLE_GPU=1` answers the guest as Apple's framework does on an
+-/// LOCAL (Atlas): `REIMS_VGPU_NON_APPLE_GPU=1` answers the guest as Apple's framework does on an
 -/// Intel or AMD Mac's GPU: no Apple GPU family (device info key 28 bit 0 off, key 37 Apple5's
 -/// fallback 1005, key 44 none), and no tile shaders, imageblocks, raster order groups,
 -/// framebuffer reads or extended XR10 formats, so the guest's compositor takes the paths it
@@ -28,7 +28,7 @@ index a785e63..2def509 100644
 -        let on = std::env::var_os("REIMS_VGPU_NON_APPLE_GPU").is_some_and(|v| v == "1");
 -        if on {
 -            log::info!("REIMS_VGPU_NON_APPLE_GPU: answering as a GPU of no Apple family (no tile shaders, imageblocks, raster order groups, framebuffer reads, XR10)");
-+/// macbox: `REIMS_VGPU_NON_APPLE_GPU` answers the guest as Apple's framework does on an
++/// LOCAL (Atlas): `REIMS_VGPU_NON_APPLE_GPU` answers the guest as Apple's framework does on an
 +/// Intel or AMD Mac's GPU, part by part, so the guest's compositor takes an immediate-mode GPU's
 +/// paths instead of a tiler's, which this platform emulates at a cost. Its value is `1` or `all`
 +/// for every part, or a comma list of: `families` (no Apple GPU family: device info key 28 bit 0

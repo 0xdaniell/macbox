@@ -1,7 +1,7 @@
-From 04698bfc53e104311bd091aef97e12a19460468a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 18:23:46 +0000
-Subject: [PATCH 4/5] live switches host_rt_in_place and
+Subject: [PATCH 04/34] live switches host_rt_in_place and
  shadow_compressed for textures over host pages
 
 host_rt_in_place (default off): under HostPageTexturePolicy::InPlace, a
@@ -68,7 +68,7 @@ index 20fd6a1a..70a18c56 100644
      /// Its check of the first move of an image over host pages, per class of pages, and its
      /// verdicts (`in_place.rs`).
      pub(crate) in_place: crate::in_place::InPlaceChecks,
-+    /// macbox: its check of rendering into an image in place over host pages, per class
++    /// LOCAL (Atlas): its check of rendering into an image in place over host pages, per class
 +    /// of pages, and its verdicts (`host_rt.rs`).
 +    pub(crate) host_rt: crate::in_place::InPlaceChecks,
      /// How no-copy buffers import host memory, or why they are refused.
@@ -78,7 +78,7 @@ index 20fd6a1a..70a18c56 100644
              textures,
              shader_cache,
              in_place: crate::in_place::InPlaceChecks::new(fail_in_place_check),
-+            // macbox: the render-target check (`host_rt.rs`).
++            // LOCAL (Atlas): the render-target check (`host_rt.rs`).
 +            host_rt: crate::in_place::InPlaceChecks::new(fail_in_place_check),
              host_import,
              shared_pointer_imports: OnceLock::new(),
@@ -87,7 +87,7 @@ index 20fd6a1a..70a18c56 100644
          }
          // The verdicts of its check of textures over host pages, where a record holds them.
          device.recall_in_place_checks();
-+        // macbox: where the switch `host_rt_in_place` is on as the device is made, its
++        // LOCAL (Atlas): where the switch `host_rt_in_place` is on as the device is made, its
 +        // render-target check starts now, on a thread of its own (`host_rt.rs`).
 +        device.start_host_rt_checks_if_switched();
          device.degrade_argument_buffers_unread();
@@ -101,7 +101,7 @@ index 9990acbf..11b17838 100644
          }
          all.push(added);
      };
-+    // macbox: where textures over host pages render or write in place
++    // LOCAL (Atlas): where textures over host pages render or write in place
 +    // (`host_rt_in_place`, `host_rt.rs`), an image's use of a key (an image in place, keyed as its
 +    // buffer) takes the uses of every byte the key lies over: a render pass's write through one
 +    // import of a surface's pages is ordered before a read through another import of them (the
@@ -123,7 +123,7 @@ index 9990acbf..11b17838 100644
              .and_then(|aliases| aliases.get(&used.key))
              .map(|alias| alias.key);
          if let Some(key) = joined {
-+            // macbox: an image's use takes the memory's every byte (above).
++            // LOCAL (Atlas): an image's use takes the memory's every byte (above).
 +            let range = match &used.range {
 +                UseRange::Image { .. } => UseRange::Bytes(whole.clone()),
 +                range => range.clone(),
@@ -140,7 +140,7 @@ index 00000000..f56f6938
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/host_rt.rs
 @@ -0,0 +1,806 @@
-+//! macbox: textures over host pages that render or write, in place.
++//! LOCAL (Atlas): textures over host pages that render or write, in place.
 +//!
 +//! Upstream takes a texture over host pages in place only where its declared usage samples or
 +//! reads it (`in_place.rs`): one that renders into it or writes it through a shader is a shadow
@@ -431,7 +431,7 @@ index 00000000..f56f6938
 +        }
 +    }
 +
-+    /// macbox: start the render-target check where it has not started (whatever the
++    /// LOCAL (Atlas): start the render-target check where it has not started (whatever the
 +    /// switch), and wait until every verdict is known or `timeout` passed: whether they are. A
 +    /// runtime extension for the lanes.
 +    #[doc(hidden)]
@@ -440,7 +440,7 @@ index 00000000..f56f6938
 +        self.shared().host_rt.wait(timeout)
 +    }
 +
-+    /// macbox: the render-target check's verdicts now, one line per class, its notes, and
++    /// LOCAL (Atlas): the render-target check's verdicts now, one line per class, its notes, and
 +    /// its time where it ended. A runtime extension for the lanes.
 +    #[doc(hidden)]
 +    pub fn host_rt_check_report(&self) -> Vec<String> {
@@ -954,7 +954,7 @@ index 86f42373..420c9ac5 100644
          lock(&self.notes).push(line);
      }
  
-+    // macbox: the render-target check's report (`host_rt.rs`).
++    // LOCAL (Atlas): the render-target check's report (`host_rt.rs`).
 +    /// What the check noted, a line each.
 +    pub(crate) fn notes(&self) -> Vec<String> {
 +        lock(&self.notes).clone()
@@ -974,7 +974,7 @@ index 46645681..d0c60be3 100644
 -struct ClassPages {
 -    buffer: Buffer,
 -    start: NonNull<u8>,
-+// macbox: crate-visible for the render-target check (`host_rt.rs`).
++// LOCAL (Atlas): crate-visible for the render-target check (`host_rt.rs`).
 +pub(crate) struct ClassPages {
 +    pub(crate) buffer: Buffer,
 +    pub(crate) start: NonNull<u8>,
@@ -993,7 +993,7 @@ index 46645681..d0c60be3 100644
  
  /// The host's page size.
 -fn host_page() -> u64 {
-+// macbox: crate-visible for the render-target check (`host_rt.rs`).
++// LOCAL (Atlas): crate-visible for the render-target check (`host_rt.rs`).
 +pub(crate) fn host_page() -> u64 {
      #[cfg(unix)]
      {
@@ -1006,7 +1006,7 @@ index 27ef226b..ca076571 100644
  mod host_memory;
  #[cfg(unix)]
  mod host_residency;
-+/// macbox: textures over host pages that render or write, in place (`host_rt_in_place`).
++/// LOCAL (Atlas): textures over host pages that render or write, in place (`host_rt_in_place`).
 +mod host_rt;
  #[cfg(unix)]
  mod host_shared_pointers;
@@ -1061,7 +1061,7 @@ index 0eb14cb2..10e313a1 100644
                                  Err((refusal, why)) => ShadowCause::Refused(refusal, why),
                              }
                          }
-+                        // macbox: a texture that renders or writes, in place, where the
++                        // LOCAL (Atlas): a texture that renders or writes, in place, where the
 +                        // switch `host_rt_in_place` is on and the device's render-target check
 +                        // passed for the class (`host_rt.rs`); the check's own textures always.
 +                        Err(ShadowCause::RenderTarget | ShadowCause::ShaderWrite)
@@ -1100,7 +1100,7 @@ index 0eb14cb2..10e313a1 100644
          {
              return Err(Error::NotImplemented(RuntimeGap::Textures));
          }
-+        // macbox: where the switch `shadow_compressed` is on, a shadow planned mutable to
++        // LOCAL (Atlas): where the switch `shadow_compressed` is on, a shadow planned mutable to
 +        // any format takes the list of the formats its own image is viewed as
 +        // (`shadow_compressible`), so a driver that compresses only images of a known list of
 +        // compatible formats may compress it (ANV: "Disabling aux: CCS_E incompatible format(s)").
@@ -1115,7 +1115,7 @@ index 0eb14cb2..10e313a1 100644
              Some(_) => (plan, None),
              None => with_unorm_view(plan, &facts),
          };
-+        // macbox diagnostic: the shadow's plan, where `M2V_SHADOW_PLANS` is set.
++        // LOCAL (Atlas) diagnostic: the shadow's plan, where `M2V_SHADOW_PLANS` is set.
 +        if std::env::var_os("M2V_SHADOW_PLANS").is_some() {
 +            eprintln!(
 +                "metal2vulkan shadow plan: {:?} {:?} {}x{} flags {:?} usage {:?} views {:?} \
@@ -1138,7 +1138,7 @@ index 0eb14cb2..10e313a1 100644
      }
  }
 +
-+/// macbox: the plans an image in place of a texture over host pages that renders or
++/// LOCAL (Atlas): the plans an image in place of a texture over host pages that renders or
 +/// writes is tried with (`host_rt.rs`), the first the device makes: as a linear image aliasing a
 +/// buffer of the runtime's own is (`Device::storage_over_buffer`'s `None` branch): with the
 +/// feedback loop usage, then with the usage the texture lacks, then with its own plan. A linear
@@ -1159,7 +1159,7 @@ index 0eb14cb2..10e313a1 100644
 +    Ok(plans)
 +}
 +
-+/// macbox: `plan`, a shadow's image, with the list of the formats the runtime views its own
++/// LOCAL (Atlas): `plan`, a shadow's image, with the list of the formats the runtime views its own
 +/// image as where it is mutable to any format (a texture of `PixelFormatView` usage, or one Metal
 +/// keeps uncompressed): the list a plan of the texture's usage without `PixelFormatView` takes, or
 +/// its own format alone. A view of a texture over a buffer in another pixel format is a texture of
@@ -1199,7 +1199,7 @@ index 3ceaa484..7bff410a 100644
          }
      }
 +
-+    // macbox: the render-target check's view of its texture (`host_rt.rs`).
++    // LOCAL (Atlas): the render-target check's view of its texture (`host_rt.rs`).
 +    /// The texture's image in place, where it is one: its `VkImage`, its format, its usage and its
 +    /// hazard key (the submission that names the key makes the image's first move).
 +    pub(crate) fn in_place_target(
@@ -1231,7 +1231,7 @@ index 2ff62202..c2394df6 100644
  mod guarded_effects;
  #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
  mod guest_frame_costs;
-+// macbox: the desktop's frames under the host-page render-target switches.
++// LOCAL (Atlas): the desktop's frames under the host-page render-target switches.
  #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
  mod half_output_blends;
  #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -1248,7 +1248,7 @@ index 2ff62202..c2394df6 100644
  ) -> Result<Device, String> {
      fatal_signals::install();
      let mut options = validated_options(messages, cache);
-+    // macbox: `M2V_LANE_IN_PLACE=1` gives every lane device the product's policy for
++    // LOCAL (Atlas): `M2V_LANE_IN_PLACE=1` gives every lane device the product's policy for
 +    // textures over host pages (`HostPageTexturePolicy::InPlace`) before the lane's own options,
 +    // so the lanes over host pages exercise the in-place paths (`host_rt_in_place` among them).
 +    if std::env::var_os("M2V_LANE_IN_PLACE").is_some_and(|v| v == "1") {
@@ -1263,11 +1263,11 @@ index 00000000..d1c701b0
 --- /dev/null
 +++ b/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
 @@ -0,0 +1,485 @@
-+//! macbox: what a desktop frame of render passes into a texture over host pages costs on
++//! LOCAL (Atlas): what a desktop frame of render passes into a texture over host pages costs on
 +//! the device the cfg selects, under each setting of the live switches `host_rt_in_place` and
 +//! `shadow_compressed` (`metal2vulkan_runtime::live`): report only, in release builds.
 +//!
-+//! The surface is the macOS desktop's framebuffer as the VM's WindowServer renders it: a
++//! The surface is the macOS desktop's framebuffer as the Atlas VM's WindowServer renders it: a
 +//! 3440x1440 `BGRA8Unorm` IOSurface plane with rows of 13824 bytes (64 past its 13760 bytes of
 +//! texels) over anonymous pages, a `Managed` no-copy buffer over them and a texture of the plane of
 +//! `RenderTarget | ShaderRead` usage, on a device that takes textures over host pages in place
@@ -1649,7 +1649,7 @@ index 00000000..d1c701b0
 +    }
 +}
 +
-+/// macbox probe: a pass that clears to (0.1, 0.2, 0.3, 0.4) (and blends over the left
++/// LOCAL (Atlas) probe: a pass that clears to (0.1, 0.2, 0.3, 0.4) (and blends over the left
 +/// half, or draws nothing) into a texture in place over host pages, a `Private` texture and a
 +/// linear image over a `Private` buffer: the bytes of texel 0 and of a texel in the right half of
 +/// each (`RT-PROBE`). On ANV 26.2.4 both linear images' clears write red 0x19 where the
@@ -1758,7 +1758,7 @@ index 73808f3a..9e1acfba 100644
              // one that only reads may be in place, counted so.
 -            let may_alias =
 -                policy == HostPageTexturePolicy::InPlace && usage == TextureUsage::SHADER_READ;
-+            // macbox: under `host_rt_in_place` one that renders or writes may be in
++            // LOCAL (Atlas): under `host_rt_in_place` one that renders or writes may be in
 +            // place too.
 +            let rt = metal2vulkan_runtime::live::on("host_rt_in_place", false);
 +            let may_alias = policy == HostPageTexturePolicy::InPlace
@@ -1775,7 +1775,7 @@ index 05fb0e6a..cf7ba041 100644
      let in_place = counts.host_textures_in_place - before.host_textures_in_place;
      let policy = device.compile_device().policy().host_page_textures;
 -    let may_alias = policy == HostPageTexturePolicy::InPlace && usage == TextureUsage::SHADER_READ;
-+    // macbox: under `host_rt_in_place` one that renders or writes may be in place too.
++    // LOCAL (Atlas): under `host_rt_in_place` one that renders or writes may be in place too.
 +    let rt = metal2vulkan_runtime::live::on("host_rt_in_place", false);
 +    let may_alias =
 +        policy == HostPageTexturePolicy::InPlace && (usage == TextureUsage::SHADER_READ || rt);

@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:01:53 +0000
+Subject: [PATCH 3/9] census: meson: build census.c on any Linux host
+
+CONFIG_LINUX is not a source-set key, so the file was never built.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/meson.build | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/accel/kvm/meson.build b/accel/kvm/meson.build
+index a154754a04..359ea27f83 100644
+--- a/accel/kvm/meson.build
++++ b/accel/kvm/meson.build
+@@ -5,4 +5,6 @@ kvm_ss.add(files(
+ ))
+ 
+ specific_ss.add_all(when: 'CONFIG_KVM', if_true: kvm_ss)
+-system_ss.add(when: 'CONFIG_LINUX', if_true: files('census.c'))
++if host_os == 'linux'
++  system_ss.add(files('census.c'))
++endif

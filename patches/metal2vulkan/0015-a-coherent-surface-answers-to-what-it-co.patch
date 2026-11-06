@@ -1,0 +1,725 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 03:50:09 +0000
+Subject: [PATCH 15/34] a coherent surface answers to what it
+ costs
+
+A window a compositor samples syncs whole each frame with no trap: met_by's flush, on a surface
+whose image the reader cannot sample. The demotion only saw traps and frames, and below 32 fps
+never fired. A ledger of what a surface spends against the copies it replaces decides now, per
+sync, with its cause counted; time outs double as they were meant to, which clearing eager_until
+had undone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/mod.rs                 |   2 +-
+ .../src/shadow_coherent.rs                    | 176 +++++++++++++-----
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  14 +-
+ .../src/runtime_lane/surface_coherent.rs      | 170 ++++++++++++++++-
+ 4 files changed, 302 insertions(+), 60 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index b2a5ab9e..4812e25c 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2526,7 +2526,7 @@ impl CommandBuffer {
+                     crate::shadow_lazy::met_by(&summaries)
+                 };
+                 for surface in met {
+-                    surface.flush();
++                    surface.flush(crate::shadow_coherent::SyncBy::GpuReader);
+                 }
+             }
+             crate::shadow_lazy::committed(id);
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 5ff37213..985ce191 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -37,10 +37,12 @@
+ //! **The next command's copy in** takes the open pages' rectangle alone, and holds them first, so
+ //! a later write opens them again ([`Coherent::taking`]).
+ //!
+-//! **Adaptive**: a surface synced in more than `surface_coherent_demote_pct` percent of a window of
+-//! its frames, or more than `surface_coherent_demote_hz` times a second (a Simulator's per-frame
+-//! reader), goes back to a copy back per frame for `surface_coherent_hold_s` seconds, doubling to
+-//! [`HOLD_MAX_S`] while it keeps coming back.
++//! **Adaptive**: each surface keeps a [`Ledger`] of what trapping spent (arms, syncs, holds, traps
++//! and the GPU copies it still needed) against what the copies back it left undone would have. A
++//! surface that spends more over [`MIN_SYNCS`] syncs goes back to a copy back per encoder for
++//! `surface_coherent_hold_s` seconds, doubling to [`HOLD_MAX_S`] while it keeps coming back.
++//! Nothing here asks who read it: a window a compositor samples each frame costs a sync with no
++//! trap at all ([`SyncBy::GpuReader`]), and pays the same as a CPU reader that traps.
+ //!
+ //! **Unmap** ([`unmapping`]) syncs, while the pages are still the guest's, and lets go of what
+ //! pending writes hold; a surface with work running answers busy, as any surface with a command
+@@ -101,6 +103,10 @@ const DEFAULT_WAIT_MS: u64 = 50;
+ const ENDED_KEPT: usize = 256;
+ /// A GPU copy of a surface, per MiB: 2.97 ms for 5.76 Mtexels of 4 bytes (`STUDY-virt.md`).
+ const DEFAULT_COPY_NS_PER_MIB: u64 = 135_000;
++/// Syncs a [`Ledger`] needs to judge: a surface's first frame pays for tracking it.
++const MIN_SYNCS: u32 = 2;
++/// A ledger halves this often, so a surface's record follows what it does now.
++const LEDGER_SPAN: Duration = Duration::from_secs(1);
+ 
+ /// What marks a surface's pages. Addresses are the surface's own mapping's, whole pages, ascending,
+ /// one surface to a call; each call comes under the surface's lock, which [`fault`] takes.
+@@ -251,6 +257,36 @@ struct Record {
+     area: [u32; 4],
+ }
+ 
++/// What made a sync run.
++#[derive(Clone, Copy)]
++pub(crate) enum SyncBy {
++    /// The guest's CPU reached an armed page.
++    Trap,
++    /// A command buffer uses the bytes through another import (`shadow_lazy::met_by`).
++    GpuReader,
++    /// A CPU read through a texture over the pages (`shadow_lazy::cpu_reads`).
++    CpuRead,
++    /// A copy in reads the pages ([`Coherent::taking`]).
++    CopyIn,
++    /// An arm a vCPU beat.
++    Refused,
++    /// Demoted: its writes go now and at each completion.
++    Demotion,
++    /// The surface leaves.
++    Unmap,
++}
++
++const SYNC_BY: [&str; 7] = ["trap", "gpu_read", "cpu_read", "copy_in", "refused", "demotion", "unmap"];
++
++/// What trapping spent lately against what the copies it replaced would have, in ns.
++#[derive(Default)]
++struct Ledger {
++    spent: u64,
++    saved: u64,
++    syncs: u32,
++    since: Option<Instant>,
++}
++
+ /// One surface's counts.
+ #[derive(Default)]
+ struct Counts {
+@@ -263,7 +299,15 @@ struct Counts {
+     unique_pages: AtomicU64,
+     regions: AtomicU64,
+     bytes_detiled: AtomicU64,
++    /// Whole syncs: `copy_ns`, `hold_ns` and what lies between.
+     sync_ns: AtomicU64,
++    sync_by: [AtomicU64; SYNC_BY.len()],
++    /// The bytes' copy alone.
++    copy_ns: AtomicU64,
++    track_ns: AtomicU64,
++    /// The [`Ledger`]'s two sides, never halved.
++    spent_ns: AtomicU64,
++    saved_ns: AtomicU64,
+     trap_ns: AtomicU64,
+     trap_ns_max: AtomicU64,
+     timed: AtomicU64,
+@@ -313,10 +357,12 @@ struct State {
+     wrote_at: Option<Instant>,
+     /// Copies back per frame until then.
+     eager_until: Option<Instant>,
++    /// The last time out's end: a surface back soon after it stays out longer.
++    out_until: Option<Instant>,
+     hold_s: u64,
+-    window_start: Option<Instant>,
+-    window_defers: u64,
+-    window_syncs: u64,
++    ledger: Ledger,
++    /// The last sync's time, which a trap's own time holds.
++    synced_ns: u64,
+     seen: HashSet<u64>,
+ }
+ 
+@@ -374,12 +420,16 @@ impl Coherent {
+         }
+         let range = self.range();
+         let live = crate::live::on(SWITCH, false);
++        let start = Instant::now();
+         let marked = pages().is_some_and(|p| live && p.track(range.start, range.end - range.start));
+         if !marked {
+             state.closed = true;
+             return false;
+         }
+         state.tracked = true;
++        let spent = start.elapsed().as_nanos() as u64;
++        self.counts.track_ns.fetch_add(spent, Ordering::Relaxed);
++        self.charge(&mut state, spent);
+         all().write().unwrap().push(self.clone());
+         true
+     }
+@@ -401,14 +451,15 @@ impl Coherent {
+             return false;
+         }
+         let now = Instant::now();
+-        state.window_defers += 1;
+-        self.roll_window(&mut state, now);
+         match state.eager_until {
+             Some(until) if now < until => {
+                 self.counts.eager.fetch_add(1, Ordering::Relaxed);
+                 return false;
+             }
+-            Some(_) => state.eager_until = None,
++            Some(_) => {
++                state.eager_until = None;
++                state.ledger = Ledger::default();
++            }
+             None => {}
+         }
+         if state.wrote_at.is_some_and(|at| at.elapsed() < self.hold()) {
+@@ -426,44 +477,58 @@ impl Coherent {
+         self.counts.defers.fetch_add(1, Ordering::Relaxed);
+         let bytes = texels(area) * self.layout.texel;
+         self.counts.deferred_bytes.fetch_add(bytes, Ordering::Relaxed);
++        let saved = self.by_gpu(bytes);
++        state.ledger.saved += saved;
++        self.counts.saved_ns.fetch_add(saved, Ordering::Relaxed);
+         true
+     }
+ 
+-    /// The window of frames closes: too many syncs in it send the surface back to copies per frame.
+-    fn roll_window(&self, state: &mut State, now: Instant) {
+-        let start = *state.window_start.get_or_insert(now);
+-        let frames = knob("surface_coherent_demote_window", 32);
+-        let elapsed = now.duration_since(start);
+-        if state.window_defers < frames && elapsed < Duration::from_secs(1) {
+-            return;
++    /// What a GPU copy of `bytes` costs.
++    fn by_gpu(&self, bytes: u64) -> u64 {
++        let per_mib = knob("surface_coherent_copy_ns_per_mib", DEFAULT_COPY_NS_PER_MIB);
++        ((u128::from(bytes) * u128::from(per_mib)) >> 20) as u64
++    }
++
++    fn charge(&self, state: &mut State, ns: u64) {
++        state.ledger.spent += ns;
++        self.counts.spent_ns.fetch_add(ns, Ordering::Relaxed);
++    }
++
++    /// A sync ended: a surface that costs more than the copies it replaces goes back to them.
++    fn judge(&self, state: &mut State) {
++        let now = Instant::now();
++        state.ledger.syncs += 1;
++        if now.duration_since(*state.ledger.since.get_or_insert(now)) >= LEDGER_SPAN {
++            state.ledger.spent /= 2;
++            state.ledger.saved /= 2;
++            state.ledger.since = Some(now);
++            state.seen.clear();
+         }
+-        let pct = knob("surface_coherent_demote_pct", 50);
+-        let hz = knob("surface_coherent_demote_hz", 64);
+-        let by_frames = state.window_defers >= frames
+-            && state.window_syncs * 100 >= state.window_defers * pct;
+-        let by_rate = state.window_syncs as f64 >= hz as f64 * elapsed.as_secs_f64().max(0.25);
+-        if by_frames || by_rate {
++        let ledger = &state.ledger;
++        if ledger.syncs >= MIN_SYNCS
++            && ledger.spent > ledger.saved
++            && state.eager_until.is_none()
++            && knob("surface_coherent_demote", 1) != 0
++        {
+             self.demote(state, now);
+         }
+-        state.window_start = Some(now);
+-        state.window_defers = 0;
+-        state.window_syncs = 0;
+-        state.seen.clear();
+     }
+ 
+     fn demote(&self, state: &mut State, now: Instant) {
+-        let last = state.eager_until;
+         let first = knob("surface_coherent_hold_s", 2).max(1);
+-        state.hold_s = match last {
++        state.hold_s = match state.out_until {
+             Some(until) if now < until + Duration::from_secs(state.hold_s.max(first)) => {
+                 (state.hold_s * 2).clamp(first, HOLD_MAX_S)
+             }
+             _ => first,
+         };
+-        state.eager_until = Some(now + Duration::from_secs(state.hold_s));
++        let until = now + Duration::from_secs(state.hold_s);
++        state.eager_until = Some(until);
++        state.out_until = Some(until);
++        state.ledger = Ledger::default();
+         self.counts.demotions.fetch_add(1, Ordering::Relaxed);
+         // What is pending goes now, and what is running at its completion.
+-        self.sync_done(state);
++        self.sync_done(state, SyncBy::Demotion);
+     }
+ 
+     /// The commit of `id` returned: its record may go back by a copy ordered after it.
+@@ -519,7 +584,7 @@ impl Coherent {
+             return;
+         };
+         if state.eager_until.is_some_and(|until| Instant::now() < until) {
+-            self.sync_done(state);
++            self.sync_done(state, SyncBy::Demotion);
+             return;
+         }
+         if state.armed.iter().any(|armed| holds(*armed, record.area)) {
+@@ -546,16 +611,17 @@ impl Coherent {
+         let spent = start.elapsed().as_nanos() as u64;
+         self.counts.arm_ns.fetch_add(spent, Ordering::Relaxed);
+         self.counts.arms.fetch_add(1, Ordering::Relaxed);
++        self.charge(state, spent);
+         // No trap comes for these: the sync is now, before anyone hears of this completion. A CPU
+         // write in the rectangle raced the GPU's; one beside it stays, and the image takes it.
+         if !refused.is_empty() {
+-            self.sync_done(state);
++            self.sync_done(state, SyncBy::Refused);
+             self.note_came(state, refused);
+         }
+     }
+ 
+     /// Copy every done rectangle into the pages, and hold them.
+-    fn sync_done(&self, state: &mut State) {
++    fn sync_done(&self, state: &mut State, by: SyncBy) {
+         if state.done.is_empty() {
+             self.thaw_all(state);
+             return;
+@@ -568,10 +634,12 @@ impl Coherent {
+         let mut list = Vec::new();
+         for record in &done {
+             let area = record.area;
++            let copying = Instant::now();
+             let moved = match state.snapshots.is_empty() {
+                 true => self.detile(area),
+                 false => self.merge(state, &pages_mark, area),
+             };
++            self.counts.copy_ns.fetch_add(copying.elapsed().as_nanos() as u64, Ordering::Relaxed);
+             if !moved {
+                 self.counts.sync_errors.fetch_add(1, Ordering::Relaxed);
+                 eprintln!("surface_coherent: a sync of {area:?} failed");
+@@ -581,7 +649,7 @@ impl Coherent {
+             self.counts.bytes_detiled.fetch_add(bytes, Ordering::Relaxed);
+             list.extend(self.layout.pages_of(area));
+         }
+-        state.window_syncs += 1;
++        self.counts.sync_by[by as usize].fetch_add(1, Ordering::Relaxed);
+         list.sort_unstable();
+         list.dedup();
+         self.thaw_all(state);
+@@ -592,7 +660,10 @@ impl Coherent {
+         state.armed.clear();
+         let spent = start.elapsed().as_nanos() as u64;
+         self.counts.sync_ns.fetch_add(spent, Ordering::Relaxed);
++        self.charge(state, spent);
++        state.synced_ns = spent;
+         self.settle_pending(state);
++        self.judge(state);
+     }
+ 
+     /// A page the guest reached as its markers moved may hold a write: the image takes it again.
+@@ -721,7 +792,7 @@ impl Coherent {
+         if state.seen.insert(page) {
+             self.counts.unique_pages.fetch_add(1, Ordering::Relaxed);
+         }
+-        self.sync_done(&mut state);
++        self.sync_done(&mut state, SyncBy::Trap);
+         let mark = pages();
+         // Another vCPU's probe may be about to rerun on these pages: only the last of them, which
+         // lets it name its page, ends the probing.
+@@ -750,7 +821,7 @@ impl Coherent {
+             // copy back already on its way cannot merge.
+             let (settled, clear) = self.wait_settled(state, None);
+             state = settled;
+-            self.sync_done(&mut state);
++            self.sync_done(&mut state, SyncBy::Trap);
+             if !clear {
+                 self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+             }
+@@ -797,7 +868,7 @@ impl Coherent {
+                     self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+                 }
+             }
+-            self.sync_done(&mut state);
++            self.sync_done(&mut state, SyncBy::CopyIn);
+             let list: Vec<u64> = state.snapshots.keys().copied().collect();
+             if let Some(mark) = pages() {
+                 let came = mark.hold(&list, true);
+@@ -815,9 +886,9 @@ impl Coherent {
+     /// A GPU copy back of what ran is about to record: everything done went on the CPU, and what
+     /// is still running goes by the copy, up to the sequence given. `None` where nothing runs. The
+     /// lock is not held while it records.
+-    pub(crate) fn before_flush(&self) -> Option<u64> {
++    pub(crate) fn before_flush(&self, by: SyncBy) -> Option<u64> {
+         let mut state = self.lock();
+-        self.sync_done(&mut state);
++        self.sync_done(&mut state, by);
+         if state.running.is_empty() {
+             return None;
+         }
+@@ -825,7 +896,7 @@ impl Coherent {
+             let area = state.guest.unwrap_or(self.layout.whole());
+             let (settled, clear) = self.wait_settled(state, Some(area));
+             state = settled;
+-            self.sync_done(&mut state);
++            self.sync_done(&mut state, by);
+             if state.running.is_empty() {
+                 return None;
+             }
+@@ -842,6 +913,7 @@ impl Coherent {
+     pub(crate) fn flush_recorded(&self, bytes: u64) {
+         self.counts.flushes.fetch_add(1, Ordering::Relaxed);
+         self.counts.flushed_bytes.fetch_add(bytes, Ordering::Relaxed);
++        self.charge(&mut self.lock(), self.by_gpu(bytes));
+     }
+ 
+     /// The copy back was not made after all.
+@@ -897,7 +969,7 @@ impl Coherent {
+     /// alone, what is running copied back by the clock.
+     pub(crate) fn abandon(&self) {
+         let mut state = self.lock();
+-        self.sync_done(&mut state);
++        self.sync_done(&mut state, SyncBy::Unmap);
+         self.close(&mut state, true);
+     }
+ 
+@@ -928,7 +1000,7 @@ impl Coherent {
+     /// a surface with work running stays busy.
+     fn unmapping(&self) -> bool {
+         let mut state = self.lock();
+-        self.sync_done(&mut state);
++        self.sync_done(&mut state, SyncBy::Unmap);
+         if !state.running.is_empty() || state.flushing != 0 {
+             return false;
+         }
+@@ -961,6 +1033,7 @@ impl Coherent {
+         self.counts.copy_ins.fetch_add(1, Ordering::Relaxed);
+         let bytes = texels * self.layout.texel;
+         self.counts.copy_in_bytes.fetch_add(bytes, Ordering::Relaxed);
++        self.charge(&mut self.lock(), self.by_gpu(bytes));
+     }
+ 
+     /// A present: whether the display may sample the image instead of the pages.
+@@ -977,13 +1050,15 @@ impl Coherent {
+         self.counts.trap_ns.fetch_add(ns, Ordering::Relaxed);
+         self.counts.timed.fetch_add(1, Ordering::Relaxed);
+         self.counts.trap_ns_max.fetch_max(ns, Ordering::Relaxed);
++        let mut state = self.lock();
++        let synced = std::mem::take(&mut state.synced_ns);
++        self.charge(&mut state, ns.saturating_sub(synced));
+     }
+ 
+     fn line(&self, label: &str, state: &State) -> String {
+         let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
+         let c = &self.counts;
+-        let copy = knob("surface_coherent_copy_ns_per_mib", DEFAULT_COPY_NS_PER_MIB) as f64;
+-        let by_gpu = |bytes: u64| bytes as f64 / (1 << 20) as f64 * copy;
++        let by_gpu = |bytes: u64| self.by_gpu(bytes) as f64;
+         let presents = read(&c.presents).max(1) as f64;
+         let trap = read(&c.trap_ns) as f64;
+         let sync = read(&c.sync_ns) as f64;
+@@ -997,6 +1072,7 @@ impl Coherent {
+             "{{\"label\":\"{label}\",\"at\":\"{:#x}\",\"w\":{},\"h\":{},\"tracked\":{},\"closed\":{},\
+              \"presents\":{},\"defers\":{},\"traps\":{},\"writes\":{},\"unique_pages\":{},\
+              \"traps_per_s\":{:.2},\"regions\":{},\"bytes_detiled\":{},\"sync_ns\":{},\
++             \"copy_ns\":{},\"track_ns\":{},\"sync_by\":{{{}}},\"spent_ns\":{},\"saved_ns\":{},\
+              \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
+              \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
+              \"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+@@ -1017,6 +1093,14 @@ impl Coherent {
+             read(&c.regions),
+             read(&c.bytes_detiled),
+             read(&c.sync_ns),
++            read(&c.copy_ns),
++            read(&c.track_ns),
++            (SYNC_BY.iter().zip(&c.sync_by))
++                .map(|(by, count)| format!("\"{by}\":{}", read(count)))
++                .collect::<Vec<_>>()
++                .join(","),
++            read(&c.spent_ns),
++            read(&c.saved_ns),
+             read(&c.trap_ns),
+             read(&c.trap_ns_max),
+             read(&c.timed),
+@@ -1036,7 +1120,7 @@ impl Coherent {
+             read(&c.sync_errors),
+             state.done.len(),
+             state.snapshots.len(),
+-            total < eager,
++            read(&c.spent_ns) < read(&c.saved_ns),
+         )
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 64dd5ec4..d1c8eded 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -92,7 +92,7 @@ use super::device::Device;
+ use super::queue::CommandQueue;
+ use super::resource::ResourceKey;
+ use super::shadow::{bounding, CopyCause, ShadowCopies, ShadowCopy, Step};
+-use super::shadow_coherent::{Coherent, Layout, Reader};
++use super::shadow_coherent::{Coherent, Layout, Reader, SyncBy};
+ use super::tracker::{Summary, Use, UseRange};
+ use crate::exit_guard;
+ use std::any::Any;
+@@ -272,7 +272,7 @@ pub(crate) fn cpu_reads(bytes: impl Fn() -> Option<Range<usize>>) {
+     };
+     for lazy in surfaces() {
+         if lazy.over(&bytes) {
+-            if let Some(flush) = lazy.flush() {
++            if let Some(flush) = lazy.flush(SyncBy::CpuRead) {
+                 let _ = flush.wait_until_completed();
+             }
+         }
+@@ -416,7 +416,7 @@ pub(crate) fn after_commit(id: u64) {
+                 .compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+         // A texture that came beside it while this command buffer was open reads the copy back.
+         if wants.is_ok() || (moved && lazy.beside_another()) {
+-            lazy.flush();
++            lazy.flush(SyncBy::GpuReader);
+         }
+     }
+ }
+@@ -501,7 +501,7 @@ fn flush_due(max: Duration) -> bool {
+             let Some(_section) = exit_guard::enter() else {
+                 return false;
+             };
+-            exit_guard::lowering_program_calls(|| lazy.flush());
++            exit_guard::lowering_program_calls(|| lazy.flush(SyncBy::Unmap));
+         }
+     }
+     any
+@@ -939,18 +939,18 @@ impl Lazy {
+             return;
+         }
+         drop(pending);
+-        self.flush();
++        self.flush(SyncBy::GpuReader);
+     }
+ 
+     /// Copy what committed command buffers left ahead back, in a command buffer of its own,
+     /// committed before this returns: that command buffer, where one was made. Nothing is copied
+     /// over the pages of a texture nothing else holds (the module docs); a copy that cannot be
+     /// recorded stays for the next asker.
+-    pub(crate) fn flush(self: &Arc<Self>) -> Option<CommandBuffer> {
++    pub(crate) fn flush(self: &Arc<Self>, by: SyncBy) -> Option<CommandBuffer> {
+         // What is done goes on the CPU: a copy back is for what runs, which it is ordered after.
+         let coherent = self.coherent().cloned();
+         let through = match &coherent {
+-            Some(coherent) => Some(coherent.before_flush()?),
++            Some(coherent) => Some(coherent.before_flush(by)?),
+             None => None,
+         };
+         let (area, copies, holds) = {
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 5ae338e6..07688b3c 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -258,6 +258,8 @@ impl Drop for Clean {
+             "surface_lazy_scoped",
+             "surface_coherent",
+             "surface_coherent_hold_s",
++            "surface_coherent_demote",
++            "surface_coherent_copy_ns_per_mib",
+             "surface_lazy_present",
+             "surface_lazy_present_all",
+             "surface_lazy_present_max_ms",
+@@ -369,8 +371,7 @@ fn surface_coherent_a_partial_region_moves_that_alone() {
+ #[test]
+ fn surface_coherent_no_sync_reads_a_line_of_an_earlier_one() {
+     on_surface(true, |case| {
+-        live::set("surface_coherent_demote_pct", Some("100000"));
+-        live::set("surface_coherent_demote_hz", Some("1000000"));
++        live::set("surface_coherent_demote", Some("0"));
+         case.draw(RED, None);
+         assert_eq!(case.read(0, 0), RED_TEXEL);
+         for frame in 0..600u64 {
+@@ -386,8 +387,6 @@ fn surface_coherent_no_sync_reads_a_line_of_an_earlier_one() {
+             let (last_x, last_y) = (x + width - 1, y + height - 1);
+             assert_eq!(case.read(last_x, last_y), texel, "frame {frame}'s last texel");
+         }
+-        live::set("surface_coherent_demote_pct", None);
+-        live::set("surface_coherent_demote_hz", None);
+     });
+ }
+ 
+@@ -571,10 +570,15 @@ fn surface_coherent_the_display_samples_the_image() {
+     });
+ }
+ 
++/// What a copy back's GPU time is taken to be: 1 ns a MiB leaves nothing a surface's traps can pay
++/// for, so every sync costs more than it saved; a second a MiB, the other way.
++const COPIES_COST_NOTHING: &str = "1";
++const COPIES_COST_A_SECOND: &str = "1000000000";
++
+ #[test]
+ fn surface_coherent_a_frequent_reader_goes_back_to_copies() {
+     on_surface(true, |case| {
+-        live::set("surface_coherent_demote_window", Some("8"));
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
+         live::set("surface_coherent_hold_s", Some("60"));
+         for _ in 0..12 {
+             case.draw(RED, None);
+@@ -587,7 +591,123 @@ fn surface_coherent_a_frequent_reader_goes_back_to_copies() {
+         case.draw(RED, None);
+         assert_eq!(case.fake.armed_pages(), 0);
+         assert_eq!(case.behind(5, 5), RED_TEXEL);
+-        live::set("surface_coherent_demote_window", None);
++    });
++}
++
++/// The signature of a window on real macOS: a sync of the whole surface per frame, with no trap, no
++/// copy back and no copy in, from a compositor sampling the surface through its own import.
++#[test]
++fn surface_coherent_a_compositor_syncs_every_frame_with_no_trap() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_demote", Some("0"));
++        let other = case.other_import();
++        for frame in 0..8u64 {
++            let (color, texel) = if frame % 2 == 0 { (RED, RED_TEXEL) } else { (GREEN, GREEN_TEXEL) };
++            case.draw(color, None);
++            assert_eq!(gpu_read(&case.queue, &other, 0..4), texel, "frame {frame}");
++        }
++        assert_eq!(case.count("defers"), case.count("regions"), "a whole sync a defer");
++        assert_eq!(case.count("gpu_read"), 8, "the reader's commit asked each of them");
++        for none in ["traps", "flushes", "presents"] {
++            assert_eq!(case.count(none), 0, "{none}");
++        }
++        assert!(case.count("copy_ins") <= 1, "the first use's alone");
++    });
++}
++
++/// A window under a compositor, below the frame rate a window of frames would see, with no trap:
++/// out after two syncs, and what it shows stays right.
++#[test]
++fn surface_coherent_a_compositor_alone_demotes_a_slow_window() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
++        live::set("surface_coherent_hold_s", Some("60"));
++        let other = case.other_import();
++        for frame in 0..6u64 {
++            let (color, texel) = if frame % 2 == 0 { (RED, RED_TEXEL) } else { (GREEN, GREEN_TEXEL) };
++            case.draw(color, None);
++            assert_eq!(gpu_read(&case.queue, &other, 0..4), texel, "frame {frame}");
++            std::thread::sleep(Duration::from_millis(40));
++        }
++        assert_eq!(case.count("traps"), 0);
++        assert_eq!(case.count("demotions"), 1, "by the ledger alone");
++        assert!(case.count("regions") <= 3, "out quickly: {} syncs", case.count("regions"));
++        assert_eq!(case.fake.armed_pages(), 0, "eager from there");
++    });
++}
++
++/// The same reader where the copies it replaces cost more: trapping pays, so it stays.
++#[test]
++fn surface_coherent_a_surface_that_pays_stays() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_A_SECOND));
++        let other = case.other_import();
++        for _ in 0..8 {
++            case.draw(RED, None);
++            gpu_read(&case.queue, &other, 0..4);
++        }
++        assert_eq!(case.count("demotions"), 0);
++    });
++}
++
++/// A display surface no one reads: defers with no sync, nothing to judge at any copy cost.
++#[test]
++fn surface_coherent_a_surface_nothing_reads_stays() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
++        for _ in 0..64 {
++            case.draw(RED, None);
++        }
++        assert_eq!(case.count("demotions"), 0);
++        assert_eq!(case.count("regions"), 0);
++        assert!(case.fake.armed_pages() > 0, "still ahead");
++    });
++}
++
++/// Back from a time out and still costing: the next one is longer.
++#[test]
++fn surface_coherent_a_surface_back_too_soon_stays_out_longer() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
++        live::set("surface_coherent_hold_s", Some("1"));
++        let other = case.other_import();
++        let frame = |color| {
++            case.draw(color, None);
++            gpu_read(&case.queue, &other, 0..4);
++        };
++        (0..4).for_each(|_| frame(RED));
++        assert_eq!(case.count("demotions"), 1);
++        std::thread::sleep(Duration::from_millis(1100));
++        (0..4).for_each(|_| frame(GREEN));
++        assert_eq!(case.count("demotions"), 2, "it came back, and it does not pay yet");
++        std::thread::sleep(Duration::from_millis(1100));
++        let eager = case.count("eager_frames");
++        frame(RED);
++        assert_eq!(case.count("eager_frames"), eager + 1, "two seconds, this time");
++        assert_eq!(case.count("demotions"), 2);
++    });
++}
++
++/// A demoted surface keeps every guarantee: a stale byte is no cheaper for being out.
++#[test]
++fn surface_coherent_a_demoted_surface_stays_correct() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
++        live::set("surface_coherent_hold_s", Some("60"));
++        let other = case.other_import();
++        for _ in 0..4 {
++            case.draw(RED, None);
++            gpu_read(&case.queue, &other, 0..4);
++        }
++        assert_eq!(case.count("demotions"), 1);
++        case.draw(GREEN, None);
++        assert_eq!(gpu_read(&case.queue, &other, 0..4), GREEN_TEXEL, "a GPU reader");
++        assert_eq!(case.read(9, 9), GREEN_TEXEL, "the guest's CPU");
++        case.write(0, 0, RED_TEXEL);
++        assert_eq!(case.read(0, 0), RED_TEXEL, "and its own write");
++        case.draw(GREEN, scissor(4, 4, 4, 4));
++        assert_eq!(case.read(0, 0), RED_TEXEL, "a later draw beside it keeps the write");
++        assert_eq!(case.read(5, 5), GREEN_TEXEL);
+     });
+ }
+ 
+@@ -765,6 +885,44 @@ fn surface_coherent_cost_of_a_frame() {
+     }
+ }
+ 
++/// A window: its whole surface drawn and a compositor sampling it through its own import, each
++/// frame. What a demoted surface costs beside a surface that never trapped: its image stays in
++/// memory placed for host reads. `--nocapture`.
++#[test]
++fn surface_coherent_cost_of_a_window() {
++    const W: u64 = 3160;
++    const H: u64 = 1680;
++    const R: u64 = 12640;
++    fn median(mut values: Vec<f64>) -> f64 {
++        values.sort_by(f64::total_cmp);
++        values[values.len() / 2]
++    }
++    for (name, coherent, demote) in [("off", false, "1"), ("stays", true, "0"), ("demoted", true, "1")] {
++        on_surface_of([W, H, R], coherent, coherent, |case| {
++            live::set("surface_coherent_demote", Some(demote));
++            live::set("surface_coherent_copy_ns_per_mib", Some(COPIES_COST_NOTHING));
++            live::set("surface_coherent_hold_s", Some("60"));
++            let other = case.other_import();
++            let [mut frames, mut gpu] = [Vec::new(), Vec::new()];
++            for i in 0..150 {
++                let start = Instant::now();
++                let command_buffer = case.queue.command_buffer().unwrap();
++                case.pass(&command_buffer, if i % 2 == 0 { RED } else { GREEN }, None);
++                run(&command_buffer);
++                gpu_read(&case.queue, &other, 0..4);
++                if i >= 30 {
++                    frames.push(start.elapsed().as_secs_f64() * 1e3);
++                    let ends = command_buffer.gpu_end_time().unwrap();
++                    gpu.push((ends - command_buffer.gpu_start_time().unwrap()) * 1e3);
++                }
++            }
++            let [frames, gpu] = [median(frames), median(gpu)];
++            let (demotions, syncs) = (case.count("demotions"), case.count("regions"));
++            eprintln!("\nwindow {name}: frame {frames:.2} ms, gpu {gpu:.2} ms, demotions {demotions}, syncs {syncs}");
++        });
++    }
++}
++
+ #[test]
+ fn surface_coherent_off_touches_no_page() {
+     on_surface(true, |case| {

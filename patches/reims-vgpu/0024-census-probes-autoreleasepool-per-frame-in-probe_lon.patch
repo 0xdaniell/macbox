@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 07:33:47 +0000
+Subject: [PATCH 24/25] census probes: autoreleasepool per frame in probe_long;
+ multi-file build through main.swift
+
+probe_long faulted in the guest driver (SIGBUS) after ~4000 frames on every build, from
+per-frame Metal objects never released; with the pool it ran 25339 frames clean on 300fd13.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/probe_long.swift      | 53 ++++++++++---------
+ scripts/internal/census/probe_signal.swift    |  2 +-
+ scripts/internal/census/probe_tail.swift      |  2 +-
+ scripts/internal/census/probe_untracked.swift |  2 +-
+ 4 files changed, 32 insertions(+), 27 deletions(-)
+
+diff --git a/scripts/internal/census/probe_long.swift b/scripts/internal/census/probe_long.swift
+index 760a2c4f..d513771f 100644
+--- a/scripts/internal/census/probe_long.swift
++++ b/scripts/internal/census/probe_long.swift
+@@ -1,4 +1,5 @@
+-// probe_long.swift (long run): swiftc -O probe_common.swift probe_long.swift -o probe_long
++// probe_long.swift (long run): copy to a folder as main.swift, then
++//   swiftc -O probe_common.swift <folder>/main.swift -o probe_long
+ // PROBE_SECONDS (default 300). Thousands of frames over minutes, each one checked:
+ // - Four surfaces are used in turn, so each is reused every fourth frame.
+ // - Every 37th frame, a surface's texture is dropped and a new one made on it.
+@@ -24,30 +25,34 @@ print("device:", dev.name, "\(W)x\(H) BGRA for \(Int(seconds)) s")
+ let start = Date()
+ var n = 0, recreatedTextures = 0, recreatedSurfaces = 0, frameFails = 0, firstFail = ""
+ while Date().timeIntervalSince(start) < seconds {
+-    let i = n % slots.count
+-    if n % 101 == 100 { slots[i] = makeSlot(); recreatedSurfaces += 1 }
+-    else if n % 37 == 36 {
+-        slots[i].writer = texture(slots[i].surface); slots[i].reader = texture(slots[i].surface); recreatedTextures += 1
+-    }
+-    let slot = slots[i], c = colour(n), y0 = (n * 13) % (H - band)
+-    gradient(slot.writer, c)
+-    let cpuBand = n % 5 == 0
+-    if cpuBand {
+-        slot.surface.lock(options: [], seed: nil)
+-        for y in y0..<(y0 + band) {
+-            let row = (slot.surface.baseAddress + y * slot.surface.bytesPerRow).assumingMemoryBound(to: UInt32.self)
+-            for x in 0..<W { row[x] = bandValue }
++    // Each frame's Metal objects (viaGPU's surface and texture) go back at its end, or they pile up
++    // until the guest driver faults (SIGBUS after ~4000 frames, seen 2026-11-03).
++    autoreleasepool {
++        let i = n % slots.count
++        if n % 101 == 100 { slots[i] = makeSlot(); recreatedSurfaces += 1 }
++        else if n % 37 == 36 {
++            slots[i].writer = texture(slots[i].surface); slots[i].reader = texture(slots[i].surface); recreatedTextures += 1
++        }
++        let slot = slots[i], c = colour(n), y0 = (n * 13) % (H - band)
++        gradient(slot.writer, c)
++        let cpuBand = n % 5 == 0
++        if cpuBand {
++            slot.surface.lock(options: [], seed: nil)
++            for y in y0..<(y0 + band) {
++                let row = (slot.surface.baseAddress + y * slot.surface.bytesPerRow).assumingMemoryBound(to: UInt32.self)
++                for x in 0..<W { row[x] = bandValue }
++            }
++            slot.surface.unlock(options: [], seed: nil)
++        }
++        let expect: (Int, Int) -> [UInt8] = { x, y in
++            cpuBand && y >= y0 && y < y0 + band ? [0x60, 0x40, 0x20, 0xff] : want(c, W, H, x, y)
++        }
++        let (g1, t1, f1) = compare(slot.surface, step: 53, expect)
++        let (g2, t2, f2) = compare(viaGPU(slot.reader), step: 53, expect)
++        if g1 != t1 || g2 != t2 {
++            frameFails += 1
++            if firstFail.isEmpty { firstFail = "frame \(n) slot \(i): cpu \(g1)/\(t1) \(f1) gpu \(g2)/\(t2) \(f2)" }
+         }
+-        slot.surface.unlock(options: [], seed: nil)
+-    }
+-    let expect: (Int, Int) -> [UInt8] = { x, y in
+-        cpuBand && y >= y0 && y < y0 + band ? [0x60, 0x40, 0x20, 0xff] : want(c, W, H, x, y)
+-    }
+-    let (g1, t1, f1) = compare(slot.surface, step: 53, expect)
+-    let (g2, t2, f2) = compare(viaGPU(slot.reader), step: 53, expect)
+-    if g1 != t1 || g2 != t2 {
+-        frameFails += 1
+-        if firstFail.isEmpty { firstFail = "frame \(n) slot \(i): cpu \(g1)/\(t1) \(f1) gpu \(g2)/\(t2) \(f2)" }
+     }
+     n += 1
+     if n % 500 == 0 {
+diff --git a/scripts/internal/census/probe_signal.swift b/scripts/internal/census/probe_signal.swift
+index b3d408d9..81f19181 100644
+--- a/scripts/internal/census/probe_signal.swift
++++ b/scripts/internal/census/probe_signal.swift
+@@ -1,4 +1,4 @@
+-// probe_signal.swift (CPU read after a shared-event signal): swiftc -O probe_common.swift probe_signal.swift -o probe_signal
++// probe_signal.swift (CPU read after a shared-event signal): copy to a folder as main.swift, then swiftc -O probe_common.swift <folder>/main.swift -o probe_signal (top-level code must be in main.swift)
+ // One command buffer renders a gradient into a surface, signals a shared event, then keeps the GPU
+ // busy with unrelated work. The CPU waits for the event, not for the command buffer, and reads the
+ // surface at once. Metal promises the render's writes are visible at the signal, so the read must
+diff --git a/scripts/internal/census/probe_tail.swift b/scripts/internal/census/probe_tail.swift
+index c0b3641f..10b7f633 100644
+--- a/scripts/internal/census/probe_tail.swift
++++ b/scripts/internal/census/probe_tail.swift
+@@ -1,4 +1,4 @@
+-// probe_tail.swift (B1): swiftc -O probe_common.swift probe_tail.swift -o probe_tail
++// probe_tail.swift (B1): copy to a folder as main.swift, then swiftc -O probe_common.swift <folder>/main.swift -o probe_tail (top-level code must be in main.swift)
+ // A 3200x1800 BGRA surface's rows end at 23,040,000 bytes; it is made with 64 KiB more, so its
+ // allocation has whole pages past the rows. The CPU writes those trailing pages (as an app keeping
+ // its own data after the pixels may) between GPU renders and CPU reads of the pixels. Every check
+diff --git a/scripts/internal/census/probe_untracked.swift b/scripts/internal/census/probe_untracked.swift
+index 42622f90..f4499fe2 100644
+--- a/scripts/internal/census/probe_untracked.swift
++++ b/scripts/internal/census/probe_untracked.swift
+@@ -1,4 +1,4 @@
+-// probe_untracked.swift (P2): swiftc -O probe_common.swift probe_untracked.swift -o probe_untracked
++// probe_untracked.swift (P2): copy to a folder as main.swift, then swiftc -O probe_common.swift <folder>/main.swift -o probe_untracked (top-level code must be in main.swift)
+ // An untracked-hazard texture is made on a surface first, then a tracked one on the same surface.
+ // The GPU writes through the tracked one and reads through the untracked one, which the runtime's
+ // hazard tracking does not see. The read must still see the write: the untracked reader is

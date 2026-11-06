@@ -33,20 +33,20 @@ Reims vGPU (host) ──► metal2vulkan ──► Vulkan (Mesa: ANV for Intel, 
 <p>Reims vGPU, metal2vulkan, reims-util and their QEMU fork are the work of Anees Iqbal (<a href="https://github.com/steelbrain">steelbrain</a>). macbox builds them from pinned commits, applies its patches, and runs them in a container.</p>
 
 <h2 id="patches">What macbox's patches change</h2>
-<p>On every GPU measured so far the GPU is the bottleneck, so what matters is how much extra work translation adds per frame. Before the patches, most of it was copies: macOS's framebuffer and the simulator's display surface live in guest RAM, and metal2vulkan copied each into a GPU image and back around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67% with the desktop. The patch series renders those textures in place, adds Arrow Lake-specific device facts, and a file of live switches for experiments. Details: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/patches/README.md">patches/README.md</a>.</p>
+<p>On every GPU measured so far the GPU is the bottleneck, so what matters is how much extra work translation adds per frame. Before the patches, most of it was copies: macOS's framebuffer and the simulator's display surface live in guest RAM, and metal2vulkan copied each into a GPU image and back around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67% with the desktop. The patch series renders those textures in place, counts flat compute grids in 32 bits, adds Arrow Lake-specific device facts and a file of live switches for experiments, and, behind an experimental switch, Coherent: QEMU traps the guest CPU's first touch of a surface's page, so the GPU's image can stay ahead of guest RAM and only the touched pages are synced. Details: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/patches/README.md">patches/README.md</a>.</p>
 
 <h2 id="results">Results</h2>
 <p>Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, 8 vCPUs and 12 GB. GlassBench is a table scrolling under Liquid Glass bars and a floating glass toolbar; frames counted at the simulator's screen, two runs each.</p>
 <div class="table"><table>
-<thead><tr><th>Workload</th><th class="num">Reims 2ce3209</th><th class="num">Reims 7198fe6</th><th class="num">macbox build</th></tr></thead>
+<thead><tr><th>Workload</th><th class="num">Reims 2ce3209</th><th class="num">Reims 7198fe6</th><th class="num">macbox, Oct 28</th><th class="num">macbox now</th><th class="num">now, Coherent on</th></tr></thead>
 <tbody>
-<tr><th>Simulator 1x (402×874)</th><td class="num">53.5</td><td class="num">57.0</td><td class="num"><strong>95.8 / 92.5</strong></td></tr>
-<tr><th>Simulator 2x (804×1748)</th><td class="num">33.5</td><td class="num">37.6</td><td class="num"><strong>67.8 / 60.5</strong></td></tr>
-<tr><th>Simulator 3x (1206×2622)</th><td class="num">17.2</td><td class="num">19.2</td><td class="num"><strong>38.5 / 39.5</strong></td></tr>
-<tr><th>Safari at 3x, blurred floating bar</th><td class="num">n/a</td><td class="num">39.5</td><td class="num"><strong>66.4 / 64.2</strong></td></tr>
+<tr><th>Simulator 1x (402×874)</th><td class="num">53.5</td><td class="num">57.0</td><td class="num">95.8 / 92.5</td><td class="num">n/m</td><td class="num">n/m</td></tr>
+<tr><th>Simulator 2x (804×1748)</th><td class="num">33.5</td><td class="num">37.6</td><td class="num">67.8 / 60.5</td><td class="num">n/m</td><td class="num">n/m</td></tr>
+<tr><th>Simulator 3x (1206×2622)</th><td class="num">17.2</td><td class="num">19.2</td><td class="num">38.5 / 39.5</td><td class="num"><strong>50.6</strong></td><td class="num"><strong>70.0</strong></td></tr>
+<tr><th>Safari at 3x, blurred floating bar</th><td class="num">n/a</td><td class="num">39.5</td><td class="num">66.4 / 64.2</td><td class="num">n/m</td><td class="num">n/m</td></tr>
 </tbody>
 </table></div>
-<p class="note">Frames per second. A Genie minimize on a 3440×1440 desktop went from about 12 to 19.5 frames per animation. At 1x the GPU spends 8.0 ms per frame; at 3x, 25.0 ms. Measure your own GPU with the tools in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/bench/README.md">bench/</a>.</p>
+<p class="note">Frames per second; n/m: not measured on the new build yet. "Now" and "Coherent on" are one A/B in one window (2026-11-05). With Coherent the GPU is 70% busy at 3x instead of 97%, and QEMU uses about 1.6 more CPU cores. A Genie minimize on a 3440×1440 desktop went from about 12 to 19.5 frames per animation on the Oct 28 build, and 30 with Coherent. Coherent is off by default (<code>MACBOX_COHERENT=on</code>): it hung the GPU once on its first day of daily use, and the cause isn't settled. Measure your own GPU with the tools in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/bench/README.md">bench/</a>.</p>
 
 <h2 id="gpus">Which GPUs</h2>
 <div class="table"><table>
@@ -70,7 +70,7 @@ Reims vGPU (host) ──► metal2vulkan ──► Vulkan (Mesa: ANV for Intel, 
 <h2 id="limits">Known limits</h2>
 <ul>
 <li><strong>Animations start about 0.1 s late on an idle display:</strong> macOS's driver for this device sends no vblank while nothing presents (<a href="https://github.com/steelbrain/reims-vgpu/issues/141">reims-vgpu#141</a>).</li>
-<li><strong>3x is GPU-bound</strong> at about 35 to 40 fps in heavy Liquid Glass scenes on this iGPU.</li>
+<li><strong>3x is GPU-bound</strong> at about 50 fps in heavy Liquid Glass scenes on this iGPU (70 with Coherent).</li>
 <li><strong>Tried without gain:</strong> answering as an Intel or AMD Mac GPU, compressed heap textures, newer Mesa, hugepages (impossible: Reims maps guest RAM in 16 KiB views). The full list is in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</li>
 </ul>
 <p>To set it up, follow <a href="/guides/run-macos-on-linux/">How to run macOS on Linux</a>.</p>

@@ -1,0 +1,1142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 01:11:17 +0000
+Subject: [PATCH 4/9] coherent pages on the census's KVM-only
+ view
+
+Under REIMS_VGPU_COHERENT=1 the library owns tracked pages' states: held,
+armed, open, frozen. Faults reach it through ops, QEMU's own RAM accesses
+through census_coherent_access. An arm drops the mapping before the write
+protection, so a page POISON refuses may be written, and goes back held and
+to the library rather than being skipped. Marks read line by line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/census.c          | 603 ++++++++++++++++++++++++++++++++++--
+ hw/display/apple-gfx.c      |  97 ++++++
+ include/system/kvm_census.h |  54 ++++
+ system/physmem.c            |  14 +-
+ 4 files changed, 739 insertions(+), 29 deletions(-)
+
+diff --git a/accel/kvm/census.c b/accel/kvm/census.c
+index 1d77d3521a..3a3740675d 100644
+--- a/accel/kvm/census.c
++++ b/accel/kvm/census.c
+@@ -42,6 +42,25 @@
+  * A failure must never take the VM with it: an -EFAULT nothing answers disarms the whole census
+  * (census_fuse) before it is allowed to reach QEMU's fatal path.
+  *
++ * Under REIMS_VGPU_COHERENT=1 the same view and markers serve metal2vulkan's trap-coherent
++ * surfaces (shadow_lazy.rs and shadow_coherent.rs there), and nothing is sampled. The library then
++ * owns every tracked page's state, and moves it only under its surface's lock:
++ *
++ *   held    Write-protected: pages and image agree. Reads pass; a write opens the page.
++ *   armed   Poison: the image is ahead of the page. Any access stops in census_on_sigbus, which
++ *           asks the library to sync (ops.fault) and reruns the instruction.
++ *   open    No marker: the guest's CPU may have written, and the image is stale here.
++ *   frozen  Poison over an open page, while a sync merges into it.
++ *
++ * A write to a held page gives a bare -EFAULT. Where the vCPU has just trapped on the page, the
++ * pending page names it. Where it has not, ops.probe arms every held page, nothing having changed
++ * in them, and the rerun's SIGBUS gives the exact address: so a write always has its page.
++ * ARMED -> HELD drops the poison and then write-protects, and POISON and WP cannot swap in one
++ * step, so a vCPU can reach the page between them: census_coh_hold reads pagemap afterwards, and
++ * reports a page that came in meanwhile as written, for a copy in of it. QEMU's own accesses (a
++ * device's DMA, KVM's emulator through an MMIO exit) use the main mapping and raise no fault, so
++ * address_space_map and the direct RAM paths call census_coherent_access.
++ *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ 
+@@ -79,6 +98,7 @@
+ #define TOP_RIPS 8
+ #define RIP_SEEN_SLOTS (1 << 16)
+ #define POISON_TRIES 4
++#define FREEZE_TRIES 4096
+ #define SPIN_LIMIT 100000 /* about 0.5 s of repeated SIGBUS on one page: real poison */
+ /* An -EFAULT unanswered this long is no race: first the markers go, then QEMU's fatal path. */
+ #define EFAULT_GAP_NS 5000000
+@@ -86,7 +106,7 @@
+ #define FATAL_AFTER_NS 120000000
+ 
+ /* A page's word: the state's three bits, then the mapping id. 0 is a page never armed. */
+-enum { ST_NONE, ST_ARMED, ST_HELD, ST_OPEN, ST_SKIP, ST_WORK, ST_STALE };
++enum { ST_NONE, ST_ARMED, ST_HELD, ST_OPEN, ST_SKIP, ST_WORK, ST_STALE, ST_FROZEN };
+ #define PW(st, id) (((uint32_t)(st) << 29) | (id))
+ #define PW_ST(w) ((w) >> 29)
+ #define PW_ID(w) ((w) & 0x1fffffffu)
+@@ -113,6 +133,8 @@ struct CensusVcpu {
+     /* The page this vCPU trapped on last, while its instruction may be rerunning. */
+     int64_t pending;
+     uint64_t pending_rip;
++    /* The instruction a probe arms the held pages for, whose next fault is its write. */
++    uint64_t probe_rip;
+     void *spin_addr;
+     uint32_t spins;
+     uint64_t efault_first;
+@@ -157,6 +179,11 @@ typedef struct Surface {
+     uint64_t presents_at_tick;
+     Tally total;
+     Tally tick;
++    /* Coherent: the pages in the surface's order, and where its texels' bytes start. */
++    uint32_t *pages;
++    uint64_t page_total;
++    uint64_t view_start;
++    bool tracked;
+     _Atomic uint64_t presents;
+     _Atomic uint32_t window_traps;
+     _Atomic uint32_t saturate;
+@@ -196,6 +223,13 @@ static struct {
+     uint32_t flush_ms;
+     uint32_t window_ms;
+ 
++    bool coherent;
++    CensusCoherentOps ops;
++    /* A page's index in its surface. */
++    uint32_t *coh_index;
++    int pagemap;
++    FILE *report;
++
+     _Atomic uint64_t presents;
+     uint64_t presents_at_window;
+     uint64_t presents_at_tick;
+@@ -211,6 +245,8 @@ static struct {
+     .lock = PTHREAD_MUTEX_INITIALIZER,
+ };
+ 
++_Atomic uint64_t census_coherent_pages;
++
+ static uint64_t now_ns(void)
+ {
+     struct timespec t;
+@@ -234,11 +270,17 @@ bool census_wanted(void)
+         census.wanted = dir && *dir;
+         if (census.wanted) {
+             snprintf(census.dir, sizeof(census.dir), "%s", dir);
++            census.coherent = env_u32("REIMS_VGPU_COHERENT", 0);
+         }
+     }
+     return census.wanted;
+ }
+ 
++bool census_coherent(void)
++{
++    return census_wanted() && census.coherent;
++}
++
+ bool census_active(void)
+ {
+     return census.active;
+@@ -421,6 +463,70 @@ static void snapshot(CensusVcpu *vc, Rec *r)
+     }
+ }
+ 
++static void census_fuse(const char *why);
++static void coherent_report(const char *label);
++
++/* Where the library knows the page: its address in the surface's own mapping of the texels. */
++static uint64_t coh_addr(uint32_t id, uint64_t page)
++{
++    return census.surfaces[id].view_start + ((uint64_t)census.coh_index[page] << PG_SHIFT);
++}
++
++static uint64_t vcpu_rip(CensusVcpu *vc)
++{
++    struct kvm_regs regs;
++
++    return ioctl(vc->fd, KVM_GET_REGS, &regs) == 0 ? regs.rip : 0;
++}
++
++static int coherent_on_sigbus(CensusVcpu *vc, void **addr, uint64_t page, uint32_t w)
++{
++    uint32_t st = PW_ST(w), id = PW_ID(w);
++    uint64_t start, rip;
++    bool write;
++
++    if (st != ST_ARMED && st != ST_FROZEN) {
++        /* A thread moved the page meanwhile, and the access reruns; real poison stays armed. */
++        if (vc->spin_addr == *addr) {
++            if (++vc->spins > SPIN_LIMIT) {
++                *addr = census.main_map + ((uint8_t *)*addr - census.view);
++                return CENSUS_NOT_OURS;
++            }
++        } else {
++            vc->spin_addr = *addr;
++            vc->spins = 0;
++        }
++        atomic_fetch_add(&census.spurious, 1);
++        return CENSUS_HANDLED;
++    }
++    vc->spin_addr = NULL;
++    start = now_ns();
++    rip = vcpu_rip(vc);
++    write = vc->probe_rip && vc->probe_rip == rip;
++    vc->probe_rip = 0;
++    census.ops.fault(census.ops.ctx, coh_addr(id, page), write);
++    /* The library answers for its pages; a page still marked here would trap forever. */
++    w = atomic_load(&census.pg[page]);
++    if (PW_ST(w) == ST_ARMED || PW_ST(w) == ST_FROZEN) {
++        uint64_t at = coh_addr(id, page);
++
++        if (PW_ST(w) == ST_ARMED) {
++            census_coh_hold(&at, 1, false, NULL, 0);
++        } else {
++            census_coh_thaw(&at, 1);
++        }
++    }
++    vc->pending = write ? -1 : (int64_t)page;
++    vc->pending_rip = rip;
++    vc->efault_first = 0;
++    atomic_fetch_add(&census.traps, 1);
++    if (write) {
++        atomic_fetch_add(&census.writes, 1);
++    }
++    census.ops.timed(census.ops.ctx, coh_addr(id, page), now_ns() - start);
++    return CENSUS_HANDLED;
++}
++
+ int census_on_sigbus(CensusVcpu *vc, void **addr)
+ {
+     uint64_t off = (uint8_t *)*addr - census.view;
+@@ -437,6 +543,9 @@ int census_on_sigbus(CensusVcpu *vc, void **addr)
+         *addr = census.main_map + off;
+         return CENSUS_NOT_OURS;
+     }
++    if (census.coherent) {
++        return coherent_on_sigbus(vc, addr, page, w);
++    }
+     if (PW_ST(w) != ST_ARMED ||
+         !atomic_compare_exchange_strong(&census.pg[page], &w, PW(ST_WORK, PW_ID(w)))) {
+         /*
+@@ -546,7 +655,7 @@ static void clear_run(uint64_t first, uint64_t count, uint32_t id, bool any_held
+ }
+ 
+ #define MASK(st) (1u << (st))
+-#define TOUCHED (MASK(ST_HELD) | MASK(ST_OPEN) | MASK(ST_SKIP))
++#define TOUCHED (MASK(ST_HELD) | MASK(ST_OPEN) | MASK(ST_SKIP) | MASK(ST_FROZEN))
+ 
+ static void census_fuse(const char *why)
+ {
+@@ -554,6 +663,10 @@ static void census_fuse(const char *why)
+         return;
+     }
+     fprintf(stderr, "census: %s: every marker dropped, the census is off\n", why);
++    /* The surfaces' pages catch up first: nothing marks them stale from here on. */
++    if (census.coherent && census.ops.abandon) {
++        census.ops.abandon(census.ops.ctx);
++    }
+     for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
+         Surface *s = &census.surfaces[id];
+ 
+@@ -563,15 +676,64 @@ static void census_fuse(const char *why)
+     }
+ }
+ 
++/* An -EFAULT: is it worth another try? Unanswered, the fuses go as in census_on_efault. */
++static bool efault_again(CensusVcpu *vc, bool at_once)
++{
++    uint64_t now = now_ns();
++
++    if (!vc->efault_first || now - vc->efault_last > EFAULT_GAP_NS) {
++        vc->efault_first = now;
++    }
++    vc->efault_last = now;
++    if (now - vc->efault_first > FUSE_AFTER_NS) {
++        census_fuse("an -EFAULT no held page explains");
++    }
++    if (now - vc->efault_first > FATAL_AFTER_NS) {
++        return false;
++    }
++    if (!at_once) {
++        usleep(20);
++    }
++    return true;
++}
++
++static bool coherent_on_efault(CensusVcpu *vc)
++{
++    uint64_t rip = vcpu_rip(vc);
++
++    if (vc->pending >= 0 && vc->pending_rip == rip) {
++        uint64_t page = vc->pending;
++        uint32_t w = atomic_load(&census.pg[page]);
++
++        vc->pending = -1;
++        if (PW_ST(w) == ST_HELD) {
++            census.ops.fault(census.ops.ctx, coh_addr(PW_ID(w), page), true);
++            atomic_fetch_add(&census.writes, 1);
++            vc->efault_first = 0;
++            return true;
++        }
++    }
++    vc->pending = -1;
++    if (atomic_load(&census_coherent_pages) && !atomic_load(&census.dead)) {
++        vc->probe_rip = rip;
++        atomic_fetch_add(&census.upgrades, 1);
++        census.ops.probe(census.ops.ctx);
++        return efault_again(vc, true);
++    }
++    return efault_again(vc, false);
++}
++
+ bool census_on_efault(CensusVcpu *vc)
+ {
+     Rec r = { .kind = REC_UPGRADE };
+     uint32_t opened = 0;
+-    uint64_t now;
+ 
+     if (!census.active || !vc) {
+         return false;
+     }
++    if (census.coherent) {
++        return coherent_on_efault(vc);
++    }
+     snapshot(vc, &r);
+     if (vc->pending >= 0 && vc->pending_rip == r.rip) {
+         uint64_t page = vc->pending;
+@@ -619,22 +781,331 @@ bool census_on_efault(CensusVcpu *vc)
+      * Nothing was held: another thread had the page, and the -EFAULT should not return. Should it
+      * keep returning, something answers it that no write protection explains.
+      */
+-    now = now_ns();
+-    if (!vc->efault_first || now - vc->efault_last > EFAULT_GAP_NS) {
+-        vc->efault_first = now;
++    pthread_mutex_unlock(&census.lock);
++    return efault_again(vc, false);
++}
++
++/* ---- coherent pages, each under its surface's lock in the library -------------------------- */
++
++void census_coherent_set_ops(const CensusCoherentOps *ops)
++{
++    census.ops = *ops;
++}
++
++/* The surface whose texels' mapping holds addr, and its page there. */
++static Surface *coh_surface(uint64_t addr, uint32_t *id, uint64_t *index)
++{
++    static _Atomic uint32_t last;
++    uint32_t at = atomic_load(&last);
++
++    for (uint32_t tried = 0; tried < CENSUS_MAX_SURFACES; tried++, at = (at + 1) % CENSUS_MAX_SURFACES) {
++        Surface *s = &census.surfaces[at];
++
++        if (s->live && s->pages && addr - s->view_start < s->page_total << PG_SHIFT) {
++            atomic_store(&last, at);
++            *id = at;
++            *index = (addr - s->view_start) >> PG_SHIFT;
++            return s;
++        }
+     }
+-    vc->efault_last = now;
+-    if (now - vc->efault_first > FUSE_AFTER_NS) {
+-        census_fuse("an -EFAULT no held page explains");
++    return NULL;
++}
++
++/*
++ * Calls fn over the runs of contiguous pages of the n addresses' surface, each run of those whose
++ * state is in mask, moved to ST_WORK. Addresses are ascending page addresses of one surface.
++ */
++static void coh_runs(const uint64_t *addrs, size_t n, uint32_t mask, RunFn *fn, void *arg)
++{
++    uint32_t id = 0;
++    uint64_t index = 0, first = 0, count = 0;
++    Surface *s = n ? coh_surface(addrs[0], &id, &index) : NULL;
++    bool any_held = false;
++
++    if (!s) {
++        return;
+     }
+-    pthread_mutex_unlock(&census.lock);
+-    if (now - vc->efault_first > FATAL_AFTER_NS) {
++    for (size_t i = 0; i < n; i++) {
++        uint64_t off = (addrs[i] - s->view_start) >> PG_SHIFT;
++        uint64_t p;
++        uint32_t w;
++
++        if (off >= s->page_total) {
++            continue;
++        }
++        p = s->pages[off];
++        w = atomic_load(&census.pg[p]);
++        if (count && first + count != p) {
++            fn(first, count, id, any_held, arg);
++            count = 0;
++            any_held = false;
++        }
++        if (PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
++            atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
++            first = count ? first : p;
++            count++;
++            any_held |= PW_ST(w) == ST_HELD;
++        } else if (count) {
++            fn(first, count, id, any_held, arg);
++            count = 0;
++            any_held = false;
++        }
++    }
++    if (count) {
++        fn(first, count, id, any_held, arg);
++    }
++}
++
++/* Where the pages a vCPU reached as their markers moved go. */
++typedef struct Came {
++    uint64_t *out;
++    size_t room, found;
++} Came;
++
++/*
++ * HELD -> ARMED. Poison needs a bare PTE, so the write protection goes first, and a write between
++ * the two would go unseen. So the mapping goes before it, the protection staying behind as a PTE
++ * marker: then a write needs a mapping, and POISON refuses a page mapped. A page it refuses may
++ * hold a write, and it may be what the vCPU's about to read, so there is no retrying it: it goes
++ * back to held, and the library hears, and has what the arm would have left to the page's trap.
++ */
++static void coh_arm_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    Came *refused = arg;
++    uint64_t at = first, end = first + count;
++    int tries = 0;
++
++    page_drop(first, count);
++    if (page_wp(first, count, false)) {
++        count_error("WP off for arming", first);
++    }
++    while (at < end) {
++        struct uffdio_poison z = {
++            .range = { (uint64_t)census.view + (at << PG_SHIFT), (end - at) << PG_SHIFT },
++        };
++        uint64_t done;
++
++        if (ioctl(census.uffd, UFFDIO_POISON, &z) == 0) {
++            store_pages(at, end - at, ST_ARMED, id);
++            return;
++        }
++        done = z.updated > 0 ? (uint64_t)z.updated >> PG_SHIFT : 0;
++        store_pages(at, done, ST_ARMED, id);
++        at += done;
++        if (at == end) {
++            return;
++        }
++        if (errno == EAGAIN && ++tries < POISON_TRIES) {
++            continue;
++        }
++        if (errno != EEXIST) {
++            count_error("poison", at);
++        }
++        page_drop(at, 1);
++        if (page_wp(at, 1, true)) {
++            count_error("WP on", at);
++        }
++        store_pages(at, 1, ST_HELD, id);
++        if (refused->found < refused->room) {
++            refused->out[refused->found++] = coh_addr(id, at);
++        }
++        at++;
++        tries = 0;
++    }
++}
++
++/*
++ * Between the poison's going and the write protection a vCPU may have faulted a page in, and
++ * written it: any page the view maps now did so, as the drop left none mapped.
++ */
++static void came_in(uint64_t first, uint64_t count, uint32_t id, Came *came)
++{
++    uint64_t bits[512];
++
++    for (uint64_t at = first; at < first + count && came->found < came->room;) {
++        uint64_t batch = MIN(first + count - at, sizeof(bits) / sizeof(bits[0]));
++        off_t place = ((uint64_t)census.view >> PG_SHIFT) + at;
++        ssize_t got = pread(census.pagemap, bits, batch * sizeof(bits[0]), place * sizeof(bits[0]));
++
++        for (ssize_t i = 0; i < got / (ssize_t)sizeof(bits[0]) && came->found < came->room; i++) {
++            if (bits[i] >> 63) {
++                came->out[came->found++] = coh_addr(id, at + i);
++            }
++        }
++        at += batch;
++    }
++}
++
++static void coh_held_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    /* A page in the run that was open keeps a mapping: it reads and writes as it pleases. */
++    page_drop(first, count);
++    if (page_wp(first, count, true)) {
++        count_error("WP on", first);
++    }
++    store_pages(first, count, ST_HELD, id);
++    if (arg) {
++        came_in(first, count, id, arg);
++    }
++}
++
++size_t census_coh_arm(const uint64_t *addrs, size_t n, uint64_t *refused, size_t room)
++{
++    Came found = { refused, room, 0 };
++
++    if (!atomic_load(&census.dead)) {
++        coh_runs(addrs, n, MASK(ST_HELD), coh_arm_run, &found);
++    }
++    return found.found;
++}
++
++size_t census_coh_hold(const uint64_t *addrs, size_t n, bool open_too, uint64_t *came, size_t room)
++{
++    uint32_t mask = MASK(ST_ARMED) | (open_too ? MASK(ST_OPEN) : 0);
++    Came found = { came, room, 0 };
++
++    coh_runs(addrs, n, mask, coh_held_run, came && census.pagemap >= 0 ? &found : NULL);
++    return found.found;
++}
++
++void census_coh_open(uint64_t addr)
++{
++    coh_runs(&addr, 1, MASK(ST_HELD), open_held, NULL);
++}
++
++static void coh_freeze_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    page_drop(first, count);
++    for (uint64_t at = first; at < first + count; at++) {
++        struct uffdio_poison z = {
++            .range = { (uint64_t)census.view + (at << PG_SHIFT), PG },
++        };
++
++        /* A vCPU writing the page wins some of these; a merge needs it out, so it loses in time. */
++        for (int tries = 0;; tries++) {
++            if (ioctl(census.uffd, UFFDIO_POISON, &z) == 0) {
++                break;
++            }
++            if (tries == FREEZE_TRIES) {
++                count_error("poison to freeze", at);
++                break;
++            }
++            if (errno == EEXIST) {
++                page_drop(at, 1);
++            }
++        }
++    }
++    store_pages(first, count, ST_FROZEN, id);
++}
++
++static void coh_thaw_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    page_drop(first, count);
++    store_pages(first, count, ST_OPEN, id);
++}
++
++void census_coh_freeze(const uint64_t *addrs, size_t n)
++{
++    coh_runs(addrs, n, MASK(ST_OPEN), coh_freeze_run, NULL);
++}
++
++void census_coh_thaw(const uint64_t *addrs, size_t n)
++{
++    coh_runs(addrs, n, MASK(ST_FROZEN), coh_thaw_run, NULL);
++}
++
++bool census_coh_track(uint64_t start, uint64_t len)
++{
++    uint32_t id;
++    uint64_t index;
++    Surface *s;
++
++    if (!census.active || !census.coherent || atomic_load(&census.dead)) {
+         return false;
+     }
+-    usleep(20);
++    pthread_mutex_lock(&census.lock);
++    s = coh_surface(start, &id, &index);
++    if (!s || s->overlaps || s->foreign) {
++        pthread_mutex_unlock(&census.lock);
++        return false;
++    }
++    if (!s->tracked) {
++        s->tracked = true;
++        atomic_fetch_add(&census_coherent_pages, s->page_total);
++        take_pages(s, id, MASK(ST_OPEN), true, coh_held_run, NULL);
++    }
++    pthread_mutex_unlock(&census.lock);
+     return true;
+ }
+ 
++/* Every marker off the surface, its pages left open. */
++static void coh_free_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    if (any_held) {
++        page_wp(first, count, false);
++    }
++    page_drop(first, count);
++    store_pages(first, count, ST_OPEN, id);
++}
++
++static void coh_untrack_locked(Surface *s, uint32_t id)
++{
++    if (s->tracked) {
++        s->tracked = false;
++        atomic_fetch_sub(&census_coherent_pages, s->page_total);
++        take_pages(s, id, MASK(ST_ARMED) | MASK(ST_HELD) | MASK(ST_FROZEN), true, coh_free_run,
++                   NULL);
++    }
++}
++
++void census_coh_untrack(uint64_t start)
++{
++    uint32_t id;
++    uint64_t index;
++    Surface *s;
++
++    if (!census.active || !census.coherent) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    s = coh_surface(start, &id, &index);
++    if (s) {
++        coh_untrack_locked(s, id);
++    }
++    pthread_mutex_unlock(&census.lock);
++}
++
++bool census_coh_surface(uint32_t mapping_id, uint64_t *start, uint64_t *len)
++{
++    Surface *s;
++
++    if (!census.active || !census.coherent || mapping_id == 0 ||
++        mapping_id >= CENSUS_MAX_SURFACES || !census.surfaces[mapping_id].live) {
++        return false;
++    }
++    s = &census.surfaces[mapping_id];
++    *start = s->view_start;
++    *len = s->page_total << PG_SHIFT;
++    return s->tracked;
++}
++
++void census_coherent_touch(void *main_ptr, uint64_t len, bool write)
++{
++    uint64_t off = (uint8_t *)main_ptr - census.main_map;
++
++    if (off >= census.len || !len) {
++        return;
++    }
++    for (uint64_t p = off >> PG_SHIFT; p <= (off + len - 1) >> PG_SHIFT && p < census.pages; p++) {
++        uint32_t w = atomic_load(&census.pg[p]), st = PW_ST(w), id = PW_ID(w);
++
++        if (w && census.surfaces[id].tracked &&
++            (st == ST_ARMED || st == ST_FROZEN || (write && st == ST_HELD))) {
++            census.ops.fault(census.ops.ctx, coh_addr(id, p), write);
++        }
++    }
++}
++
+ /* ---- surfaces, from the library's threads ------------------------------------------------- */
+ 
+ static void queue_line(const char *format, ...)
+@@ -775,12 +1246,15 @@ static void surface_end(Surface *s, uint32_t id, const char *event)
+ static void surface_close(Surface *s, uint32_t id, const char *event)
+ {
+     drain_locked();
++    coh_untrack_locked(s, id);
+     take_pages(s, id, MASK(ST_ARMED) | TOUCHED, true, clear_run, NULL);
+     surface_end(s, id, event);
+     s->live = false;
+     free(s->runs);
+     s->runs = NULL;
+     s->run_count = 0;
++    free(s->pages);
++    s->pages = NULL;
+ }
+ 
+ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t page_count,
+@@ -800,6 +1274,13 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+     if (s->live) {
+         surface_close(s, id, "replaced");
+     }
++    s->pages = NULL;
++    s->page_total = 0;
++    s->tracked = false;
++    if (census.coherent && page_count) {
++        s->pages = calloc(page_count, sizeof(*s->pages));
++        s->view_start = f->base_address - f->offset;
++    }
+     atomic_store(&s->presents, 0);
+     atomic_store(&s->window_traps, 0);
+     atomic_store(&s->saturate, 0);
+@@ -830,6 +1311,10 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+                 census.overlaps++;
+                 continue;
+             }
++            if (s->pages) {
++                census.coh_index[p] = s->page_total;
++                s->pages[s->page_total++] = p;
++            }
+             if (s->run_count && s->runs[s->run_count - 1].first +
+                 s->runs[s->run_count - 1].count == p) {
+                 s->runs[s->run_count - 1].count++;
+@@ -846,7 +1331,12 @@ void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t
+         }
+     }
+     for (uint32_t i = 0; i < s->run_count; i++) {
+-        arm_run(s->runs[i].first, s->runs[i].count, id, false);
++        if (census.coherent) {
++            /* Nothing on it until the library tracks the surface. */
++            store_pages(s->runs[i].first, s->runs[i].count, ST_OPEN, id);
++        } else {
++            arm_run(s->runs[i].first, s->runs[i].count, id, false);
++        }
+     }
+     queue_line("{\"ev\":\"map\",\"t\":%.3f,\"s\":%u,\"id\":%u,\"format\":\"%#x\",\"w\":%" PRIu64
+                ",\"h\":%" PRIu64 ",\"row\":%" PRIu64 ",\"alloc\":%" PRIu64 ",\"protection\":%"
+@@ -907,6 +1397,9 @@ void census_reset(void)
+     if (!census.active) {
+         return;
+     }
++    if (census.coherent && census.ops.reset) {
++        census.ops.reset(census.ops.ctx);
++    }
+     pthread_mutex_lock(&census.lock);
+     for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
+         if (census.surfaces[id].live) {
+@@ -916,6 +1409,7 @@ void census_reset(void)
+     for (int i = 0; i < CENSUS_MAX_VCPUS; i++) {
+         if (census.vcpus[i]) {
+             census.vcpus[i]->pending = -1;
++            census.vcpus[i]->probe_rip = 0;
+         }
+     }
+     pthread_mutex_unlock(&census.lock);
+@@ -1082,24 +1576,52 @@ static void write_lines(void)
+     fflush(census.rips);
+ }
+ 
+-/* <dir>/mark: "every N" sets the re-arm period; anything else is a label in the timeline. */
++/* One line of coherent.jsonl per surface, what the library counts, under the label. */
++static void coherent_report(const char *label)
++{
++    static char text[1 << 18];
++    size_t n;
++
++    if (!census.coherent || !census.ops.report || !census.report) {
++        return;
++    }
++    n = census.ops.report(census.ops.ctx, label, text, sizeof(text));
++    fwrite(text, 1, MIN(n, sizeof(text)), census.report);
++    fflush(census.report);
++}
++
++static void read_mark_line(char *text);
++
++/*
++ * <dir>/mark: each line, in order. "every N" sets the re-arm period; anything else is a label in
++ * the timeline. Append with >>: a write over a line the census has not read yet replaces it.
++ */
+ static void read_mark(void)
+ {
+-    char path[sizeof(census.dir) + 8], text[128] = "";
++    char path[sizeof(census.dir) + 8], moved[sizeof(path) + 8], text[128];
+     FILE *f;
+-    size_t n;
+-    unsigned long every;
+ 
+     snprintf(path, sizeof(path), "%s/mark", census.dir);
+-    f = fopen(path, "r");
++    snprintf(moved, sizeof(moved), "%s.read", path);
++    if (rename(path, moved)) {
++        return;
++    }
++    f = fopen(moved, "r");
+     if (!f) {
+         return;
+     }
+-    n = fread(text, 1, sizeof(text) - 1, f);
++    while (fgets(text, sizeof(text), f)) {
++        text[strcspn(text, "\n")] = 0;
++        read_mark_line(text);
++    }
+     fclose(f);
+-    unlink(path);
+-    text[n] = 0;
+-    text[strcspn(text, "\n")] = 0;
++    unlink(moved);
++}
++
++static void read_mark_line(char *text)
++{
++    unsigned long every;
++
+     pthread_mutex_lock(&census.lock);
+     if (sscanf(text, "every %lu", &every) == 1 && every > 0) {
+         atomic_store(&census.every, every);
+@@ -1110,6 +1632,9 @@ static void read_mark(void)
+         }
+         tick_locked();
+         queue_line("{\"mark\":\"%s\",\"t\":%.3f}\n", text, census_time());
++        pthread_mutex_unlock(&census.lock);
++        coherent_report(text);
++        return;
+     }
+     pthread_mutex_unlock(&census.lock);
+ }
+@@ -1122,6 +1647,8 @@ static void *census_thread(void *unused)
+     pthread_sigmask(SIG_BLOCK, &all, NULL);
+     pthread_setname_np(pthread_self(), "reims-census");
+     census.window_ns = census.tick_ns = now_ns();
++    bool report_due = false;
++
+     for (;;) {
+         struct timespec until;
+         uint64_t now, every = atomic_load(&census.every);
+@@ -1137,17 +1664,25 @@ static void *census_thread(void *unused)
+         read_mark();
+         pthread_mutex_lock(&census.lock);
+         drain_locked();
+-        saturate_locked();
+-        if (atomic_load(&census.presents) - census.presents_at_window >= every ||
+-            now - census.window_ns >= census.window_ms * 1000000ULL) {
++        if (!census.coherent) {
++            saturate_locked();
++        }
++        if (!census.coherent &&
++            (atomic_load(&census.presents) - census.presents_at_window >= every ||
++             now - census.window_ns >= census.window_ms * 1000000ULL)) {
+             close_window_locked();
+         }
+         if (now - census.tick_ns >= census.flush_ms * 1000000ULL) {
+             tick_locked();
+             census.tick_ns = now;
++            report_due = true;
+         }
+         pthread_mutex_unlock(&census.lock);
+         write_lines();
++        if (report_due) {
++            coherent_report("");
++            report_due = false;
++        }
+     }
+     return unused;
+ }
+@@ -1166,6 +1701,7 @@ void census_flush(void)
+ static void census_at_exit(void)
+ {
+     census_flush();
++    coherent_report("exit");
+ }
+ 
+ void census_counts(CensusCounts *out)
+@@ -1183,6 +1719,11 @@ void census_counts(CensusCounts *out)
+     };
+ }
+ 
++void census_fuse_test(void)
++{
++    census_fuse("a test");
++}
++
+ int census_page_state(const void *main_addr)
+ {
+     uint64_t off = (const uint8_t *)main_addr - census.main_map;
+@@ -1226,6 +1767,7 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+     census.ticks = open_output("ticks.jsonl");
+     census.facts = open_output("surfaces.jsonl");
+     census.rips = open_output("rips.jsonl");
++    census.report = census.coherent ? open_output("coherent.jsonl") : NULL;
+     if (!census.ticks || !census.facts || !census.rips) {
+         return census_refuse("the output directory");
+     }
+@@ -1252,9 +1794,14 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+     census.len = len;
+     census.pages = len >> PG_SHIFT;
+     census.pg = calloc(census.pages, sizeof(*census.pg));
++    census.pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
++    if (census.coherent) {
++        census.coh_index = calloc(census.pages, sizeof(*census.coh_index));
++    }
+     census.surfaces = calloc(CENSUS_MAX_SURFACES, sizeof(*census.surfaces));
+     census.rips_seen = calloc(RIP_SEEN_SLOTS, sizeof(*census.rips_seen));
+-    if (!census.pg || !census.surfaces || !census.rips_seen) {
++    if (!census.pg || !census.surfaces || !census.rips_seen ||
++        (census.coherent && !census.coh_index)) {
+         return census_refuse("memory");
+     }
+     census.lines_tail = &census.lines_head;
+@@ -1277,7 +1824,7 @@ bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
+     queue_line("{\"started\":%.3f,\"pid\":%d,\"bytes\":%" PRIu64 ",\"rw\":%d,\"every\":%u,"
+                "\"min_pixels\":%u,\"saturate\":%u}\n", census_time(), getpid(), len, census.rw,
+                census.every, census.min_pixels, census.saturate_at);
+-    fprintf(stderr, "census: on, writing to %s: %" PRIu64 " MiB view at %p\n", census.dir,
+-            len >> 20, census.view);
++    fprintf(stderr, "census: %s, writing to %s: %" PRIu64 " MiB view at %p\n",
++            census.coherent ? "coherent" : "on", census.dir, len >> 20, census.view);
+     return true;
+ }
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index 935c5850d1..84df348295 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -1026,6 +1026,8 @@ static void apple_gfx_census_mapped(void *ctx, const RvgCensusSurface *surface,
+         .compression_type = surface->compression_type,
+         .read_only = surface->read_only,
+         .host_only = surface->host_only,
++        .base_address = surface->base_address,
++        .offset = surface->base_offset,
+     };
+ 
+     census_surface_mapped(&facts, pages, page_count, page_size);
+@@ -1033,6 +1035,11 @@ static void apple_gfx_census_mapped(void *ctx, const RvgCensusSurface *surface,
+ 
+ static void apple_gfx_census_unmapped(void *ctx, uint32_t mapping_id)
+ {
++    uint64_t start, len;
++
++    if (census_coh_surface(mapping_id, &start, &len)) {
++        rvg_coherent_unmapped(start, len);
++    }
+     census_surface_unmapped(mapping_id);
+ }
+ 
+@@ -1047,6 +1054,73 @@ static void apple_gfx_census_presented(void *ctx, uint64_t mapping_id)
+     census_presented(mapping_id);
+ }
+ 
++static bool apple_gfx_coh_track(void *ctx, uint64_t start, uint64_t len)
++{
++    return census_coh_track(start, len);
++}
++
++static void apple_gfx_coh_untrack(void *ctx, uint64_t start)
++{
++    census_coh_untrack(start);
++}
++
++static size_t apple_gfx_coh_arm(void *ctx, const uint64_t *addrs, size_t n, uint64_t *refused,
++                                size_t room)
++{
++    return census_coh_arm(addrs, n, refused, room);
++}
++
++static size_t apple_gfx_coh_hold(void *ctx, const uint64_t *addrs, size_t n, bool open_too,
++                                 uint64_t *came, size_t room)
++{
++    return census_coh_hold(addrs, n, open_too, came, room);
++}
++
++static void apple_gfx_coh_open(void *ctx, uint64_t addr)
++{
++    census_coh_open(addr);
++}
++
++static void apple_gfx_coh_freeze(void *ctx, const uint64_t *addrs, size_t n)
++{
++    census_coh_freeze(addrs, n);
++}
++
++static void apple_gfx_coh_thaw(void *ctx, const uint64_t *addrs, size_t n)
++{
++    census_coh_thaw(addrs, n);
++}
++
++static void apple_gfx_coh_fault(void *ctx, uint64_t addr, bool write)
++{
++    rvg_coherent_fault(addr, write);
++}
++
++static void apple_gfx_coh_timed(void *ctx, uint64_t addr, uint64_t ns)
++{
++    rvg_coherent_timed(addr, ns);
++}
++
++static void apple_gfx_coh_probe(void *ctx)
++{
++    rvg_coherent_probe();
++}
++
++static void apple_gfx_coh_abandon(void *ctx)
++{
++    rvg_coherent_abandon();
++}
++
++static void apple_gfx_coh_reset(void *ctx)
++{
++    rvg_coherent_reset();
++}
++
++static size_t apple_gfx_coh_report(void *ctx, const char *label, char *out, size_t room)
++{
++    return rvg_coherent_report(label, out, room);
++}
++
+ static void apple_gfx_census_register(void)
+ {
+     static const RvgCensusCallbacks callbacks = {
+@@ -1057,6 +1131,29 @@ static void apple_gfx_census_register(void)
+         .presented = apple_gfx_census_presented,
+     };
+ 
++    if (census_coherent() && census_active()) {
++        static const CensusCoherentOps ops = {
++            .fault = apple_gfx_coh_fault,
++            .timed = apple_gfx_coh_timed,
++            .probe = apple_gfx_coh_probe,
++            .abandon = apple_gfx_coh_abandon,
++            .reset = apple_gfx_coh_reset,
++            .report = apple_gfx_coh_report,
++        };
++        static const RvgCoherentHooks hooks = {
++            .struct_size = sizeof(hooks),
++            .track = apple_gfx_coh_track,
++            .untrack = apple_gfx_coh_untrack,
++            .arm = apple_gfx_coh_arm,
++            .hold = apple_gfx_coh_hold,
++            .open = apple_gfx_coh_open,
++            .freeze = apple_gfx_coh_freeze,
++            .thaw = apple_gfx_coh_thaw,
++        };
++
++        census_coherent_set_ops(&ops);
++        rvg_coherent_set_hooks(&hooks);
++    }
+     if (census_active()) {
+         rvg_census_set_callbacks(&callbacks);
+     }
+diff --git a/include/system/kvm_census.h b/include/system/kvm_census.h
+index e242236452..3673e4286e 100644
+--- a/include/system/kvm_census.h
++++ b/include/system/kvm_census.h
+@@ -7,6 +7,7 @@
+ #ifndef KVM_CENSUS_H
+ #define KVM_CENSUS_H
+ 
++#include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -28,6 +29,9 @@ typedef struct CensusSurface {
+     uint32_t compression_type;
+     bool read_only;
+     bool host_only;
++    /* Where the library's mapping of the surface's bytes starts, and base's offset in it. */
++    uint64_t base_address;
++    uint64_t offset;
+ } CensusSurface;
+ 
+ typedef struct CensusVcpu CensusVcpu;
+@@ -37,6 +41,8 @@ typedef void CensusReadGpa(void *opaque, uint64_t gpa, void *buf, unsigned len);
+ 
+ /* REIMS_VGPU_CENSUS is set, and nothing has refused it yet. */
+ bool census_wanted(void);
++/* With it, REIMS_VGPU_COHERENT: the view serves trap-coherent surfaces, and nothing is sampled. */
++bool census_coherent(void);
+ /* The view exists and traps are being counted. */
+ bool census_active(void);
+ 
+@@ -75,6 +81,52 @@ void census_surface_unmapped(uint32_t mapping_id);
+ void census_surface_used(uint32_t mapping_id, uint64_t usage, uint64_t storage_mode);
+ void census_presented(uint64_t mapping_id);
+ 
++/*
++ * Trap-coherent surfaces (census.c, and shadow_coherent.rs in metal2vulkan). Addresses are of the
++ * library's mapping of the surface, whole pages, ascending, one surface to a call. The census_coh_
++ * calls come only under the surface's lock in the library; fault takes that lock, so nothing here
++ * holds a lock across fault.
++ */
++typedef struct CensusCoherentOps {
++    void *ctx;
++    /* A page is touched: sync it, and open it for a write. Waits for no GPU work it does not need. */
++    void (*fault)(void *ctx, uint64_t addr, bool write);
++    /* Trap time, from the access's stop to its rerun. */
++    void (*timed)(void *ctx, uint64_t addr, uint64_t ns);
++    /* A write hit a held page unnamed: arm every held page, nothing changed in them. */
++    void (*probe)(void *ctx);
++    /* Every surface catches up and stops being tracked: the markers go now. */
++    void (*abandon)(void *ctx);
++    /* The guest resets: every surface is forgotten, its pages not written. */
++    void (*reset)(void *ctx);
++    /* One line a surface, under label: the bytes they took. */
++    size_t (*report)(void *ctx, const char *label, char *out, size_t room);
++} CensusCoherentOps;
++
++void census_coherent_set_ops(const CensusCoherentOps *ops);
++bool census_coh_track(uint64_t start, uint64_t len);
++void census_coh_untrack(uint64_t start);
++/* Held pages armed. Into up to `room` of `refused`, those a vCPU reached: held, and how many. */
++size_t census_coh_arm(const uint64_t *addrs, size_t n, uint64_t *refused, size_t room);
++/* Into up to room of came, the pages a vCPU reached as these moved: written, for all it knows. */
++size_t census_coh_hold(const uint64_t *addrs, size_t n, bool open_too, uint64_t *came, size_t room);
++void census_coh_open(uint64_t addr);
++void census_coh_freeze(const uint64_t *addrs, size_t n);
++void census_coh_thaw(const uint64_t *addrs, size_t n);
++/* The surface of a mapping id, and whether the library tracks it. */
++bool census_coh_surface(uint32_t mapping_id, uint64_t *start, uint64_t *len);
++
++/* The pages tracked now: 0 while no surface is. */
++extern _Atomic uint64_t census_coherent_pages;
++void census_coherent_touch(void *main_ptr, uint64_t len, bool write);
++/* QEMU's own access to guest RAM through the main mapping, on any thread. */
++static inline void census_coherent_access(void *main_ptr, uint64_t len, bool write)
++{
++    if (__atomic_load_n((uint64_t *)&census_coherent_pages, __ATOMIC_RELAXED)) {
++        census_coherent_touch(main_ptr, len, write);
++    }
++}
++
+ /* Writes everything counted so far. For a test: the census's thread does this on its own. */
+ void census_flush(void);
+ 
+@@ -85,6 +137,8 @@ typedef struct CensusCounts {
+ void census_counts(CensusCounts *out);
+ /* Runs the end of a window now, whatever the presents count. */
+ void census_close_window(void);
++/* The fuse, for a test. */
++void census_fuse_test(void);
+ /* Whether the page at this main-mapping address carries a marker of the census's, by its state. */
+ int census_page_state(const void *main_addr);
+ 
+diff --git a/system/physmem.c b/system/physmem.c
+index bd5f41cb02..c4f9363775 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -44,6 +44,12 @@
+ #include "system/tcg.h"
+ #include "system/qtest.h"
+ #include "system/physmem.h"
++#ifdef CONFIG_LINUX
++#include "system/kvm_census.h"
++#define census_ram_access census_coherent_access
++#else
++#define census_ram_access(ptr, len, write)
++#endif
+ #include "system/ramblock.h"
+ #include "qemu/timer.h"
+ #include "qemu/config-file.h"
+@@ -3314,6 +3320,7 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
+         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
+                                                false, true);
+ 
++        census_ram_access(ram_ptr, *l, true);
+         qemu_ram_move(ram_ptr, buf, *l);
+         invalidate_and_set_dirty(mr, mr_addr, *l);
+ 
+@@ -3407,6 +3414,7 @@ static MemTxResult flatview_read_continue_step(MemTxAttrs attrs, uint8_t *buf,
+         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
+                                                false, false);
+ 
++        census_ram_access(ram_ptr, *l, false);
+         qemu_ram_move(buf, ram_ptr, *l);
+ 
+         return MEMTX_OK;
+@@ -3807,7 +3815,11 @@ void *address_space_map(AddressSpace *as,
+     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
+                                         l, is_write, attrs);
+     fuzz_dma_read_cb(addr, *plen, mr);
+-    return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
++    void *mapped = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true,
++                                       is_write);
++    /* A device reads or fills the pages through this with no further word. */
++    census_ram_access(mapped, *plen, is_write);
++    return mapped;
+ }
+ 
+ /* Unmaps a memory region previously mapped by address_space_map().

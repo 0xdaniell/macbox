@@ -37,7 +37,8 @@ node), makes an SSH key `~/.ssh/macbox_ed25519`, and adds a `Host macbox` block 
 | `MACBOX_RESOLUTION`, `MACBOX_REFRESH` | 1920x1080, 60 | macOS's screen; more pixels cost GPU time |
 | `MACBOX_CPUSET` | empty | pin QEMU to some cores, e.g. a hybrid CPU's performance cores (`0-7`) |
 | `MACBOX_BUILD_CPUSET` | empty | cores for `macbox build`, e.g. the efficiency cores |
-| `MACBOX_DISK_CACHE` | writeback | `unsafe` is faster, but a crash of the host itself can corrupt the VM's disk |
+| `MACBOX_DISK_CACHE` | none | `writeback` panicked macOS's NVMe driver under heavy swap; `unsafe` is faster, but a crash of the host itself can corrupt the VM's disk. Applies at the next `macbox up` |
+| `MACBOX_COHERENT` | off | `on`: Coherent, zero-copy surfaces, about 40% faster at 3x and experimental ([performance.md](performance.md#coherent-experimental-off-by-default)) |
 | `MACBOX_HOME` | ~/.local/share/macbox | everything macbox keeps |
 
 Then:

@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 07:05:14 +0000
+Subject: [PATCH 9/9] census: QEMU's own small loads and stores of guest RAM
+ reach the census
+
+address_space_ld*/st* (ldl_phys, stl_le_phys and the like, and their
+_cached_slow forms) read and write RAM through qemu_map_ram_ptr directly,
+past flatview_{read,write}_continue_step where census_ram_access is: such an
+access of a Coherent surface's armed page read the older bytes, and a write to
+a held or armed page never reached the library. Each now calls
+census_ram_access first, one relaxed load while nothing is tracked.
+
+Left alone: address_space_{read,write}_cached's inline memcpy, whose only
+user here is virtio's vring caches, which lie in the guest kernel's memory,
+never in an IOSurface's pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ system/memory_ldst.c.inc | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/system/memory_ldst.c.inc b/system/memory_ldst.c.inc
+index a728b7737c..3239d04ca7 100644
+--- a/system/memory_ldst.c.inc
++++ b/system/memory_ldst.c.inc
+@@ -43,8 +43,12 @@ uint64_t glue(address_space_ldm_internal, SUFFIX)(ARG1_DECL, MemOp mop,
+         r = memory_region_dispatch_read(mr, addr1, &val, mop, attrs);
+     } else {
+         /* RAM case */
++        void *ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
++
+         fuzz_dma_read_cb(addr, size, mr);
+-        val = ldm_p(qemu_map_ram_ptr(mr->ram_block, addr1), mop);
++        /* LOCAL (Atlas): a Coherent surface's armed page is brought up to date first. */
++        census_ram_access(ptr, size, false);
++        val = ldm_p(ptr, mop);
+         r = MEMTX_OK;
+     }
+     if (result) {
+@@ -85,7 +89,11 @@ void glue(address_space_stm_internal, SUFFIX)(ARG1_DECL, MemOp mop,
+         r = memory_region_dispatch_write(mr, addr1, val, mop, attrs);
+     } else {
+         /* RAM case */
+-        stm_p(qemu_map_ram_ptr(mr->ram_block, addr1), mop, val);
++        void *ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
++
++        /* LOCAL (Atlas): a Coherent surface's held or armed page hears of the write first. */
++        census_ram_access(ptr, size, true);
++        stm_p(ptr, mop, val);
+         invalidate_and_set_dirty(mr, addr1, size);
+         r = MEMTX_OK;
+     }

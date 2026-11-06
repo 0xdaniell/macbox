@@ -74,7 +74,7 @@ Report what you verified: the screenshots and recordings you took, and what `sim
 The iOS Simulator draws on the host's GPU through the VM's virtual GPU, so the host's GPU sets the ceiling:
 
 - **Measure motion on a 1x iOS simulator** (`slim-1`, `slim-2`, `full`). Example, measured on an Intel Arrow Lake iGPU (Core Ultra 200S) on 2026-10-28: 1x simulators reached about 92 to 96 frames/s in a heavy Liquid Glass benchmark, well above 60.
-- **`sharp` and `small` are 3x.** They have 9 times the pixels, so heavy scenes can fall below 60 because of the host's GPU, not your app (about 35 to 40 frames/s on that same iGPU). Use them for still screenshots, not for frame-rate verdicts.
+- **`sharp` and `small` are 3x.** They have 9 times the pixels, so heavy scenes can fall below 60 because of the host's GPU, not your app (about 50 frames/s on that same iGPU). Use them for still screenshots, not for frame-rate verdicts.
 - **Other simulators animating at the same time share the GPU.** If `sim-fps` shows drops, check `mac-sim status` / `android-sim status` and record again. Record with nobody watching the Device panel too, when you can.
 - **A stretch `sim-fps` calls "still or frozen"** may be the screen standing still, or the app freezing. Look at the frames on both sides of it.
 
