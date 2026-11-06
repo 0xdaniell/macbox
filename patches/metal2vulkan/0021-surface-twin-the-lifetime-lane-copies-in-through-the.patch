@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 11:42:48 +0000
+Subject: [PATCH 21/34] surface twin: the lifetime lane copies in through the
+ reader's hold
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime_lane/surface_coherent.rs                      | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 7da9b9dc..7594a5a9 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -817,6 +817,10 @@ fn surface_twin_a_reader_outlives_the_first_texture() {
+         assert_eq!(mapping.read(0..4), [BEFORE; 4], "it stays ahead");
+         shadow_coherent::fault(mapping.pointer().as_ptr() as u64, false);
+         assert_eq!(mapping.read(0..4), RED_TEXEL, "and comes back through the reader's hold");
++        // A guest's write goes in through the first texture's buffer, which the reader holds.
++        shadow_coherent::fault(mapping.pointer().as_ptr() as u64, true);
++        mapping.write(0, &[1, 2, 3, 255]);
++        assert_eq!(sampled_bgra8(&case.queue, &reader, WIDTH, HEIGHT)[..4], [1, 2, 3, 255]);
+     });
+ }
+ 

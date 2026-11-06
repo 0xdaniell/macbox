@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 02:23:01 +0000
+Subject: [PATCH 15/25] a boot test of coherent pages through
+ NVMe DMA
+
+dma.c swaps through QEMU's NVMe controller over pages armed, held, frozen, stale
+and plain, under rvg_coherent_rehearse, and checks every word; run-dma.sh fails
+one that reached no such page. coherent_test.c gets the stale page that crashed
+the VM.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/include/reims_vgpu.h |   3 +
+ crates/reims-vgpu-c/src/coherent.rs      |  58 ++++++
+ crates/reims-vgpu-c/tests/c/harness.c    |   1 +
+ crates/reims-vgpu-c/tests/c_harness.rs   |   2 +-
+ docs/api.md                              |   2 +-
+ scripts/internal/census/census_report.py |   5 +
+ scripts/internal/census/coherent_test.c  |  15 ++
+ scripts/internal/census/guest/dma.c      | 213 +++++++++++++++++++++++
+ scripts/internal/census/guest/run-dma.sh |  45 +++++
+ 9 files changed, 342 insertions(+), 2 deletions(-)
+ create mode 100644 scripts/internal/census/guest/dma.c
+ create mode 100755 scripts/internal/census/guest/run-dma.sh
+
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index 3adaf431..3e4f9ea6 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -1004,6 +1004,9 @@ void rvg_coherent_abandon(void);
+ void rvg_coherent_reset(void);
+ // The surface over `len` bytes from `start` was unmapped, and its pages are the guest's to reuse.
+ void rvg_coherent_unmapped(uint64_t start, uint64_t len);
++// With REIMS_VGPU_COHERENT_REHEARSE set, a test's: a thread runs the surface at `base` through every
++// step a texture's command buffers make, with no GPU, until it goes. Otherwise nothing.
++void rvg_coherent_rehearse(uint64_t base, uint32_t width, uint32_t height, uint64_t row);
+ // One JSON line a surface under `label` into `out`, up to `room` bytes: the bytes they took,
+ // which may exceed `room`.
+ size_t rvg_coherent_report(const char *label, char *out, size_t room);
+diff --git a/crates/reims-vgpu-c/src/coherent.rs b/crates/reims-vgpu-c/src/coherent.rs
+index d8f6e9ad..25278ac4 100644
+--- a/crates/reims-vgpu-c/src/coherent.rs
++++ b/crates/reims-vgpu-c/src/coherent.rs
+@@ -59,6 +59,53 @@ mod on {
+ 
+     pub(super) use metal2vulkan_runtime::shadow_coherent as runtime;
+ 
++    /// While `REIMS_VGPU_COHERENT_REHEARSE=<period us>:<take every n frames, 0 for never>` says so,
++    /// a thread runs a surface's command buffers over its top half, with no GPU, each "image" a
++    /// new word in every texel, until the surface goes.
++    pub(super) fn rehearse(base: u64, width: u32, height: u32, row: u64) {
++        use metal2vulkan_runtime::shadow_coherent::{Layout, Rehearsal};
++        use std::time::Duration;
++
++        let Ok(asked) = std::env::var("REIMS_VGPU_COHERENT_REHEARSE") else {
++            return;
++        };
++        let (period, every) = asked.split_once(':').unwrap_or((&asked, "0"));
++        let period = Duration::from_micros(period.parse().unwrap_or(500));
++        let every: u64 = every.parse().unwrap_or(0);
++        let frame = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
++        let word = frame.clone();
++        let layout = Layout { base, row, texel: 4, width, height };
++        let read = Box::new(move |[x0, y0, x1, y1]: [u32; 4], to: *mut u8, stride: u32| {
++            let word = word.load(std::sync::atomic::Ordering::Relaxed) | 0xc0de_0000;
++            for y in 0..u64::from(y1 - y0) {
++                for x in 0..u64::from(x1 - x0) {
++                    let at = (y * u64::from(stride) + x) * 4;
++                    // SAFETY: the sync gives `to` over the rectangle's rows of `stride` texels.
++                    unsafe { to.add(at as usize).cast::<u32>().write_unaligned(word) };
++                }
++            }
++            true
++        });
++        let area = [0, 0, width, height / 2];
++        let surface = Rehearsal::new(layout, read);
++        let spawned = std::thread::Builder::new().name("rehearsal".into()).spawn(move || {
++            if !surface.track() {
++                eprintln!("rehearsal: the surface at {base:#x} does not track");
++                return;
++            }
++            eprintln!("rehearsal: {width}x{height} at {base:#x}");
++            for id in (1u64 << 48).. {
++                frame.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                let take = every != 0 && id % every == 0;
++                if !surface.frame(id, area, period / 4, take) {
++                    return;
++                }
++                std::thread::sleep(period);
++            }
++        });
++        drop(spawned);
++    }
++
+     /// The host's hooks, as the runtime's marks.
+     pub(super) struct HostPages(pub(super) RvgCoherentHooks);
+ 
+@@ -225,6 +272,17 @@ pub extern "C" fn rvg_coherent_unmapped(start: u64, len: u64) {
+     });
+ }
+ 
++/// A rehearsal of the surface. See the header.
++#[unsafe(no_mangle)]
++pub extern "C" fn rvg_coherent_rehearse(base: u64, width: u32, height: u32, row: u64) {
++    ffi::export(|| {
++        #[cfg(feature = "vulkan")]
++        on::rehearse(base, width, height, row);
++        #[cfg(not(feature = "vulkan"))]
++        let _ = (base, width, height, row);
++    });
++}
++
+ /// The report. See the header.
+ ///
+ /// # Safety
+diff --git a/crates/reims-vgpu-c/tests/c/harness.c b/crates/reims-vgpu-c/tests/c/harness.c
+index 639e4aff..c47826dd 100644
+--- a/crates/reims-vgpu-c/tests/c/harness.c
++++ b/crates/reims-vgpu-c/tests/c/harness.c
+@@ -185,6 +185,7 @@ static void check_status_and_log(void) {
+     rvg_coherent_abandon();
+     rvg_coherent_reset();
+     rvg_coherent_unmapped(0, 0);
++    rvg_coherent_rehearse(0, 0, 0, 0);
+     CHECK(rvg_coherent_report("", NULL, 0) == 0);
+     CHECK(RVG_MAX_DISPLAY_PORTS == 8 && RVG_DEVICE_MMIO_SIZE == 0x4000);
+     CHECK(RVG_PCI_VENDOR_ID == 0x106b && RVG_PCI_DEVICE_ID == 0xeeee);
+diff --git a/crates/reims-vgpu-c/tests/c_harness.rs b/crates/reims-vgpu-c/tests/c_harness.rs
+index 7b4c7053..1c08e961 100644
+--- a/crates/reims-vgpu-c/tests/c_harness.rs
++++ b/crates/reims-vgpu-c/tests/c_harness.rs
+@@ -111,7 +111,7 @@ fn c_harness_calls_every_function() {
+             Some(&rest[..end])
+         })
+         .collect();
+-    assert_eq!(declared.len(), 56, "{declared:?}");
++    assert_eq!(declared.len(), 57, "{declared:?}");
+     let missing: Vec<&str> = declared
+         .iter()
+         .copied()
+diff --git a/docs/api.md b/docs/api.md
+index 900d4255..4459a8b7 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -703,7 +703,7 @@ The header's 47 functions, in its order. "May" is the header's mark "may call ba
+ | 40 | `rvg_video_device_invalidate` | | a reset's first phase: the session sends the guest nothing more |
+ | 41 | `rvg_video_device_reset` | | both phases: the session's work drains and it ends |
+ | 42a | `rvg_census_set_callbacks` | | LOCAL (Atlas): the touch census's news of surfaces and presents (`reims_vgpu_core::census`); no calls without it |
+-| 42b | `rvg_coherent_set_hooks`, `rvg_coherent_fault`, `rvg_coherent_timed`, `rvg_coherent_probe`, `rvg_coherent_abandon`, `rvg_coherent_reset`, `rvg_coherent_unmapped`, `rvg_coherent_report` | | LOCAL (Atlas): trap-coherent surfaces (metal2vulkan's `shadow_coherent.rs`): QEMU's census view marks their pages, and tells of each touch; no effect without the live switch `surface_coherent` |
++| 42b | `rvg_coherent_set_hooks`, `rvg_coherent_fault`, `rvg_coherent_timed`, `rvg_coherent_probe`, `rvg_coherent_abandon`, `rvg_coherent_reset`, `rvg_coherent_unmapped`, `rvg_coherent_rehearse`, `rvg_coherent_report` | | LOCAL (Atlas): trap-coherent surfaces (metal2vulkan's `shadow_coherent.rs`): QEMU's census view marks their pages, and tells of each touch; no effect without the live switch `surface_coherent` |
+ | 42 | `rvg_scaler_device_create` | | the M2 scaler device (106b:1a0b), from an `RvgScalerDeviceConfig`, made on every host: transforming with the library's own kernel on the GPU it draws with (Metal's on macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included), and with none where that opens no device or the device refuses the kernel |
+ | 43 | `rvg_scaler_device_release` | | drops the host's reference; the last one drops its accelerator and ends its guest-memory table |
+ | 44 | `rvg_scaler_device_scales` | | whether the device has a GPU to transform on; where it has not, the host refuses the guest's features (FEATURES_OK), so the guest's driver does without the device |
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+index b13d5aeb..b29a1a12 100644
+--- a/scripts/internal/census/census_report.py
++++ b/scripts/internal/census/census_report.py
+@@ -138,6 +138,8 @@ def life(surfaces):
+ def coherent(directory, wanted):
+     """The last report of each surface at the mark `wanted`, or at the last mark."""
+     rows = list(lines(os.path.join(directory, "coherent.jsonl")))
++    touches = [r for r in rows if "touches" in r]
++    rows = [r for r in rows if "at" in r]
+     label = wanted or (rows[-1].get("label") if rows else None)
+     if label is None:
+         sys.exit(f"{directory}: no coherent.jsonl")
+@@ -159,6 +161,9 @@ def coherent(directory, wanted):
+               f" {r['demotions']:>6} {r['writes']:>6} {cost['detect'] / 1e3:>7.1f}"
+               f" {cost['sync'] / 1e3:>7.1f} {cost['fetch'] / 1e3:>7.1f} {cost['total'] / 1e3:>7.1f}"
+               f" {cost['eager_would'] / 1e3:>8.1f} {'yes' if r['pays'] else 'NO'}")
++    for r in touches[-1:]:
++        print(f"QEMU's own accesses: open {r['open']} armed {r['armed']} held {r['held']}"
++              f" frozen {r['frozen']} stale {r['stale']}")
+     bad = [r for r in found.values() if r["sync_errors"] or r["overwrite_risk"]]
+     for r in bad:
+         print(f"surface {r['at']}: sync_errors {r['sync_errors']}, overwrite_risk {r['overwrite_risk']}")
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+index 3cb7eca5..15de6d6d 100644
+--- a/scripts/internal/census/coherent_test.c
++++ b/scripts/internal/census/coherent_test.c
+@@ -242,6 +242,20 @@ static void t_emulator_read(struct vcpu *c) {
+     census_surface_unmapped(6);
+ }
+ 
++static void t_stale_page(struct vcpu *c) {
++    printf("[stale] QEMU's own access to a surface's old page, another surface tracked\n");
++    surface(13, 0xf00000);
++    surface(14, 0x1000000);
++    census_surface_unmapped(13);
++    s.off = 0xf00000;
++    CHECK(state(0) == 6, "the page is stale");
++    census_coherent_access(main_map + 0xf00000, 8 * PG, true);
++    census_coherent_access(main_map + 0xf00000, 8 * PG, false);
++    CHECK(1, "and a device reads and writes it as RAM");
++    s.off = 0x1000000;
++    census_surface_unmapped(14);
++}
++
+ static void t_unmap_reset(struct vcpu *c) {
+     printf("[unmap] armed, held and open pages all come off\n");
+     surface(7, 0x700000);
+@@ -472,6 +486,7 @@ int main(int argc, char **argv) {
+     t_frozen(&c);
+     t_kernel_copy(&c);
+     t_emulator_read(&c);
++    t_stale_page(&c);
+     t_unmap_reset(&c);
+     t_coherent_race(mib);
+     t_arm_window();
+diff --git a/scripts/internal/census/guest/dma.c b/scripts/internal/census/guest/dma.c
+new file mode 100644
+index 00000000..7c5e6ae1
+--- /dev/null
++++ b/scripts/internal/census/guest/dma.c
+@@ -0,0 +1,213 @@
++/* A multiboot guest that swaps through a real NVMe controller, as a loaded macOS does, while
++ * real surfaces of the IOSurface device are live: QEMU's nvme_read and nvme_write, dma_blk_cb and
++ * address_space_map run on the main thread over pages armed, held, frozen, stale and plain. Each
++ * round fills a page, writes it out, spoils it, reads it back, and checks every word. Exit code
++ * (stage << 1) | 1: 0x11 passes. Run it with REIMS_VGPU_COHERENT_REHEARSE, see run-dma.sh.
++ *   ROUNDS  the swap-outs, each with its swap-in
++ *   CHURN   1 where the rehearsal takes the image, so that a GPU write may rightly replace what a
++ *           page of its rectangle held: those pages are then not checked */
++#define main_c device_main
++#include "device.c"
++#undef main_c
++
++#ifndef ROUNDS
++#define ROUNDS 1000000u
++#endif
++#ifndef CHURN
++#define CHURN 0
++#endif
++#define ASQ 0x01100000u
++#define ACQ 0x01101000u
++#define IOSQ 0x01102000u
++#define IOCQ 0x01103000u
++#define PLAIN 0x10000000u /* 64 pages no surface ever held */
++#define STALE 0x30000000u /* the pages of a surface that went: a word that names no surface */
++#define STALE_ID 7u
++#define QSIZE 64u
++
++static uint32_t nv, stride, sqt, cqh_a, sqt_a, cqh, phase, phase_a; /* link.ld keeps no .data */
++
++static void nvme_cmd(uint32_t *c, uint32_t sq, uint32_t *tail, uint32_t q) {
++    uint32_t *to = (uint32_t *)(uintptr_t)(sq + *tail * 64);
++    for (int i = 0; i < 16; i++) to[i] = c[i];
++    *tail = (*tail + 1) % QSIZE;
++    R32(nv + 0x1000 + 2 * q * stride) = *tail;
++}
++static uint32_t nvme_done(uint32_t cq, uint32_t *head, uint32_t *ph, uint32_t q) {
++    volatile uint32_t *e = (volatile uint32_t *)(uintptr_t)(cq + *head * 16);
++    for (uint32_t n = 0; (e[3] >> 16 & 1) != *ph; n++) {
++        if (n > 2000000000u) die(0x40);
++        __asm__("pause");
++    }
++    uint32_t status = e[3] >> 17;
++    *head = (*head + 1) % QSIZE;
++    if (!*head) *ph ^= 1;
++    R32(nv + 0x1000 + (2 * q + 1) * stride) = *head;
++    return status;
++}
++static void admin(uint32_t op, uint32_t prp, uint32_t cdw10, uint32_t cdw11) {
++    uint32_t c[16] = {0};
++    c[0] = op; c[1] = op == 6 ? 1 : 0; c[6] = prp; c[10] = cdw10; c[11] = cdw11;
++    nvme_cmd(c, ASQ, &sqt_a, 0);
++    if (nvme_done(ACQ, &cqh_a, &phase_a, 0)) die(0x41);
++}
++/* The one request: `count` pages at the guest's `page`, then the PRP list `list` for more. */
++static void io(uint32_t op, uint32_t lba, uint32_t prp1, uint32_t prp2, uint32_t count) {
++    uint32_t c[16] = {0};
++    c[0] = op | (lba & 63) << 16; c[1] = 1; c[6] = prp1; c[8] = prp2;
++    c[10] = lba; c[12] = count * 8 - 1;
++    nvme_cmd(c, IOSQ, &sqt, 1);
++    if (nvme_done(IOCQ, &cqh, &phase, 1)) die(0x42);
++}
++static void nvme_up(void) {
++    phase = phase_a = 1;
++    for (int d = 0; d < 32 && !nv; d++)
++        if (cfg(d, 8) >> 8 == 0x010802) {
++            nv = cfg(d, 0x10) & ~0xfu;
++            cfgw(d, 4, cfg(d, 4) | 6);
++        }
++    if (!nv) die(0x43);
++    stride = 4u << (R32(nv + 4) & 15);
++    R32(nv + 0x14) = 0;
++    for (uint32_t n = 0; R32(nv + 0x1c) & 1; n++) if (n > 400000000u) die(0x44);
++    R32(nv + 0x24) = (QSIZE - 1) << 16 | (QSIZE - 1);
++    R64(nv + 0x28) = ASQ;
++    R64(nv + 0x30) = ACQ;
++    R32(nv + 0x14) = 1 | 6 << 16 | 4 << 20;
++    for (uint32_t n = 0; !(R32(nv + 0x1c) & 1); n++) if (n > 400000000u) die(0x45);
++    admin(5, IOCQ, (QSIZE - 1) << 16 | 1, 1);
++    admin(1, IOSQ, (QSIZE - 1) << 16 | 1, 1 << 16 | 1);
++}
++
++static void fill(uint32_t p, uint32_t seed) {
++    for (uint32_t w = 0; w < PG / 4; w++) R32(p + 4 * w) = seed ^ (w * 0x9e3779b1u);
++}
++static void hex(uint32_t v) {
++    for (int i = 28; i >= 0; i -= 4) outb(0xe9, "0123456789abcdef"[v >> i & 15]);
++    outb(0xe9, ' ');
++}
++/* On the console: the page, its first wrong word, what it holds, what it should, how many differ. */
++static int same(uint32_t p, uint32_t seed) {
++    uint32_t wrong = 0, first = 0, held = 0;
++    for (uint32_t w = 0; w < PG / 4; w++) {
++        uint32_t is = R32(p + 4 * w);
++        if (is != (seed ^ (w * 0x9e3779b1u))) {
++            if (!wrong++) { first = w; held = is; }
++        }
++    }
++    if (wrong) {
++        hex(p); hex(first); hex(held); hex(seed ^ (first * 0x9e3779b1u)); hex(wrong);
++        outb(0xe9, '\n');
++    }
++    return !wrong;
++}
++/* What a pager does to one page, checked or not. */
++static void swap(uint32_t p, uint32_t seed, uint32_t lba, int check, int stage) {
++    fill(p, seed);
++    io(1, lba, p, 0, 1);
++    fill(p, ~seed);
++    io(2, lba, p, 0, 1);
++    if (check && !same(p, seed)) die(stage);
++}
++
++/* Long enough for the rehearsal's next frames, at its 500 us. */
++static void wait_frames(void) {
++    for (uint32_t n = 0; n < 60000; n++) __asm__("pause");
++}
++
++static void unmap(uint32_t id) {
++    for (uint32_t n = 0; ; n++) {
++        int r = cmd(2, id);
++        if (!r) return;
++        /* Busy: work runs in its image, and the guest tries again. */
++        if (n > 2000000) die(0x46);
++        for (int i = 0; i < 2000; i++) __asm__("pause");
++    }
++}
++
++void main_c(void) {
++    uint32_t i;
++    for (int d = 0; d < 32 && !bar; d++)
++        if (cfg(d, 0) == (0xeeefu << 16 | 0x106b)) {
++            bar = cfg(d, 0x10) & ~0xfu;
++            cfgw(d, 4, cfg(d, 4) | 6);
++        }
++    if (!bar) die(0x31);
++    for (i = 0; i < 16; i++) R32(TABLE + 4 * i) = pte(DPAGE + i * PG);
++    R32(bar + 0x1030) = 1;
++    R32(bar + 0x1000) = RING;
++    R32(bar + 0x1008) = 256;
++    R32(bar + 0x1010) = TABLE;
++    wr = R32(bar + 0x1020);
++    nvme_up();
++    /* The driver itself, before any surface. */
++    swap(PLAIN, 0x0badcafeu, 8 * 4000, 1, 0x48);
++
++    /* A surface that comes and goes: its pages stay stale for the guest to reuse. */
++    for (i = 0; i < PAGES; i++) R32(ROOT + 4 * i) = pte(STALE + 2 * i * PG);
++    descriptor(STALE_ID, 0);
++    if (cmd(1, STALE_ID)) die(0x47);
++    for (uint32_t n = 0; n < 40000000; n++) __asm__("pause"); /* its rehearsal gets going */
++    unmap(STALE_ID);
++
++    /* The surface that stays: its top half is the rectangle the "GPU" writes (armed, frozen as
++     * pages open), its bottom half stays held. Pages scattered, as a real surface's. */
++    for (i = 0; i < PAGES; i++) R32(ROOT + 4 * i) = pte(page(i));
++    descriptor(ID, 0);
++    if (cmd(1, ID)) die(0x34);
++    for (uint32_t n = 0; n < 40000000; n++) __asm__("pause");
++
++    /* Direct RAM paths, with no map: a list of pages QEMU reads, an identify it writes. */
++    for (i = 0; i < 4; i++) {
++        uint32_t list = page(600 + i), armed_list = page(100 + i), target = page(40 + i);
++        R32(list) = target + PG; R32(list + 4) = 0;
++        R32(list + 8) = target + 2 * PG; R32(list + 12) = 0;
++        R32(armed_list) = target + PG; R32(armed_list + 4) = 0;
++        R32(armed_list + 8) = target + 2 * PG; R32(armed_list + 12) = 0;
++        io(2, 8 * 1000, target, list, 3);
++        io(2, 8 * 1000, target, armed_list, 3);
++        admin(6, page(120 + i), 1, 0);
++        admin(6, page(620 + i), 1, 0);
++        admin(6, STALE + 2 * i * PG, 1, 0);
++    }
++
++    /* The device first, the guest not having touched the page: a swap-in into each state. A
++     * swap-out of an armed page must carry what the GPU left there, not the page's old bytes. */
++    for (i = 0; i < 300; i++) {
++        uint32_t seed = 0x51ed2700u + i, lba = 8 * (3000 + i);
++        fill(PLAIN + PG, seed);
++        io(1, lba, PLAIN + PG, 0, 1);
++        wait_frames();
++        io(2, lba, page(i), 0, 1);                       /* armed, or held since a sync */
++        if (!CHURN && !same(page(i), seed)) die(0x55);
++        wait_frames();
++        io(2, lba, page(512 + i), 0, 1);                 /* held */
++        if (!same(page(512 + i), seed)) die(0x56);
++        fill(page(i), ~seed);                            /* open */
++        wait_frames();
++        io(2, lba, page(i), 0, 1);                       /* frozen by the frames since */
++        if (!CHURN && !same(page(i), seed)) die(0x57);
++    }
++    for (i = 0; i < 100; i++) {
++        wait_frames();
++        io(1, 8 * (3400 + i), page(400 + i), 0, 1);      /* out of an armed page */
++        io(2, 8 * (3400 + i), PLAIN + 2 * PG, 0, 1);
++        if (R32(PLAIN + 2 * PG) >> 16 != 0xc0de) { hex(R32(PLAIN + 2 * PG)); die(0x58); }
++    }
++
++    /* Every kind in turn, for ROUNDS swaps: the load of a guest short of memory. */
++    for (uint32_t round = 0; round < ROUNDS; round++) {
++        uint32_t seed = round * 0x01000193u + 0xa5a5a5a5u, kind = round % 4, at = (round >> 2) % 400;
++        uint32_t lba = 8 * (kind * 512 + at);
++        switch (kind) {
++        case 0: swap(page(at), seed, lba, !CHURN, 0x50); break;            /* armed, frozen */
++        case 1: swap(page(512 + at), seed, lba, 1, 0x51); break;           /* held */
++        case 2: swap(STALE + 2 * at * PG, seed, lba, 1, 0x52); break;      /* stale */
++        default: swap(PLAIN + (at % 64) * PG, seed, lba, 1, 0x53); break;  /* plain */
++        }
++    }
++    unmap(ID);
++    /* A page of the surface, as plain RAM again. */
++    swap(page(1), 0x12345678u, 8, 1, 0x54);
++    die(0x11);
++}
+diff --git a/scripts/internal/census/guest/run-dma.sh b/scripts/internal/census/guest/run-dma.sh
+new file mode 100755
+index 00000000..1e9fb760
+--- /dev/null
++++ b/scripts/internal/census/guest/run-dma.sh
+@@ -0,0 +1,45 @@
++#!/bin/bash
++# run-dma.sh <name> <guest elf> [ENV=VALUE]...: dma.c on the installed $CENSUS_BUILD, in the run image
++# as the VM runs: Reims's device, the census, and the NVMe controller of bin/qemu-disk, on lavapipe,
++# CPUs 8-19. Output in /srv/warm/census/out/<name>; exit 35 is the guest's pass. Also prints QEMU's
++# accesses by page state. $RAM (MiB) is 1024; 12288 is the VM's.
++name=$1 elf=$2; shift 2
++Q=${QEMU_DIR:-/srv/data/macos-vm/home/.local/share/reims-ctl/qemu/${CENSUS_BUILD:?}}
++O=/srv/warm/census/out/$name RAM=${RAM:-1024}
++rm -rf "$O"; mkdir -p "$O"
++printf 'surface_lazy=1\nsurface_lazy_scoped=1\nsurface_coherent=1\n' > "$O/live.conf"
++# NODEMOTE=1: a surface stays armed however often it traps, or pages rarely stay marked for a device.
++[ -n "${NODEMOTE:-}" ] && printf 'surface_coherent_demote_pct=1000\nsurface_coherent_demote_hz=100000000\nsurface_coherent_hold_s=0\n' >> "$O/live.conf"
++truncate -s 64M "$O/disk.raw"
++args=()
++for e in "$@"; do args+=(-e "$e"); done
++timeout ${LIMIT:-280} docker run -i --rm --name census-dma-$name --init \
++  --ulimit core=${CORE:-0} --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/kvm \
++  -e HOME=/srv/warm/census/home -e VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
++  -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json -e RUST_LOG=${RUST_LOG:-error} \
++  -e M2V_LIVE=$O/live.conf -e REIMS_VGPU_CENSUS=$O -e REIMS_VGPU_COHERENT=1 -e REIMS_VGPU_WINDOW=0 \
++  "${args[@]}" -w "$O" \
++  -v /srv/data/macos-vm/home/.local/share/reims-ctl/qemu:/srv/data/macos-vm/home/.local/share/reims-ctl/qemu:ro \
++  -v /srv/warm/census:/srv/warm/census macos-vm:run2 \
++  taskset -c 8-19 $Q/bin/qemu-system-x86_64 -L $Q/share/qemu \
++    -accel kvm -cpu host -smp 2 -machine q35,memory-backend=ram,dump-guest-core=off -display none -vga none \
++    -object memory-backend-memfd,id=ram,size=${RAM}M,share=on \
++    -device isa-debug-exit,iobase=0xf4,iosize=1 -chardev file,id=dbg,path=$O/console -device isa-debugcon,iobase=0xe9,chardev=dbg -serial none -monitor none \
++    -drive id=disk,file=$O/disk.raw,if=none,format=raw,cache=${CACHE:-writeback},discard=unmap \
++    -device nvme,drive=disk,serial=reims-ctl,addr=0xa \
++    -device apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays=1,resolution=1280x720 \
++    -device apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6 \
++    -kernel "$elf" ${EXTRA:-} 2>&1 | grep -vE '^metal2vulkan: ' | tail -${TAIL:-12}
++rc=${PIPESTATUS[0]}
++echo "exit $rc"
++# A pass counts only over a page of each state, with no error and the fuse whole.
++[ "${STATES:-1}" = 1 ] && python3 -I - "$O" <<'PY'
++import json, sys
++rows = [json.loads(l) for l in open(sys.argv[1] + "/coherent.jsonl")]
++last = [r for r in rows if "touches" in r][-1]
++missing = [k for k in ("armed", "held", "frozen", "stale") if not last[k]]
++tick = [json.loads(l) for l in open(sys.argv[1] + "/ticks.jsonl")][-1]
++print("states", {k: last[k] for k in ("open", "armed", "held", "frozen", "stale")},
++      "errors", tick.get("errors"), "dead", tick.get("dead"))
++print("MISSED " + " ".join(missing) if missing else "every state reached")
++PY

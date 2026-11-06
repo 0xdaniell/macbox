@@ -1,0 +1,2992 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 01:11:17 +0000
+Subject: [PATCH 13/34] trap-coherent surfaces behind
+ surface_coherent
+
+A surface's copy back stays deferred with its pages poisoned through a KVM-only
+view: the first guest touch syncs the pending rectangles on the CPU with
+VK_EXT_host_image_copy, a write opens its page and the next GPU use copies it
+in, a CPU write is kept by merging against a snapshot. Off by default.
+
+Fixes two things surface_lazy_present_all got wrong: a released texture's
+completed writes were discarded while the surface stayed mapped, and CPU
+readers saw stale bytes until the next flush.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/buffer_texture.rs                     |   22 +
+ .../src/command_buffer/mod.rs                 |    8 +
+ crates/metal2vulkan-runtime/src/lib.rs        |    1 +
+ crates/metal2vulkan-runtime/src/memory.rs     |   35 +
+ crates/metal2vulkan-runtime/src/shadow.rs     |   50 +-
+ .../src/shadow_coherent.rs                    | 1076 +++++++++++++++++
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  228 +++-
+ crates/metal2vulkan-runtime/src/texture.rs    |   91 +-
+ .../src/texture/host_copy.rs                  |  124 +-
+ .../src/runtime_lane.rs                       |    2 +
+ .../src/runtime_lane/pitched_surfaces.rs      |   33 +
+ .../src/runtime_lane/surface_coherent.rs      |  812 +++++++++++++
+ 12 files changed, 2453 insertions(+), 29 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/shadow_coherent.rs
+ create mode 100644 crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index d466dd62..7197fdc2 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1440,6 +1440,28 @@ impl Texels {
+         })
+     }
+ 
++    /// LOCAL (Atlas): whether a shadow of these texels is lazy (`shadow_lazy.rs`).
++    pub(super) fn lies_lazily(&self) -> bool {
++        self.backing() == super::shadow::Backing::Surface
++            && super::shadow_lazy::takes_surface(
++                (self.layout.row_bytes / self.texel_bytes) as u32,
++                self.layout.row_bytes / self.texel_bytes * u64::from(self.layout.rows),
++            )
++    }
++
++    /// LOCAL (Atlas): where the texels of a one-texel-a-block image of `extent` lie in host pages,
++    /// for a trapping surface (`shadow_coherent.rs`).
++    pub(super) fn surface_layout(&self, extent: [u32; 2]) -> Option<super::shadow_coherent::Layout> {
++        let bytes = self.buffer.host_range()?;
++        Some(super::shadow_coherent::Layout {
++            base: bytes.start as u64 + self.layout.offset,
++            row: self.layout.row_pitch,
++            texel: self.texel_bytes,
++            width: extent[0],
++            height: extent[1],
++        })
++    }
++
+     /// The staging buffer of a shadowed texture or a texture buffer over the texels laid out as
+     /// `layout`, which start at `at` of the buffer's `VkBuffer`: the texels' bytes from the first
+     /// to the last, at its start, of the texture's hazard tracking, in a buffer of whole 4-byte
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 97d01cf3..b2a5ab9e 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -4332,6 +4332,14 @@ impl CommandBufferShared {
+         let submitted_holds;
+         // No rebind encodes it again from here: a group that was never submitted runs nothing.
+         self.device.shared().rebinds.no_replays(self);
++        // LOCAL (Atlas): its writes in surfaces' images trap before anything can tell the guest it
++        // completed (`shadow_coherent.rs`).
++        if crate::shadow_lazy::ahead() {
++            let id = lock(&self.state).shadow_carry.as_ref().map(ShadowCarry::id);
++            if let Some(id) = id {
++                crate::shadow_lazy::completing(id);
++            }
++        }
+         {
+             let mut state = lock(&self.state);
+             // Every trail of the work it waited for (a pipeline's making, a twin's decode) was
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 48b3a27d..546bf564 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -203,6 +203,7 @@ mod shader_cache;
+ mod shadow;
+ mod shadow_copy_back;
+ mod shadow_copy_in;
++pub mod shadow_coherent; // LOCAL (Atlas)
+ pub mod shadow_lazy; // LOCAL (Atlas)
+ mod shadow_merge;
+ mod shadow_stencil;
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 25c32549..e91fe33e 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -202,6 +202,32 @@ pub(super) fn host_incoherent(types: &[vk::MemoryType]) -> u32 {
+         .fold(0, |bits, (index, _)| bits | 1 << index)
+ }
+ 
++/// LOCAL (Atlas): [`host_cached_placement`] for an image the host only reads (a trapping surface's,
++/// `shadow_coherent.rs`), where a type the host maps without coherence serves too: nothing writes
++/// the image through the host, whose stale lines the [`host_cached`] filter is for, and the host
++/// copy invalidates its own reads.
++pub(super) fn read_cached_placement(
++    types: &[vk::MemoryType],
++    allowed: u32,
++    class: MemoryClass,
++    unified: bool,
++) -> Option<(MemoryClass, u32)> {
++    use vk::MemoryPropertyFlags as P;
++    let cached = P::HOST_VISIBLE | P::HOST_CACHED;
++    let bits = (types.iter().enumerate())
++        .filter(|(_, ty)| ty.property_flags.contains(cached))
++        .fold(0, |bits, (index, _)| bits | 1 << index)
++        & allowed;
++    let has = |class: MemoryClass| !candidates(types, bits, class, unified).is_empty();
++    if has(class) {
++        Some((class, bits))
++    } else if unified && has(MemoryClass::Shared) {
++        Some((MemoryClass::Shared, bits))
++    } else {
++        None
++    }
++}
++
+ /// The memory class an image of `class` with host-transfer usage takes in memory the host caches,
+ /// and its memory types among `allowed`, as bits: the host-cached types ([`host_cached`]) of
+ /// `class` where it has one among them; else, on a device with unified memory (`unified`), those
+@@ -1153,6 +1179,15 @@ impl Memory {
+         host_cached_placement(&self.types, allowed, class, self.unified)
+     }
+ 
++    /// LOCAL (Atlas): [`read_cached_placement`] of this device's types.
++    pub(super) fn read_cached_placement(
++        &self,
++        allowed: u32,
++        class: MemoryClass,
++    ) -> Option<(MemoryClass, u32)> {
++        read_cached_placement(&self.types, allowed, class, self.unified)
++    }
++
+     /// The memory types the host maps without coherence, as bits ([`host_incoherent`]).
+     pub(super) fn host_incoherent(&self) -> u32 {
+         host_incoherent(&self.types)
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 2c2917fd..b84969b5 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -766,7 +766,7 @@ impl ShadowCopies {
+             && other_writer
+             && !self.drops_writes
+             && self.unmerged().is_none()
+-            && self.lazy.is_none()
++            && self.lazy.as_ref().is_none_or(|lazy| lazy.wants_merge())
+     }
+ 
+     /// Whether two shadowed textures copy some of the same truth.
+@@ -1962,6 +1962,9 @@ struct Entry<M> {
+     /// first use's copy in is the one the carry takes off the run
+     /// (`WorkCounts::shadow_texels_first_copy_in_carried`).
+     carried: bool,
++    /// LOCAL (Atlas): it took a trapping surface's standing and neither copied in nor wrote so far
++    /// (`shadow_coherent.rs`).
++    only_read: bool,
+     /// [`ShadowCopies::touched`] when the encoder met the shadow: its end carries the image to
+     /// the command buffer's later encoders only where it still stands there, no other encoder
+     /// having ended with the shadow in between ([`ShadowCarry`]).
+@@ -2197,9 +2200,15 @@ impl<M> ShadowSync<M> {
+         let mut carry = ShadowCarry {
+             id: self.carry.id,
+             entries: Vec::new(),
++            left: self.carry.left,
+         };
+         carry.entries.append(&mut self.carry.entries);
+         for entry in &self.entries {
++            // LOCAL (Atlas): the display sampled a standing: the image is as it was, and a writer
++            // of a later command buffer still takes it (`shadow_coherent.rs`).
++            if entry.only_read {
++                continue;
++            }
+             let touched = entry.copies.touched.fetch_add(1, Ordering::Relaxed);
+             // LOCAL (Atlas): what a later command buffer takes (`shadow_lazy.rs`).
+             if let Some(lazy) = &entry.copies.lazy {
+@@ -2263,6 +2272,9 @@ pub(super) struct ShadowCarry {
+     /// buffer by its pointer, which another may take once it is freed.
+     id: u64,
+     entries: Vec<Carried>,
++    /// LOCAL (Atlas): an encoder of it left writes ahead in a trapping surface's image, which a
++    /// later command that meets the bytes copies back (`shadow_lazy::met_by_command`).
++    left: bool,
+ }
+ 
+ impl Default for ShadowCarry {
+@@ -2272,6 +2284,7 @@ impl Default for ShadowCarry {
+         ShadowCarry {
+             id: NEXT.fetch_add(1, Ordering::Relaxed),
+             entries: Vec::new(),
++            left: false,
+         }
+     }
+ }
+@@ -2359,6 +2372,8 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     (None, Some(lazy)) => lazy.take(self.carry.id, met),
+                     _ => None,
+                 };
++                let only_read = lazily.is_some() && (copies.lazy.as_ref())
++                    .is_some_and(|lazy| lazy.whole_image());
+                 let (standing, held, stale) = match (&carried, lazily) {
+                     (Some(carried), _) => (Standing::Current, carried.held, carried.stale),
+                     (None, Some((held, stale))) => (Standing::Current, held, stale),
+@@ -2376,6 +2391,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     stale,
+                     met,
+                     carried: carried.is_some(),
++                    only_read,
+                 });
+                 self.entries.len() - 1
+             }
+@@ -2510,6 +2526,15 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             entry.scratch = Some(scratch);
+         }
+         let mut copies = Vec::new();
++        // LOCAL (Atlas): what an earlier encoder left ahead in an image, where this command meets
++        // the bytes (`shadow_lazy.rs`).
++        if self.carry.left {
++            copies = super::shadow_lazy::met_by_command(self.carry.id, uses, |theirs| {
++                (shadows.iter()).any(|shadow| {
++                    shadow.copies.shadow_key != theirs.shadow_key && shadow.copies.shares_truth(theirs)
++                })
++            });
++        }
+         // Merge what the command before wrote two ways; copy back what this one reads or writes
+         // another way: through the buffer's bytes, or through another texture over them that is
+         // copied in next.
+@@ -2547,7 +2572,10 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             // a rectangle; every texel where it writes through a shadow whose copies back move
+             // every texel, or writes the bytes two ways, as the merge after it compares every
+             // texel the keep took.
+-            let needs = match two_ways || !shadow.copies.cuts() {
++            // LOCAL (Atlas): a trapping surface's image holds every texel: its records' rectangles
++            // bound what may lie apart (`shadow_coherent.rs`).
++            let whole = (shadow.copies.lazy.as_ref()).is_some_and(|lazy| lazy.whole_image());
++            let needs = match two_ways || whole || !shadow.copies.cuts() {
+                 true => None,
+                 false if shadow.writes && !shadow.copies.cuts_back() => None,
+                 false if shadow.writes => bounding(shadow.loads, shadow.area),
+@@ -2582,18 +2610,20 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             let took = carried && cause.is_none() && !overwrites;
+             if let Some(cause) = cause {
+                 if !overwrites {
+-                    copies.push(ShadowCopy {
++                    let copy = ShadowCopy {
+                         copies: Arc::clone(&shadow.copies),
+                         step: Step::Into,
+                         kept: shadow.kept,
+                         area: needs,
+                         cause: Some(cause),
+                         moves: None,
+-                    });
++                    };
+                     // LOCAL (Atlas): counted by cause (`shadow_lazy.rs`).
+                     if let Some(lazy) = &shadow.copies.lazy {
+-                        lazy.copied_in(cause);
++                        lazy.copied_in(cause, copy.texels_copied_in());
+                     }
++                    copies.push(copy);
++                    entry.only_read = false;
+                 }
+                 entry.standing = Standing::Current;
+                 entry.held = needs;
+@@ -2615,18 +2645,20 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     }
+                 };
+                 if let (false, Some(area)) = (overwrites, area) {
+-                    copies.push(ShadowCopy {
++                    let copy = ShadowCopy {
+                         copies: Arc::clone(&shadow.copies),
+                         step: Step::Into,
+                         kept: shadow.kept,
+                         area: Some(area),
+                         cause: Some(CopyCause::Bounded),
+                         moves: None,
+-                    });
++                    };
+                     // LOCAL (Atlas): as above.
+                     if let Some(lazy) = &shadow.copies.lazy {
+-                        lazy.copied_in(CopyCause::Bounded);
++                        lazy.copied_in(CopyCause::Bounded, copy.texels_copied_in());
+                     }
++                    copies.push(copy);
++                    entry.only_read = false;
+                 }
+             }
+             // The command writes every texel before it reads any.
+@@ -2729,6 +2761,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             let i = self.entry(&shadow.copies);
+             // Writes Metal drops are not copied back, and the image no longer holds the bytes.
+             let entry = &mut self.entries[i];
++            entry.only_read = false;
+             match shadow.copies.drops_writes {
+                 true => entry.lose(Lost::Dropped),
+                 false => {
+@@ -2796,6 +2829,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                 });
+             match left {
+                 true => {
++                    self.carry.left = true;
+                     let entry = &mut self.entries[i];
+                     entry.dirty = false;
+                     entry.area = None;
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+new file mode 100644
+index 00000000..22172ac7
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -0,0 +1,1076 @@
++//! LOCAL (Atlas): a lazy surface (`shadow_lazy.rs`) whose pages trap, under the live switch
++//! `surface_coherent` (default off) and with a [`Pages`] installed: QEMU's census view
++//! (`accel/kvm/census.c` in Reims' QEMU), or a lane's. Installed by nothing and switched off,
++//! nothing here runs.
++//!
++//! A surface's writes stay in its optimal image, where nothing copies them, until something
++//! touches their pages: the display samples the image itself, so no present copies either. Each
++//! page of a tracked surface is:
++//!
++//! - **held**: write-protected, the page and the image agree; reads pass, a write traps.
++//! - **armed**: poisoned, the image is ahead; any access of the guest, in any mode, traps first.
++//! - **open**: the guest's CPU wrote it, and the image is stale there ([`State::guest`]).
++//! - **frozen**: an open page poisoned, while a sync merges into it.
++//!
++//! **A write's record** goes open (recording), running (committed), done (completed).
++//! [`completing`] runs before the command buffer's completed handlers, so a page is armed before
++//! the guest can learn the work ended. A read before that may read the older bytes, as Metal lets
++//! it: nothing promises a command's writes to the CPU before its completion.
++//!
++//! **A sync** ([`Coherent::sync_done`]) copies every done rectangle at once on the host
++//! (`VK_EXT_host_image_copy`), so the first trap in a surface brings all of it, then holds the
++//! pages. It queues no GPU work and waits for none, and its lock is never held across a GPU wait.
++//! A running record stays out of it: its pages stay as they are until it completes and arms them.
++//! So a sync moves only completed work, and may tear with a write still in flight over the same
++//! texels (the image's bytes are then partly new): that is a read racing a running command, which
++//! Metal leaves undefined too, and the running record, still pending, syncs those texels again
++//! once it completes. Completed work is never lost: a batch's writes are visible to the host at
++//! its completion (`tracker.rs`), and the record is dropped only after its copy.
++//!
++//! **A CPU write** never loses to a sync. The write stops before it lands, so the page's snapshot
++//! is what the guest overwrote: a later sync over the open page keeps every texel that differs
++//! from the snapshot ([`Coherent::merge`]). A GPU copy back over an open page cannot merge, so
++//! [`Coherent::before_flush`] waits for the records, a bounded time, and syncs on the CPU; past
++//! the bound it counts `overwrite_risk`. Writing also demotes the surface to the shadow's own keep
++//! and merge.
++//!
++//! **The next command's copy in** takes the open pages' rectangle alone, and holds them first, so
++//! a later write opens them again ([`Coherent::taking`]).
++//!
++//! **Adaptive**: a surface synced in more than `surface_coherent_demote_pct` percent of a window of
++//! its frames, or more than `surface_coherent_demote_hz` times a second (a Simulator's per-frame
++//! reader), goes back to a copy back per frame for `surface_coherent_hold_s` seconds, doubling to
++//! [`HOLD_MAX_S`] while it keeps coming back.
++//!
++//! **Unmap** ([`unmapping`]) syncs, while the pages are still the guest's, and lets go of what
++//! pending writes hold; a surface with work running answers busy, as any surface with a command
++//! running over it does. Nothing is pooled across surfaces: each image is its texture's.
++//!
++//! The report ([`report`]) gives per surface what detection, sync and fetch cost per present,
++//! beside what the copies they replace would have.
++
++use super::shadow::bounding;
++use super::shadow_lazy::Lazy;
++use std::collections::{BTreeMap, HashSet};
++use std::ops::Range;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
++use std::time::{Duration, Instant};
++
++/// The live switch.
++const SWITCH: &str = "surface_coherent";
++/// The display samples a surface's image instead of its pages.
++const DISPLAY: &str = "surface_coherent_display";
++pub(crate) const PAGE: u64 = 4096;
++const HOLD_MAX_S: u64 = 30;
++/// Records apart at most: past it the done ones join, as the image holds every texel between.
++const RECORDS: usize = 8;
++const PROBE_GIVEN_UP: Duration = Duration::from_millis(1);
++const DEFAULT_WAIT_MS: u64 = 50;
++/// The closed surfaces' lines kept between reports.
++const ENDED_KEPT: usize = 256;
++/// A GPU copy of a surface, per MiB: 2.97 ms for 5.76 Mtexels of 4 bytes (`STUDY-virt.md`).
++const DEFAULT_COPY_NS_PER_MIB: u64 = 135_000;
++
++/// What marks a surface's pages. Addresses are the surface's own mapping's, whole pages, ascending,
++/// one surface to a call; each call comes under the surface's lock, which [`fault`] takes.
++pub trait Pages: Send + Sync {
++    /// Every page held from now on: whether it can be, this surface.
++    fn track(&self, start: u64, len: u64) -> bool;
++    /// Every marker off the surface around `start`.
++    fn untrack(&self, start: u64);
++    /// Held pages armed: the next access traps. Others stay. The pages a CPU reached as their
++    /// markers moved come back, still held, and they may hold a write: the caller has them.
++    fn arm(&self, pages: &[u64]) -> Vec<u64>;
++    /// Armed pages, and open ones with `open_too`, held; the pages a CPU may have reached as the
++    /// markers moved come back.
++    fn hold(&self, pages: &[u64], open_too: bool) -> Vec<u64>;
++    /// A held page opened to the guest's write.
++    fn open(&self, page: u64);
++    /// Open pages poisoned, while a sync merges into them.
++    fn freeze(&self, pages: &[u64]);
++    /// Frozen pages open again.
++    fn thaw(&self, pages: &[u64]);
++}
++
++static PAGES: RwLock<Option<Arc<dyn Pages>>> = RwLock::new(None);
++
++/// The last words of the surfaces that went since the last report.
++fn ended() -> &'static Mutex<Vec<String>> {
++    static ENDED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
++    ENDED.get_or_init(Mutex::default)
++}
++
++/// Every tracked surface, by which a fault finds its own.
++fn all() -> &'static RwLock<Vec<Arc<Coherent>>> {
++    static ALL: OnceLock<RwLock<Vec<Arc<Coherent>>>> = OnceLock::new();
++    ALL.get_or_init(RwLock::default)
++}
++
++/// Install what marks the pages (one call at start, a lane's `None` after).
++pub fn set_pages(pages: Option<Arc<dyn Pages>>) {
++    *PAGES.write().unwrap() = pages;
++}
++
++fn pages() -> Option<Arc<dyn Pages>> {
++    PAGES.read().unwrap().clone()
++}
++
++/// Whether a surface made now traps.
++pub(crate) fn enabled() -> bool {
++    crate::live::on(SWITCH, false) && PAGES.read().unwrap().is_some()
++}
++
++fn knob(name: &str, default: u64) -> u64 {
++    crate::live::get(name).and_then(|v| v.parse().ok()).unwrap_or(default)
++}
++
++/// Copies an image's rectangle `[x0, y0, x1, y1)` to bytes laid out in rows of the given texels,
++/// on the host: whether it did.
++pub(crate) type Reader = Box<dyn Fn([u32; 4], *mut u8, u32) -> bool + Send + Sync>;
++
++/// A surface's texels in host pages.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Layout {
++    /// The host address of the first texel's byte.
++    pub(crate) base: u64,
++    pub(crate) row: u64,
++    pub(crate) texel: u64,
++    pub(crate) width: u32,
++    pub(crate) height: u32,
++}
++
++impl Layout {
++    fn whole(&self) -> [u32; 4] {
++        [0, 0, self.width, self.height]
++    }
++
++    fn first_page(&self) -> u64 {
++        self.base & !(PAGE - 1)
++    }
++
++    fn end(&self) -> u64 {
++        (self.base + self.row * u64::from(self.height)).next_multiple_of(PAGE)
++    }
++
++    /// The pages `area`'s texels lie in, ascending.
++    fn pages_of(&self, area: [u32; 4]) -> Vec<u64> {
++        let [x0, y0, x1, y1] = area;
++        let mut found = Vec::new();
++        if x0 >= x1 || y0 >= y1 {
++            return found;
++        }
++        let (x0, x1) = (u64::from(x0) * self.texel, u64::from(x1) * self.texel);
++        let mut last = None;
++        for y in u64::from(y0)..u64::from(y1) {
++            let row = self.base + y * self.row;
++            let (first, end) = ((row + x0) & !(PAGE - 1), row + x1);
++            let mut page = first;
++            while page < end {
++                if last.is_none_or(|last| page > last) {
++                    found.push(page);
++                    last = Some(page);
++                }
++                page += PAGE;
++            }
++        }
++        found
++    }
++
++    /// The rectangle of every texel of the row-spans `page` holds any byte of.
++    fn area_of(&self, page: u64) -> Option<[u32; 4]> {
++        let start = page.max(self.base) - self.base;
++        let end = (page + PAGE).checked_sub(self.base)?.min(self.row * u64::from(self.height));
++        (start < end).then(|| {
++            let (y0, y1) = (start / self.row, (end - 1) / self.row + 1);
++            let (x0, x1) = match y1 - y0 {
++                1 => (
++                    (start % self.row / self.texel).min(u64::from(self.width)),
++                    ((end - 1) % self.row / self.texel + 1).min(u64::from(self.width)),
++                ),
++                _ => (0, u64::from(self.width)),
++            };
++            [x0 as u32, y0 as u32, x1 as u32, y1 as u32]
++        })
++    }
++
++    fn at(&self, x: u32, y: u32) -> u64 {
++        self.base + u64::from(y) * self.row + u64::from(x) * self.texel
++    }
++}
++
++fn meet(a: [u32; 4], b: [u32; 4]) -> bool {
++    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
++}
++
++fn holds(outer: [u32; 4], inner: [u32; 4]) -> bool {
++    outer[0] <= inner[0] && outer[1] <= inner[1] && inner[2] <= outer[2] && inner[3] <= outer[3]
++}
++
++fn texels(area: [u32; 4]) -> u64 {
++    u64::from(area[2] - area[0]) * u64::from(area[3] - area[1])
++}
++
++/// One write left in the image.
++#[derive(Clone, Copy, Debug)]
++struct Record {
++    /// The command buffer's identity (`shadow::ShadowCarry::id`), 0 once several joined.
++    id: u64,
++    /// Its place among records committed: what a GPU copy back moved it by.
++    seq: u64,
++    area: [u32; 4],
++}
++
++/// One surface's counts.
++#[derive(Default)]
++struct Counts {
++    presents: AtomicU64,
++    defers: AtomicU64,
++    /// Bytes the encoders left ahead: what a copy back per encoder would have moved.
++    deferred_bytes: AtomicU64,
++    traps: AtomicU64,
++    writes: AtomicU64,
++    unique_pages: AtomicU64,
++    regions: AtomicU64,
++    bytes_detiled: AtomicU64,
++    sync_ns: AtomicU64,
++    trap_ns: AtomicU64,
++    trap_ns_max: AtomicU64,
++    timed: AtomicU64,
++    arm_ns: AtomicU64,
++    arms: AtomicU64,
++    hold_ns: AtomicU64,
++    demotions: AtomicU64,
++    eager: AtomicU64,
++    merges: AtomicU64,
++    came: AtomicU64,
++    flushes: AtomicU64,
++    flushed_bytes: AtomicU64,
++    copy_ins: AtomicU64,
++    copy_in_bytes: AtomicU64,
++    probes: AtomicU64,
++    overwrite_risk: AtomicU64,
++    sync_errors: AtomicU64,
++}
++
++#[derive(Default)]
++struct State {
++    /// The surface's pages are marked.
++    tracked: bool,
++    /// Not trapping any more: the switch went off, a fuse, a reset, an unmap.
++    closed: bool,
++    open: Vec<Record>,
++    running: Vec<Record>,
++    done: Vec<Record>,
++    /// Records of a sequence up to this went back by a GPU copy that completed.
++    flushed_to: u64,
++    /// A GPU copy back in flight, up to this sequence: 0 for none.
++    flushing: u64,
++    seq: u64,
++    /// Rectangles whose pages are armed: nothing to do for what one holds.
++    armed: Vec<[u32; 4]>,
++    /// A probe armed every held page: the next fault holds them again.
++    /// Probes whose write has not named its page yet, and when the last began. A probe of another
++    /// surface's write leaves this one's count up, and `PROBE_GIVEN_UP` ends it.
++    probing: u32,
++    probed_at: Option<Instant>,
++    /// Where the guest's CPU wrote, which the image misses.
++    guest: Option<[u32; 4]>,
++    /// Each open page, as it was before the guest's write.
++    snapshots: BTreeMap<u64, Box<[u8]>>,
++    frozen: Vec<u64>,
++    /// When the last write was: the surface keeps and merges for the hold after it.
++    wrote_at: Option<Instant>,
++    /// Copies back per frame until then.
++    eager_until: Option<Instant>,
++    hold_s: u64,
++    window_start: Option<Instant>,
++    window_defers: u64,
++    window_syncs: u64,
++    seen: HashSet<u64>,
++}
++
++/// A surface's trap coherence, beside its [`Lazy`].
++pub(crate) struct Coherent {
++    state: Mutex<State>,
++    /// Tells [`Coherent::wait_settled`] a record moved.
++    moved: Condvar,
++    layout: Layout,
++    read: Reader,
++    lazy: Weak<Lazy>,
++    counts: Counts,
++    made: Instant,
++}
++
++impl Coherent {
++    pub(crate) fn new(layout: Layout, read: Reader, lazy: Weak<Lazy>) -> Arc<Coherent> {
++        Arc::new(Coherent {
++            state: Mutex::default(),
++            moved: Condvar::new(),
++            layout,
++            read,
++            lazy,
++            counts: Counts::default(),
++            made: Instant::now(),
++        })
++    }
++
++    fn lock(&self) -> MutexGuard<'_, State> {
++        self.state.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    /// Whether it still answers for its pages.
++    pub(crate) fn is_live(&self) -> bool {
++        !self.lock().closed
++    }
++
++    pub(crate) fn range(&self) -> Range<u64> {
++        self.layout.first_page()..self.layout.end()
++    }
++
++    fn all_pages(&self) -> Vec<u64> {
++        (self.range().step_by(PAGE as usize)).collect()
++    }
++
++    /// Whether the surface traps now, tracking it at its first use: its pages are held before any
++    /// copy in reads them, so nothing the guest writes after that goes unseen.
++    pub(crate) fn tracks(self: &Arc<Self>) -> bool {
++        let mut state = self.lock();
++        if state.closed {
++            return false;
++        }
++        if state.tracked {
++            return true;
++        }
++        let range = self.range();
++        let live = crate::live::on(SWITCH, false);
++        let marked = pages().is_some_and(|p| live && p.track(range.start, range.end - range.start));
++        if !marked {
++            state.closed = true;
++            return false;
++        }
++        state.tracked = true;
++        all().write().unwrap().push(self.clone());
++        true
++    }
++
++    /// Whether it writes back as a shadow keeping and merging: a CPU write came lately.
++    pub(crate) fn wants_merge(&self) -> bool {
++        let state = self.lock();
++        state.tracked && !state.closed && state.wrote_at.is_some_and(|at| at.elapsed() < self.hold())
++    }
++
++    fn hold(&self) -> Duration {
++        Duration::from_secs(knob("surface_coherent_hold_s", 2))
++    }
++
++    /// Whether an encoder of `id` leaves `area` ahead; if so it is recorded.
++    pub(crate) fn defers(&self, id: u64, area: Option<[u32; 4]>) -> bool {
++        let mut state = self.lock();
++        if state.closed || !state.tracked {
++            return false;
++        }
++        let now = Instant::now();
++        state.window_defers += 1;
++        self.roll_window(&mut state, now);
++        match state.eager_until {
++            Some(until) if now < until => {
++                self.counts.eager.fetch_add(1, Ordering::Relaxed);
++                return false;
++            }
++            Some(_) => state.eager_until = None,
++            None => {}
++        }
++        if state.wrote_at.is_some_and(|at| at.elapsed() < self.hold()) {
++            return false;
++        }
++        let whole = self.layout.whole();
++        let area = area.unwrap_or(whole);
++        match state.open.iter_mut().find(|record| record.id == id) {
++            Some(record) => {
++                let joined = bounding(Some(record.area), Some(area));
++                record.area = joined.unwrap_or(whole);
++            }
++            None => state.open.push(Record { id, seq: 0, area }),
++        }
++        self.counts.defers.fetch_add(1, Ordering::Relaxed);
++        let bytes = texels(area) * self.layout.texel;
++        self.counts.deferred_bytes.fetch_add(bytes, Ordering::Relaxed);
++        true
++    }
++
++    /// The window of frames closes: too many syncs in it send the surface back to copies per frame.
++    fn roll_window(&self, state: &mut State, now: Instant) {
++        let start = *state.window_start.get_or_insert(now);
++        let frames = knob("surface_coherent_demote_window", 32);
++        let elapsed = now.duration_since(start);
++        if state.window_defers < frames && elapsed < Duration::from_secs(1) {
++            return;
++        }
++        let pct = knob("surface_coherent_demote_pct", 50);
++        let hz = knob("surface_coherent_demote_hz", 64);
++        let by_frames = state.window_defers >= frames
++            && state.window_syncs * 100 >= state.window_defers * pct;
++        let by_rate = state.window_syncs as f64 >= hz as f64 * elapsed.as_secs_f64().max(0.25);
++        if by_frames || by_rate {
++            self.demote(state, now);
++        }
++        state.window_start = Some(now);
++        state.window_defers = 0;
++        state.window_syncs = 0;
++        state.seen.clear();
++    }
++
++    fn demote(&self, state: &mut State, now: Instant) {
++        let last = state.eager_until;
++        let first = knob("surface_coherent_hold_s", 2).max(1);
++        state.hold_s = match last {
++            Some(until) if now < until + Duration::from_secs(state.hold_s.max(first)) => {
++                (state.hold_s * 2).clamp(first, HOLD_MAX_S)
++            }
++            _ => first,
++        };
++        state.eager_until = Some(now + Duration::from_secs(state.hold_s));
++        self.counts.demotions.fetch_add(1, Ordering::Relaxed);
++        // What is pending goes now, and what is running at its completion.
++        self.sync_done(state);
++    }
++
++    /// The commit of `id` returned: its record may go back by a copy ordered after it.
++    pub(crate) fn committed(&self, id: u64) {
++        let mut state = self.lock();
++        if let Some(at) = state.open.iter().position(|record| record.id == id) {
++            let mut record = state.open.swap_remove(at);
++            state.seq += 1;
++            record.seq = state.seq;
++            state.running.push(record);
++        }
++        self.settle_pending(&state);
++    }
++
++    /// The command buffer `id` is done, before anything tells the guest: its pages trap from here.
++    pub(crate) fn completing(&self, id: u64) {
++        let mut state = self.lock();
++        let found = match state.running.iter().position(|record| record.id == id) {
++            Some(at) => Some(state.running.swap_remove(at)),
++            // Its commit has not returned yet.
++            None => (state.open.iter().position(|record| record.id == id)).map(|at| {
++                let mut record = state.open.swap_remove(at);
++                state.seq += 1;
++                record.seq = state.seq;
++                record
++            }),
++        };
++        if let Some(record) = found {
++            if record.seq > state.flushed_to {
++                self.finish_record(&mut state, record);
++            }
++            self.moved.notify_all();
++        }
++        self.settle_pending(&state);
++    }
++
++    fn finish_record(&self, state: &mut State, record: Record) {
++        if state.closed || !state.tracked {
++            return;
++        }
++        if state.done.len() >= RECORDS {
++            let mut joined = record;
++            for other in state.done.drain(..) {
++                joined.area = bounding(Some(joined.area), Some(other.area)).unwrap_or(joined.area);
++                joined.seq = joined.seq.max(other.seq);
++                joined.id = 0;
++            }
++            state.done.push(joined);
++        } else {
++            state.done.push(record);
++        }
++        let Some(pages_mark) = pages() else {
++            return;
++        };
++        if state.eager_until.is_some_and(|until| Instant::now() < until) {
++            self.sync_done(state);
++            return;
++        }
++        if state.armed.iter().any(|armed| holds(*armed, record.area)) {
++            return;
++        }
++        let start = Instant::now();
++        let list = self.layout.pages_of(record.area);
++        let refused = pages_mark.arm(&list);
++        // A page the guest wrote takes the rectangle too, by the merge.
++        let open: Vec<u64> = (state.snapshots.keys())
++            .filter(|page| list.binary_search(page).is_ok())
++            .copied()
++            .collect();
++        if !open.is_empty() {
++            pages_mark.freeze(&open);
++            state.frozen.extend(open);
++            state.frozen.sort_unstable();
++            state.frozen.dedup();
++        }
++        if state.armed.len() == RECORDS {
++            state.armed.clear();
++        }
++        state.armed.push(record.area);
++        let spent = start.elapsed().as_nanos() as u64;
++        self.counts.arm_ns.fetch_add(spent, Ordering::Relaxed);
++        self.counts.arms.fetch_add(1, Ordering::Relaxed);
++        // No trap comes for these: the sync is now, before anyone hears of this completion. A CPU
++        // write in the rectangle raced the GPU's; one beside it stays, and the image takes it.
++        if !refused.is_empty() {
++            self.sync_done(state);
++            self.note_came(state, refused);
++        }
++    }
++
++    /// Copy every done rectangle into the pages, and hold them.
++    fn sync_done(&self, state: &mut State) {
++        if state.done.is_empty() {
++            self.thaw_all(state);
++            return;
++        }
++        let Some(pages_mark) = pages() else {
++            return;
++        };
++        let start = Instant::now();
++        let done = std::mem::take(&mut state.done);
++        let mut list = Vec::new();
++        for record in &done {
++            let area = record.area;
++            let moved = match state.snapshots.is_empty() {
++                true => self.detile(area),
++                false => self.merge(state, &pages_mark, area),
++            };
++            if !moved {
++                self.counts.sync_errors.fetch_add(1, Ordering::Relaxed);
++                eprintln!("surface_coherent: a sync of {area:?} failed");
++            }
++            self.counts.regions.fetch_add(1, Ordering::Relaxed);
++            let bytes = texels(area) * self.layout.texel;
++            self.counts.bytes_detiled.fetch_add(bytes, Ordering::Relaxed);
++            list.extend(self.layout.pages_of(area));
++        }
++        state.window_syncs += 1;
++        list.sort_unstable();
++        list.dedup();
++        self.thaw_all(state);
++        let held = Instant::now();
++        let came = pages_mark.hold(&list, false);
++        self.counts.hold_ns.fetch_add(held.elapsed().as_nanos() as u64, Ordering::Relaxed);
++        self.note_came(state, came);
++        state.armed.clear();
++        let spent = start.elapsed().as_nanos() as u64;
++        self.counts.sync_ns.fetch_add(spent, Ordering::Relaxed);
++        self.settle_pending(state);
++    }
++
++    /// A page the guest reached as its markers moved may hold a write: the image takes it again.
++    fn note_came(&self, state: &mut State, came: Vec<u64>) {
++        self.counts.came.fetch_add(came.len() as u64, Ordering::Relaxed);
++        for page in came {
++            if let Some(area) = self.layout.area_of(page) {
++                state.guest = Some(match state.guest {
++                    Some(guest) => bounding(Some(guest), Some(area)).unwrap_or(guest),
++                    None => area,
++                });
++            }
++        }
++    }
++
++    fn thaw_all(&self, state: &mut State) {
++        if !state.frozen.is_empty() {
++            if let Some(pages_mark) = pages() {
++                pages_mark.thaw(&state.frozen);
++            }
++            state.frozen.clear();
++        }
++    }
++
++    fn detile(&self, area: [u32; 4]) -> bool {
++        let to = self.layout.at(area[0], area[1]) as *mut u8;
++        (self.read)(area, to, (self.layout.row / self.layout.texel) as u32)
++    }
++
++    /// `area` into the pages, keeping what the guest wrote in open pages: every texel of them that
++    /// differs from the page's snapshot. Those pages stay frozen meanwhile, and the snapshot takes
++    /// the texels the sync moved.
++    fn merge(&self, state: &mut State, pages_mark: &Arc<dyn Pages>, area: [u32; 4]) -> bool {
++        let [x0, y0, x1, y1] = area;
++        let texel = self.layout.texel as usize;
++        let (width, height) = ((x1 - x0) as usize, (y1 - y0) as usize);
++        let row = width * texel;
++        let mut scratch = vec![0u8; row * height];
++        if !(self.read)(area, scratch.as_mut_ptr(), width as u32) {
++            return false;
++        }
++        let list = self.layout.pages_of(area);
++        let opened: Vec<u64> = (state.snapshots.keys())
++            .filter(|page| list.binary_search(page).is_ok() && !state.frozen.contains(page))
++            .copied()
++            .collect();
++        pages_mark.freeze(&opened);
++        state.frozen.extend(&opened);
++        state.frozen.sort_unstable();
++        self.counts.merges.fetch_add(1, Ordering::Relaxed);
++        for (y, line) in (y0..y1).zip(scratch.chunks_exact(row)) {
++            for (x, source) in (x0..x1).zip(line.chunks_exact(texel)) {
++                let at = self.layout.at(x, y);
++                // SAFETY: `at` lies in the surface's mapping, whole texels of it; the guest's CPU
++                // does not reach a frozen page, and a page with no snapshot is armed or held.
++                unsafe {
++                    let bytes = std::slice::from_raw_parts_mut(at as *mut u8, texel);
++                    let page = at & !(PAGE - 1);
++                    let offset = (at - page) as usize;
++                    match state.snapshots.get_mut(&page) {
++                        Some(snapshot) => {
++                            let was = &mut snapshot[offset..(offset + texel).min(PAGE as usize)];
++                            if bytes[..was.len()] == *was {
++                                bytes[..was.len()].copy_from_slice(&source[..was.len()]);
++                                was.copy_from_slice(&source[..was.len()]);
++                            }
++                        }
++                        None => bytes.copy_from_slice(source),
++                    }
++                }
++            }
++        }
++        true
++    }
++
++    /// Wait, with the lock let go, until no GPU copy back runs and, with `area`, no record it
++    /// overlaps does, or the bound: whether none does. The caller stopped a vCPU or an encoder, and
++    /// nothing it holds blocks the GPU.
++    fn wait_settled<'a>(
++        &'a self,
++        mut state: MutexGuard<'a, State>,
++        area: Option<[u32; 4]>,
++    ) -> (MutexGuard<'a, State>, bool) {
++        let until = Instant::now() + Duration::from_millis(knob("surface_coherent_wait_ms", DEFAULT_WAIT_MS));
++        loop {
++            let overlaps = |area| state.running.iter().any(|record| meet(record.area, area));
++            let busy = state.flushing != 0 || area.is_some_and(overlaps);
++            if !busy {
++                return (state, true);
++            }
++            let left = until.saturating_duration_since(Instant::now());
++            if left.is_zero() {
++                return (state, false);
++            }
++            let (guard, _) = self.moved.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner());
++            state = guard;
++        }
++    }
++
++    /// The guest touched `page`.
++    fn fault(&self, page: u64, write: bool) {
++        let mut state = self.lock();
++        if !state.tracked {
++            return;
++        }
++        self.counts.traps.fetch_add(1, Ordering::Relaxed);
++        if state.seen.insert(page) {
++            self.counts.unique_pages.fetch_add(1, Ordering::Relaxed);
++        }
++        self.sync_done(&mut state);
++        let mark = pages();
++        // Another vCPU's probe may be about to rerun on these pages: only the last of them, which
++        // lets it name its page, ends the probing.
++        let over = state.probed_at.is_some_and(|at| at.elapsed() >= PROBE_GIVEN_UP);
++        if state.probing > 0 && (over || (write && state.probing == 1)) {
++            state.probing = 0;
++            state.probed_at = None;
++            if let Some(mark) = &mark {
++                let came = mark.hold(&self.all_pages(), false);
++                self.note_came(&mut state, came);
++            }
++            state.armed.clear();
++        } else if write {
++            state.probing = state.probing.saturating_sub(1);
++        }
++        if !write {
++            if let Some(mark) = &mark {
++                let came = mark.hold(&[page], false);
++                self.note_came(&mut state, came);
++            }
++            return;
++        }
++        self.counts.writes.fetch_add(1, Ordering::Relaxed);
++        if let Some(area) = self.layout.area_of(page) {
++            // A running write needs no wait: the merge at its completion keeps this one. A GPU
++            // copy back already on its way cannot merge.
++            let (settled, clear) = self.wait_settled(state, None);
++            state = settled;
++            self.sync_done(&mut state);
++            if !clear {
++                self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            }
++            state.guest = Some(match state.guest {
++                Some(guest) => bounding(Some(guest), Some(area)).unwrap_or(guest),
++                None => area,
++            });
++        }
++        state.wrote_at = Some(Instant::now());
++        if !state.snapshots.contains_key(&page) {
++            // SAFETY: the page lies in the surface's mapping; the guest's write stopped before it.
++            let was = unsafe { std::slice::from_raw_parts(page as *const u8, PAGE as usize) };
++            state.snapshots.insert(page, was.into());
++        }
++        if let Some(mark) = &mark {
++            mark.hold(&[page], false);
++            mark.open(page);
++        }
++    }
++
++    /// An encoder is about to use the image: where the guest wrote is stale in it, and comes back
++    /// for this command's copy in. With no standing (`whole`) the copy in reads every texel. The
++    /// pages hold everything done first, and are held before the copy in can read them.
++    pub(crate) fn taking(&self, whole: bool) -> Option<[u32; 4]> {
++        let mut state = self.lock();
++        if !state.tracked {
++            return None;
++        }
++        if !whole && state.guest.is_none() {
++            return None;
++        }
++        let mut stale = state.guest;
++        if whole {
++            stale = Some(self.layout.whole());
++        }
++        if let Some(area) = stale {
++            // The copy in runs after what is running here, and reads pages that lack it: a running
++            // write's texels must reach the pages first. Over no CPU write, a refused standing's
++            // copy back (`shadow_lazy::met_by`) does that without a wait.
++            if !state.snapshots.is_empty() {
++                let (settled, clear) = self.wait_settled(state, Some(area));
++                state = settled;
++                if !clear {
++                    self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++            self.sync_done(&mut state);
++            let list: Vec<u64> = state.snapshots.keys().copied().collect();
++            if let Some(mark) = pages() {
++                let came = mark.hold(&list, true);
++                state.guest = None;
++                self.note_came(&mut state, came);
++            }
++            state.snapshots.clear();
++            if whole {
++                state.guest = None;
++            }
++        }
++        stale
++    }
++
++    /// A GPU copy back of what ran is about to record: everything done went on the CPU, and what
++    /// is still running goes by the copy, up to the sequence given. `None` where nothing runs. The
++    /// lock is not held while it records.
++    pub(crate) fn before_flush(&self) -> Option<u64> {
++        let mut state = self.lock();
++        self.sync_done(&mut state);
++        if state.running.is_empty() {
++            return None;
++        }
++        if !state.snapshots.is_empty() {
++            let area = state.guest.unwrap_or(self.layout.whole());
++            let (settled, clear) = self.wait_settled(state, Some(area));
++            state = settled;
++            self.sync_done(&mut state);
++            if state.running.is_empty() {
++                return None;
++            }
++            if !clear {
++                self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++        let through = state.seq;
++        state.flushing = through;
++        Some(through)
++    }
++
++    /// The copy back of everything up to `through`, of `bytes`, recorded and committed.
++    pub(crate) fn flush_recorded(&self, bytes: u64) {
++        self.counts.flushes.fetch_add(1, Ordering::Relaxed);
++        self.counts.flushed_bytes.fetch_add(bytes, Ordering::Relaxed);
++    }
++
++    /// The copy back was not made after all.
++    pub(crate) fn flush_failed(&self) {
++        self.lock().flushing = 0;
++        self.moved.notify_all();
++    }
++
++    /// That copy back completed.
++    pub(crate) fn flushed(&self, through: u64) {
++        let mut state = self.lock();
++        if state.flushing == through {
++            state.flushing = 0;
++        }
++        state.flushed_to = state.flushed_to.max(through);
++        let (gone, kept): (Vec<_>, Vec<_>) = state.done.iter().partition(|r| r.seq <= through);
++        state.done = kept;
++        if let Some(mark) = pages() {
++            let mut list: Vec<u64> =
++                gone.iter().flat_map(|record| self.layout.pages_of(record.area)).collect();
++            list.sort_unstable();
++            list.dedup();
++            let still: Vec<u64> = (state.done.iter())
++                .flat_map(|record| self.layout.pages_of(record.area))
++                .collect();
++            list.retain(|page| !still.contains(page));
++            if !list.is_empty() {
++                let came = mark.hold(&list, false);
++                self.note_came(&mut state, came);
++                state.armed.clear();
++            }
++        }
++        self.moved.notify_all();
++        self.settle_pending(&state);
++    }
++
++    /// A probe: every held page armed, so the write that started it names its page.
++    fn probe(&self) {
++        let mut state = self.lock();
++        if !state.tracked || state.closed {
++            return;
++        }
++        state.probing += 1;
++        state.probed_at = Some(Instant::now());
++        self.counts.probes.fetch_add(1, Ordering::Relaxed);
++        if let Some(mark) = pages() {
++            let refused = mark.arm(&self.all_pages());
++            self.note_came(&mut state, refused);
++        }
++    }
++
++    /// Everything done into the pages and the markers off: it goes on as `surface_lazy_present`
++    /// alone, what is running copied back by the clock.
++    pub(crate) fn abandon(&self) {
++        let mut state = self.lock();
++        self.sync_done(&mut state);
++        self.close(&mut state, true);
++    }
++
++    fn close(&self, state: &mut State, untrack: bool) {
++        state.closed = true;
++        if state.tracked {
++            state.tracked = false;
++            if let (true, Some(mark)) = (untrack, pages()) {
++                mark.untrack(self.layout.first_page());
++            }
++            let me = std::ptr::from_ref(self);
++            all().write().unwrap().retain(|other| !std::ptr::eq(Arc::as_ptr(other), me));
++        }
++        state.done.clear();
++        state.snapshots.clear();
++        state.frozen.clear();
++        self.moved.notify_all();
++        if self.counts.defers.load(Ordering::Relaxed) + self.counts.traps.load(Ordering::Relaxed) > 0 {
++            let mut ended = ended().lock().unwrap_or_else(|e| e.into_inner());
++            if ended.len() < ENDED_KEPT {
++                ended.push(self.line("closed", state));
++            }
++        }
++    }
++
++    /// Before an unmap: whether it may go on. Everything done goes to the pages while they are
++    /// still the guest's, and what the pending writes hold goes, so the surface's references fall;
++    /// a surface with work running stays busy.
++    fn unmapping(&self) -> bool {
++        let mut state = self.lock();
++        self.sync_done(&mut state);
++        if !state.running.is_empty() || state.flushing != 0 {
++            return false;
++        }
++        state.open.clear();
++        self.settle_pending(&state);
++        true
++    }
++
++    /// Whether writes are pending in records yet: the texture's image must live on.
++    fn has_records(&self, state: &State) -> bool {
++        !(state.open.is_empty() && state.running.is_empty() && state.done.is_empty())
++    }
++
++    /// What the plain path's [`Lazy`] holds of this: the bounding rectangle of what ran.
++    fn settle_pending(&self, state: &State) {
++        let Some(lazy) = self.lazy.upgrade() else {
++            return;
++        };
++        let mut settled = None;
++        for record in state.running.iter().chain(&state.done) {
++            settled = Some(match settled {
++                Some(area) => bounding(Some(area), Some(record.area)).unwrap_or(area),
++                None => record.area,
++            });
++        }
++        lazy.settled_coherently(settled, self.has_records(state));
++    }
++
++    pub(crate) fn copied_in(&self, texels: u64) {
++        self.counts.copy_ins.fetch_add(1, Ordering::Relaxed);
++        let bytes = texels * self.layout.texel;
++        self.counts.copy_in_bytes.fetch_add(bytes, Ordering::Relaxed);
++    }
++
++    /// A present: whether the display may sample the image instead of the pages.
++    pub(crate) fn presented(&self) -> bool {
++        self.counts.presents.fetch_add(1, Ordering::Relaxed);
++        let state = self.lock();
++        state.tracked
++            && !state.closed
++            && state.eager_until.is_none_or(|until| Instant::now() >= until)
++            && crate::live::on(DISPLAY, true)
++    }
++
++    fn timed(&self, ns: u64) {
++        self.counts.trap_ns.fetch_add(ns, Ordering::Relaxed);
++        self.counts.timed.fetch_add(1, Ordering::Relaxed);
++        self.counts.trap_ns_max.fetch_max(ns, Ordering::Relaxed);
++    }
++
++    fn line(&self, label: &str, state: &State) -> String {
++        let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
++        let c = &self.counts;
++        let copy = knob("surface_coherent_copy_ns_per_mib", DEFAULT_COPY_NS_PER_MIB) as f64;
++        let by_gpu = |bytes: u64| bytes as f64 / (1 << 20) as f64 * copy;
++        let presents = read(&c.presents).max(1) as f64;
++        let trap = read(&c.trap_ns) as f64;
++        let sync = read(&c.sync_ns) as f64;
++        let detect = (read(&c.arm_ns) as f64 + (trap - sync).max(0.0)) / presents;
++        let sync = sync / presents;
++        let fetch = by_gpu(read(&c.copy_in_bytes) + read(&c.flushed_bytes)) / presents;
++        let eager = by_gpu(read(&c.deferred_bytes)) / presents;
++        let total = detect + sync + fetch;
++        let seconds = self.made.elapsed().as_secs_f64().max(0.001);
++        format!(
++            "{{\"label\":\"{label}\",\"at\":\"{:#x}\",\"w\":{},\"h\":{},\"tracked\":{},\"closed\":{},\
++             \"presents\":{},\"defers\":{},\"traps\":{},\"writes\":{},\"unique_pages\":{},\
++             \"traps_per_s\":{:.2},\"regions\":{},\"bytes_detiled\":{},\"sync_ns\":{},\
++             \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
++             \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
++             \"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
++             \"overwrite_risk\":{},\"sync_errors\":{},\"pending_done\":{},\"open_pages\":{},\
++             \"per_present_ns\":{{\"detect\":{detect:.0},\"sync\":{sync:.0},\"fetch\":{fetch:.0},\
++             \"total\":{total:.0},\"eager_would\":{eager:.0}}},\"pays\":{}}}\n",
++            self.layout.first_page(),
++            self.layout.width,
++            self.layout.height,
++            state.tracked,
++            state.closed,
++            read(&c.presents),
++            read(&c.defers),
++            read(&c.traps),
++            read(&c.writes),
++            read(&c.unique_pages),
++            read(&c.traps) as f64 / seconds,
++            read(&c.regions),
++            read(&c.bytes_detiled),
++            read(&c.sync_ns),
++            read(&c.trap_ns),
++            read(&c.trap_ns_max),
++            read(&c.timed),
++            read(&c.arm_ns),
++            read(&c.arms),
++            read(&c.hold_ns),
++            read(&c.demotions),
++            read(&c.eager),
++            read(&c.merges),
++            read(&c.came),
++            read(&c.probes),
++            read(&c.flushes),
++            read(&c.flushed_bytes),
++            read(&c.copy_ins),
++            read(&c.copy_in_bytes),
++            read(&c.overwrite_risk),
++            read(&c.sync_errors),
++            state.done.len(),
++            state.snapshots.len(),
++            total < eager,
++        )
++    }
++}
++
++fn find(addr: u64) -> Option<Arc<Coherent>> {
++    (all().read().unwrap().iter()).find(|one| one.range().contains(&addr)).cloned()
++}
++
++fn tracked() -> Vec<Arc<Coherent>> {
++    all().read().unwrap().clone()
++}
++
++/// The guest touched the page at `addr`, of a surface's mapping: answered once its bytes are
++/// current. A write leaves it open.
++pub fn fault(addr: u64, write: bool) {
++    let page = addr & !(PAGE - 1);
++    match find(addr) {
++        Some(surface) => surface.fault(page, write),
++        None => {
++            if let Some(mark) = pages() {
++                mark.untrack(addr);
++            }
++        }
++    }
++}
++
++/// From a stop at `addr` to the access's rerun.
++pub fn timed(addr: u64, ns: u64) {
++    if let Some(surface) = find(addr) {
++        surface.timed(ns);
++    }
++}
++
++/// A write hit a held page no one named: every held page armed, to name it.
++pub fn probe() {
++    for surface in tracked() {
++        surface.probe();
++    }
++}
++
++/// Everything back in its pages and untracked: the markers are about to go.
++pub fn abandon() {
++    for surface in tracked() {
++        surface.abandon();
++    }
++}
++
++/// The guest resets: every surface goes, nothing written. The vCPUs are stopped.
++pub fn reset() {
++    for surface in tracked() {
++        let mut state = surface.lock();
++        surface.close(&mut state, false);
++        state.running.clear();
++        state.open.clear();
++        surface.settle_pending(&state);
++    }
++}
++
++/// Before an unmap of the surface over `bytes`: whether it may go on (the module docs).
++pub fn unmapping(bytes: Range<u64>) -> bool {
++    tracked().iter().filter(|s| s.range().start < bytes.end && bytes.start < s.range().end).all(|s| s.unmapping())
++}
++
++/// The surface over `bytes` was unmapped: QEMU already dropped the marks.
++pub fn unmapped(bytes: Range<u64>) {
++    for surface in tracked() {
++        if surface.range().start < bytes.end && bytes.start < surface.range().end {
++            let mut state = surface.lock();
++            surface.close(&mut state, false);
++        }
++    }
++}
++
++/// Whether any surface is tracked, one lock: while none is, a completion does nothing here.
++pub(crate) fn surfaces_tracked() -> bool {
++    !all().read().unwrap().is_empty()
++}
++
++/// One line a surface: what [`Coherent::line`] says, under `label`. A surface that went comes once.
++pub fn report(label: &str) -> String {
++    let mut lines: String = std::mem::take(&mut *ended().lock().unwrap_or_else(|e| e.into_inner())).concat();
++    for surface in tracked() {
++        lines.push_str(&surface.line(label, &surface.lock()));
++    }
++    lines
++}
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 5aefa2df..64dd5ec4 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -81,18 +81,23 @@
+ //! `surface_lazy` alone keeps it unless a command buffer runs meanwhile.
+ //!
+ //! **A texture released while ahead** is not copied back where nothing else holds its image: its
+-//! pages may be another surface's by then.
++//! pages may be another surface's by then. Where they are not, a mapped surface's completed writes
++//! go missing here: this switch's stale bytes. `shadow_coherent.rs` keeps them until the unmap.
++//!
++//! **Under the switch `surface_coherent`** the surface's pages trap instead (`shadow_coherent.rs`):
++//! no clock, no copy back at a present or a later encoder, and exact news of a CPU write.
+ 
+ use super::command_buffer::CommandBuffer;
+ use super::device::Device;
+ use super::queue::CommandQueue;
+ use super::resource::ResourceKey;
+ use super::shadow::{bounding, CopyCause, ShadowCopies, ShadowCopy, Step};
++use super::shadow_coherent::{Coherent, Layout, Reader};
+ use super::tracker::{Summary, Use, UseRange};
+ use crate::exit_guard;
+ use std::any::Any;
+ use std::cell::Cell;
+-use std::collections::VecDeque;
++use std::collections::{HashSet, VecDeque};
+ use std::ops::Range;
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+@@ -201,6 +206,15 @@ fn surfaces() -> Vec<Arc<Lazy>> {
+         .collect()
+ }
+ 
++/// Where a standing's stale texels and the guest's writes join.
++fn bounding_stale(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
++    match (a, b) {
++        (Some(_), Some(_)) => bounding(a, b),
++        (a, None) => a,
++        (None, b) => b,
++    }
++}
++
+ /// Whether two ranges of host addresses share a byte.
+ fn meet(a: &Range<usize>, b: &Range<usize>) -> bool {
+     a.start < b.end && b.start < a.end
+@@ -217,6 +231,10 @@ pub(crate) fn remapped(bytes: Range<usize>) {
+     }
+     for lazy in surfaces() {
+         if lazy.over(&bytes) {
++            // The surface's mapping stays while a texture holds it: what is done still lands.
++            if let Some(coherent) = lazy.coherent() {
++                coherent.abandon();
++            }
+             lazy.written.fetch_add(1, Ordering::Relaxed);
+         }
+     }
+@@ -274,13 +292,41 @@ pub(crate) fn presented(bytes: impl Fn() -> Option<Range<usize>>) {
+             matched = true;
+             lazy.displayed.store(true, Ordering::Relaxed);
+             lazy.presents.fetch_add(1, Ordering::Relaxed);
+-            lazy.flush_once_committed();
++            // What traps needs no copy back for the display, which samples its image or its pages.
++            if lazy.coherent().is_none() {
++                lazy.flush_once_committed();
++            }
+         }
+     }
+     let count = if matched { &PRESENTS } else { &PRESENTS_UNMATCHED };
+     count.fetch_add(1, Ordering::Relaxed);
+ }
+ 
++/// The surface whose image the display may sample instead of the pages of `bytes`, under
++/// `surface_coherent`: a present copies nothing then. `Some` only where its image holds a standing
++/// a command buffer can take (the module docs), and it stays ordered through its own key.
++pub(crate) fn display_image(bytes: &Range<usize>) -> Option<Hold> {
++    if !ANY.load(Ordering::Relaxed) {
++        return None;
++    }
++    let lazy = surfaces().into_iter().find(|lazy| lazy.over(bytes))?;
++    let coherent = lazy.coherent()?;
++    let takes = coherent.presented() && lazy.standing_committed() && !lazy.beside_another();
++    takes.then(|| lazy.owner.get().and_then(Weak::upgrade)).flatten()
++}
++
++/// A command buffer completed, before its handlers: its writes in images trap from here.
++pub(crate) fn completing(id: u64) {
++    if !crate::shadow_coherent::surfaces_tracked() {
++        return;
++    }
++    for lazy in surfaces() {
++        if let Some(coherent) = lazy.coherent() {
++            coherent.completing(id);
++        }
++    }
++}
++
+ /// Whether any surface is lazy, one atomic read: while none is, a commit does nothing here.
+ pub(crate) fn active() -> bool {
+     ANY.load(Ordering::Relaxed)
+@@ -333,7 +379,16 @@ pub(crate) fn ahead() -> bool {
+ /// docs). A copy in is such a use, so its command buffer's own writes wait for its commit.
+ pub(crate) fn met_by(summaries: &[&Summary<ResourceKey>]) -> Vec<Arc<Lazy>> {
+     let mut met = Vec::new();
++    // Most surfaces stay ahead for good where the pages trap: their keys rule most of them out.
++    let keys: HashSet<ResourceKey> = (summaries.iter())
++        .flat_map(|s| s.all_uses().iter().map(|used| used.key))
++        .collect();
+     for lazy in surfaces() {
++        if !lazy.truth.get().is_some_and(|(key, alias, _)| {
++            keys.contains(key) || alias.is_some_and(|alias| keys.contains(&alias))
++        }) {
++            continue;
++        }
+         let settled = (lazy.pending.lock().unwrap().as_ref())
+             .is_some_and(|left| left.settled.is_some());
+         let used = || (summaries.iter()).any(|s| s.all_uses().iter().any(|u| lazy.meets(u)));
+@@ -352,6 +407,10 @@ pub(crate) fn after_commit(id: u64) {
+     }
+     for lazy in surfaces() {
+         let moved = (lazy.pending.lock().unwrap().as_mut()).is_some_and(|left| left.committed(id));
++        if let Some(coherent) = lazy.coherent() {
++            coherent.committed(id);
++            continue;
++        }
+         let wants =
+             lazy.flush_after
+                 .compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+@@ -367,6 +426,10 @@ pub(crate) fn after_commit(id: u64) {
+ pub(crate) fn deferred_by(id: u64) -> Vec<(Arc<Lazy>, ShadowCopy, Vec<Hold>)> {
+     let mut left = Vec::new();
+     for lazy in surfaces() {
++        // A command that meets its bytes copies them back itself ([`met_by_command`]).
++        if lazy.coherent().is_some() {
++            continue;
++        }
+         let mut pending = lazy.pending.lock().unwrap();
+         let Some(ahead) = pending.as_mut() else {
+             continue;
+@@ -389,10 +452,46 @@ pub(crate) fn deferred_by(id: u64) -> Vec<(Arc<Lazy>, ShadowCopy, Vec<Hold>)> {
+     left
+ }
+ 
++/// The copies back a command of the command buffer `id` needs before it, its uses `uses`: of what
++/// that command buffer's earlier encoders left ahead in a trapping surface whose bytes it meets.
++/// The record stays, whose texels the copy repeats, so what the record holds lasts the copy.
++pub(super) fn met_by_command<M>(
++    id: u64,
++    uses: &[Use<ResourceKey>],
++    shares: impl Fn(&ShadowCopies) -> bool,
++) -> Vec<ShadowCopy<M>> {
++    let mut copies = Vec::new();
++    for lazy in surfaces() {
++        if lazy.coherent().is_none() {
++            continue;
++        }
++        let pending = lazy.pending.lock().unwrap();
++        let Some(ahead) = pending.as_ref() else {
++            continue;
++        };
++        let Some((_, area)) = ahead.open.iter().find(|(open, _)| *open == id) else {
++            continue;
++        };
++        let shared = ahead.copies.downcast_ref::<ShadowCopies>().is_some_and(&shares);
++        if shared || uses.iter().any(|used| lazy.meets(used)) {
++            copies.push(copy_back_of(ahead.copies.clone(), *area));
++        }
++    }
++    copies
++}
++
+ /// The copies back the clock asks for (the module docs): whether any surface holds writes ahead.
+ fn flush_due(max: Duration) -> bool {
+     let mut any = false;
+     for lazy in surfaces() {
++        // Nothing stale here but what the traps answer, while they do.
++        if let Some(coherent) = lazy.coherent() {
++            if crate::live::on("surface_coherent", false) {
++                any |= lazy.ahead.load(Ordering::Relaxed);
++                continue;
++            }
++            coherent.abandon();
++        }
+         let due = (lazy.pending.lock().unwrap().as_ref()).map(|left| {
+             let waited = left.since.elapsed();
+             waited >= max && (left.settled.is_some() || waited >= max * 4)
+@@ -548,7 +647,7 @@ impl Pending {
+ }
+ 
+ /// A copy back of `area` of `copies`, as an encoder's end makes it.
+-fn copy_back_of(copies: Hold, area: Option<[u32; 4]>) -> ShadowCopy {
++fn copy_back_of<M>(copies: Hold, area: Option<[u32; 4]>) -> ShadowCopy<M> {
+     ShadowCopy {
+         copies: copies.downcast().expect("a surface's copies"),
+         step: Step::Back,
+@@ -613,6 +712,10 @@ pub(crate) struct Lazy {
+     refused: AtomicU64,
+     copied_in: AtomicU64,
+     presents: AtomicU64,
++    /// Its trap coherence (`shadow_coherent.rs`), where the texture's image takes it.
++    coherent: OnceLock<Arc<Coherent>>,
++    /// Weakly, the texture the display samples instead of the pages ([`display_image`]).
++    owner: OnceLock<Weak<dyn Any + Send + Sync>>,
+ }
+ 
+ impl Lazy {
+@@ -644,10 +747,57 @@ impl Lazy {
+                 refused: AtomicU64::new(0),
+                 copied_in: AtomicU64::new(0),
+                 presents: AtomicU64::new(0),
++                coherent: OnceLock::new(),
++                owner: OnceLock::new(),
+             })
+         })
+     }
+ 
++    /// Its pages trap, through `read` of its image, laid out as `layout`.
++    pub(crate) fn traps(self: &Arc<Self>, layout: Layout, read: Reader) {
++        let _ = self.coherent.set(Coherent::new(layout, read, Arc::downgrade(self)));
++    }
++
++    /// The texture over it, the display's way to its image.
++    pub(crate) fn owned_by(&self, texture: Weak<dyn Any + Send + Sync>) {
++        let _ = self.owner.set(texture);
++    }
++
++    /// Its trap coherence, while it holds: `None` where it never traps or no longer does.
++    pub(crate) fn coherent(&self) -> Option<&Arc<Coherent>> {
++        self.coherent.get().filter(|coherent| coherent.is_live())
++    }
++
++    /// Whether its image must stay whole: a trapping surface's copies back are any rectangle.
++    pub(super) fn whole_image(&self) -> bool {
++        self.coherent.get().is_some_and(|coherent| coherent.is_live())
++    }
++
++    /// Whether it writes back keeping and merging, a CPU write having come lately.
++    pub(super) fn wants_merge(&self) -> bool {
++        self.coherent().is_some_and(|coherent| coherent.wants_merge())
++    }
++
++    /// Whether a standing stands, from a command buffer already committed.
++    fn standing_committed(&self) -> bool {
++        let stood = *self.stood.lock().unwrap();
++        stood.is_some_and(|stood| committed_ids().lock().unwrap().contains(&stood.id))
++    }
++
++    /// `settled` is what ran and is not in the pages, and whether any record stays at all.
++    pub(crate) fn settled_coherently(&self, settled: Option<[u32; 4]>, records: bool) {
++        let mut pending = self.pending.lock().unwrap();
++        let Some(left) = pending.as_mut() else {
++            return;
++        };
++        left.settled = settled.map(Some);
++        if !records {
++            *pending = None;
++            drop(pending);
++            self.left_behind();
++        }
++    }
++
+     /// Note what its copies back hold, weakly: its image, and the bytes its texture lies over.
+     pub(crate) fn keeps(&self, image: Weak<dyn Any + Send + Sync>, bytes: Weak<dyn Any + Send + Sync>) {
+         let _ = self.keeps.set([image, bytes]);
+@@ -681,7 +831,10 @@ impl Lazy {
+     }
+ 
+     /// Note a copy in of its bytes for `cause`.
+-    pub(super) fn copied_in(&self, cause: CopyCause) {
++    pub(super) fn copied_in(&self, cause: CopyCause, texels: u64) {
++        if let Some(coherent) = self.coherent() {
++            coherent.copied_in(texels);
++        }
+         let at = match cause {
+             CopyCause::First => 0,
+             CopyCause::BeyondHeld => 1,
+@@ -701,8 +854,10 @@ impl Lazy {
+         area: Option<[u32; 4]>,
+         id: u64,
+     ) -> bool {
+-        if !crate::live::on(PRESENT, false)
+-            || !(self.displayed.load(Ordering::Relaxed) || crate::live::on(PRESENT_ALL, false))
++        let coherent = self.coherent();
++        if coherent.is_none()
++            && (!crate::live::on(PRESENT, false)
++                || !(self.displayed.load(Ordering::Relaxed) || crate::live::on(PRESENT_ALL, false)))
+         {
+             return false;
+         }
+@@ -727,6 +882,10 @@ impl Lazy {
+             };
+             let _ = self.queue.set(Arc::new(queue));
+         }
++        // Its record is what a trap copies: no page, no deferring.
++        if coherent.is_some_and(|coherent| !coherent.defers(id, area)) {
++            return false;
++        }
+         let mut pending = self.pending.lock().unwrap();
+         match &mut *pending {
+             Some(left) => match left.open.iter_mut().find(|(open, _)| *open == id) {
+@@ -788,21 +947,33 @@ impl Lazy {
+     /// over the pages of a texture nothing else holds (the module docs); a copy that cannot be
+     /// recorded stays for the next asker.
+     pub(crate) fn flush(self: &Arc<Self>) -> Option<CommandBuffer> {
++        // What is done goes on the CPU: a copy back is for what runs, which it is ordered after.
++        let coherent = self.coherent().cloned();
++        let through = match &coherent {
++            Some(coherent) => Some(coherent.before_flush()?),
++            None => None,
++        };
+         let (area, copies, holds) = {
+             let pending = self.pending.lock().unwrap();
+             let left = pending.as_ref()?;
+             (left.settled, left.copies.clone(), left.holds.clone())
+         };
+-        // The image's: `Pending`'s and this one, where neither texture nor command holds it.
+-        if holds.first().is_some_and(|image| Arc::strong_count(image) <= 2) {
++        // The image's: `Pending`'s and this one, where neither texture nor command holds it. A
++        // trapping surface's pages stay the guest's until its unmap, whatever texture went.
++        if coherent.is_none() && holds.first().is_some_and(|image| Arc::strong_count(image) <= 2) {
+             *self.pending.lock().unwrap() = None;
+             self.left_behind();
+             DISCARDED.fetch_add(1, Ordering::Relaxed);
+             return None;
+         }
+-        let area = area?;
++        let Some(area) = area else {
++            if let Some(coherent) = &coherent {
++                coherent.flush_failed();
++            }
++            return None;
++        };
+         let _own = self.own();
+-        let copy = copy_back_of(copies, area);
++        let copy: ShadowCopy = copy_back_of(copies, area);
+         let texels = copy.texels_back();
+         let flush = (|| {
+             let queue = self.queue.get()?.downcast_ref::<CommandQueue>()?;
+@@ -810,13 +981,27 @@ impl Lazy {
+             let mut encoder = command_buffer.blit_command_encoder().ok()?;
+             encoder.surface_copy_back(&copy, holds);
+             encoder.end_encoding().ok()?;
++            if let (Some(coherent), Some(through)) = (&coherent, through) {
++                let done = coherent.clone();
++                let handler = Box::new(move |_: &CommandBuffer| done.flushed(through));
++                command_buffer.add_completed_handler(handler).ok()?;
++            }
+             command_buffer.commit().ok()?;
+             Some(command_buffer)
+         })();
+         let Some(flush) = flush else {
+             eprintln!("surface_lazy: a copy back was not recorded");
++            if let Some(coherent) = &coherent {
++                coherent.flush_failed();
++            }
+             return None;
+         };
++        if let Some(coherent) = &coherent {
++            coherent.flush_recorded(texels * 4);
++            FLUSHES.fetch_add(1, Ordering::Relaxed);
++            FLUSHED_TEXELS.fetch_add(texels, Ordering::Relaxed);
++            return Some(flush);
++        }
+         self.settle(area);
+         FLUSHES.fetch_add(1, Ordering::Relaxed);
+         FLUSHED_TEXELS.fetch_add(texels, Ordering::Relaxed);
+@@ -882,6 +1067,24 @@ impl Lazy {
+     /// Where the image stands for an encoder that met `touched`, of a command buffer of identity
+     /// `id`: `Some((held, stale))` where it needs no copy in (the module docs).
+     pub(super) fn take(&self, id: u64, touched: u64) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
++        // Tracked from here: nothing its copy in reads can change unseen.
++        let coherent = self.coherent().filter(|coherent| coherent.tracks());
++        let taken = self.take_standing(id, touched, coherent.is_some());
++        match coherent {
++            Some(coherent) => {
++                let stale = coherent.taking(taken.is_none());
++                taken.map(|(held, was)| (held, bounding_stale(was, stale)))
++            }
++            None => taken,
++        }
++    }
++
++    fn take_standing(
++        &self,
++        id: u64,
++        touched: u64,
++        tracked: bool,
++    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
+         report();
+         let Some(stood) = *self.stood.lock().unwrap() else {
+             REFUSED_BY[Refused::NoStanding as usize].fetch_add(1, Ordering::Relaxed);
+@@ -910,7 +1113,8 @@ impl Lazy {
+             .and_then(|v| v.parse().ok())
+             .unwrap_or(DEFAULT_RESYNC_MS);
+         // Writes left ahead would be lost to a copy in, and a copy back goes over the bytes anyway.
+-        if every > 0 && !self.ahead.load(Ordering::Relaxed) {
++        // Where the pages trap, a write is news, and no clock need look.
++        if every > 0 && !tracked && !self.ahead.load(Ordering::Relaxed) {
+             let mut resynced = self.resynced.lock().unwrap();
+             if resynced.elapsed().as_millis() as u64 >= every {
+                 *resynced = Instant::now();
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 9644b731..94970fef 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2368,7 +2368,14 @@ impl Device {
+         // (`shadow.rs`), so it starts as its memory lies: zeros there would never be read, and
+         // writing them took most of the making (the host's zeros copied into a 1307x512 image
+         // took 0.9 ms of 1 ms on ANV).
++        // LOCAL (Atlas): a surface whose pages trap takes copies on the host.
++        let traps = aspects == every && crate::shadow_coherent::enabled() && texels.lies_lazily();
+         let image = match aspects == every {
++            true if traps => {
++                let identity = Identity::new(hazard, false);
++                let owner = Device::runtime_owner;
++                self.new_image_starting(plan, layout, descriptor, identity, Start::Traps, owner)?
++            }
+             true => {
+                 let identity = Identity::new(hazard, false);
+                 let owner = Device::runtime_owner;
+@@ -2435,6 +2442,21 @@ impl Device {
+             let (held, bytes): (Arc<dyn std::any::Any + Send + Sync>, Arc<dyn std::any::Any + Send + Sync>) =
+                 (image.clone(), texels.clone());
+             lazy.keeps(Arc::downgrade(&held), Arc::downgrade(&bytes));
++            if let (true, true, Some(surface)) =
++                (traps, image.takes_host_copies(), texels.surface_layout([image.plan.extent[0], image.plan.extent[1]]))
++            {
++                let reads = Arc::downgrade(&image);
++                lazy.traps(
++                    surface,
++                    Box::new(move |area, to, row| {
++                        // SAFETY: `shadow_coherent.rs` gives `to` over `area`'s rows, in the
++                        // surface's mapping or a scratch of the rectangle.
++                        (reads.upgrade()).is_some_and(|image| unsafe {
++                            image.host_read_to(area, to, row).unwrap_or(false)
++                        })
++                    }),
++                );
++            }
+         }
+         Ok(Storage::Shadow {
+             image,
+@@ -2905,6 +2927,19 @@ impl Device {
+         texture_type: TextureType,
+         class: MemoryClass,
+         sharing: Sharing<'_>,
++    ) -> Result<(vk::Image, Placement), Error> {
++        self.placed_image_read(plan, texture_type, class, sharing, false)
++    }
++
++    /// [`placed_image`](Self::placed_image), where `host_reads` says the host only reads the image
++    /// (LOCAL (Atlas): a trapping surface's, `memory::read_cached_placement`).
++    fn placed_image_read(
++        &self,
++        plan: &ImagePlan,
++        texture_type: TextureType,
++        class: MemoryClass,
++        sharing: Sharing<'_>,
++        host_reads: bool,
+     ) -> Result<(vk::Image, Placement), Error> {
+         let shared = self.shared();
+         let raw_device = shared.vk();
+@@ -2928,6 +2963,10 @@ impl Device {
+         // host-transfer usage, its copies through submissions, as on a device without host copies.
+         let hosted = plan.usage.contains(ImageUsageFlags::HOST_TRANSFER);
+         let cached = match hosted {
++            true if host_reads => {
++                let memory = lock(&shared.memory);
++                memory.read_cached_placement(requirements.memory_type_bits, class)
++            }
+             true => {
+                 let memory = lock(&shared.memory);
+                 requirements.memory_type_bits &= !memory.host_incoherent();
+@@ -3015,6 +3054,7 @@ impl Device {
+         texture_type: TextureType,
+         class: MemoryClass,
+         staged: bool,
++        host_reads: bool,
+     ) -> Option<(ImagePlan, vk::Image, Placement)> {
+         let shared = self.shared();
+         shared.host_copies.as_ref()?;
+@@ -3035,8 +3075,14 @@ impl Device {
+         }
+         let mut hosted = plan.clone();
+         hosted.usage |= ImageUsageFlags::HOST_TRANSFER;
+-        let (raw, placement) =
+-            (self.placed_image(&hosted, texture_type, class, shared.sharing())).ok()?;
++        let (raw, placement) = (self.placed_image_read(
++            &hosted,
++            texture_type,
++            class,
++            shared.sharing(),
++            host_reads,
++        ))
++        .ok()?;
+         Some((hosted, raw, placement))
+     }
+ 
+@@ -3096,8 +3142,11 @@ impl Device {
+         start: Start,
+         owner: impl FnOnce(Placement, vk::Image) -> Owner,
+     ) -> Result<Image, Error> {
+-        let held = start == Start::Held;
+-        let moved = start == Start::Moved;
++        // LOCAL (Atlas): a trapping surface's image is moved on the host, the copy in its first
++        // texels; held as ever where it cannot be made so (`shadow_coherent.rs`).
++        let traps = start == Start::Traps;
++        let mut held = start == Start::Held;
++        let mut moved = start == Start::Moved || traps;
+         let storage = descriptor.resource_options.storage_mode()?;
+         // LOCAL (Atlas) diagnostic: where the image was asked for, for the image census
+         // (`image_log.rs`).
+@@ -3125,11 +3174,17 @@ impl Device {
+         // `VUID-vkCmdCopyBufferToImage-dstImage-07973`), and Metal makes no CPU copy of a
+         // multisample texture: such an image takes neither path, and a clear writes its zeros.
+         let one_sample = layout.samples == 1;
+-        let staged = !held && !private && one_sample && self.stages(&plan, layout.pixel_format);
+-        let hosted = match held || private || !one_sample || is_pvrtc(descriptor.pixel_format) {
++        let staged =
++            !traps && !held && !private && one_sample && self.stages(&plan, layout.pixel_format);
++        let refused = (held || private) && !traps;
++        let hosted = match refused || !one_sample || is_pvrtc(descriptor.pixel_format) {
+             true => None,
+-            false => self.host_placed_image(&plan, layout.texture_type, class, staged),
++            false => self.host_placed_image(&plan, layout.texture_type, class, staged, traps),
+         };
++        if traps && hosted.is_none() {
++            held = true;
++            moved = false;
++        }
+         let (plan, raw, placement, host_copies) = match hosted {
+             Some((plan, raw, placement)) => (plan, raw, placement, true),
+             None => {
+@@ -3814,6 +3869,9 @@ enum Start {
+     /// image stages, `texture/decoded_twin.rs`): on the host or the staging queue where it takes
+     /// their copies, as it is made; else by the next submission, as a held image's.
+     Moved,
++    /// LOCAL (Atlas): a trapping surface's image (`shadow_coherent.rs`): moved on the host, its
++    /// memory the host reads fast; held where it cannot be.
++    Traps,
+ }
+ 
+ impl Start {
+@@ -4130,6 +4188,13 @@ impl Texture {
+         if let Some(objects) = texture.0.storage.objects() {
+             objects.object_made();
+         }
++        // LOCAL (Atlas): the display's way to a trapping surface's image (`shadow_coherent.rs`).
++        if let Storage::Shadow { copies, .. } = &texture.0.storage {
++            if let Some(lazy) = &copies.lazy {
++                let held: Arc<dyn std::any::Any + Send + Sync> = texture.0.clone();
++                lazy.owned_by(Arc::downgrade(&held));
++            }
++        }
+         // A texture over host pages' bytes, or in a heap over them (a view of one too): a
+         // detach of them makes its image present a stand-in (`stand_in.rs`).
+         if let Some((bytes, image, exact)) = texture.image_over_bytes() {
+@@ -4243,8 +4308,18 @@ impl Texture {
+ 
+     /// LOCAL (Atlas): tell the runtime the display presents the texture's bytes
+     /// (`shadow_lazy.rs`). Not a Metal call.
+-    pub fn surface_presented(&self) {
++    ///
++    /// Under `surface_coherent`, the texture for the display to sample in this one's place, where
++    /// a surface's image holds these bytes ahead of its pages: no copy back then.
++    pub fn surface_presented(&self) -> Option<Texture> {
+         crate::shadow_lazy::presented(|| self.host_range());
++        let bytes = self.host_range()?;
++        let owner = crate::shadow_lazy::display_image(&bytes)?;
++        let owner = Texture(owner.downcast::<TextureShared>().ok()?);
++        let same = owner.pixel_format() == self.pixel_format()
++            && owner.width() == self.width()
++            && owner.height() == self.height();
++        (same && owner.usage().contains(TextureUsage::SHADER_READ)).then_some(owner)
+     }
+ 
+     /// The buffer's bytes a texture buffer is, or `None` for a texture with an image.
+diff --git a/crates/metal2vulkan-runtime/src/texture/host_copy.rs b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+index 0e1e751f..a5f6e1c8 100644
+--- a/crates/metal2vulkan-runtime/src/texture/host_copy.rs
++++ b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+@@ -59,7 +59,7 @@
+ //!   lock a detach takes to present a stand-in (`detach.rs`), so it never reaches a `VkImage` that
+ //!   went.
+ 
+-use super::Image;
++use super::{Image, Owner};
+ use crate::device::lock;
+ use crate::error::{vulkan, Error};
+ use crate::exit_guard;
+@@ -293,6 +293,128 @@ impl Image {
+         Ok(true)
+     }
+ 
++    /// LOCAL (Atlas): the rectangle `[x0, y0, x1, y1)` of level 0 of a color image into rows of
++    /// `row` texels at `to`, on the host, for a trapping surface's sync (`shadow_coherent.rs`).
++    /// Whether it did: not while the image presents a stand-in.
++    ///
++    /// # Safety
++    ///
++    /// The image [takes host copies](Self::takes_host_copies), and `to` is writable over every
++    /// row of the rectangle.
++    pub(crate) unsafe fn host_read_to(
++        &self,
++        area: [u32; 4],
++        to: *mut u8,
++        row: u32,
++    ) -> Result<bool, Error> {
++        let shared = self.device.shared();
++        let Some(functions) = shared.host_copies.as_ref() else {
++            return Ok(false);
++        };
++        let device = shared.vk().handle();
++        let detached = lock(&self.detached);
++        if detached.is_some() {
++            return Ok(false);
++        }
++        // SAFETY: the image is live; its lock is held.
++        unsafe { self.invalidate_rows(functions, area[1], area[3]) }?;
++        let region = vk::ImageToMemoryCopyEXT {
++            p_host_pointer: to.cast(),
++            memory_row_length: row,
++            memory_image_height: 0,
++            image_subresource: vk::ImageSubresourceLayers {
++                aspect_mask: vk::ImageAspectFlags::COLOR,
++                mip_level: 0,
++                base_array_layer: 0,
++                layer_count: 1,
++            },
++            image_offset: vk::Offset3D {
++                x: area[0] as i32,
++                y: area[1] as i32,
++                z: 0,
++            },
++            image_extent: vk::Extent3D {
++                width: area[2] - area[0],
++                height: area[3] - area[1],
++                depth: 1,
++            },
++            ..Default::default()
++        };
++        let info = vk::CopyImageToMemoryInfoEXT::default()
++            .src_image(self.raw.get())
++            .src_image_layout(vk::ImageLayout::GENERAL)
++            .regions(std::slice::from_ref(&region));
++        // SAFETY: the caller's contract; the image is live and in `GENERAL` since it was made, and
++        // the lock keeps its own `VkImage` presented.
++        unsafe { (functions.copy_image_to_memory_ext)(device, &info) }
++            .result()
++            .map_err(vulkan)?;
++        drop(detached);
++        shared.counts.host_texel_copy();
++        Ok(true)
++    }
++
++    /// LOCAL (Atlas): drop what the host's caches hold of the bytes of rows `y0..y1` of level 0. An
++    /// image's memory the host caches without coherence (Arrow Lake-S's type) keeps clean lines of
++    /// an earlier read, and a read of texels the GPU wrote since returns them: 1 run in 25 read
++    /// stale texels on ANV without this, whose `vkCopyImageToMemoryEXT` does not drop them. Tiled
++    /// rows lie in bands of tiles: [`TILE_ROWS`] bounds a tile's height at 32-bit texels, so the
++    /// bands of a rectangle's rows hold its every byte, where the driver gives the row pitch a
++    /// host-transfer image's layout may give. Where it gives none, the whole image.
++    ///
++    /// # Safety
++    ///
++    /// The image is live, its memory the runtime's own, with host-transfer usage.
++    unsafe fn invalidate_rows(
++        &self,
++        functions: &DeviceFn,
++        y0: u32,
++        y1: u32,
++    ) -> Result<(), Error> {
++        const TILE_ROWS: u64 = 256;
++        let shared = self.device.shared();
++        let Owner::Runtime { placement, .. } = &self.owner else {
++            return Ok(());
++        };
++        if placement.mapped.is_none() {
++            return Ok(());
++        }
++        let subresource = vk::ImageSubresource2EXT::default().image_subresource(vk::ImageSubresource {
++            aspect_mask: vk::ImageAspectFlags::COLOR,
++            mip_level: 0,
++            array_layer: 0,
++        });
++        let mut layout = vk::SubresourceLayout2EXT::default();
++        // SAFETY: the caller's contract; the structures are the extension's.
++        unsafe {
++            (functions.get_image_subresource_layout2_ext)(
++                shared.vk().handle(),
++                self.raw.get(),
++                &subresource,
++                &mut layout,
++            )
++        };
++        let (pitch, whole) = (layout.subresource_layout.row_pitch, layout.subresource_layout.size);
++        let whole = whole.max(placement.size());
++        let (first, last) = match pitch {
++            0 => (0, whole),
++            _ => (
++                u64::from(y0) / TILE_ROWS * TILE_ROWS * pitch,
++                (u64::from(y1).div_ceil(TILE_ROWS) * TILE_ROWS * pitch).min(whole),
++            ),
++        };
++        // Vulkan bounds `nonCoherentAtomSize` by this, a power of two as it is.
++        let atom = 256;
++        let start = (placement.offset + first) / atom * atom;
++        let end = placement.offset + last;
++        let range = vk::MappedMemoryRange::default()
++            .memory(placement.memory)
++            .offset(start)
++            .size((end - start).next_multiple_of(atom));
++        // SAFETY: the memory is mapped whole for its life, and the range lies in the image's.
++        unsafe { shared.vk().invalidate_mapped_memory_ranges(&[range]) }.map_err(vulkan)
++    }
++
+     /// Copy the image's texels `copy` reaches into `bytes` on the host, laid out as `copy` writes
+     /// them to a buffer; the image [takes host copies](Self::takes_host_copies). Whether it did:
+     /// not while the image presents a stand-in.
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane.rs b/crates/metal2vulkan-validation/src/runtime_lane.rs
+index 573b692e..aab89800 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane.rs
+@@ -785,6 +785,8 @@ mod submit_per_import;
+ mod surface_aliases;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+ mod surface_present; // LOCAL (Atlas)
++#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
++mod surface_coherent; // LOCAL (Atlas)
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ mod surface_fills;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+index cf7ba041..6ba4b66b 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+@@ -363,6 +363,39 @@ pub(super) fn reading(device: &Device, pf: PixelFormat, fragment: &str) -> Rende
+         .unwrap()
+ }
+ 
++/// LOCAL (Atlas): a `BGRA8Unorm` texture's first texels of `width` by `height`, sampled by a render
++/// encoder, as the display reads a frame: tight rows.
++pub(super) fn sampled_bgra8(
++    queue: &CommandQueue,
++    texture: &Texture,
++    width: u64,
++    height: u64,
++) -> Vec<u8> {
++    let device = queue.device();
++    let layout = Layout::bgra8("sampled", width, height, width * 4);
++    let samples = reading(device, PixelFormat::BGRA8Unorm, "tob_sample");
++    let nearest = sampler(device, SamplerMinMagFilter::Nearest);
++    drawn(queue, &layout, &samples, texture, Some(&nearest))
++}
++
++/// What [`sampled_bgra8`] makes, for [`drawn_small`].
++pub(super) fn bgra8_sampling(device: &Device) -> (RenderPipelineState, SamplerState) {
++    let samples = reading(device, PixelFormat::BGRA8Unorm, "tob_sample");
++    (samples, sampler(device, SamplerMinMagFilter::Nearest))
++}
++
++/// A draw that samples `texture` into a small target, run: a display's frame, with nothing read.
++pub(super) fn drawn_small(
++    queue: &CommandQueue,
++    samples: &RenderPipelineState,
++    nearest: &SamplerState,
++    texture: &Texture,
++) {
++    let layout = Layout::bgra8("small", 64, 64, 256);
++    let (command_buffer, _target) = draw_reading(queue, &layout, samples, texture, Some(nearest));
++    run(&command_buffer);
++}
++
+ /// What a draw of `pipeline` over a whole target of `layout`'s format and size reads from
+ /// `texture` (through `sampler`, where given): the target's texels, tight rows.
+ fn drawn(
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+new file mode 100644
+index 00000000..5ae338e6
+--- /dev/null
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -0,0 +1,812 @@
++//! LOCAL (Atlas): a surface whose pages trap (`shadow_coherent.rs`). [`Fake`] stands for QEMU's
++//! marks over the pages, and each lane plays the guest through it: a read or a write of a marked
++//! page faults first, as the guest's CPU would. Beside them, a lane pins down what loses writes
++//! under `surface_lazy_present` alone, and the same steps under the traps.
++
++use super::first_use_writes::CHECK_WAIT;
++use super::host_memory::{gpu_read, run, Mapping};
++use super::host_rt_frames::{pass, surface_buffer};
++use super::no_copy_textures::{rects, staged};
++use super::{validated_device_with, Messages, ScratchCache};
++use crate::gpu::TEST_DEVICE;
++use metal2vulkan::device::HostPageTexturePolicy;
++use super::pitched_surfaces::{bgra8_sampling, drawn_small, sampled_bgra8};
++use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan_runtime::shadow_coherent::{self, Pages};
++use metal2vulkan_runtime::{
++    live, Buffer, CommandBuffer, CommandQueue, Device, IoSurfacePlane, LoadAction,
++    RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, StoreAction,
++    Texture, TextureDescriptor,
++};
++use std::collections::BTreeMap;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++const WIDTH: u64 = 1024;
++const HEIGHT: u64 = 256;
++const ROW: u64 = 4096;
++const BEFORE: u8 = 0x55;
++const PAGE: u64 = 4096;
++const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
++const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
++const RED_TEXEL: [u8; 4] = [0, 0, 255, 255];
++const GREEN_TEXEL: [u8; 4] = [0, 255, 0, 255];
++const SOON: Duration = Duration::from_secs(3);
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Mark {
++    Held,
++    Armed,
++    Open,
++    Frozen,
++}
++
++/// QEMU's page states, without the guest.
++#[derive(Default)]
++struct Fake {
++    pages: Mutex<BTreeMap<u64, Mark>>,
++    /// Pages to answer as reached while their markers moved.
++    came: Mutex<Vec<u64>>,
++    /// Pages the next `arm` answers as reached, and leaves held.
++    refused: Mutex<Vec<u64>>,
++    /// Every page each `arm` and `hold` moved, for the counts of what moved.
++    armed: Mutex<u64>,
++}
++
++impl Pages for Fake {
++    fn track(&self, start: u64, len: u64) -> bool {
++        let mut pages = self.pages.lock().unwrap();
++        for page in (start..start + len).step_by(PAGE as usize) {
++            pages.entry(page).or_insert(Mark::Held);
++        }
++        true
++    }
++
++    fn untrack(&self, start: u64) {
++        let _ = start;
++        self.pages.lock().unwrap().clear();
++    }
++
++    fn arm(&self, list: &[u64]) -> Vec<u64> {
++        let mut pages = self.pages.lock().unwrap();
++        let mut refused = self.refused.lock().unwrap();
++        for page in list {
++            if pages.get(page) == Some(&Mark::Held) && !refused.contains(page) {
++                pages.insert(*page, Mark::Armed);
++                *self.armed.lock().unwrap() += 1;
++            }
++        }
++        std::mem::take(&mut *refused)
++    }
++
++    fn hold(&self, list: &[u64], open_too: bool) -> Vec<u64> {
++        let mut pages = self.pages.lock().unwrap();
++        for page in list {
++            let at = pages.get(page).copied();
++            if at == Some(Mark::Armed) || (open_too && at == Some(Mark::Open)) {
++                pages.insert(*page, Mark::Held);
++            }
++        }
++        std::mem::take(&mut *self.came.lock().unwrap())
++    }
++
++    fn open(&self, page: u64) {
++        let mut pages = self.pages.lock().unwrap();
++        if pages.get(&page) == Some(&Mark::Held) {
++            pages.insert(page, Mark::Open);
++        }
++    }
++
++    fn freeze(&self, list: &[u64]) {
++        let mut pages = self.pages.lock().unwrap();
++        for page in list {
++            if pages.get(page) == Some(&Mark::Open) {
++                pages.insert(*page, Mark::Frozen);
++            }
++        }
++    }
++
++    fn thaw(&self, list: &[u64]) {
++        let mut pages = self.pages.lock().unwrap();
++        for page in list {
++            if pages.get(page) == Some(&Mark::Frozen) {
++                pages.insert(*page, Mark::Open);
++            }
++        }
++    }
++}
++
++impl Fake {
++    fn mark(&self, page: u64) -> Option<Mark> {
++        self.pages.lock().unwrap().get(&page).copied()
++    }
++
++    fn armed_pages(&self) -> usize {
++        (self.pages.lock().unwrap().values()).filter(|mark| **mark == Mark::Armed).count()
++    }
++}
++
++struct Case<'d> {
++    device: &'d Device,
++    queue: CommandQueue,
++    mapping: Mapping,
++    len: usize,
++    row: u64,
++    buffer: Buffer,
++    texture: Option<Texture>,
++    opaque: RenderPipelineState,
++    rect: Buffer,
++    fake: Arc<Fake>,
++}
++
++impl Case<'_> {
++    fn base(&self) -> u64 {
++        self.mapping.pointer().as_ptr() as u64
++    }
++
++    fn range(&self) -> std::ops::Range<u64> {
++        self.base()..self.base() + self.len as u64
++    }
++
++    fn texture(&self) -> &Texture {
++        self.texture.as_ref().unwrap()
++    }
++
++    fn draw(&self, color: [f32; 4], damage: Option<ScissorRect>) {
++        let command_buffer = self.queue.command_buffer().unwrap();
++        self.pass(&command_buffer, color, damage);
++        run(&command_buffer);
++    }
++
++    fn pass(&self, command_buffer: &CommandBuffer, color: [f32; 4], damage: Option<ScissorRect>) {
++        let color = staged(self.device, &floats4(color));
++        let rects = std::slice::from_ref(&self.rect);
++        pass(command_buffer, self.texture(), &self.opaque, rects, &color, damage);
++    }
++
++    /// The pages' bytes at `x`, `y`, with no guest in the way: what an untrapped read would see.
++    fn behind(&self, x: u64, y: u64) -> [u8; 4] {
++        let at = (y * self.row + x * 4) as usize;
++        self.mapping.read(at..at + 4).try_into().unwrap()
++    }
++
++    /// The guest reads the texel: a marked page stops it first.
++    fn read(&self, x: u64, y: u64) -> [u8; 4] {
++        let addr = self.base() + y * self.row + x * 4;
++        self.touch(addr, false);
++        self.behind(x, y)
++    }
++
++    /// The guest writes the texel, as the page's marks let it.
++    fn write(&self, x: u64, y: u64, texel: [u8; 4]) {
++        let addr = self.base() + y * ROW + x * 4;
++        self.touch(addr, false);
++        self.touch(addr, true);
++        let at = (y * ROW + x * 4) as usize;
++        self.mapping.write(at, &texel);
++    }
++
++    fn touch(&self, addr: u64, write: bool) {
++        let page = addr & !(PAGE - 1);
++        match (self.fake.mark(page), write) {
++            (Some(Mark::Armed | Mark::Frozen), false) => shadow_coherent::fault(addr, false),
++            (Some(Mark::Armed | Mark::Frozen | Mark::Held), true) => {
++                shadow_coherent::fault(addr, true);
++            }
++            _ => {}
++        }
++    }
++
++    /// What the texture's image holds at `x`, `y`, its alpha gone: a pass that blends nothing over
++    /// every texel loads the image and stores it, and the guest's read then fetches that.
++    fn through_image(&self, x: u64, y: u64) -> [u8; 4] {
++        let color = staged(self.device, &floats4([0.0; 4]));
++        let rects = std::slice::from_ref(&self.rect);
++        let blending = rects_blending(self.device);
++        let command_buffer = self.queue.command_buffer().unwrap();
++        pass(&command_buffer, self.texture(), &blending, rects, &color, None);
++        run(&command_buffer);
++        self.read(x, y)
++    }
++
++    /// A count of the surface's report line.
++    fn count(&self, name: &str) -> u64 {
++        let report = shadow_coherent::report("lane");
++        let key = format!("\"{name}\":");
++        let line = report.lines().last().unwrap_or_default();
++        let at = line.find(&key).map_or(line.len(), |at| at + key.len());
++        let digits: String = line[at..].chars().take_while(char::is_ascii_digit).collect();
++        digits.parse().unwrap_or(0)
++    }
++}
++
++fn rects_blending(device: &Device) -> RenderPipelineState {
++    rects(device, PixelFormat::BGRA8Unorm, true)
++}
++
++fn floats4(values: [f32; 4]) -> Vec<u8> {
++    values.iter().flat_map(|v| v.to_ne_bytes()).collect()
++}
++
++fn switches(coherent: bool) {
++    live::set("surface_lazy", Some("1"));
++    live::set("surface_lazy_min_texels", Some("1"));
++    live::set("surface_lazy_resync_ms", Some("0"));
++    live::set("surface_lazy_scoped", Some("1"));
++    live::set("surface_coherent", coherent.then_some("1"));
++    live::set("surface_coherent_hold_s", Some("1"));
++    live::set("surface_lazy_present", (!coherent).then_some("1"));
++    live::set("surface_lazy_present_all", (!coherent).then_some("1"));
++    live::set("surface_lazy_present_max_ms", Some("10"));
++}
++
++fn scissor(x: u64, y: u64, width: u64, height: u64) -> Option<ScissorRect> {
++    Some(ScissorRect { x, y, width, height })
++}
++
++/// Leaves no surface or switch behind, whatever a lane did.
++struct Clean;
++
++impl Drop for Clean {
++    fn drop(&mut self) {
++        shadow_coherent::reset();
++        shadow_coherent::set_pages(None);
++        for switch in [
++            "surface_lazy",
++            "surface_lazy_min_texels",
++            "surface_lazy_resync_ms",
++            "surface_lazy_scoped",
++            "surface_coherent",
++            "surface_coherent_hold_s",
++            "surface_lazy_present",
++            "surface_lazy_present_all",
++            "surface_lazy_present_max_ms",
++        ] {
++            live::set(switch, None);
++        }
++    }
++}
++
++/// `test` on a surface whose bytes are [`BEFORE`], marks in place where `coherent`.
++fn on_surface(coherent: bool, test: impl FnOnce(Case<'_>)) {
++    on_surface_of([WIDTH, HEIGHT, ROW], coherent, true, test);
++}
++
++fn on_surface_of(
++    [width, height, row]: [u64; 3],
++    coherent: bool,
++    lazy: bool,
++    test: impl FnOnce(Case<'_>),
++) {
++    let fake = Arc::new(Fake::default());
++    shadow_coherent::set_pages(coherent.then(|| fake.clone() as Arc<dyn Pages>));
++    switches(coherent);
++    live::set("surface_lazy", lazy.then_some("1"));
++    let _clean = Clean;
++    let cache = ScratchCache::new().unwrap();
++    let messages = Messages::default();
++    {
++        let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |o| {
++            o.policy.host_page_textures = HostPageTexturePolicy::InPlace;
++        })
++        .unwrap();
++        assert!(device.settle_in_place_checks(CHECK_WAIT));
++        let len = ((row * height) as usize).next_multiple_of(16384);
++        let mapping = Mapping::anonymous(len);
++        mapping.fill(BEFORE);
++        let buffer = surface_buffer(&device, &mapping, len);
++        let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, height, false);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        d.resource_options = buffer.resource_options();
++        let texture = buffer
++            .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, row, false))
++            .unwrap();
++        let rect = [-1.0f32, -1.0, 1.0, 1.0].iter().flat_map(|v| v.to_ne_bytes());
++        test(Case {
++            device: &device,
++            queue: device.new_command_queue().unwrap(),
++            len,
++            row,
++            buffer,
++            texture: Some(texture),
++            opaque: rects(&device, PixelFormat::BGRA8Unorm, false),
++            rect: staged(&device, &rect.collect::<Vec<_>>()),
++            mapping,
++            fake,
++        });
++    }
++    let reported = messages.take();
++    assert!(reported.is_empty(), "the layer reported: {reported:#?}");
++}
++
++#[test]
++fn surface_coherent_a_stale_page_traps_and_reads_the_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "nothing copied");
++        assert!(case.fake.armed_pages() > 0, "armed at completion");
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++        assert_eq!(case.behind(WIDTH - 1, HEIGHT - 1), RED_TEXEL, "one trap brings all of it");
++        assert_eq!(case.fake.armed_pages(), 0);
++        assert_eq!(case.count("traps"), 1);
++        assert_eq!(case.count("regions"), 1);
++        assert_eq!(case.count("flushes"), 0, "no GPU work");
++    });
++}
++
++#[test]
++fn surface_coherent_no_reader_copies_nothing() {
++    on_surface(true, |case| {
++        for frame in 0..20 {
++            case.draw(if frame % 2 == 0 { RED } else { GREEN }, None);
++        }
++        assert_eq!(case.behind(5, 5), [BEFORE; 4]);
++        assert_eq!(case.count("traps"), 0);
++        assert_eq!(case.count("flushes"), 0);
++        assert_eq!(case.count("copy_ins"), 1, "the first use's alone");
++        assert_eq!(case.read(5, 5), GREEN_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_a_partial_region_moves_that_alone() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        let bytes = case.count("bytes_detiled");
++        case.draw(GREEN, scissor(100, 100, 16, 8));
++        assert_eq!(case.fake.armed_pages(), 8, "the rectangle's rows' pages");
++        assert_eq!(case.behind(100, 100), RED_TEXEL);
++        assert_eq!(case.read(104, 104), GREEN_TEXEL);
++        assert_eq!(case.count("bytes_detiled") - bytes, 16 * 8 * 4);
++        assert_eq!(case.behind(99, 100), RED_TEXEL);
++        assert_eq!(case.behind(116, 100), RED_TEXEL);
++    });
++}
++
++/// Each sync reads the image through the host's caches, so the next reads what the GPU wrote since
++/// or a line kept from the last: a read after every write, in the worst order, reads the write.
++#[test]
++fn surface_coherent_no_sync_reads_a_line_of_an_earlier_one() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_demote_pct", Some("100000"));
++        live::set("surface_coherent_demote_hz", Some("1000000"));
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        for frame in 0..600u64 {
++            let (color, texel) = match frame % 2 {
++                0 => (GREEN, GREEN_TEXEL),
++                _ => (RED, RED_TEXEL),
++            };
++            // A rectangle moved each frame: small, whole-row and tile-crossing ones.
++            let (x, y) = (frame * 37 % (WIDTH - 64), frame * 13 % (HEIGHT - 40));
++            let (width, height) = (1 + frame * 7 % 64, 1 + frame * 3 % 40);
++            case.draw(color, scissor(x, y, width, height));
++            assert_eq!(case.read(x, y), texel, "frame {frame}'s first texel");
++            let (last_x, last_y) = (x + width - 1, y + height - 1);
++            assert_eq!(case.read(last_x, last_y), texel, "frame {frame}'s last texel");
++        }
++        live::set("surface_coherent_demote_pct", None);
++        live::set("surface_coherent_demote_hz", None);
++    });
++}
++
++#[test]
++fn surface_coherent_a_screenshot_reads_every_texel_at_its_truth() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        for at in 0..8 {
++            case.draw(GREEN, scissor(at * 100, at * 30, 40, 10));
++        }
++        for y in 0..HEIGHT {
++            for x in (0..WIDTH).step_by(7) {
++                let inside = (0..8).any(|at| {
++                    (at * 100..at * 100 + 40).contains(&x) && (at * 30..at * 30 + 10).contains(&y)
++                });
++                let want = if inside { GREEN_TEXEL } else { RED_TEXEL };
++                assert_eq!(case.read(x, y), want, "at {x}, {y}");
++            }
++        }
++        assert!(case.count("traps") <= 2, "{} traps", case.count("traps"));
++        assert_eq!(case.fake.armed_pages(), 0);
++    });
++}
++
++#[test]
++fn surface_coherent_cpu_write_then_gpu_read() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.write(7, 7, [1, 2, 3, 4]);
++        assert_eq!(case.fake.mark(case.base() + 7 * PAGE), Some(Mark::Open));
++        assert_eq!(case.through_image(7, 7), [1, 2, 3, 0], "the image took the write");
++        assert_eq!(case.through_image(8, 7), [0, 0, 255, 0], "and the page's other texels hold");
++        // A later write opens it again.
++        case.write(7, 7, [5, 6, 7, 8]);
++        assert_eq!(case.through_image(7, 7), [5, 6, 7, 0]);
++        // Its rectangle alone: the first use's and the pages' own rows.
++        assert_eq!(case.count("copy_ins"), 3);
++    });
++}
++
++#[test]
++fn surface_coherent_gpu_write_then_cpu_read_then_gpu_again() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(1, 1), RED_TEXEL);
++        case.draw(GREEN, scissor(0, 0, 8, 8));
++        assert_eq!(case.read(1, 1), GREEN_TEXEL);
++        case.draw(RED, scissor(0, 0, 4, 4));
++        assert_eq!(case.read(1, 1), RED_TEXEL);
++        assert_eq!(case.read(5, 5), GREEN_TEXEL);
++    });
++}
++
++/// A write before the command buffer that holds a GPU write completes: the merge keeps it.
++#[test]
++fn surface_coherent_a_cpu_write_outlasts_a_write_in_flight() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        let command_buffer = case.queue.command_buffer().unwrap();
++        case.pass(&command_buffer, GREEN, scissor(0, 7, 64, 1));
++        case.write(9, 7, [1, 2, 3, 4]);
++        assert_eq!(case.fake.mark(case.base() + 7 * PAGE), Some(Mark::Open));
++        run(&command_buffer);
++        assert_eq!(case.fake.mark(case.base() + 7 * PAGE), Some(Mark::Frozen), "merged at a touch");
++        assert_eq!(case.read(9, 7), [1, 2, 3, 4], "the CPU's texel");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the GPU's around it");
++        assert_eq!(case.count("merges"), 1);
++    });
++}
++
++/// A write followed by a GPU reader of the bytes through another import: no flush over it.
++#[test]
++fn surface_coherent_a_cpu_write_outlives_a_copy_back() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        case.draw(GREEN, scissor(0, 0, 64, 16));
++        case.write(9, 7, [1, 2, 3, 4]);
++        let read = gpu_read(&case.queue, &case.other_import(), 7 * ROW + 32..7 * ROW + 40);
++        assert_eq!(read[..4], GREEN_TEXEL);
++        assert_eq!(read[4..], [1, 2, 3, 4]);
++        assert_eq!(case.count("overwrite_risk"), 0);
++    });
++}
++
++#[test]
++fn surface_coherent_a_page_reached_as_its_markers_moved_goes_back_to_the_image() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let page = case.base() + 3 * PAGE;
++        case.fake.came.lock().unwrap().push(page);
++        case.read(0, 0);
++        // The guest's write landed unseen in the window.
++        case.mapping.write((3 * ROW) as usize, &[9, 9, 9, 9]);
++        assert_eq!(case.through_image(0, 3), [9, 9, 9, 0]);
++        assert_eq!(case.count("came"), 1);
++    });
++}
++
++#[test]
++fn surface_coherent_a_page_refused_its_arm_syncs_at_once_and_goes_back_to_the_image() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        case.fake.refused.lock().unwrap().push(case.base() + 3 * PAGE);
++        // The guest's write landed unseen in the window, beside the rectangle.
++        case.mapping.write((3 * ROW + 400) as usize, &[9, 9, 9, 9]);
++        case.draw(GREEN, scissor(0, 0, 16, 16));
++        assert_eq!(case.behind(0, 3), GREEN_TEXEL, "no trap comes for that page");
++        assert_eq!(case.fake.armed_pages(), 0, "the rectangle went with it");
++        assert_eq!(case.count("came"), 1);
++        assert_eq!(case.through_image(100, 3), [9, 9, 9, 0]);
++    });
++}
++
++#[test]
++fn surface_coherent_a_reader_through_another_import_reads_the_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(gpu_read(&case.queue, &case.other_import(), 0..4), RED_TEXEL);
++        assert_eq!(case.count("flushes"), 0, "done work goes on the CPU");
++        assert_eq!(case.fake.armed_pages(), 0);
++    });
++}
++
++#[test]
++fn surface_coherent_a_later_encoder_of_the_writer_reads_the_writes() {
++    on_surface(true, |case| {
++        let other = case.other_import();
++        let copy = case.device.new_buffer(4, ResourceOptions::shared()).unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        case.pass(&command_buffer, RED, None);
++        let mut blit = command_buffer.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&other, 0, &copy, 0, 4).unwrap();
++        blit.end_encoding().unwrap();
++        run(&command_buffer);
++        // SAFETY: a `Shared` buffer no command uses now.
++        let read = unsafe { std::slice::from_raw_parts(copy.contents().unwrap().as_ptr(), 4) };
++        assert_eq!(read, RED_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_passes_of_one_command_buffer_stay_ahead() {
++    on_surface(true, |case| {
++        let command_buffer = case.queue.command_buffer().unwrap();
++        case.pass(&command_buffer, RED, None);
++        case.pass(&command_buffer, GREEN, scissor(0, 0, WIDTH / 2, HEIGHT));
++        run(&command_buffer);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "no copy at the second encoder");
++        assert_eq!(case.read(5, 5), GREEN_TEXEL);
++        assert_eq!(case.read(WIDTH - 5, 5), RED_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_the_display_samples_the_image() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let other = {
++            let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
++            d.usage = TextureUsage::SHADER_READ;
++            d.resource_options = case.buffer.resource_options();
++            let plane = IoSurfacePlane::new(0, ROW, false);
++            case.other_import().new_texture_with_iosurface_plane(&d, plane).unwrap()
++        };
++        let shown = other.surface_presented().expect("the surface's own texture");
++        assert_eq!(case.behind(5, 5), [BEFORE; 4]);
++        let read = sampled_bgra8(&case.queue, &shown, WIDTH, HEIGHT);
++        assert_eq!(read[..4], RED_TEXEL);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "and it copied nothing");
++        // The next writer still takes the image.
++        let copies = case.count("copy_ins");
++        case.draw(GREEN, scissor(0, 0, 1, 1));
++        assert_eq!(case.count("copy_ins"), copies, "the display cost it no standing");
++        let read = sampled_bgra8(&case.queue, &shown, WIDTH, HEIGHT);
++        assert_eq!(read[..4], GREEN_TEXEL);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "still");
++        assert_eq!(case.read(0, 0), GREEN_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_a_frequent_reader_goes_back_to_copies() {
++    on_surface(true, |case| {
++        live::set("surface_coherent_demote_window", Some("8"));
++        live::set("surface_coherent_hold_s", Some("60"));
++        for _ in 0..12 {
++            case.draw(RED, None);
++            case.read(0, 0);
++            case.draw(GREEN, None);
++            case.read(0, 0);
++        }
++        assert!(case.count("demotions") >= 1);
++        // Copied back per frame now: no trap, no armed page.
++        case.draw(RED, None);
++        assert_eq!(case.fake.armed_pages(), 0);
++        assert_eq!(case.behind(5, 5), RED_TEXEL);
++        live::set("surface_coherent_demote_window", None);
++    });
++}
++
++#[test]
++fn surface_coherent_unmap_during_deferred_syncs_and_lets_go() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.behind(5, 5), [BEFORE; 4]);
++        assert!(shadow_coherent::unmapping(case.range()), "no work runs");
++        assert_eq!(case.behind(5, 5), RED_TEXEL, "landed while the pages are the guest's");
++        assert_eq!(case.fake.armed_pages(), 0);
++        shadow_coherent::unmapped(case.range());
++        assert_eq!(shadow_coherent::report("after").matches("\"tracked\":true").count(), 0);
++    });
++}
++
++#[test]
++fn surface_coherent_unmap_with_work_running_is_busy() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let hold = case.device.new_shared_event().unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        command_buffer.encode_wait_for_event((&hold).into(), 1).unwrap();
++        case.pass(&command_buffer, GREEN, None);
++        command_buffer.commit().unwrap();
++        let start = Instant::now();
++        assert!(!shadow_coherent::unmapping(case.range()), "work runs");
++        assert_eq!(case.behind(5, 5), RED_TEXEL, "what is done landed");
++        assert!(start.elapsed() < Duration::from_millis(500), "nothing waited");
++        hold.set_signaled_value(1);
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++        assert!(shadow_coherent::unmapping(case.range()));
++        assert_eq!(case.behind(5, 5), GREEN_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_a_remap_over_deferred_writes_lands_them_first() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        let start = std::ptr::NonNull::new(case.mapping.pointer().as_ptr().cast()).unwrap();
++        case.device.host_range_remapped(start, case.len as u64);
++        assert_eq!(case.behind(5, 5), RED_TEXEL);
++        assert_eq!(case.fake.armed_pages(), 0, "and it stops trapping");
++        // On as a plain lazy surface: nothing left ahead.
++        case.draw(GREEN, None);
++        assert_eq!(case.behind(5, 5), GREEN_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_a_reset_writes_nothing() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        shadow_coherent::reset();
++        assert_eq!(case.behind(5, 5), [BEFORE; 4]);
++        assert_eq!(shadow_coherent::report("after").matches("\"tracked\":true").count(), 0);
++    });
++}
++
++#[test]
++fn surface_coherent_switched_off_lands_everything() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        live::set("surface_coherent", None);
++        let start = Instant::now();
++        // The report waits for a sync under way, as an unmap does.
++        while shadow_coherent::report("off").contains("\"tracked\":true") {
++            assert!(start.elapsed() < SOON, "the clock lands it");
++            std::thread::sleep(Duration::from_millis(2));
++        }
++        assert_eq!(case.behind(5, 5), RED_TEXEL);
++        assert_eq!(case.behind(WIDTH - 1, HEIGHT - 1), RED_TEXEL);
++    });
++}
++
++/// A texture of a mapped surface that goes while ahead: `surface_lazy_present` drops what it left
++/// (`shadow_lazy::Lazy::flush`), and nothing writes those pages again.
++#[test]
++fn surface_lazy_present_loses_writes_of_a_released_texture() {
++    on_surface(false, |mut case| {
++        case.draw(RED, None);
++        case.texture = None;
++        std::thread::sleep(Duration::from_millis(100));
++        assert_eq!(case.behind(5, 5), [BEFORE; 4], "the writes went with the texture");
++    });
++}
++
++#[test]
++fn surface_coherent_keeps_writes_of_a_released_texture() {
++    on_surface(true, |mut case| {
++        case.draw(RED, None);
++        case.texture = None;
++        std::thread::sleep(Duration::from_millis(100));
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++    });
++}
++
++#[test]
++fn surface_coherent_copies_back_no_texel_it_does_not_hold() {
++    on_surface(true, |case| {
++        case.draw_replacing(RED, scissor(0, 0, 8, 8));
++        case.draw_replacing(GREEN, scissor(WIDTH - 8, HEIGHT - 8, 8, 8));
++        gpu_read(&case.queue, &case.other_import(), 0..4);
++        assert_eq!(case.read(WIDTH / 2, HEIGHT / 2), [BEFORE; 4]);
++        assert_eq!(case.read(1, 1), RED_TEXEL);
++        assert_eq!(case.read(WIDTH - 1, HEIGHT - 1), GREEN_TEXEL);
++    });
++}
++
++/// With the switch off and marks installed, a surface runs as `surface_lazy` alone.
++/// What a frame costs at 3200x1800, with the display sampling the surface and, where `read`, the
++/// guest's CPU reading what changed: eager copies, `surface_lazy_present_all`, and this.
++#[test]
++fn surface_coherent_cost_of_a_frame() {
++    const W: u64 = 3200;
++    const H: u64 = 1800;
++    const R: u64 = 12800;
++    const WARM: usize = 30;
++    const FRAMES: usize = 120;
++    #[derive(Clone, Copy, Debug, PartialEq)]
++    enum Mode {
++        Eager,
++        LazyPresent,
++        Coherent,
++    }
++    fn median(mut values: Vec<f64>) -> f64 {
++        values.sort_by(f64::total_cmp);
++        values[values.len() / 2]
++    }
++    for (name, damage, read) in [
++        ("1x1", scissor(1000, 700, 1, 1), false),
++        ("400x300", scissor(1000, 700, 400, 300), false),
++        ("1600x900", scissor(400, 400, 1600, 900), false),
++        ("whole", None, false),
++        ("400x300 cpu read", scissor(1000, 700, 400, 300), true),
++    ] {
++        for mode in [Mode::Eager, Mode::LazyPresent, Mode::Coherent] {
++            on_surface_of([W, H, R], mode == Mode::Coherent, mode != Mode::Eager, |case| {
++                let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, W, H, false);
++                d.usage = TextureUsage::SHADER_READ;
++                d.resource_options = case.buffer.resource_options();
++                let plane = IoSurfacePlane::new(0, R, false);
++                let other = case.other_import().new_texture_with_iosurface_plane(&d, plane).unwrap();
++                let (samples, nearest) = bgra8_sampling(case.device);
++                let [mut drew, mut shown, mut gpu] = [Vec::new(), Vec::new(), Vec::new()];
++                for i in 0..WARM + FRAMES {
++                    let color = if i % 2 == 0 { RED } else { GREEN };
++                    let start = Instant::now();
++                    let command_buffer = case.queue.command_buffer().unwrap();
++                    case.pass(&command_buffer, color, damage);
++                    run(&command_buffer);
++                    let middle = Instant::now();
++                    let display = other.surface_presented().unwrap_or_else(|| other.clone());
++                    drawn_small(&case.queue, &samples, &nearest, &display);
++                    if read {
++                        let [x, y] = damage.map_or([0, 0], |d| [d.x, d.y]);
++                        assert_eq!(case.read(x, y), if color == RED { RED_TEXEL } else { GREEN_TEXEL });
++                    }
++                    if i >= WARM {
++                        drew.push((middle - start).as_secs_f64() * 1e3);
++                        shown.push(middle.elapsed().as_secs_f64() * 1e3);
++                        let ends = command_buffer.gpu_end_time().unwrap();
++                        gpu.push((ends - command_buffer.gpu_start_time().unwrap()) * 1e3);
++                    }
++                }
++                let [drew, shown, gpu] = [median(drew), median(shown), median(gpu)];
++                eprintln!("cost {name}: {mode:?} draw {drew:.2} ms (gpu {gpu:.2}), then {shown:.2} ms");
++                if mode == Mode::Coherent {
++                    let report = shadow_coherent::report("cost");
++                    eprintln!("cost {name}: {}", report.lines().last().unwrap_or_default());
++                }
++            });
++        }
++    }
++}
++
++#[test]
++fn surface_coherent_off_touches_no_page() {
++    on_surface(true, |case| {
++        live::set("surface_coherent", None);
++        let buffer = case.other_import();
++        let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        d.resource_options = buffer.resource_options();
++        let plane = IoSurfacePlane::new(0, ROW, false);
++        let texture = buffer.new_texture_with_iosurface_plane(&d, plane).unwrap();
++        let color = staged(case.device, &floats4(RED));
++        let command_buffer = case.queue.command_buffer().unwrap();
++        pass(&command_buffer, &texture, &case.opaque, std::slice::from_ref(&case.rect), &color, None);
++        run(&command_buffer);
++        assert_eq!(case.behind(5, 5), RED_TEXEL);
++        assert!(case.fake.pages.lock().unwrap().is_empty());
++    });
++}
++
++impl Case<'_> {
++    fn other_import(&self) -> Buffer {
++        surface_buffer(self.device, &self.mapping, self.len)
++    }
++
++    /// One command buffer of a pass that loads nothing, as a pass that replaces what it draws does.
++    fn draw_replacing(&self, color: [f32; 4], damage: Option<ScissorRect>) {
++        let color = staged(self.device, &floats4(color));
++        let mut descriptor = RenderPassDescriptor::new();
++        let attachment = &mut descriptor.color_attachments[0];
++        attachment.texture = self.texture.clone();
++        attachment.load_action = LoadAction::DontCare;
++        attachment.store_action = StoreAction::Store;
++        let command_buffer = self.queue.command_buffer().unwrap();
++        let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
++        encoder.set_render_pipeline_state(&self.opaque).unwrap();
++        encoder.set_fragment_buffer(Some(&color), 0, 0).unwrap();
++        if let Some(damage) = damage {
++            encoder.set_scissor_rect(damage).unwrap();
++        }
++        encoder.set_vertex_buffer(Some(&self.rect), 0, 0).unwrap();
++        encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0).unwrap();
++        encoder.end_encoding().unwrap();
++        run(&command_buffer);
++    }
++}

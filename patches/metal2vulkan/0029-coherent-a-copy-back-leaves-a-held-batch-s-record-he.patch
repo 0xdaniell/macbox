@@ -1,0 +1,809 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 18:49:53 +0000
+Subject: [PATCH 29/34] coherent: a copy back leaves a held batch's record;
+ held batches copy in later writes through other imports (path 4)
+
+Two defects behind the path-4 lanes (ebc8cb30), both losing writes Metal keeps:
+
+- A GPU copy back (shadow_lazy's flush, for a command buffer that meets the bytes through
+  another import, met_by) covered every running record (before_flush's through = seq). A
+  command buffer waiting for a shared event has a batch the scheduler has not planned, which the
+  tracker cannot order the copy after: the copy ran before it, flushed() marked its record done,
+  its completion armed nothing, and its writes never reached the pages (the guest read the older
+  bytes). Base lanes: every failing variant made exactly one copy back, both passing none.
+  Now the scheduler notes each command buffer from its commit to the plan of its last batch
+  (shadow_lazy::planned, under the scheduler's lock, one short lock), and a copy back covers the
+  records up to the first one still unplanned: that one and those after it land at their
+  completion as ever. flushed() takes the copy's mark apart from what it covered.
+  Counted: flushes_held_back.
+- Path 4, left by 6e193b3b: a standing taken after a wait knew nothing of a write of the
+  surface's bytes through another import (a buffer over the pages, another texture's copy back)
+  encoded after it and ordered before the signal. Each such write of a trapping surface is now
+  kept with its command buffer and rectangle (Lazy's Beside, from note_writes, by the byte range
+  against the truth's), and the held batch's late copy in also takes the rectangles written after
+  its standing's count by command buffers the scheduler planned all of: the copy's uses join the
+  batch's summary, so the tracker orders it after those writes, as Metal orders them before the
+  batch by the event. A write not planned yet is ordered after the batch and left (counted
+  late_beside_unplanned). A record still open or running over the rectangle is counted busy,
+  as in taking_late (the own variants count one: the command buffer's own earlier pass).
+  Proof that path 4 is its own defect: with the second fix off (first alone), the three buffer
+  variants lose the other import's write at (9,100).
+
+Counters: per surface late_copies, late_busy, late_compares, late_compare_ns(_max), late_beside;
+a process line first in shadow_coherent::report (so coherent.jsonl carries it), with
+late_copies_in(_busy), the snapshot compares (count, ns, max), late_beside(_unplanned),
+flushes_held_back and the other fallbacks. A surface's line stays last.
+
+Lanes (ANV): the six path-4 lanes fail 4/6 at bc15b13e and pass here; unit tests
+tests::coherent_late (area of a byte range, the plan set).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/submit.rs              |  11 +-
+ crates/metal2vulkan-runtime/src/encoder.rs    |   4 +-
+ crates/metal2vulkan-runtime/src/shadow.rs     |  25 ++-
+ .../src/shadow_coherent.rs                    | 201 +++++++++++++++++-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 167 ++++++++++++++-
+ .../src/tests/coherent_late.rs                |  47 ++++
+ crates/metal2vulkan-runtime/src/tests/mod.rs  |   1 +
+ 7 files changed, 422 insertions(+), 34 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/tests/coherent_late.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 7c41b410..4a5b8416 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1048,6 +1048,13 @@ impl CommandBufferShared {
+         let handlers = (schedules && !state.submission.is_empty()) || forms;
+         state.submitting = handlers;
+         scheduler.tracker.apply(plan);
++        // LOCAL (Atlas): all of it is planned: a trapping surface's copy back planned from here
++        // is ordered after its writes (`shadow_coherent::Coherent::before_flush`).
++        if last && crate::shadow_lazy::active() {
++            if let Some(carry) = state.shadow_carry.as_ref() {
++                crate::shadow_lazy::planned(carry.id());
++            }
++        }
+         held_moves.submitted();
+         shared.counts.held_depths_released(held_moves.released);
+         let several = shared.queues.len() > 1;
+@@ -1208,7 +1215,9 @@ impl CommandBufferShared {
+         }
+         let id = carry.id();
+         let copies: Vec<_> = (shadows.iter())
+-            .flat_map(|(left, copies)| crate::shadow_lazy::late_copy_in(copies, id, *left))
++            .flat_map(|(left, written, copies)| {
++                crate::shadow_lazy::late_copy_in(copies, id, *left, *written)
++            })
+             .collect();
+         if copies.is_empty() {
+             return Ok(());
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 10dc6b45..3b04eea9 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -1680,7 +1680,7 @@ impl EncoderCore {
+         self.uses.record(stages, tracked, None);
+         // LOCAL (Atlas): this way past `track`, as a copy back of another texture over the bytes.
+         if writes_truth {
+-            crate::shadow_lazy::note_copy_back(tracked);
++            crate::shadow_lazy::note_copy_back(tracked, self.shadows.carry_id());
+         }
+         self.touch(uses);
+     }
+@@ -1716,7 +1716,7 @@ impl EncoderCore {
+             let before = run.before(tracked, copy.writes_truth());
+             // LOCAL (Atlas): as in `shadow_command`.
+             if copy.writes_truth() {
+-                crate::shadow_lazy::note_copy_back(tracked);
++                crate::shadow_lazy::note_copy_back(tracked, self.shadows.carry_id());
+             }
+             // SAFETY: the held command buffer is recording outside a render pass instance (the
+             // caller ended the one before), and only this encoder records it; its commands retain
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index b508e291..b89814b5 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -2202,6 +2202,12 @@ impl<M> ShadowSync<M> {
+         self.entries.is_empty()
+     }
+ 
++    /// LOCAL (Atlas): the identity of the command buffer the encoder records for
++    /// ([`ShadowCarry::id`]).
++    pub(super) fn carry_id(&self) -> u64 {
++        self.carry.id
++    }
++
+     /// Carry no texture's image on, and let every texture the encoder met go: the encoder's
+     /// commands from here on read another writer's bytes, which each texture copies in again to
+     /// hold, and its later encoders take none of the images this one leaves (`ShadowCarry`).
+@@ -2219,7 +2225,7 @@ impl<M> ShadowSync<M> {
+     /// writes nothing else here would see.
+     pub(super) fn wrote(&mut self, uses: &[Use<ResourceKey>]) {
+         // LOCAL (Atlas): any surface's, whatever this encoder uses (`shadow_lazy.rs`).
+-        super::shadow_lazy::note_writes(uses);
++        super::shadow_lazy::note_writes(uses, self.carry.id);
+         if self.carry.entries.is_empty() {
+             return;
+         }
+@@ -2340,9 +2346,10 @@ pub(super) struct LateCopies {
+     /// The command buffer's part (`command_buffer::State::recorded`) the last wait for a shared
+     /// event holds back: the work encoded from here on waits for it.
+     since: Option<usize>,
+-    /// Each surface noted, with the part of the wait it was noted after, and whether an earlier
+-    /// encoder of the command buffer had left writes ahead in its image then.
+-    shadows: Vec<(usize, bool, Arc<ShadowCopies>)>,
++    /// Each surface noted, with the part of the wait it was noted after, whether an earlier
++    /// encoder of the command buffer had left writes ahead in its image then, and the count of
++    /// writes of its bytes its standing was taken at (`shadow_lazy::Lazy::taken_written`).
++    shadows: Vec<(usize, bool, u64, Arc<ShadowCopies>)>,
+ }
+ 
+ impl Default for ShadowCarry {
+@@ -2416,15 +2423,15 @@ impl ShadowCarry {
+         &mut self,
+         end: usize,
+         met: impl Fn(&ShadowCopies) -> bool,
+-    ) -> Vec<(bool, Arc<ShadowCopies>)> {
++    ) -> Vec<(bool, u64, Arc<ShadowCopies>)> {
+         if self.late.shadows.is_empty() {
+             return Vec::new();
+         }
+         let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.late.shadows)
+             .into_iter()
+-            .partition(|(from, _, copies)| *from < end && met(copies));
++            .partition(|(from, _, _, copies)| *from < end && met(copies));
+         self.late.shadows = kept;
+-        taken.into_iter().map(|(_, left, copies)| (left, copies)).collect()
++        taken.into_iter().map(|(_, left, written, copies)| (left, written, copies)).collect()
+     }
+ }
+ 
+@@ -2476,12 +2483,12 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                 if let (Some(_), Some(lazy), Some(since)) = (&lazily, &copies.lazy, self.carry.late.since) {
+                     let late = &mut self.carry.late.shadows;
+                     if lazy.whole_image()
+-                        && !(late.iter()).any(|(from, _, known)| {
++                        && !(late.iter()).any(|(from, _, _, known)| {
+                             *from == since && known.shadow_key == copies.shadow_key
+                         })
+                     {
+                         let left = lazy.left_open_by(self.carry.id);
+-                        late.push((since, left, Arc::clone(copies)));
++                        late.push((since, left, lazy.taken_written(), Arc::clone(copies)));
+                     }
+                 }
+                 let only_read = lazily.is_some() && (copies.lazy.as_ref())
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index c8f5d54b..404e0e08 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -198,10 +198,28 @@ pub(crate) enum Fallback {
+     /// Of those, the copies in made while another command buffer's write over the rectangle still
+     /// ran, whose texels the copy may lose: the submission waits for nothing.
+     LateCopyInBusy,
++    /// A GPU copy back (`shadow_lazy`'s `flush`) left a running record out of what it moved: its
++    /// command buffer had batches the scheduler had not planned yet (held for an event), which
++    /// the copy is not ordered after, so the record lands at its completion as ever
++    /// ([`Coherent::before_flush`]).
++    FlushHeldBack,
++    /// A held batch's copy in took a rectangle another command buffer wrote through another
++    /// import after the batch's encoder took the image's standing, ordered before the batch by
++    /// the tracker (`shadow_lazy::late_copy_in`).
++    LateBeside,
++    /// Such a write whose command buffer was not planned yet as the batch went: the copy leaves
++    /// it, as nothing orders it before the batch.
++    LateBesideUnplanned,
+ }
+ 
+-const FALLBACKS: usize = Fallback::LateCopyInBusy as usize + 1;
++const FALLBACKS: usize = Fallback::LateBesideUnplanned as usize + 1;
+ static FALLBACK: [AtomicU64; FALLBACKS] = [const { AtomicU64::new(0) }; FALLBACKS];
++/// The late copies in's compares of snapshot pages, every surface's ([`Coherent::taking_late`]):
++/// how many, and their ns in all and at most. Under the scheduler's lock, so the VM's smoke check
++/// reads them ([`report`]'s first line).
++static LATE_COMPARES: AtomicU64 = AtomicU64::new(0);
++static LATE_COMPARE_NS: AtomicU64 = AtomicU64::new(0);
++static LATE_COMPARE_NS_MAX: AtomicU64 = AtomicU64::new(0);
+ 
+ pub(crate) fn count(what: Fallback) {
+     FALLBACK[what as usize].fetch_add(1, Ordering::Relaxed);
+@@ -260,6 +278,13 @@ pub struct CoherentFallbackCounts {
+     pub late_copies_in: u64,
+     /// Of those, the ones made while another command buffer's write over the rectangle ran.
+     pub late_copies_in_busy: u64,
++    /// GPU copies back that left a running record out: its command buffer had batches unplanned.
++    pub flushes_held_back: u64,
++    /// Held batches' copies in of a rectangle another command buffer wrote through another
++    /// import after the standing was taken.
++    pub late_beside: u64,
++    /// Such writes left out: their command buffer was not planned as the batch went.
++    pub late_beside_unplanned: u64,
+ }
+ 
+ /// The counts of [`CoherentFallbackCounts`] so far.
+@@ -287,6 +312,9 @@ pub fn fallback_counts() -> CoherentFallbackCounts {
+         signals_behind_arm: read(Fallback::SignalBehindArm),
+         late_copies_in: read(Fallback::LateCopyIn),
+         late_copies_in_busy: read(Fallback::LateCopyInBusy),
++        flushes_held_back: read(Fallback::FlushHeldBack),
++        late_beside: read(Fallback::LateBeside),
++        late_beside_unplanned: read(Fallback::LateBesideUnplanned),
+     }
+ }
+ 
+@@ -487,6 +515,17 @@ struct Counts {
+     probes: AtomicU64,
+     overwrite_risk: AtomicU64,
+     sync_errors: AtomicU64,
++    /// Held batches' copies in of what the CPU wrote ([`Coherent::taking_late`]), and of those
++    /// the ones counted busy.
++    late_copies: AtomicU64,
++    late_busy: AtomicU64,
++    /// Of the late copies in, the ones that compared the open pages with their snapshots under
++    /// the scheduler's lock, and what the compares took, in all and at most.
++    late_compares: AtomicU64,
++    late_compare_ns: AtomicU64,
++    late_compare_ns_max: AtomicU64,
++    /// Rectangles held batches copied in that other imports wrote ([`Coherent::taking_beside`]).
++    late_beside: AtomicU64,
+ }
+ 
+ #[derive(Default)]
+@@ -1197,7 +1236,15 @@ impl Coherent {
+             self.sync_done(&mut state, SyncBy::CopyIn);
+             let list: Vec<u64> = state.snapshots.keys().copied().collect();
+             let came = pages().map(|mark| mark.hold(&list, true)).unwrap_or_default();
++            let comparing = Instant::now();
+             let (changed, whole) = self.changed(&state, area);
++            let ns = comparing.elapsed().as_nanos() as u64;
++            self.counts.late_compares.fetch_add(1, Ordering::Relaxed);
++            self.counts.late_compare_ns.fetch_add(ns, Ordering::Relaxed);
++            self.counts.late_compare_ns_max.fetch_max(ns, Ordering::Relaxed);
++            LATE_COMPARES.fetch_add(1, Ordering::Relaxed);
++            LATE_COMPARE_NS.fetch_add(ns, Ordering::Relaxed);
++            LATE_COMPARE_NS_MAX.fetch_max(ns, Ordering::Relaxed);
+             rects = changed;
+             busy |= whole && ahead(&state, &rects);
+             state.guest = None;
+@@ -1212,14 +1259,75 @@ impl Coherent {
+         }
+         if busy {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            self.counts.late_busy.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyInBusy);
+         }
+         if !rects.is_empty() {
++            self.counts.late_copies.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyIn);
+         }
+         rects
+     }
+ 
++    /// LOCAL (Atlas): the rectangle of the surface's bytes `[from, to)`, counted from its first
++    /// texel: its rows, or the texels of one row. `None` where it holds no texel.
++    pub(crate) fn area_of_bytes(&self, from: u64, to: u64) -> Option<[u32; 4]> {
++        let Layout { row, texel, width, height, .. } = self.layout;
++        if row == 0 || texel == 0 || to <= from {
++            return None;
++        }
++        let (y0, y1) = ((from / row) as u32, (to.div_ceil(row) as u32).min(height));
++        if y0 >= y1 {
++            return None;
++        }
++        let area = match y1 - y0 {
++            1 => {
++                let start = from - u64::from(y0) * row;
++                let end = to - u64::from(y0) * row;
++                let x0 = ((start / texel) as u32).min(width);
++                let x1 = (end.div_ceil(texel) as u32).min(width);
++                [x0, y0, x1, y1]
++            }
++            _ => [0, y0, width, y1],
++        };
++        (area[0] < area[2]).then_some(area)
++    }
++
++    /// Every texel of the surface.
++    pub(crate) fn whole(&self) -> [u32; 4] {
++        self.layout.whole()
++    }
++
++    /// LOCAL (Atlas): a held batch of the command buffer `id` is about to copy in `areas`, which
++    /// other command buffers wrote through another import of the bytes after its encoder took
++    /// the image's standing, planned before it, so the tracker orders the copy after them
++    /// (`shadow_lazy::late_copy_in`). What is done goes to the pages first. A record still open
++    /// or running over them (another command buffer's, or this one's where it left writes ahead
++    /// before the wait, `left`) holds texels the pages may lack: counted busy, as in
++    /// [`taking_late`](Self::taking_late). `areas` as they go, none where the surface no longer
++    /// traps.
++    pub(crate) fn taking_beside(&self, id: u64, left: bool, areas: Vec<[u32; 4]>) -> Vec<[u32; 4]> {
++        let mut state = self.lock();
++        if !state.tracked || state.closed || areas.is_empty() {
++            return Vec::new();
++        }
++        self.sync_done(&mut state, SyncBy::CopyIn);
++        let busy = (state.open.iter().chain(&state.running))
++            .filter(|record| left || record.id != id)
++            .filter(|record| record.seq == 0 || record.seq > state.flushed_to || record.id == id)
++            .any(|record| areas.iter().any(|area| meet(record.area, *area)));
++        if busy {
++            self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            self.counts.late_busy.fetch_add(1, Ordering::Relaxed);
++            count(Fallback::LateCopyInBusy);
++        }
++        self.counts.late_beside.fetch_add(areas.len() as u64, Ordering::Relaxed);
++        for _ in &areas {
++            count(Fallback::LateBeside);
++        }
++        areas
++    }
++
+     /// The rectangles of `area`'s texels the guest changed against its open pages' snapshots,
+     /// and whether they are coarser than that: a page in `area` with no snapshot takes its whole
+     /// rectangle, and past [`LATE_RECTS`] each band of rows changed takes its bounds, then
+@@ -1324,7 +1432,15 @@ impl Coherent {
+     /// A GPU copy back of what ran is about to record: everything done went on the CPU, and what
+     /// is still running goes by the copy, up to the sequence given. `None` where nothing runs. The
+     /// lock is not held while it records.
+-    pub(crate) fn before_flush(&self, by: SyncBy) -> Option<u64> {
++    ///
++    /// LOCAL (Atlas): `Some((mark, through))`: `mark` names the copy in flight, and the copy moves
++    /// the records up to `through` alone. A record whose command buffer still has a batch the
++    /// scheduler has not planned (one held for an event, `shadow_lazy::planned`) is not covered,
++    /// nor is any after it: the tracker orders the copy after what was planned before it, so the
++    /// held batch runs after the copy, and that record lands at its completion as ever. Before,
++    /// the copy covered it, its completion then armed nothing, and its writes never reached the
++    /// pages (lane `surface_coherent_a_standing_after_a_wait_keeps_a_later_buffer_write_before_the_signal`).
++    pub(crate) fn before_flush(&self, by: SyncBy) -> Option<(u64, u64)> {
+         let mut state = self.lock();
+         self.sync_done(&mut state, by);
+         if state.running.is_empty() {
+@@ -1342,9 +1458,16 @@ impl Coherent {
+                 self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+             }
+         }
+-        let through = state.seq;
+-        state.flushing = through;
+-        Some(through)
++        let held = (state.running.iter())
++            .filter(|record| super::shadow_lazy::unplanned(record.id))
++            .map(|record| record.seq)
++            .min();
++        if held.is_some() {
++            count(Fallback::FlushHeldBack);
++        }
++        let mark = state.seq;
++        state.flushing = mark;
++        Some((mark, held.map_or(mark, |seq| seq - 1)))
+     }
+ 
+     /// The copy back of everything up to `through`, of `bytes`, recorded and committed.
+@@ -1360,10 +1483,11 @@ impl Coherent {
+         self.moved.notify_all();
+     }
+ 
+-    /// That copy back completed.
+-    pub(crate) fn flushed(&self, through: u64) {
++    /// That copy back, `mark` of [`before_flush`](Self::before_flush), completed: the records up
++    /// to `through` are in the pages.
++    pub(crate) fn flushed(&self, mark: u64, through: u64) {
+         let mut state = self.lock();
+-        if state.flushing == through {
++        if state.flushing == mark {
+             state.flushing = 0;
+         }
+         state.flushed_to = state.flushed_to.max(through);
+@@ -1514,7 +1638,9 @@ impl Coherent {
+              \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
+              \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
+              \"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+-             \"overwrite_risk\":{},\"sync_errors\":{},\"pending_done\":{},\"open_pages\":{},\
++             \"overwrite_risk\":{},\"sync_errors\":{},\"late_copies\":{},\"late_busy\":{},\
++             \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
++             \"late_beside\":{},\"pending_done\":{},\"open_pages\":{},\
+              \"per_present_ns\":{{\"detect\":{detect:.0},\"sync\":{sync:.0},\"fetch\":{fetch:.0},\
+              \"total\":{total:.0},\"eager_would\":{eager:.0}}},\"pays\":{}}}\n",
+             self.layout.first_page(),
+@@ -1556,6 +1682,12 @@ impl Coherent {
+             read(&c.copy_in_bytes),
+             read(&c.overwrite_risk),
+             read(&c.sync_errors),
++            read(&c.late_copies),
++            read(&c.late_busy),
++            read(&c.late_compares),
++            read(&c.late_compare_ns),
++            read(&c.late_compare_ns_max),
++            read(&c.late_beside),
+             state.done.len(),
+             state.snapshots.len(),
+             read(&c.spent_ns) < read(&c.saved_ns),
+@@ -1688,9 +1820,56 @@ pub(crate) fn unarmed() -> bool {
+ 
+ /// One line a surface: what [`Coherent::line`] says, under `label`. A surface that went comes once.
+ pub fn report(label: &str) -> String {
+-    let mut lines: String = std::mem::take(&mut *ended().lock().unwrap_or_else(|e| e.into_inner())).concat();
+-    for surface in tracked() {
++    let ended: String = std::mem::take(&mut *ended().lock().unwrap_or_else(|e| e.into_inner())).concat();
++    let surfaces = tracked();
++    let mut lines = String::new();
++    // The process's counts first, where any surface traps or went: a surface's line stays last.
++    if !ended.is_empty() || !surfaces.is_empty() {
++        lines.push_str(&process_line(label));
++    }
++    lines.push_str(&ended);
++    for surface in surfaces {
+         lines.push_str(&surface.line(label, &surface.lock()));
+     }
+     lines
+ }
++
++/// [`report`]'s line of the process's counts: [`fallback_counts`]' silent fallbacks, and the
++/// late copies in's compares (count, ns in all, ns at most).
++fn process_line(label: &str) -> String {
++    let c = fallback_counts();
++    let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
++    format!(
++        "{{\"process\":\"{label}\",\"late_copies_in\":{},\"late_copies_in_busy\":{},\
++         \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
++         \"late_beside\":{},\"late_beside_unplanned\":{},\"flushes_held_back\":{},\
++         \"signals_behind_arm\":{},\"met_untracked\":{},\"flush_nothing_left\":{},\
++         \"host_reads\":{},\"host_reads_synced\":{},\"host_writes\":{},\"host_writes_opened\":{},\
++         \"demotions\":{},\"closed_by_overlap\":{},\"closed_by_marks\":{},\"retired_dead\":{},\
++         \"orphan_faults\":{},\"defer_refused_closed\":{},\"defer_refused_eager\":{},\
++         \"defer_refused_wrote\":{}}}\n",
++        c.late_copies_in,
++        c.late_copies_in_busy,
++        read(&LATE_COMPARES),
++        read(&LATE_COMPARE_NS),
++        read(&LATE_COMPARE_NS_MAX),
++        c.late_beside,
++        c.late_beside_unplanned,
++        c.flushes_held_back,
++        c.signals_behind_arm,
++        c.met_untracked,
++        c.flush_nothing_left,
++        c.host_reads,
++        c.host_reads_synced,
++        c.host_writes,
++        c.host_writes_opened,
++        c.demotions,
++        c.closed_by_overlap,
++        c.closed_by_marks,
++        c.retired_dead,
++        c.orphan_faults,
++        c.defer_refused_closed,
++        c.defer_refused_eager,
++        c.defer_refused_wrote,
++    )
++}
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 15164b8b..24d4ea28 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -187,6 +187,45 @@ fn committed_ids() -> &'static Mutex<VecDeque<u64>> {
+     IDS.get_or_init(Mutex::default)
+ }
+ 
++/// LOCAL (Atlas): the command buffers committed whose last batch the scheduler has not planned
++/// yet ([`planned`]), and the last [`PLANNED_KEPT`] that it planned.
++#[derive(Default)]
++struct Plans {
++    unplanned: HashSet<u64>,
++    planned: VecDeque<u64>,
++}
++
++/// The planned command buffers remembered: an older one counts as not planned ([`was_planned`]).
++const PLANNED_KEPT: usize = 4096;
++
++fn plans() -> &'static Mutex<Plans> {
++    static PLANS: OnceLock<Mutex<Plans>> = OnceLock::new();
++    PLANS.get_or_init(Mutex::default)
++}
++
++/// LOCAL (Atlas): the scheduler planned the last batch of the command buffer of identity `id`
++/// (`command_buffer/submit.rs`): a copy back planned after this is ordered after all of its work.
++/// Under the scheduler's lock, one short lock of its own.
++pub(crate) fn planned(id: u64) {
++    let mut plans = plans().lock().unwrap();
++    if plans.unplanned.remove(&id) {
++        if plans.planned.len() == PLANNED_KEPT {
++            plans.planned.pop_front();
++        }
++        plans.planned.push_back(id);
++    }
++}
++
++/// Whether the command buffer `id` was committed and has a batch the scheduler has not planned.
++pub(crate) fn unplanned(id: u64) -> bool {
++    plans().lock().unwrap().unplanned.contains(&id)
++}
++
++/// Whether the scheduler planned all of the command buffer `id`, lately.
++fn was_planned(id: u64) -> bool {
++    plans().lock().unwrap().planned.contains(&id)
++}
++
+ /// Whether a texture over host pages of `width` and `texels` stays a shadow to render lazily
+ /// (`host_rt.rs`): `surface_lazy_min_width` (default none) keeps a narrow surface, a Simulator's
+ /// portrait display among them, out, as it is made and whatever is presented later.
+@@ -334,6 +373,9 @@ pub(crate) fn display_image(bytes: &Range<usize>) -> Option<Hold> {
+ 
+ /// A command buffer completed, before its handlers: its writes in images trap from here.
+ pub(crate) fn completing(id: u64) {
++    if ANY.load(Ordering::Relaxed) {
++        planned(id);
++    }
+     if !crate::shadow_coherent::surfaces_tracked() {
+         return;
+     }
+@@ -356,12 +398,23 @@ pub(crate) fn committed(id: u64) {
+         ids.pop_front();
+     }
+     ids.push_back(id);
++    drop(ids);
++    // Before its commit hands its batches to the scheduler: none is planned yet.
++    let mut plans = plans().lock().unwrap();
++    // A command buffer whose batches never reach the scheduler (a commit refused) stays here:
++    // bounded, the oldest is lost first, which counts it planned.
++    if plans.unplanned.len() >= PLANNED_KEPT {
++        plans.unplanned.clear();
++    }
++    plans.unplanned.insert(id);
+ }
+ 
+-/// Note a recorded command with `uses` (the host memory's among them): each of its writes of a
+-/// surface's truth drops that surface's standing. A surface's own copy back counts too: its
+-/// encoder's end reads the count after it ([`Lazy::stand`]).
+-pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
++/// Note a recorded command with `uses` (the host memory's among them) of the command buffer `id`
++/// (`shadow::ShadowCarry::id`): each of its writes of a surface's truth drops that surface's
++/// standing. A surface's own copy back counts too: its encoder's end reads the count after it
++/// ([`Lazy::stand`]). LOCAL (Atlas): a trapping surface keeps each, for a held batch whose
++/// encoder took its standing before ([`Beside`], [`late_copy_in`]).
++pub(super) fn note_writes(uses: &[Use<ResourceKey>], id: u64) {
+     if !ANY.load(Ordering::Relaxed) {
+         return;
+     }
+@@ -369,7 +422,8 @@ pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
+     for used in uses.iter().filter(|used| !used.write.is_empty()) {
+         for lazy in all.iter().filter_map(Weak::upgrade) {
+             if lazy.meets(used) && !lazy.own_thread() {
+-                lazy.written.fetch_add(1, Ordering::Relaxed);
++                let count = lazy.written.fetch_add(1, Ordering::Relaxed) + 1;
++                lazy.note_beside(count, id, used);
+             }
+         }
+     }
+@@ -378,11 +432,11 @@ pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
+ /// Note a copy back recorded past [`note_writes`]: a command of an unordered encoder. A standing of
+ /// another texture's image over the bytes must drop with it, which `surface_lazy` alone leaves to
+ /// the next resync: the new switches close that.
+-pub(crate) fn note_copy_back(uses: &[Use<ResourceKey>]) {
++pub(crate) fn note_copy_back(uses: &[Use<ResourceKey>], id: u64) {
+     if ANY.load(Ordering::Relaxed)
+         && (crate::live::on(SCOPED, false) || crate::live::on(PRESENT, false))
+     {
+-        note_writes(uses);
++        note_writes(uses, id);
+     }
+ }
+ 
+@@ -517,14 +571,29 @@ pub(crate) fn signalled_by<M>(id: u64) -> Option<Vec<(Arc<Lazy>, ShadowCopy<M>,
+ /// ([`Coherent::taking_late`](super::shadow_coherent)). None where it wrote nothing, or the
+ /// surface no longer traps.
+ /// `left`: an earlier encoder of it left writes ahead in the image before the wait.
+-pub(crate) fn late_copy_in(copies: &Arc<ShadowCopies>, id: u64, left: bool) -> Vec<ShadowCopy> {
++///
++/// LOCAL (Atlas), the fourth path: with them, what other command buffers wrote of the bytes
++/// through another import (a buffer over the pages, another texture's copy back) after the
++/// encoder took the standing (`written`, [`Lazy::written`] then), where the scheduler planned
++/// that command buffer before this batch: the tracker orders the copy after its write, as Metal
++/// orders it before the batch through the event the batch waited for. A write not planned yet is
++/// ordered after the batch, and left (counted, [`Fallback::LateBesideUnplanned`]).
++pub(crate) fn late_copy_in(
++    copies: &Arc<ShadowCopies>,
++    id: u64,
++    left: bool,
++    written: u64,
++) -> Vec<ShadowCopy> {
+     let Some(lazy) = copies.lazy.as_ref() else {
+         return Vec::new();
+     };
+     let Some(coherent) = lazy.coherent() else {
+         return Vec::new();
+     };
+-    let list: Vec<ShadowCopy> = (coherent.taking_late(id, left, copies.cuts()).into_iter())
++    let mut areas = coherent.taking_late(id, left, copies.cuts());
++    let beside = lazy.beside_since(written, id, coherent);
++    areas.extend(coherent.taking_beside(id, left, beside));
++    let list: Vec<ShadowCopy> = (areas.into_iter())
+         .map(|area| ShadowCopy {
+             copies: Arc::clone(copies),
+             step: Step::Into,
+@@ -783,10 +852,26 @@ pub fn ahead_counts() -> AheadCounts {
+     }
+ }
+ 
++/// LOCAL (Atlas): the writes of a trapping surface's bytes through another import, by the
++/// [`Lazy::written`] count each made, for a held batch's copy in (`late_copy_in`): the last
++/// [`BESIDE_KEPT`], each with its command buffer's identity (0: not known) and rectangle (`None`:
++/// every texel), and the count the last one let go reached.
++#[derive(Default)]
++struct Beside {
++    writes: VecDeque<(u64, u64, Option<[u32; 4]>)>,
++    lost: u64,
++}
++
++const BESIDE_KEPT: usize = 32;
++
+ /// One surface's standing.
+ pub(crate) struct Lazy {
+     truth: OnceLock<(ResourceKey, Option<ResourceKey>, UseRange)>,
+     written: AtomicU64,
++    /// LOCAL (Atlas): [`Beside`], of a trapping surface.
++    beside: Mutex<Beside>,
++    /// LOCAL (Atlas): [`Lazy::written`] as the last standing taken found it.
++    taken_written: AtomicU64,
+     stood: Mutex<Option<Stood>>,
+     resynced: Mutex<Instant>,
+     /// The [`Device`] its queue comes from.
+@@ -831,6 +916,8 @@ impl Lazy {
+             Arc::new(Lazy {
+                 truth: OnceLock::new(),
+                 written: AtomicU64::new(0),
++                beside: Mutex::default(),
++                taken_written: AtomicU64::new(0),
+                 stood: Mutex::new(None),
+                 resynced: Mutex::new(Instant::now()),
+                 device: Arc::new(device.clone()),
+@@ -1094,9 +1181,9 @@ impl Lazy {
+             let mut encoder = command_buffer.blit_command_encoder().ok()?;
+             encoder.surface_copy_back(&copy, holds);
+             encoder.end_encoding().ok()?;
+-            if let (Some(coherent), Some(through)) = (&coherent, through) {
++            if let (Some(coherent), Some((mark, through))) = (&coherent, through) {
+                 let done = coherent.clone();
+-                let handler = Box::new(move |_: &CommandBuffer| done.flushed(through));
++                let handler = Box::new(move |_: &CommandBuffer| done.flushed(mark, through));
+                 command_buffer.add_completed_handler(handler).ok()?;
+             }
+             command_buffer.commit().ok()?;
+@@ -1231,6 +1318,63 @@ impl Lazy {
+         }
+     }
+ 
++    /// LOCAL (Atlas): a write `used` of its bytes through another import by the command buffer
++    /// `id` made the [`Lazy::written`] count `count` ([`Beside`]): kept where it traps.
++    fn note_beside(&self, count: u64, id: u64, used: &Use<ResourceKey>) {
++        let Some(coherent) = self.coherent() else {
++            return;
++        };
++        let area = match (self.truth.get(), &used.range) {
++            (Some((_, _, UseRange::Bytes(truth))), UseRange::Bytes(bytes)) => {
++                let from = bytes.start.max(truth.start) - truth.start;
++                let to = bytes.end.min(truth.end).saturating_sub(truth.start);
++                coherent.area_of_bytes(from, to)
++            }
++            _ => None,
++        };
++        let mut beside = self.beside.lock().unwrap();
++        if beside.writes.len() == BESIDE_KEPT {
++            if let Some((count, _, _)) = beside.writes.pop_front() {
++                beside.lost = beside.lost.max(count);
++            }
++        }
++        beside.writes.push_back((count, id, area));
++    }
++
++    /// LOCAL (Atlas): the rectangles written through other imports after the count `written` by
++    /// command buffers other than `id` the scheduler planned all of ([`late_copy_in`]); one that
++    /// it has not, or one let go of, counted and left.
++    fn beside_since(&self, written: u64, id: u64, coherent: &Coherent) -> Vec<[u32; 4]> {
++        if self.written.load(Ordering::Relaxed) == written {
++            return Vec::new();
++        }
++        let beside = self.beside.lock().unwrap();
++        if beside.lost > written {
++            count(Fallback::LateBesideUnplanned);
++        }
++        let mut areas: Vec<[u32; 4]> = Vec::new();
++        for (count_at, by, area) in beside.writes.iter().copied() {
++            if count_at <= written || by == id {
++                continue;
++            }
++            if by == 0 || !was_planned(by) {
++                count(Fallback::LateBesideUnplanned);
++                continue;
++            }
++            let area = area.unwrap_or_else(|| coherent.whole());
++            if !areas.contains(&area) {
++                areas.push(area);
++            }
++        }
++        areas
++    }
++
++    /// LOCAL (Atlas): [`Lazy::written`] as the last standing taken found it, for its note
++    /// (`shadow::LateCopies`).
++    pub(super) fn taken_written(&self) -> u64 {
++        self.taken_written.load(Ordering::Relaxed)
++    }
++
+     /// Whether its standing is one an encoder of the command buffer `id` left.
+     fn stood_by(&self, id: u64) -> bool {
+         (*self.stood.lock().unwrap()).is_some_and(|stood| stood.id == id)
+@@ -1286,6 +1430,7 @@ impl Lazy {
+                 return None;
+             }
+         }
++        self.taken_written.store(stood.written, Ordering::Relaxed);
+         TAKEN.fetch_add(1, Ordering::Relaxed);
+         self.taken.fetch_add(1, Ordering::Relaxed);
+         Some((stood.held, stood.stale))
+diff --git a/crates/metal2vulkan-runtime/src/tests/coherent_late.rs b/crates/metal2vulkan-runtime/src/tests/coherent_late.rs
+new file mode 100644
+index 00000000..0aa52845
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/coherent_late.rs
+@@ -0,0 +1,47 @@
++//! LOCAL (Atlas): the pieces of a held batch's copy in (`shadow::LateCopies`) that need no GPU:
++//! the rectangle a write of a trapping surface's bytes through another import covers
++//! (`shadow_coherent::Coherent::area_of_bytes`), and the plans a GPU copy back reads to leave a
++//! record whose command buffer still has a batch unplanned (`shadow_lazy::planned`).
++
++use crate::shadow_coherent::{Coherent, Layout};
++use std::sync::Weak;
++
++fn surface() -> std::sync::Arc<Coherent> {
++    let layout = Layout { base: 0x10_0000, row: 4096, texel: 4, width: 1000, height: 64 };
++    Coherent::new(layout, Box::new(|_, _, _| true), Weak::new())
++}
++
++#[test]
++fn a_write_inside_one_row_covers_its_texels() {
++    let surface = surface();
++    assert_eq!(surface.area_of_bytes(4096 * 3 + 36, 4096 * 3 + 100), Some([9, 3, 25, 4]));
++    // A texel's part takes the texel.
++    assert_eq!(surface.area_of_bytes(4096 * 3 + 37, 4096 * 3 + 38), Some([9, 3, 10, 4]));
++}
++
++#[test]
++fn a_write_over_rows_covers_them_whole() {
++    let surface = surface();
++    assert_eq!(surface.area_of_bytes(4096 * 2 + 8, 4096 * 5 + 4), Some([0, 2, 1000, 6]));
++    assert_eq!(surface.area_of_bytes(0, 4096 * 64), Some([0, 0, 1000, 64]));
++}
++
++#[test]
++fn a_write_past_the_texels_covers_none() {
++    let surface = surface();
++    // The row's padding past the texels, and past the last row.
++    assert_eq!(surface.area_of_bytes(4000 + 4096, 4096 * 2), None);
++    assert_eq!(surface.area_of_bytes(4096 * 64, 4096 * 65), None);
++    assert_eq!(surface.area_of_bytes(8, 8), None);
++}
++
++#[test]
++fn a_command_buffer_is_unplanned_from_its_commit_to_its_last_batch() {
++    // Identities no command buffer of the test process takes (`ShadowCarry::id` counts up).
++    let id = u64::MAX - 7;
++    assert!(!crate::shadow_lazy::unplanned(id));
++    crate::shadow_lazy::committed(id);
++    assert!(crate::shadow_lazy::unplanned(id));
++    crate::shadow_lazy::planned(id);
++    assert!(!crate::shadow_lazy::unplanned(id));
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index f60537af..87e655e9 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -245,6 +245,7 @@ mod shader_cache;
+ mod shader_cache_off_thread;
+ mod shader_cache_queue;
+ mod shader_cache_time;
++mod coherent_late;
+ mod shadow;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod shadow_carried_read;

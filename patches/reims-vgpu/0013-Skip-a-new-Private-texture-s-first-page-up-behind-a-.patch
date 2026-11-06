@@ -1,0 +1,1057 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 00:17:35 +0000
+Subject: [PATCH 13/25] Skip a new Private texture's first page-up, behind a
+ switch
+
+Safari's compositor makes about ten 2368x256 Private render targets per
+present, and each one builds a view of 148 guest-page runs, imports it
+and blits it, on the exec's serial path, only to overwrite a texture
+that already reads zero. REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1|2 skips that
+first page-up: no view, no import, no paging buffer. Off by default.
+
+Mapping reuse found nothing to reuse, because the guest puts other
+physical pages behind the recycled ranges. So mapstat gains the stale
+runs, the skips, the refusals and the mmaps with their time, and the
+trun event gives each walk's run count and hash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                                     |   1 +
+ .../reims-vgpu-core/src/device/lifecycle.rs   |   1 +
+ crates/reims-vgpu-core/src/gpu_task/memory.rs |   9 +
+ .../src/gpu_task/paged_buffers.rs             | 197 ++++++++++++++++--
+ crates/reims-vgpu-core/src/gpu_task/paging.rs | 114 +++++++++-
+ .../reims-vgpu-core/src/gpu_task/service.rs   |  14 +-
+ crates/reims-vgpu-core/src/memory/mapping.rs  |   6 +
+ crates/reims-vgpu-core/src/resources/host.rs  |  14 ++
+ .../reims-vgpu-core/src/resources/resource.rs |  10 +
+ .../reims-vgpu-core/src/resources/texture.rs  |  51 +++++
+ .../src/resources/texture/blit.rs             | 186 +++++++++++++++++
+ .../reims-vgpu-core/src/resources/validity.rs |  20 +-
+ .../src/testkit/resource_host.rs              |  27 +++
+ crates/reims-vgpu-vulkan/src/os/linux/vm.rs   |   8 +
+ 14 files changed, 643 insertions(+), 15 deletions(-)
+
+diff --git a/README.md b/README.md
+index abfbbda0..2f4622de 100644
+--- a/README.md
++++ b/README.md
+@@ -182,6 +182,7 @@ reads them once per process, and an unset or unparsable value is the default.
+ | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
+ | `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
+ | `REIMS_VGPU_PAGED_BUFFER_CACHE=32` | LOCAL (Atlas): entries per task of the buffers kept over guest pages for paged textures (`gpu_task/paged_buffers.rs`); unset or 0 keeps none |
++| `REIMS_VGPU_PRIVATE_SKIP_PAGE_UP` | LOCAL (Atlas). A new `Private` texture takes no first page-up: no guest-page view, no import, no paging buffer. `1` unless its host copy was ever marked stale, `2` unless a current copy went stale. Unset or `0` pages as ever. |
+ | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS: SDL3's window in place of AppKit's |
+ | `REIMS_VGPU_STRICT=1` | the Vulkan platform: end the process at each difference from Metal's answer it would otherwise log |
+ | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+diff --git a/crates/reims-vgpu-core/src/device/lifecycle.rs b/crates/reims-vgpu-core/src/device/lifecycle.rs
+index 855269b2..bd00794d 100644
+--- a/crates/reims-vgpu-core/src/device/lifecycle.rs
++++ b/crates/reims-vgpu-core/src/device/lifecycle.rs
+@@ -333,6 +333,7 @@ impl<P: Platform> DeviceCore<P> {
+         mut error: Option<&mut Option<u64>>,
+     ) -> bool {
+         log::info!("device resuming");
++        crate::gpu_task::paged_buffers::note_resumed();
+         self.run_state.store(RunState::LeavingSuspendEarly);
+         let Some(bytes) = state else {
+             set_error(error, RESUME_ERROR_INVALID_CONTENT.cast_unsigned());
+diff --git a/crates/reims-vgpu-core/src/gpu_task/memory.rs b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+index 26254d2c..f6fbc6a0 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/memory.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+@@ -144,6 +144,15 @@ impl<P: Platform> GpuTask<P> {
+         if range.physical_length != 0 {
+             ranges.push(range);
+         }
++        if crate::trace::on() {
++            // Trace `trun`: task offset, length, runs, and a hash of them, equal for two walks
++            // that found the same physical pages.
++            let hash = ranges.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, r| {
++                (hash ^ r.physical_address ^ r.physical_length.rotate_left(32))
++                    .wrapping_mul(0x0000_0100_0000_01b3)
++            });
++            crate::trace::event("trun", &[offset, length, ranges.len().to_u64(), hash]);
++        }
+         Ok(Runs { ranges, writable })
+     }
+ 
+diff --git a/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+index cfd7766b..79384ec9 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+@@ -19,19 +19,33 @@
+ //! end and drop, which is also where a device's guest-memory lease ends for its tasks. Dropping
+ //! an entry drops one reference: a command buffer or texture still using the buffer keeps it,
+ //! and the view goes with the last reference, by the buffer's own deallocator, as ever.
++//!
++//! **Measured on macOS 26.7.1 and Safari: no reuse.** The guest backs a recycled task range with
++//! other physical pages each time, so every lookup is a stale match. [`SKIP_ENV_VAR`] and the
++//! counters beyond the first six are what that run led to.
+ 
+-use std::collections::VecDeque;
++use std::collections::{HashSet, VecDeque};
+ use std::sync::OnceLock;
+-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+ use std::time::Duration;
+ 
+ use crate::host::PhysRange;
++use crate::memory::mapping::{VIEW_MMAP_NS, VIEW_MMAPS};
+ use crate::num::ToU64;
+ use crate::platform::Handle;
+ use crate::platform::os::clock::MonoTime;
+ 
+ /// The environment variable: entries per task.
+ pub(crate) const ENV_VAR: &str = "REIMS_VGPU_PAGED_BUFFER_CACHE";
++/// The environment variable of a new `Private` texture's page-up: unset or 0 pages it as ever; 1
++/// skips it unless the host copy was ever marked stale; 2 skips it unless a current host copy
++/// went stale, so a guest's mark on a texture never used is ignored
++/// (`PagedTexture::skip_first_page_up`).
++pub(crate) const SKIP_ENV_VAR: &str = "REIMS_VGPU_PRIVATE_SKIP_PAGE_UP";
++/// The pages noted as paged down, past which a task stops skipping.
++pub(crate) const MAX_PAGED_DOWN: usize = 1 << 16;
++/// The counters of the `mapstat` event.
++const COUNTERS: usize = 11;
+ /// The most entries the variable takes.
+ const MAX_ENTRIES: usize = 256;
+ /// An entry unused for this long goes at the next sweep.
+@@ -51,6 +65,32 @@ pub(crate) fn entries_by_env() -> usize {
+     })
+ }
+ 
++/// The mode [`SKIP_ENV_VAR`] asks for (read once): 0 without it, or for any other value.
++pub(crate) fn skip_mode_by_env() -> u8 {
++    static MODE: OnceLock<u8> = OnceLock::new();
++    *MODE.get_or_init(|| match std::env::var(SKIP_ENV_VAR).as_deref() {
++        Ok("1") => 1,
++        Ok("2") => 2,
++        _ => 0,
++    })
++}
++
++/// Set for good once the process resumes a device: resumed tasks make their `Private` textures
++/// anew over guest pages that hold the contents.
++static RESUMED: AtomicBool = AtomicBool::new(false);
++
++/// A device of the process is resuming: no first page-up is skipped from now on.
++pub(crate) fn note_resumed() {
++    RESUMED.store(true, Ordering::Relaxed);
++}
++
++/// Whether a device of the process resumed. Never in tests: their process shares this among
++/// devices that resume on their own; [`FreshPageUps::mode_at`] takes the answer, and its rule is
++/// tested there.
++pub(crate) fn resumed() -> bool {
++    !cfg!(test) && RESUMED.load(Ordering::Relaxed)
++}
++
+ /// Counters of the guest-page mappings of the whole process, relaxed, cumulative. They count with
+ /// the switch off too, for the baseline.
+ #[derive(Debug, Default)]
+@@ -67,6 +107,12 @@ pub struct MappingStats {
+     pub map_ns: AtomicU64,
+     /// Nanoseconds making no-copy buffers over the views: the Vulkan import.
+     pub import_ns: AtomicU64,
++    /// Lookups that found other physical runs behind an entry: part of `invalidated`.
++    pub stale_runs: AtomicU64,
++    /// First page-ups of `Private` textures skipped.
++    pub page_ups_skipped: AtomicU64,
++    /// First page-ups of `Private` textures kept because the host copy was marked stale.
++    pub fresh_told_invalid: AtomicU64,
+ }
+ 
+ /// The process's counters.
+@@ -77,11 +123,14 @@ pub static STATS: MappingStats = MappingStats {
+     walk_ns: AtomicU64::new(0),
+     map_ns: AtomicU64::new(0),
+     import_ns: AtomicU64::new(0),
++    stale_runs: AtomicU64::new(0),
++    page_ups_skipped: AtomicU64::new(0),
++    fresh_told_invalid: AtomicU64::new(0),
+ };
+ 
+ impl MappingStats {
+     /// The counters, in the order of the `mapstat` event.
+-    fn values(&self) -> [u64; 6] {
++    fn values(&self) -> [u64; COUNTERS] {
+         [
+             self.made.load(Ordering::Relaxed),
+             self.reused.load(Ordering::Relaxed),
+@@ -89,6 +138,11 @@ impl MappingStats {
+             self.walk_ns.load(Ordering::Relaxed),
+             self.map_ns.load(Ordering::Relaxed),
+             self.import_ns.load(Ordering::Relaxed),
++            self.stale_runs.load(Ordering::Relaxed),
++            self.page_ups_skipped.load(Ordering::Relaxed),
++            self.fresh_told_invalid.load(Ordering::Relaxed),
++            VIEW_MMAPS.load(Ordering::Relaxed),
++            VIEW_MMAP_NS.load(Ordering::Relaxed),
+         ]
+     }
+ }
+@@ -99,33 +153,114 @@ pub(crate) fn add_since(counter: &AtomicU64, from: MonoTime, to: MonoTime) {
+     counter.fetch_add(ns, Ordering::Relaxed);
+ }
+ 
+-/// One present: the trace's `mapstat` (made, reused, invalidated, walk, map and import ns, all
+-/// cumulative), and with the switch on a log line per [`LOG_EVERY`] presents, of the difference.
++/// One present: the trace's `mapstat`, all cumulative: made, reused, invalidated, walk, map and
++/// import ns, stale runs, page-ups skipped, page-ups kept as told, the views' `mmap`s and their
++/// ns. With a switch on, a log line per [`LOG_EVERY`] presents, of the difference.
+ pub fn present_counted() {
+     static PRESENTS: AtomicU64 = AtomicU64::new(0);
+-    static LAST: crate::sync::Mutex<[u64; 6]> = crate::sync::Mutex::new([0; 6]);
++    static LAST: crate::sync::Mutex<[u64; COUNTERS]> = crate::sync::Mutex::new([0; COUNTERS]);
+     let values = STATS.values();
+     crate::trace::event("mapstat", &values);
+     let presents = PRESENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+-    if entries_by_env() != 0 && presents.is_multiple_of(LOG_EVERY) {
++    if (entries_by_env() != 0 || skip_mode_by_env() != 0) && presents.is_multiple_of(LOG_EVERY) {
+         let before = std::mem::replace(&mut *LAST.lock(), values);
+-        let [made, reused, gone, walk, map, import] = values;
+-        let [made0, reused0, gone0, walk0, map0, import0] = before;
++        let [
++            made,
++            reused,
++            gone,
++            walk,
++            map,
++            import,
++            stale,
++            skipped,
++            told,
++            mmaps,
++            mmap_ns,
++        ] = values;
++        let [
++            made0,
++            reused0,
++            gone0,
++            walk0,
++            map0,
++            import0,
++            stale0,
++            skipped0,
++            told0,
++            mmaps0,
++            mmap_ns0,
++        ] = before;
+         let per = |now: u64, then: u64| now.wrapping_sub(then).div_euclid(LOG_EVERY);
+         let us = |now: u64, then: u64| per(now, then).div_euclid(1000);
+         log::info!(
+-            "paged buffers, per present: {} views made, {} reused, {} invalidated, walk {} us, \
+-             map {} us, import {} us",
++            "paged buffers, per present: {} views made, {} reused, {} invalidated ({} stale runs), \
++             walk {} us, map {} us ({} mmaps, {} us in them), import {} us, {} page-ups skipped, \
++             {} kept as told",
+             per(made, made0),
+             per(reused, reused0),
+             per(gone, gone0),
++            per(stale, stale0),
+             us(walk, walk0),
+             us(map, map0),
+-            us(import, import0)
++            per(mmaps, mmaps0),
++            us(mmap_ns, mmap_ns0),
++            us(import, import0),
++            per(skipped, skipped0),
++            per(told, told0),
+         );
+     }
+ }
+ 
++/// A task's say over new `Private` textures' page-ups ([`SKIP_ENV_VAR`]).
++pub(crate) struct FreshPageUps {
++    mode: AtomicU8,
++    /// The task pages a `Private` page-down reached, where a later object is paged up as ever;
++    /// `None` past [`MAX_PAGED_DOWN`], where the task skips no more.
++    paged_down: crate::sync::Mutex<Option<HashSet<u32>>>,
++}
++
++impl FreshPageUps {
++    /// With mode `mode`.
++    pub(crate) fn new(mode: u8) -> Self {
++        FreshPageUps {
++            mode: AtomicU8::new(mode),
++            paged_down: crate::sync::Mutex::new(Some(HashSet::new())),
++        }
++    }
++
++    /// Turns the mode to `mode`, as the variable would have.
++    #[cfg(test)]
++    pub(crate) fn set_mode(&self, mode: u8) {
++        self.mode.store(mode, Ordering::Relaxed);
++    }
++
++    /// The mode for a texture at `page`, 0 for none, `resumed` being [`resumed`].
++    pub(crate) fn mode_at(&self, page: u32, resumed: bool) -> u8 {
++        let mode = self.mode.load(Ordering::Relaxed);
++        if mode == 0 || resumed {
++            return 0;
++        }
++        match self.paged_down.lock().as_ref() {
++            Some(pages) if !pages.contains(&page) => mode,
++            _ => 0,
++        }
++    }
++
++    /// A `Private` page-down reached `page`.
++    pub(crate) fn note_paged_down(&self, page: u32) {
++        if self.mode.load(Ordering::Relaxed) == 0 {
++            return;
++        }
++        let mut guard = self.paged_down.lock();
++        if let Some(pages) = guard.as_mut() {
++            pages.insert(page);
++            if pages.len() > MAX_PAGED_DOWN {
++                *guard = None;
++            }
++        }
++    }
++}
++
+ /// What a walk found behind a task range.
+ #[derive(Debug, Clone, Default)]
+ pub(crate) struct Runs {
+@@ -219,6 +354,7 @@ impl<B: Handle, L: PartialEq> PagedBuffers<B, L> {
+         }
+         drop(entries);
+         STATS.invalidated.fetch_add(1, Ordering::Relaxed);
++        STATS.stale_runs.fetch_add(1, Ordering::Relaxed);
+         (None, Gone(vec![entry]))
+     }
+ 
+@@ -298,3 +434,40 @@ impl<B: Handle, L: PartialEq> PagedBuffers<B, L> {
+         self.entries.lock().len()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Off, nothing is ever skipped, and nothing is kept
++    #[test]
++    fn mode_zero_says_no() {
++        let fresh = FreshPageUps::new(0);
++        fresh.note_paged_down(3);
++        assert_eq!(fresh.mode_at(4, false), 0);
++        assert!(fresh.paged_down.lock().as_ref().unwrap().is_empty());
++    }
++
++    /// On, it says its mode, but not for a page a page-down reached, or after a resume
++    #[test]
++    fn a_paged_down_page_and_a_resume_refuse() {
++        let fresh = FreshPageUps::new(2);
++        assert_eq!(fresh.mode_at(3, false), 2);
++        fresh.note_paged_down(3);
++        assert_eq!(fresh.mode_at(3, false), 0);
++        assert_eq!(fresh.mode_at(4, false), 2);
++        assert_eq!(fresh.mode_at(4, true), 0);
++    }
++
++    /// Past the bound it forgets the pages, and so skips nothing more for good
++    #[test]
++    fn past_the_bound_it_refuses_for_good() {
++        let fresh = FreshPageUps::new(1);
++        for page in 0..=u32::try_from(MAX_PAGED_DOWN).unwrap() {
++            fresh.note_paged_down(page);
++        }
++        assert_eq!(fresh.mode_at(u32::MAX, false), 0);
++        fresh.note_paged_down(u32::MAX);
++        assert_eq!(fresh.mode_at(u32::MAX, false), 0);
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/gpu_task/paging.rs b/crates/reims-vgpu-core/src/gpu_task/paging.rs
+index f3ec99b4..a775ede9 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/paging.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/paging.rs
+@@ -80,7 +80,9 @@ impl<P: Platform> GpuTask<P> {
+                 r.set_is_host_valid(false);
+             }
+             if let Some(r) = resource.as_ref().filter(|r| r.needs_prepare()) {
+-                if r.needs_cpu_paging() {
++                if r.skip_first_page_up() {
++                    // LOCAL (Atlas): no pages, no blit, no paging buffer.
++                } else if r.needs_cpu_paging() {
+                     cpu_resources.push(Arc::clone(r));
+                 } else if r.needs_compute_paging() {
+                     compute_resources.push(Arc::clone(r));
+@@ -295,8 +297,16 @@ mod tests {
+     use super::super::testing::*;
+     use super::*;
+     use crate::platform::device::GpuDevice;
++    use crate::resources::host::ResourceHost;
++    use crate::resources::manager::create::Resources;
++    use crate::resources::resource::with_platform;
++    use crate::resources::texture::create_texture_resource;
++    use crate::resources::texture::test_support::{desc, header, mip, paging, rec1};
++    use crate::testkit::FakePlatform;
+     use crate::testkit::capture::catch_death;
++    use crate::testkit::impls::new_texture;
+     use crate::testkit::script::Step;
++    use zerocopy::IntoBytes;
+ 
+     /// Nothing to page: no buffer, the paging counter unmoved, nothing to wait for
+     #[test]
+@@ -388,4 +398,106 @@ mod tests {
+         assert!(pos("encodeWaitForEvent:value:") < pos("addCompletedHandler:"));
+         assert!(pos("addCompletedHandler:") < pos("commit"));
+     }
++
++    /// LOCAL (Atlas): a `Private` texture of this task, registered at reference 1.
++    fn fresh_private(tx: &Tx) -> Arc<Resource<FakePlatform>> {
++        let t = new_texture(tx.p.world(), desc(70, 16, 8, 1, 3), None, 0, None, false);
++        t.state().device = Some(tx.p.device().erase());
++        t.set_storage_mode(2);
++        let task = Arc::clone(&tx.task) as Arc<dyn ResourceHost<FakePlatform>>;
++        let dimension = rec1(
++            header(0x300, 4, 3),
++            vec![
++                mip(0, 0x200, 64, 16, 8, 1),
++                mip(0x200, 0x80, 32, 8, 4, 1),
++                mip(0x280, 0x20, 16, 4, 2, 1),
++            ],
++        );
++        let r = with_platform(&tx.p, || {
++            create_texture_resource(
++                Arc::downgrade(&task),
++                2,
++                &paging(1, 0x1000),
++                &dimension,
++                0x84,
++                t,
++            )
++        })
++        .unwrap()
++        .unwrap();
++        assert!(
++            tx.task
++                .parts()
++                .1
++                .register_object::<Resources>(1, Arc::clone(&r))
++        );
++        r
++    }
++
++    /// The calls of one prepare of reference 1 with `flags`.
++    fn prepared(tx: &Tx, flags: u32) -> Vec<&'static str> {
++        let record = [CmdExecIndirectResource3 {
++            reference: 1,
++            flags,
++        }];
++        let mark = tx.p.call_log().mark();
++        let mut ids = Vec::new();
++        tx.task
++            .prepare_resources(
++                Hold::NONE,
++                Records::new(record.as_bytes(), 1).unwrap(),
++                None,
++                0,
++                &mut ids,
++            )
++            .unwrap();
++        tx.p.call_log().sels_since(mark)
++    }
++
++    fn pages(sels: &[&str]) -> bool {
++        sels.contains(&"commit")
++    }
++
++    /// LOCAL (Atlas): on, a new `Private` texture adds no paging buffer to the exec's path
++    #[test]
++    fn a_skipped_page_up_makes_no_paging_buffer() {
++        let tx = ready(&rw_pages(4));
++        tx.task.fresh_page_ups.set_mode(1);
++        let r = fresh_private(&tx);
++        let sels = prepared(&tx, 0);
++        assert!(!pages(&sels), "{sels:?}");
++        assert!(sels.is_empty(), "{sels:?}");
++        assert!(r.state.host_valid());
++    }
++
++    /// LOCAL (Atlas): off, the same texture is paged as ever
++    #[test]
++    fn off_pages_a_new_private_texture() {
++        let tx = ready(&rw_pages(4));
++        let r = fresh_private(&tx);
++        assert!(pages(&prepared(&tx, 0)));
++        assert!(r.state.host_valid());
++    }
++
++    /// LOCAL (Atlas): the guest's `invalidateHost` on a new texture pages it in mode 1, and is
++    /// ignored in mode 2
++    #[test]
++    fn the_guests_mark_decides_by_mode() {
++        for (mode, paged) in [(1, true), (2, false)] {
++            let tx = ready(&rw_pages(4));
++            tx.task.fresh_page_ups.set_mode(mode);
++            fresh_private(&tx);
++            assert_eq!(pages(&prepared(&tx, 1)), paged, "mode {mode}");
++        }
++    }
++
++    /// LOCAL (Atlas): a page a `Private` page-down reached is paged up for the next texture there
++    #[test]
++    fn a_paged_down_page_pages_up() {
++        let tx = ready(&rw_pages(4));
++        tx.task.fresh_page_ups.set_mode(2);
++        tx.task.note_paged_down(1);
++        fresh_private(&tx);
++        assert!(pages(&prepared(&tx, 0)));
++    }
+ }
+diff --git a/crates/reims-vgpu-core/src/gpu_task/service.rs b/crates/reims-vgpu-core/src/gpu_task/service.rs
+index b33c112a..861d9b35 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/service.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/service.rs
+@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock, Weak};
+ use parking_lot::{Mutex, MutexGuard};
+ 
+ use super::exec::FifoInfo;
+-use super::paged_buffers::PagedBuffers;
++use super::paged_buffers::{FreshPageUps, PagedBuffers};
+ use super::surfaces::CachedSurface;
+ use super::{DeathKind, Unsupported, blit, exception, unraised};
+ use crate::collections::LookupMap;
+@@ -81,6 +81,8 @@ pub struct GpuTask<P: Platform> {
+     pub(super) surfaces: Mutex<LookupMap<u64, CachedSurface<P>>>,
+     /// LOCAL (Atlas): the buffers kept over task pages for paged textures (`paged_buffers`).
+     pub(super) paged_buffers: PagedBuffers<P::Buffer, usize>,
++    /// LOCAL (Atlas): new `Private` textures' page-ups.
++    pub(super) fresh_page_ups: FreshPageUps,
+     /// Serializes the execs' and infos' paging-in.
+     pub(super) prepare_lock: Mutex<()>,
+     /// Serializes the object lists' mapping.
+@@ -154,6 +156,7 @@ impl<P: Platform> GpuTask<P> {
+             features: Arc::new(SharedFeatures::new()),
+             surfaces: Mutex::new(LookupMap::new()),
+             paged_buffers: PagedBuffers::new(super::paged_buffers::entries_by_env()),
++            fresh_page_ups: FreshPageUps::new(super::paged_buffers::skip_mode_by_env()),
+             prepare_lock: Mutex::new(()),
+             object_lists_lock: Mutex::new(()),
+             fifos: Mutex::new(LookupMap::new()),
+@@ -711,6 +714,15 @@ impl<P: Platform> ResourceHost<P> for GpuTask<P> {
+         GpuTask::paged_texture_buffer(self, hold, page, length)
+     }
+ 
++    fn fresh_page_up_mode(&self, page: u32) -> u8 {
++        self.fresh_page_ups
++            .mode_at(page, super::paged_buffers::resumed())
++    }
++
++    fn note_paged_down(&self, page: u32) {
++        self.fresh_page_ups.note_paged_down(page);
++    }
++
+     fn prepare_backing(
+         &self,
+         _hold: Hold<'_>,
+diff --git a/crates/reims-vgpu-core/src/memory/mapping.rs b/crates/reims-vgpu-core/src/memory/mapping.rs
+index 043d2641..d7cff8c6 100644
+--- a/crates/reims-vgpu-core/src/memory/mapping.rs
++++ b/crates/reims-vgpu-core/src/memory/mapping.rs
+@@ -1,12 +1,18 @@
+ //! A host range over guest memory, and what its last release does.
+ 
+ use std::sync::Arc;
++use std::sync::atomic::AtomicU64;
+ 
+ use crate::host::{HostPtr, HostTask};
+ use crate::memory::DeathKind;
+ use crate::platform::Platform;
+ use crate::seams::links::MappingDeviceLink;
+ 
++/// LOCAL (Atlas): the `mmap` calls of views of guest pages, for the `mapstat` counters.
++pub static VIEW_MMAPS: AtomicU64 = AtomicU64::new(0);
++/// LOCAL (Atlas): the nanoseconds in those calls.
++pub static VIEW_MMAP_NS: AtomicU64 = AtomicU64::new(0);
++
+ /// What a mapping's last release does.
+ pub enum Teardown<P: Platform> {
+     /// Nothing: the range belongs to someone else.
+diff --git a/crates/reims-vgpu-core/src/resources/host.rs b/crates/reims-vgpu-core/src/resources/host.rs
+index 51801d7c..d65a4c52 100644
+--- a/crates/reims-vgpu-core/src/resources/host.rs
++++ b/crates/reims-vgpu-core/src/resources/host.rs
+@@ -84,6 +84,20 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
+         self.new_buffer_for_virtual_page(hold, page, length)
+     }
+ 
++    /// LOCAL (Atlas): whether a Private paged texture at task page `page` may skip its first
++    /// page-up (`PagedTexture::skip_first_page_up`): 0 no, else the mode. Only a task of a guest
++    /// process says yes, never the kernel's.
++    fn fresh_page_up_mode(&self, page: u32) -> u8 {
++        let _ = page;
++        0
++    }
++
++    /// LOCAL (Atlas): a Private paged texture at task page `page` was paged down: the guest's
++    /// pages there now hold what a later object over them may need.
++    fn note_paged_down(&self, page: u32) {
++        let _ = page;
++    }
++
+     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
+     /// nothing checks: the backing's validity writes still happen.
+     fn prepare_backing(
+diff --git a/crates/reims-vgpu-core/src/resources/resource.rs b/crates/reims-vgpu-core/src/resources/resource.rs
+index eb30ee69..7f1f1385 100644
+--- a/crates/reims-vgpu-core/src/resources/resource.rs
++++ b/crates/reims-vgpu-core/src/resources/resource.rs
+@@ -171,6 +171,12 @@ pub trait ResourceClass<P: Platform>: Send + Sync {
+         let _ = this;
+         false
+     }
++    /// LOCAL (Atlas): whether this first prepare needs no paging at all, the resource then
++    /// host-valid (`PagedTexture::skip_first_page_up`). Only paged textures may.
++    fn skip_first_page_up(&self, this: &Resource<P>) -> bool {
++        let _ = this;
++        false
++    }
+     /// Guest to host through a blit encoder. `encoder` is `None` when Metal gave no encoder,
+     /// which nothing checks: the sends are skipped and the flag writes still happen.
+     fn prepare_in_encoder(
+@@ -355,6 +361,10 @@ impl<P: Platform> Resource<P> {
+     pub fn needs_prepare(&self) -> bool {
+         self.class().needs_prepare(self)
+     }
++    /// LOCAL (Atlas): whether this first prepare needs no paging at all.
++    pub fn skip_first_page_up(&self) -> bool {
++        self.class().skip_first_page_up(self)
++    }
+     /// Whether it pages on the CPU.
+     pub fn needs_cpu_paging(&self) -> bool {
+         self.class().needs_cpu_paging(self)
+diff --git a/crates/reims-vgpu-core/src/resources/texture.rs b/crates/reims-vgpu-core/src/resources/texture.rs
+index 673ca01e..b5b88bb0 100644
+--- a/crates/reims-vgpu-core/src/resources/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/texture.rs
+@@ -65,14 +65,17 @@ pub mod views;
+ 
+ use std::fmt;
+ use std::sync::Arc;
++use std::sync::atomic::Ordering;
+ 
+ use zerocopy::{FromBytes, IntoBytes};
+ 
++use crate::gpu_task::paged_buffers::STATS;
+ use crate::num::ToUsize;
+ use crate::platform::resource::{GpuResource, Texture};
+ use crate::platform::{Handle, Platform};
+ use crate::raise::{Kept, RaiseResult, keep_forever};
+ use crate::resources::resource::AnyResource;
++use crate::resources::resource::STORAGE_MODE_PRIVATE;
+ use crate::resources::resource::{
+     PURGEABLE_EMPTY, PURGEABLE_NON_VOLATILE, PURGEABLE_VOLATILE, Resource, ResourceClass,
+     ResourceKind, ResourceState, TaskRef,
+@@ -425,6 +428,43 @@ impl<P: Platform> PagedTexture<P> {
+         Ok(())
+     }
+ 
++    /// LOCAL (Atlas): a new `Private` texture takes no page-up: its first prepare binds no guest
++    /// pages and copies nothing, and the texture is host-valid. It answers whether it did.
++    ///
++    /// No guest CPU writes `Private` bytes, so its pages hold data only where a page-down put it,
++    /// or where the guest says so. A new host texture reads zero (the runtime's `FirstMove`, every
++    /// storage mode but memoryless), so nothing of an earlier texture or another process shows.
++    /// Refused, and paged as ever, for: another storage mode; a protected texture; one with pages
++    /// bound, volatile or already host-valid; the guest kernel's tasks; any process that resumed
++    /// from a suspend; a page a `Private` page-down reached in this task; and, in mode 1, a
++    /// texture whose host copy was ever marked stale, or, in mode 2, only one whose current host
++    /// copy went stale. Pages bind as ever at a later page-down or page-up.
++    pub(crate) fn skip_first_page_up(&self, state: &ResourceState) -> bool {
++        if state.host_valid()
++            || state.is_volatile()
++            || self.texture.storage_mode() != STORAGE_MODE_PRIVATE
++            || self.texture.protection_options() != 0
++            || self.transfer_buffer.lock().is_some()
++        {
++            return false;
++        }
++        let Some(task) = self.task.upgrade() else {
++            return false;
++        };
++        let refused = match task.fresh_page_up_mode(self.page) {
++            1 => state.host_told_invalid(),
++            2 => state.host_lost_valid(),
++            _ => return false,
++        };
++        if refused {
++            STATS.fresh_told_invalid.fetch_add(1, Ordering::Relaxed);
++            return false;
++        }
++        state.set_host_valid(true);
++        STATS.page_ups_skipped.fetch_add(1, Ordering::Relaxed);
++        true
++    }
++
+     /// Guest to host: devolatilize, then page up unless host-valid. A protected texture is never
+     /// paged, yet marked host-valid. `ensure` binds the pages, `page` pages them.
+     pub(crate) fn prepare(
+@@ -463,6 +503,11 @@ impl<P: Platform> PagedTexture<P> {
+             log::warn!("synchronizing a texture whose host copy is not valid");
+         }
+         if self.texture.protection_options() == 0 {
++            if self.texture.storage_mode() == STORAGE_MODE_PRIVATE
++                && let Some(task) = self.task.upgrade()
++            {
++                task.note_paged_down(self.page);
++            }
+             ensure()?;
+             page()?;
+         }
+@@ -486,6 +531,12 @@ impl<P: Platform> ResourceClass<P> for TextureResource<P> {
+         matches!(self.layout, TextureLayout::DualPlaneCompute(_))
+     }
+ 
++    fn skip_first_page_up(&self, this: &Resource<P>) -> bool {
++        // One plane, its levels all paged: generated mipmaps start from a paged level 0.
++        matches!(&self.layout, TextureLayout::SinglePlane(l) if !l.generate_mipmaps)
++            && self.paged.skip_first_page_up(&this.state)
++    }
++
+     fn prepare_in_encoder(
+         &self,
+         hold: Hold<'_>,
+diff --git a/crates/reims-vgpu-core/src/resources/texture/blit.rs b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+index dc3c8ad9..e4f5b2d8 100644
+--- a/crates/reims-vgpu-core/src/resources/texture/blit.rs
++++ b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+@@ -663,6 +663,10 @@ mod tests {
+             }
+         }
+ 
++        fn parts_of(r: &Resource<P>) -> &TextureResource<P> {
++            parts(r).0
++        }
++
+         fn made(e: &Env, ty: u32, levels: u64) -> Arc<Resource<P>> {
+             let t = e.tex(desc(70, 16, 8, 1, levels), false);
+             e.run(|| create_texture_resource(e.task(), ty, &paging(7, 0x300), &good16x8(), 0x84, t))
+@@ -670,6 +674,188 @@ mod tests {
+                 .unwrap()
+         }
+ 
++        /// LOCAL (Atlas): a new `Private` texture's first page-up (`skip_first_page_up`).
++        mod fresh_private {
++            use super::*;
++            use crate::gpu_task::paged_buffers::STATS;
++            use std::sync::atomic::Ordering;
++
++            fn private(e: &Env, ty: u32, levels: u64, mode: u8) -> Arc<Resource<P>> {
++                let t = e.tex(desc(70, 16, 8, 1, levels), false);
++                t.set_storage_mode(2);
++                e.rec.set_fresh_page_up_mode(mode);
++                e.run(|| {
++                    create_texture_resource(e.task(), ty, &paging(7, 0x300), &good16x8(), 0x84, t)
++                })
++                .unwrap()
++                .unwrap()
++            }
++
++            /// Skipped: no guest pages bound, no copy, host-valid, the guest's copy untouched
++            #[test]
++            fn binds_and_copies_nothing() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 1);
++                let m = e.p.call_log().mark();
++                assert!(r.skip_first_page_up());
++                assert!(e.sels(m).iter().all(|s| !s.contains("buffer") && *s != UP));
++                assert!(r.state.host_valid());
++                assert!(r.state.guest_valid());
++                assert!(!r.needs_prepare());
++                assert!(parts_of(&r).paged.transfer_buffer.lock().is_none());
++            }
++
++            /// The switch off, the kernel's tasks and a task that refuses: paged as ever
++            #[test]
++            fn mode_zero_pages_as_ever() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 0);
++                assert!(!r.skip_first_page_up());
++                assert!(!r.state.host_valid());
++                let enc = e.blit();
++                let m = e.p.call_log().mark();
++                r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++                assert_eq!(e.sels(m), vec!["new_buffer_for_virtual_page", UP, UP, UP]);
++            }
++
++            /// Shared storage holds what the guest's CPU wrote: paged
++            #[test]
++            fn other_storage_pages() {
++                let e = Env::new();
++                e.rec.set_fresh_page_up_mode(2);
++                let r = made(&e, 2, 3);
++                assert!(!r.skip_first_page_up());
++                assert!(!r.state.host_valid());
++            }
++
++            /// Generated levels start from a paged level 0: paged
++            #[test]
++            fn generated_mipmaps_page() {
++                let e = Env::new();
++                let r = private(&e, 3, 3, 2);
++                assert!(!r.skip_first_page_up());
++                assert!(!r.state.host_valid());
++            }
++
++            /// A protected texture is never paged anyway; it keeps its own path
++            #[test]
++            fn protected_keeps_its_path() {
++                let e = Env::new();
++                let t = e.tex(desc(70, 16, 8, 1, 3), false);
++                t.set_storage_mode(2);
++                t.set_protection_options(2);
++                e.rec.set_fresh_page_up_mode(1);
++                let r = e
++                    .run(|| {
++                        create_texture_resource(
++                            e.task(),
++                            2,
++                            &paging(7, 0x300),
++                            &good16x8(),
++                            0x84,
++                            t,
++                        )
++                    })
++                    .unwrap()
++                    .unwrap();
++                assert!(!r.skip_first_page_up());
++            }
++
++            /// Mode 1 believes any stale mark, even on a texture never used
++            #[test]
++            fn mode_one_refuses_a_marked_texture() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 1);
++                r.set_is_host_valid(false);
++                let before = STATS.fresh_told_invalid.load(Ordering::Relaxed);
++                assert!(!r.skip_first_page_up());
++                assert!(STATS.fresh_told_invalid.load(Ordering::Relaxed) > before);
++                assert!(!r.state.host_valid());
++            }
++
++            /// Mode 2 ignores that mark on a texture that never was current
++            #[test]
++            fn mode_two_ignores_a_mark_on_a_new_texture() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 2);
++                r.set_is_host_valid(false);
++                assert!(r.skip_first_page_up());
++                assert!(r.state.host_valid());
++            }
++
++            /// A skip is the first prepare only: a copy that went stale later is paged, in either
++            /// mode, through pages bound then
++            #[test]
++            fn a_later_stale_mark_pages_up() {
++                for mode in [1, 2] {
++                    let e = Env::new();
++                    let r = private(&e, 2, 3, mode);
++                    assert!(r.skip_first_page_up());
++                    r.set_is_host_valid(false);
++                    assert!(!r.skip_first_page_up());
++                    let enc = e.blit();
++                    let m = e.p.call_log().mark();
++                    r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++                    assert_eq!(e.sels(m), vec!["new_buffer_for_virtual_page", UP, UP, UP]);
++                    assert!(r.state.host_valid());
++                }
++            }
++
++            /// Volatile: `Metal` may have emptied it, and that path devolatilizes first
++            #[test]
++            fn volatile_keeps_its_path() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 2);
++                r.state.set_is_volatile(true);
++                assert!(!r.skip_first_page_up());
++                assert!(!r.state.host_valid());
++            }
++
++            /// Pages bound by an earlier use: they stay in charge
++            #[test]
++            fn bound_pages_refuse() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 2);
++                parts_of(&r).paged.ensure_physical(Hold::NONE).unwrap();
++                assert!(!r.skip_first_page_up());
++            }
++
++            /// After a skip a page-down still binds the pages and copies the real contents, and
++            /// the task hears of the page
++            #[test]
++            fn a_later_page_down_works_and_is_noted() {
++                let e = Env::new();
++                let r = private(&e, 2, 3, 1);
++                assert!(r.skip_first_page_up());
++                r.state.set_guest_valid(false);
++                let enc = e.blit();
++                let m = e.p.call_log().mark();
++                let (synchronized, lines) =
++                    logged(|| r.synchronize_in_encoder(Hold::NONE, Some(&enc)));
++                synchronized.unwrap();
++                assert_eq!(
++                    e.sels(m),
++                    vec!["new_buffer_for_virtual_page", DOWN, DOWN, DOWN]
++                );
++                assert!(lines.is_empty());
++                assert!(r.state.guest_valid());
++                assert_eq!(e.rec.paged_down(), vec![7]);
++            }
++
++            /// A page-down of another storage mode is no one's business
++            #[test]
++            fn shared_page_down_is_not_noted() {
++                let e = Env::new();
++                e.rec.set_fresh_page_up_mode(1);
++                let r = made(&e, 2, 3);
++                r.state.set_host_valid(true);
++                r.state.set_guest_valid(false);
++                let enc = e.blit();
++                r.synchronize_in_encoder(Hold::NONE, Some(&enc)).unwrap();
++                assert!(e.rec.paged_down().is_empty());
++            }
++        }
++
+         mod paging {
+             use super::*;
+ 
+diff --git a/crates/reims-vgpu-core/src/resources/validity.rs b/crates/reims-vgpu-core/src/resources/validity.rs
+index 5f2a2312..050343f0 100644
+--- a/crates/reims-vgpu-core/src/resources/validity.rs
++++ b/crates/reims-vgpu-core/src/resources/validity.rs
+@@ -21,6 +21,10 @@ pub struct ResourceState {
+     host_valid: AtomicBool,
+     guest_valid: AtomicBool,
+     is_volatile: AtomicBool,
++    /// LOCAL (Atlas): the host copy was marked stale at least once, by anyone.
++    host_told_invalid: AtomicBool,
++    /// LOCAL (Atlas): a host copy that was current went stale at least once.
++    host_lost_valid: AtomicBool,
+ }
+ 
+ impl ResourceState {
+@@ -30,7 +34,21 @@ impl ResourceState {
+     }
+     /// Stores the host-valid flag.
+     pub fn set_host_valid(&self, v: bool) {
+-        self.host_valid.store(v, Ordering::Relaxed)
++        let was = self.host_valid.swap(v, Ordering::Relaxed);
++        if !v {
++            self.host_told_invalid.store(true, Ordering::Relaxed);
++            if was {
++                self.host_lost_valid.store(true, Ordering::Relaxed);
++            }
++        }
++    }
++    /// LOCAL (Atlas): whether anything ever marked the host copy stale.
++    pub fn host_told_invalid(&self) -> bool {
++        self.host_told_invalid.load(Ordering::Relaxed)
++    }
++    /// LOCAL (Atlas): whether a current host copy ever went stale.
++    pub fn host_lost_valid(&self) -> bool {
++        self.host_lost_valid.load(Ordering::Relaxed)
+     }
+     /// The raw guest-valid flag.
+     pub fn guest_valid(&self) -> bool {
+diff --git a/crates/reims-vgpu-core/src/testkit/resource_host.rs b/crates/reims-vgpu-core/src/testkit/resource_host.rs
+index c6723c9b..9274152a 100644
+--- a/crates/reims-vgpu-core/src/testkit/resource_host.rs
++++ b/crates/reims-vgpu-core/src/testkit/resource_host.rs
+@@ -13,6 +13,7 @@
+ 
+ use crate::testkit::script::Policy;
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicU8, Ordering};
+ 
+ use crate::sync::Mutex;
+ 
+@@ -48,6 +49,10 @@ struct Shared {
+     paging_queue: Mutex<Option<Fk<kind::CommandQueue>>>,
+     /// What runs inside the next call of a selector, once (a racing caller's whole call).
+     during: Mutex<Vec<During>>,
++    /// The answer of `fresh_page_up_mode`, as the task would give it.
++    fresh_page_up_mode: AtomicU8,
++    /// The pages `note_paged_down` was told of.
++    paged_down: Mutex<Vec<u32>>,
+ }
+ 
+ /// A scripted task. Siblings share one log, script and state.
+@@ -77,10 +82,24 @@ impl FakeResourceHost {
+                 provided: Mutex::new(Vec::new()),
+                 paging_queue: Mutex::new(None),
+                 during: Mutex::new(Vec::new()),
++                fresh_page_up_mode: AtomicU8::new(0),
++                paged_down: Mutex::new(Vec::new()),
+             }),
+         })
+     }
+ 
++    /// Sets the task's answer on skipping a first page-up.
++    pub fn set_fresh_page_up_mode(&self, mode: u8) {
++        self.shared
++            .fresh_page_up_mode
++            .store(mode, Ordering::Relaxed);
++    }
++
++    /// The pages noted as paged down.
++    pub fn paged_down(&self) -> Vec<u32> {
++        self.shared.paged_down.lock().clone()
++    }
++
+     /// Another handle on the same state: a second task object whose last release a test
+     /// controls on its own.
+     pub fn sibling(&self) -> Arc<FakeResourceHost> {
+@@ -177,6 +196,14 @@ impl FakeResourceHost {
+ }
+ 
+ impl ResourceHost<P> for FakeResourceHost {
++    fn fresh_page_up_mode(&self, _page: u32) -> u8 {
++        self.shared.fresh_page_up_mode.load(Ordering::Relaxed)
++    }
++
++    fn note_paged_down(&self, page: u32) {
++        self.shared.paged_down.lock().push(page);
++    }
++
+     fn new_buffer_for_virtual_page(
+         &self,
+         _hold: Hold<'_>,
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
+index 5ef6bc84..c434e8c5 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/vm.rs
+@@ -46,7 +46,9 @@
+ 
+ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+ use std::sync::Arc;
++use std::sync::atomic::Ordering;
+ 
++use reims_vgpu_core::memory::mapping::{VIEW_MMAP_NS, VIEW_MMAPS};
+ use reims_vgpu_core::num::{ToU64, ToUsize};
+ use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
+ use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+@@ -530,6 +532,9 @@ impl HostVm for LinuxVm {
+             return Err(INVALID_ADDRESS);
+         };
+         budget::admit(mappings_added(&pieces), "a view of guest pages");
++        // LOCAL (Atlas): the calls' share of a view, for the `mapstat` counters.
++        #[allow(clippy::disallowed_methods)]
++        let timed = std::time::Instant::now();
+         for (done, piece) in pieces.iter().enumerate() {
+             if let Err(kr) = file(
+                 Some(target + piece.at),
+@@ -543,6 +548,9 @@ impl HostVm for LinuxVm {
+                 return Err(kr);
+             }
+         }
++        let ns = u64::try_from(timed.elapsed().as_nanos()).unwrap_or(u64::MAX);
++        VIEW_MMAP_NS.fetch_add(ns, Ordering::Relaxed);
++        VIEW_MMAPS.fetch_add(pieces.len().to_u64(), Ordering::Relaxed);
+         files::record_pieces(target, pieces);
+         Ok(HostAddr::from_addr(target.to_usize()))
+     }

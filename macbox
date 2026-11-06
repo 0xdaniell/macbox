@@ -14,7 +14,8 @@ eval "$_env"
 : "${MACBOX_SSH_HOST:=macbox}" "${MACBOX_SSH_PORT:=2226}" "${MACBOX_SCREEN_PORT:=6081}"
 : "${MACBOX_GUEST_USER:=dev}" "${MACBOX_CPUS:=8}" "${MACBOX_MEMORY:=12G}" "${MACBOX_DISK_SIZE:=160G}"
 : "${MACBOX_RESOLUTION:=1920x1080}" "${MACBOX_REFRESH:=60}" "${MACBOX_CPUSET:=}"
-: "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=writeback}" "${MACBOX_GPU_TUNING:=auto}"
+: "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=none}" "${MACBOX_GPU_TUNING:=auto}"
+: "${MACBOX_COHERENT:=off}"
 : "${MACBOX_SIM_PREFIX:=macbox}" "${MACBOX_POOL:=full slim-1 slim-2 sharp small}"
 : "${MACBOX_T3_HOST_ID:=$MACBOX_SSH_HOST}" "${MACBOX_T3_SETTINGS:=$HOME/.t3/userdata/settings.json}"
 DOCKER="${MACBOX_DOCKER:-docker}"
@@ -95,13 +96,27 @@ tuning_on() {
   esac
 }
 apply_tuning() {  # before each start
+  local live="$RUN/live.conf"
   if tuning_on; then
-    [ -s "$RUN/live.conf" ] || printf '# metal2vulkan live switches (patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$RUN/live.conf"
-    local env=(--env "M2V_LIVE=$RUN/live.conf")
+    [ -s "$live" ] || printf '# metal2vulkan live switches (patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$live"
+    sed -i '/^surface_\(lazy\|lazy_scoped\|coherent\)=/d' "$live"
+    local env=(--env "M2V_LIVE=$live" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1)
     if gpu_is_arl; then env+=(--env "M2V_ARL_FACTS=$ARL_FACTS"); else env+=(--env "M2V_ARL_FACTS="); fi
+    if [ "$MACBOX_COHERENT" = on ]; then
+      # QEMU's census traps the guest CPU's touches of the surfaces metal2vulkan renders in place.
+      # A run that doesn't end well leaves coherent/coherent.running, and every later start then
+      # boots without Coherent until that file is removed (macbox coherent reset).
+      mkdir -p "$RUN/coherent"
+      printf 'surface_lazy=1\nsurface_lazy_scoped=1\nsurface_coherent=1\n' >>"$live"
+      env+=(--env "REIMS_VGPU_CENSUS=$RUN/coherent" --env REIMS_VGPU_COHERENT=1 --env REIMS_VGPU_CENSUS_FLUSH_MS=60000)
+    else
+      env+=(--env REIMS_VGPU_CENSUS= --env REIMS_VGPU_COHERENT= --env REIMS_VGPU_CENSUS_FLUSH_MS=)
+    fi
     ctl set "$MACBOX_VM" "${env[@]}" >/dev/null
   else
-    ctl set "$MACBOX_VM" --env "M2V_LIVE=" --env "M2V_ARL_FACTS=" >/dev/null
+    [ -f "$live" ] && sed -i '/^surface_\(lazy\|lazy_scoped\|coherent\)=/d' "$live"
+    ctl set "$MACBOX_VM" --env "M2V_LIVE=" --env "M2V_ARL_FACTS=" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP= \
+      --env REIMS_VGPU_CENSUS= --env REIMS_VGPU_COHERENT= --env REIMS_VGPU_CENSUS_FLUSH_MS= >/dev/null
   fi
 }
 
@@ -149,10 +164,13 @@ MACBOX_CPUSET=$MACBOX_CPUSET
 # Host CPUs for macbox build (taskset list, e.g. the efficiency cores); empty: all
 MACBOX_BUILD_CPUSET=${MACBOX_BUILD_CPUSET:-}
 MACBOX_RENDER_NODE=${node:-$MACBOX_RENDER_NODE}
-# writeback (safe) or unsafe (faster; a crash of the host itself can corrupt the VM's disk)
+# none (the default: macOS's NVMe driver panicked under heavy swap with writeback), writeback, or
+# unsafe (faster; a crash of the host itself can corrupt the VM's disk)
 MACBOX_DISK_CACHE=$MACBOX_DISK_CACHE
 # auto: macbox's metal2vulkan tuning with the macbox build; on; off
 MACBOX_GPU_TUNING=$MACBOX_GPU_TUNING
+# on: Coherent, zero-copy IOSurfaces (docs/performance.md). Experimental: one GPU hang with it on
+MACBOX_COHERENT=$MACBOX_COHERENT
 # iOS Simulator pool: names are "<device> (<prefix> <label>)"
 MACBOX_SIM_PREFIX=$MACBOX_SIM_PREFIX
 MACBOX_POOL="$MACBOX_POOL"
@@ -288,7 +306,7 @@ cmd_up() {
     wd=$(in_c "$REPO/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
   fi
   if ! vm_running; then
-    ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" >/dev/null
+    ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" --extra-args "$(qemu_extra)" >/dev/null
     apply_tuning
     ctl start "$MACBOX_VM"
   fi
@@ -322,6 +340,7 @@ cmd_status() {
   in_c test -S /tmp/host-wayland/wayland-0 && say "  view: local (a window on the host's desktop)" ||
     { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/"; in_c "$REPO/container/stream-up.sh" status | sed 's/^/  /'; }
   say "  build: $(build_id)$(tuning_on && echo ', GPU tuning on' || echo ', GPU tuning off')"
+  say "  coherent: $(coherent_state)"
   say "  screen: $(resolution)"
   ssh_ok && say "  ssh $MACBOX_SSH_HOST: ok" || say "  ssh $MACBOX_SSH_HOST: no answer"
 }
@@ -522,6 +541,25 @@ PY
   esac
 }
 
+coherent_state() {
+  if [ "$MACBOX_COHERENT" != on ] || ! tuning_on; then echo "off (MACBOX_COHERENT=on to try it)"
+  elif [ -e "$RUN/coherent/coherent.running" ] && ! vm_running; then
+    echo "on, but held off: the last coherent run did not end well (macbox coherent reset)"
+  else echo "on"; fi
+}
+cmd_coherent() {  # Coherent's crash guard (docs/performance.md)
+  case "${1:-status}" in
+    status) say "coherent: $(coherent_state)"
+      [ -s "$RUN/coherent/coherent.running" ] && say "  guard: $(cat "$RUN/coherent/coherent.running")"
+      grep -h "coherent pages\|census:" "$VMDIR/logs/qemu.log" 2>/dev/null | tail -3 | sed 's/^/  /' || true ;;
+    reset)
+      vm_running && die "the VM is running: macbox down first"
+      rm -f "$RUN/coherent/coherent.running"
+      say "the guard is cleared: the next macbox up tries Coherent again" ;;
+    *) die "usage: macbox coherent [status|reset]" ;;
+  esac
+}
+
 cmd_backup() {
   local name=${1:?usage: macbox backup <name>} b="$MACBOX_HOME/backups/$1" disk
   vm_running && die "the VM is running: macbox down first"
@@ -563,6 +601,7 @@ Day to day:
   macbox ssh [command]
   macbox screenshot [out.png] | click X Y [right|double] | move X Y | scroll X Y N
   macbox type TEXT|-  |  key COMBO...  |  wait SECONDS [out.png]
+  macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=on, experimental)
   macbox backup <name>
 EOF
 }
@@ -613,6 +652,7 @@ case "$sub" in
   pool) ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"; guest "MACBOX_SIM_PREFIX=$(printf '%q' "$MACBOX_SIM_PREFIX") MACBOX_POOL=$(printf '%q' "$MACBOX_POOL") ~/.macbox/macbox-guest pool ${1:-create}" ;;
   t3) cmd_t3 "$@" ;;
   agents) cmd_agents "$@" ;;
+  coherent) cmd_coherent "$@" ;;
   backup) cmd_backup "$@" ;;
   help|-h|--help) cmd_help ;;
   *) cmd_help >&2; exit 2 ;;

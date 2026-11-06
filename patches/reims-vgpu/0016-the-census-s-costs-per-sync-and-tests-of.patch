@@ -1,0 +1,355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 03:50:10 +0000
+Subject: [PATCH 16/25] the census's costs per sync, and tests
+ of what real surfaces do
+
+A scattered surface's runs, guest memory on the view against the main mapping beside marker
+traffic, the report's copy, hold, arm and spent against saved, and the NVMe boot test reaching the
+BARs at the VM's real RAM size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/census_report.py |  11 ++
+ scripts/internal/census/census_test.c    |   9 +-
+ scripts/internal/census/coherent_test.c  | 211 +++++++++++++++++++++++
+ scripts/internal/census/guest/dma.c      |  23 ++-
+ scripts/internal/census/guest/run-dma.sh |   2 +-
+ 5 files changed, 252 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+index b29a1a12..635a81c0 100644
+--- a/scripts/internal/census/census_report.py
++++ b/scripts/internal/census/census_report.py
+@@ -161,7 +161,18 @@ def coherent(directory, wanted):
+               f" {r['demotions']:>6} {r['writes']:>6} {cost['detect'] / 1e3:>7.1f}"
+               f" {cost['sync'] / 1e3:>7.1f} {cost['fetch'] / 1e3:>7.1f} {cost['total'] / 1e3:>7.1f}"
+               f" {cost['eager_would'] / 1e3:>8.1f} {'yes' if r['pays'] else 'NO'}")
++    print("per sync in ms (sync_ns holds the copy and the hold), and what spent and saved came to")
++    print(f"{'surface':>12} {'defers':>7} {'syncs':>6} {'copy':>6} {'hold':>6} {'arm':>6} {'MB/s':>6}"
++          f" {'spent ms':>9} {'saved ms':>9}  synced by")
++    for r in sorted(found.values(), key=lambda r: -r["spent_ns"])[:40]:
++        syncs = r["regions"] or 1
++        speed = r["bytes_detiled"] / r["copy_ns"] * 1e3 if r["copy_ns"] else 0
++        by = " ".join(f"{k}:{n}" for k, n in r["sync_by"].items() if n)
++        print(f"{r['at']:>12} {r['defers']:>7} {r['regions']:>6} {r['copy_ns'] / syncs / 1e6:>6.2f}"
++              f" {r['hold_ns'] / syncs / 1e6:>6.2f} {r['arm_ns'] / (r['arms'] or 1) / 1e6:>6.2f}"
++              f" {speed:>6.0f} {r['spent_ns'] / 1e6:>9.1f} {r['saved_ns'] / 1e6:>9.1f}  {by}")
+     for r in touches[-1:]:
++        print(f"marker runs {r.get('runs', 0)}")
+         print(f"QEMU's own accesses: open {r['open']} armed {r['armed']} held {r['held']}"
+               f" frozen {r['frozen']} stale {r['stale']}")
+     bad = [r for r in found.values() if r["sync_errors"] or r["overwrite_risk"]]
+diff --git a/scripts/internal/census/census_test.c b/scripts/internal/census/census_test.c
+index de2d48ba..9d70f624 100644
+--- a/scripts/internal/census/census_test.c
++++ b/scripts/internal/census/census_test.c
+@@ -38,11 +38,18 @@ __asm__(
+ "g_outs:     mov $0x11,%dx\n rep outsb\n out %al,$0x10\n"
+ "g_loop:     mov (%rbx),%rax\n add %rdx,%rbx\n dec %rcx\n jnz g_loop\n out %al,$0x10\n"
+ "g_wloop:    mov %rax,(%rbx)\n add %rdx,%rbx\n dec %rcx\n jnz g_wloop\n out %al,$0x10\n"
++"g_copy:     mov %rsi,%r8\n mov %rdi,%r9\n mov %rcx,%r10\n"
++"1:          mov %r8,%rsi\n mov %r9,%rdi\n mov %r10,%rcx\n rep movsb\n dec %rax\n jnz 1b\n out %al,$0x10\n"
++"g_vcopy:    vpcmpeqd %ymm1,%ymm1,%ymm1\n"
++"1:          xor %rdx,%rdx\n"
++"2:          vmovdqu (%rsi,%rdx),%ymm0\n vpblendvb %ymm1,%ymm0,%ymm0,%ymm0\n vmovdqu %ymm0,(%rdi,%rdx)\n"
++"            add $32,%rdx\n cmp %rcx,%rdx\n jb 2b\n dec %rax\n jnz 1b\n out %al,$0x10\n"
++"g_chase:    mov (%rbx),%rbx\n dec %rcx\n jnz g_chase\n out %al,$0x10\n"
+ "g_end:\n"
+ ".popsection\n");
+ // clang-format on
+ extern const char g_start[], g_end[], g_read[], g_write[], g_lock[], g_avx[], g_repmovs[], g_outs[],
+-    g_loop[], g_wloop[];
++    g_loop[], g_wloop[], g_copy[], g_vcopy[], g_chase[];
+ #define STUB(s) (CODE + (uint64_t)((s) - g_start))
+ 
+ #define DIE(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, " (%s)\n", strerror(errno)); exit(1); } while (0)
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+index 15de6d6d..28978dc3 100644
+--- a/scripts/internal/census/coherent_test.c
++++ b/scripts/internal/census/coherent_test.c
+@@ -455,6 +455,215 @@ static void t_coherent_cost(struct vcpu *c) {
+     }
+ }
+ 
++// A surface as macOS lays one out: chunks of `run` pages, descending inside, apart in the view.
++static size_t scattered(uint64_t off, size_t n, size_t run, uint64_t *list) {
++    size_t chunks = 0;
++
++    for (size_t i = 0; i < n; chunks++) {
++        for (size_t j = 0; j < run && i < n; j++, i++) {
++            list[i] = (uint64_t)main_map + off + (chunks * (run + 1) + run - 1 - j) * PG;
++        }
++    }
++    return chunks;
++}
++
++enum { SCATTERED = 5650, SCATTERED_RUN = 9 };
++#define SCATTERED_OFF 0x10000000UL
++static uint64_t scattered_main[SCATTERED], scattered_view[SCATTERED];
++
++static size_t scattered_surface(uint32_t id) {
++    size_t chunks = scattered(SCATTERED_OFF, SCATTERED, SCATTERED_RUN, scattered_main);
++    CensusSurface f = {.mapping_id = id, .width = 2000, .height = 2000, .pixel_format = 0x42475241,
++                       .alloc_size = SCATTERED * PG, .bytes_per_row = 8000,
++                       .base_address = scattered_main[0]};
++    uint64_t start = 0, len = 0;
++
++    census_surface_mapped(&f, scattered_main, SCATTERED, PG);
++    census_coh_surface(id, &start, &len);
++    if (!census_coh_track(start, len)) DIE("track");
++    for (size_t i = 0; i < SCATTERED; i++) scattered_view[i] = start + i * PG;
++    return chunks;
++}
++
++static void t_scattered(void) {
++    printf("[scattered] pages descending in the surface move in runs of the view\n");
++    static uint64_t refused[SCATTERED], came[SCATTERED];
++    uint64_t *view = scattered_view, tries = 200, armed_ns = 0, held_ns = 0, one_ns = 0;
++    size_t chunks = scattered_surface(21);
++
++    uint64_t runs = census_coh_run_count();
++    census_coh_arm(view, SCATTERED, refused, SCATTERED);
++    CHECK(census_coh_run_count() - runs == chunks, "an arm is one run a chunk: %llu for %zu chunks",
++          (unsigned long long)(census_coh_run_count() - runs), chunks);
++    int right = 0;
++    for (size_t i = 0; i < SCATTERED; i++) right += census_page_state((void *)scattered_main[i]) == 1;
++    CHECK(right == SCATTERED, "every page armed");
++    runs = census_coh_run_count();
++    census_coh_hold(view, SCATTERED, false, came, SCATTERED);
++    CHECK(census_coh_run_count() - runs == chunks, "a hold too");
++
++    census_coh_arm(view + 100, 3, refused, SCATTERED);
++    right = 0;
++    for (size_t i = 0; i < SCATTERED; i++) {
++        right += census_page_state((void *)scattered_main[i]) == (i >= 100 && i < 103 ? 1 : 2);
++    }
++    CHECK(right == SCATTERED, "an arm of three pages moved those three, wherever they lie");
++    census_coh_hold(view, SCATTERED, false, came, SCATTERED);
++
++    for (uint64_t i = 0; i < tries; i++) {
++        uint64_t t0 = now_ns();
++        census_coh_arm(view, SCATTERED, refused, SCATTERED);
++        uint64_t t1 = now_ns();
++        census_coh_hold(view, SCATTERED, false, came, SCATTERED);
++        armed_ns += t1 - t0;
++        held_ns += now_ns() - t1;
++    }
++    for (uint64_t i = 0; i < 20; i++) {
++        uint64_t t0 = now_ns();
++        for (size_t p = 0; p < SCATTERED; p++) census_coh_arm(view + p, 1, refused, SCATTERED);
++        for (size_t p = 0; p < SCATTERED; p++) census_coh_hold(view + p, 1, false, came, SCATTERED);
++        one_ns += now_ns() - t0;
++    }
++    printf("    %d pages, %zu chunks: arm %.0f us, hold %.0f us; a run a page, both: %.0f us\n",
++           SCATTERED, chunks, armed_ns / 1e3 / tries, held_ns / 1e3 / tries, one_ns / 1e3 / 20);
++    census_surface_unmapped(21);
++}
++
++// Guest memory speed, the view against the main mapping, beside the markers' traffic.
++#define MAIN_GPA (64UL << 30)
++enum { COPY, VCOPY, CHASE };
++static struct vcpu speed_vcpus[8];
++struct speed_run {
++    struct vcpu *c;
++    int kind;
++    uint64_t base, bytes;
++    atomic_int *stop;
++    uint64_t done, ns;
++};
++
++static void *speed_vcpu(void *arg) {
++    struct speed_run *r = arg;
++    struct vcpu *c = r->c;
++    uint64_t src = r->base, dst = src + r->bytes, t0, rounds = 0;
++
++    setr(c, STUB(g_loop), 0, src, r->bytes * 2 / PG, PG, 0, 0);
++    run_guest(c, 0);
++    t0 = now_ns();
++    while (!atomic_load(r->stop)) {
++        if (r->kind == COPY) setr(c, STUB(g_copy), 4, 0, r->bytes, 0, src, dst);
++        else if (r->kind == VCOPY) setr(c, STUB(g_vcopy), 4, 0, r->bytes, 0, src, dst);
++        else setr(c, STUB(g_chase), 0, src, 1 << 18, 0, 0, 0);
++        if (run_guest(c, 0) != RUN_IO) DIE("speed vcpu");
++        rounds++;
++    }
++    r->ns = now_ns() - t0;
++    r->done = r->kind == CHASE ? rounds << 18 : rounds * 4 * r->bytes;
++    return 0;
++}
++
++// The markers beside the vCPUs: the scattered surface armed and held `hz` times a second, 0 flat
++// out, and with `mapped` read by a vCPU of its own while held, so each move has EPT entries to zap
++// and every vCPU a TLB shootdown to take.
++static struct { int hz, mapped; atomic_int *stop; uint64_t frames; int per_page; } traffic;
++
++static void *traffic_thread(void *unused) {
++    static uint64_t refused[SCATTERED], came[SCATTERED];
++    uint64_t *view = scattered_view;
++    struct vcpu *reader = &speed_vcpus[7];
++    uint64_t span = SCATTERED / SCATTERED_RUN * (SCATTERED_RUN + 1);
++
++    while (!atomic_load(traffic.stop)) {
++        if (traffic.mapped) {
++            setr(reader, STUB(g_loop), 0, DATA_GPA + SCATTERED_OFF, span, PG, 0, 0);
++            if (run_guest(reader, 0) != RUN_IO) DIE("traffic reader");
++        }
++        if (traffic.per_page) {
++            for (size_t p = 0; p < SCATTERED; p++) census_coh_arm(view + p, 1, refused, SCATTERED);
++            for (size_t p = 0; p < SCATTERED; p++) census_coh_hold(view + p, 1, false, came, SCATTERED);
++        } else {
++            census_coh_arm(view, SCATTERED, refused, SCATTERED);
++            census_coh_hold(view, SCATTERED, false, came, SCATTERED);
++        }
++        traffic.frames++;
++        if (traffic.hz) usleep(1000000 / traffic.hz);
++    }
++    return 0;
++}
++
++static double speed(int kind, uint64_t base, int n, uint64_t bytes) {
++    static struct speed_run runs[16];
++    pthread_t t[16], th;
++    atomic_int stop = 0;
++    double total = 0;
++
++    traffic.stop = &stop;
++    traffic.frames = 0;
++    for (int i = 0; i < n; i++) {
++        uint64_t off = 0x40000000UL + i * 2 * (bytes + (1 << 20));
++
++        runs[i] = (struct speed_run){&speed_vcpus[i], kind, base + off, bytes, &stop};
++        // A ring through every page in a random order, each load a walk of the page tables.
++        for (uint64_t pages = bytes / PG, p = 0, at = 0; kind == CHASE && p < pages; p++) {
++            static uint32_t order[1 << 16];
++
++            if (p == 0) {
++                for (uint64_t k = 0; k < pages; k++) order[k] = k;
++                for (uint64_t k = pages - 1; k > 0; k--) {
++                    uint64_t j = rand() % (k + 1), t = order[k];
++                    order[k] = order[j]; order[j] = t;
++                }
++            }
++            at = order[p];
++            *(uint64_t *)(main_map + off + at * PG) = base + off + order[(p + 1) % pages] * PG;
++        }
++        pthread_create(&t[i], 0, speed_vcpu, &runs[i]);
++    }
++    if (traffic.hz >= 0) pthread_create(&th, 0, traffic_thread, 0);
++    usleep(2500000);
++    atomic_store(&stop, 1);
++    if (traffic.hz >= 0) pthread_join(th, 0);
++    for (int i = 0; i < n; i++) {
++        pthread_join(t[i], 0);
++        total += kind == CHASE ? runs[i].ns / (double)runs[i].done : runs[i].done * 1e3 / runs[i].ns;
++    }
++    return kind == CHASE ? total / n : total;
++}
++
++static void t_guest_speed(void) {
++    printf("[speed] guest memory on the view and on the main mapping (MB/s all vCPUs, ns a load)\n");
++    static const char *kinds[] = {"rep movsb", "avx2 copy", "chase"};
++    struct kvm_userspace_memory_region m = {.slot = 2, .guest_phys_addr = MAIN_GPA, .memory_size = mem_len,
++                                            .userspace_addr = (uint64_t)main_map};
++    if (ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &m)) DIE("slot 2");
++    for (int i = 0; i < 8; i++) vcpu_init(&speed_vcpus[i], 40 + i);
++    traffic.hz = -1;
++    for (int n = 1; n <= 7; n += 6) {
++        for (uint64_t bytes = 8 << 20; bytes <= (256 << 20); bytes <<= 5) {
++            for (int kind = COPY; kind <= CHASE; kind++) {
++                double view = speed(kind, DATA_GPA, n, bytes), main = speed(kind, MAIN_GPA, n, bytes);
++                printf("    %d vCPU %3llu MiB %-9s view %9.2f main %9.2f (%+.1f%%)\n", n,
++                       (unsigned long long)(bytes >> 20), kinds[kind], view, main, (view / main - 1) * 100);
++            }
++        }
++    }
++    printf("[speed] 7 vCPUs' avx2 copy of 8 MiB on the view, markers beside them\n");
++    scattered_surface(22);
++    static const struct { const char *what; int hz, mapped, per_page; } cases[] = {
++        {"no markers", -1, 0, 0},
++        {"26 Hz", 26, 0, 0},
++        {"26 Hz, read by a vCPU", 26, 1, 0},
++        {"flat out", 0, 0, 0},
++        {"flat out, read by a vCPU", 0, 1, 0},
++        {"26 Hz, read, a run a page", 26, 1, 1},
++    };
++    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++        traffic.hz = cases[i].hz; traffic.mapped = cases[i].mapped; traffic.per_page = cases[i].per_page;
++        double rate = speed(VCOPY, DATA_GPA, 7, 8 << 20);
++        printf("    %-28s %9.1f MB/s, %.0f frames/s\n", cases[i].what, rate, traffic.frames / 2.5);
++    }
++    census_surface_unmapped(22);
++}
++
+ static void t_fuse_coherent(struct vcpu *c) {
+     printf("[fuse] an -EFAULT nothing explains: everything lands, markers off\n");
+     surface(11, 0xd00000);
+@@ -491,6 +700,8 @@ int main(int argc, char **argv) {
+     t_coherent_race(mib);
+     t_arm_window();
+     t_coherent_cost(&c);
++    t_scattered();
++    if (getenv("CENSUS_SPEED")) t_guest_speed();
+     t_fuse_coherent(&c);
+     census_flush();
+     printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
+diff --git a/scripts/internal/census/guest/dma.c b/scripts/internal/census/guest/dma.c
+index 7c5e6ae1..56097df2 100644
+--- a/scripts/internal/census/guest/dma.c
++++ b/scripts/internal/census/guest/dma.c
+@@ -59,11 +59,24 @@ static void io(uint32_t op, uint32_t lba, uint32_t prp1, uint32_t prp2, uint32_t
+     nvme_cmd(c, IOSQ, &sqt, 1);
+     if (nvme_done(IOCQ, &cqh, &phase, 1)) die(0x42);
+ }
++/* With the VM's RAM the BARs lie past this 32-bit guest's reach: `at` is below it. */
++static uint32_t reachable(int d, uint32_t at) {
++    if (cfg(d, 0x10) & 4) {
++        cfgw(d, 4, cfg(d, 4) & ~2u);
++        cfgw(d, 0x14, 0);
++    }
++    if (!(cfg(d, 0x10) & ~0xfu) || cfg(d, 0x10) >= 0xfec00000u || (cfg(d, 0x10) & 4)) {
++        cfgw(d, 4, cfg(d, 4) & ~2u);
++        cfgw(d, 0x10, at);
++    }
++    return cfg(d, 0x10) & ~0xfu;
++}
++
+ static void nvme_up(void) {
+     phase = phase_a = 1;
+     for (int d = 0; d < 32 && !nv; d++)
+         if (cfg(d, 8) >> 8 == 0x010802) {
+-            nv = cfg(d, 0x10) & ~0xfu;
++            nv = reachable(d, 0xb0000000u);
+             cfgw(d, 4, cfg(d, 4) | 6);
+         }
+     if (!nv) die(0x43);
+@@ -127,9 +140,15 @@ static void unmap(uint32_t id) {
+ 
+ void main_c(void) {
+     uint32_t i;
++#ifdef FILLMEM
++    /* For a core's size: 1 GiB of the guest's RAM in use, then the host may kill it. */
++    for (uint32_t p = 0x40000000u; p < 0x80000000u; p += PG) R32(p) = p;
++    outb(0xe9, 'F');
++    for (;;) __asm__("hlt");
++#endif
+     for (int d = 0; d < 32 && !bar; d++)
+         if (cfg(d, 0) == (0xeeefu << 16 | 0x106b)) {
+-            bar = cfg(d, 0x10) & ~0xfu;
++            bar = reachable(d, 0xa0000000u);
+             cfgw(d, 4, cfg(d, 4) | 6);
+         }
+     if (!bar) die(0x31);
+diff --git a/scripts/internal/census/guest/run-dma.sh b/scripts/internal/census/guest/run-dma.sh
+index 1e9fb760..660c1442 100755
+--- a/scripts/internal/census/guest/run-dma.sh
++++ b/scripts/internal/census/guest/run-dma.sh
+@@ -9,7 +9,7 @@ O=/srv/warm/census/out/$name RAM=${RAM:-1024}
+ rm -rf "$O"; mkdir -p "$O"
+ printf 'surface_lazy=1\nsurface_lazy_scoped=1\nsurface_coherent=1\n' > "$O/live.conf"
+ # NODEMOTE=1: a surface stays armed however often it traps, or pages rarely stay marked for a device.
+-[ -n "${NODEMOTE:-}" ] && printf 'surface_coherent_demote_pct=1000\nsurface_coherent_demote_hz=100000000\nsurface_coherent_hold_s=0\n' >> "$O/live.conf"
++[ -n "${NODEMOTE:-}" ] && printf 'surface_coherent_demote=0\nsurface_coherent_hold_s=0\n' >> "$O/live.conf"
+ truncate -s 64M "$O/disk.raw"
+ args=()
+ for e in "$@"; do args+=(-e "$e"); done

@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 07:09:42 +0000
+Subject: [PATCH 23/25] Coherent: a CPU write through a surface's own mapping
+ tells the traps (R1)
+
+- write_surface_bytes (replaceRegion: into a surface made GPU-read-only, row
+  by row into the guest's pages) wrote under a trapping surface with no
+  notice, so the image another texture over the same pages held stayed stale
+  and its later copy back could overwrite the write. It now tells
+  shadow_coherent::host_writes of the view of the bytes and of each run of
+  pages they land in, before they land; the os::surface lend test checks the
+  ranges and the order.
+- The IOSurface ring's test pattern write (IoSurfaceTable::test_pattern) does
+  the same through a new Surface::host_writes (no-op by default, the Linux
+  surface's is surface_device_access).
+- host_meets' doc comment sat on surface_device_access.
+- vendor/qemu 82cef5aac4: address_space_ld*/st* reach the census.
+
+Not hooked, as they cannot meet a surface's pages: GuestPtr writes and reads
+(FIFO rings, device and display registers, task roots and object lists,
+placement words, the IOSurface descriptor table, the ICB write-back into its
+own guest buffer) are the guest kernel's protocol memory; the display's
+property buffers and rate-map samples are the library's own memory; Map::write
+and WritableCursor have no product caller over surface pages. Reims tests
+single-threaded, before and after: vulkan lib 410 passed 21 failed, core lib
+2376 passed 1 failed, the same failures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-core/src/iosurface/table.rs |  2 +
+ .../src/platform/os/surface.rs                |  4 ++
+ .../reims-vgpu-vulkan/src/os/linux/surface.rs |  4 ++
+ crates/reims-vgpu-vulkan/src/os/surface.rs    | 52 ++++++++++++++++---
+ 4 files changed, 55 insertions(+), 7 deletions(-)
+
+diff --git a/crates/reims-vgpu-core/src/iosurface/table.rs b/crates/reims-vgpu-core/src/iosurface/table.rs
+index ade7fcaa..045e3b73 100644
+--- a/crates/reims-vgpu-core/src/iosurface/table.rs
++++ b/crates/reims-vgpu-core/src/iosurface/table.rs
+@@ -397,6 +397,8 @@ impl<P: Platform> HostDeviceCore<P> {
+             return IoReturn::BadArgument;
+         };
+         let _ = surface.lock(0);
++        // LOCAL (Atlas): the host's GPU hears of the write first (`Surface::host_writes`).
++        surface.host_writes();
+         let size = surface.alloc_size();
+         let base = GuestPtr::new(surface.base_address());
+         // The base less the offset, wrapping.
+diff --git a/crates/reims-vgpu-core/src/platform/os/surface.rs b/crates/reims-vgpu-core/src/platform/os/surface.rs
+index 4f7793c6..481dbff6 100644
+--- a/crates/reims-vgpu-core/src/platform/os/surface.rs
++++ b/crates/reims-vgpu-core/src/platform/os/surface.rs
+@@ -44,6 +44,10 @@ pub trait Surface: Handle {
+     fn lookup_by_port(&self) -> Option<Self>
+     where
+         Self: Sized;
++    /// LOCAL (Atlas): the library is about to write the surface's bytes through its own mapping,
++    /// not through a texture (`IoSurfaceTable::test_pattern`): the host's GPU, whose textures over
++    /// the same pages may trap (`shadow_coherent` in metal2vulkan), is told. Nothing by default.
++    fn host_writes(&self) {}
+ }
+ 
+ /// Creates IOSurfaces. The private keys a spec can carry (client address ranges, direction,
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/surface.rs b/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+index a2540a79..c7bae0a0 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/surface.rs
+@@ -334,6 +334,10 @@ impl Surface for LinuxSurface {
+         self.data().alloc_size
+     }
+ 
++    fn host_writes(&self) {
++        crate::os::surface_device_access(self, true);
++    }
++
+     fn lookup_by_port(&self) -> Option<Self> {
+         Some(LinuxSurface(ManuallyDrop::new(Arc::new(Object(
+             Arc::clone(&self.0.0),
+diff --git a/crates/reims-vgpu-vulkan/src/os/surface.rs b/crates/reims-vgpu-vulkan/src/os/surface.rs
+index af2d644b..39ded8fd 100644
+--- a/crates/reims-vgpu-vulkan/src/os/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/surface.rs
+@@ -292,6 +292,19 @@ pub(crate) fn memory_kind(surface: &OsSurface) -> &'static str {
+ /// reaches (`replaceRegion:`, measured: `tests/client_direction.rs`). False, writing nothing,
+ /// for a surface not made over the guest's pages, and for bytes past them.
+ pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]) -> bool {
++    write_surface_bytes_noticed(surface, offset, bytes, rt::shadow_coherent::host_writes)
++}
++
++/// [`write_surface_bytes`], `notice` told of each range of host memory it is about to write.
++/// LOCAL (Atlas): the runtime's trapping surfaces (`shadow_coherent::host_writes`) are told
++/// before the bytes land, as a lend's are ([`host_meets`]): the surface's view of the bytes and
++/// each run of the guest's pages they lie in, so the next command over them copies them in.
++fn write_surface_bytes_noticed(
++    surface: &OsSurface,
++    offset: u64,
++    bytes: &[u8],
++    mut notice: impl FnMut(std::ops::Range<u64>),
++) -> bool {
+     let Some(held) = recorded(surface, |made| {
+         let first = made.offset.saturating_add(offset);
+         in_runs(
+@@ -305,6 +318,13 @@ pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]
+     if total != bytes.len().to_u64() {
+         return false;
+     }
++    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    if base != 0 {
++        notice(base.saturating_add(offset)..base.saturating_add(offset + bytes.len().to_u64()));
++    }
++    for run in &held {
++        notice(run.clone());
++    }
+     let mut from = bytes;
+     for run in held {
+         let (now, rest) = from.split_at((run.end - run.start).to_usize());
+@@ -521,13 +541,6 @@ impl Lent {
+     }
+ }
+ 
+-/// LOCAL (Atlas): tells the runtime's trapping surfaces (`shadow_coherent`) that a host outside
+-/// it is about to read or write `surface`'s `length` bytes (`notice` is `host_reads` or
+-/// `host_writes`), so a read sees the GPU's writes copied back first and a write reaches the
+-/// image the next command uses. A trapping surface lies over the buffer a texture on it is over,
+-/// which is either the run of the guest's pages the bytes lie in or the surface's own view of
+-/// them at `base`, so both are named; a surface that meets neither costs a scan of the tracked
+-/// surfaces, none when nothing traps.
+ /// LOCAL (Atlas): a device is about to read (`write` false) or write `surface`'s bytes as a lend
+ /// would lend them, through memory lent to it outside a lend (a dma-buf of its pages): the
+ /// trapping surfaces over them are told, as [`lend_surface_bytes`] tells them.
+@@ -543,6 +556,13 @@ pub fn surface_device_access(surface: &OsSurface, write: bool) {
+     host_meets(&made, base, offset, length, notice);
+ }
+ 
++/// LOCAL (Atlas): tells the runtime's trapping surfaces (`shadow_coherent`) that a host outside
++/// it is about to read or write `surface`'s `length` bytes (`notice` is `host_reads` or
++/// `host_writes`), so a read sees the GPU's writes copied back first and a write reaches the
++/// image the next command uses. A trapping surface lies over the buffer a texture on it is over,
++/// which is either the run of the guest's pages the bytes lie in or the surface's own view of
++/// them at `base`, so both are named; a surface that meets neither costs a scan of the tracked
++/// surfaces, none when nothing traps.
+ fn host_meets(
+     made: &Option<(Vec<std::ops::Range<u64>>, u64)>,
+     base: u64,
+@@ -829,6 +849,24 @@ pub(crate) mod tests {
+             [base..base + 2 * page - 0x40, high + 0x40..high + page, low..low + page],
+             "a trapping surface is told of the view and of each run of pages the bytes lie in"
+         );
++        // A CPU write through a texture on a GPU-read-only surface (`replaceRegion:`) is told so
++        // too, before its bytes land: the view of the bytes, then each run they lie in.
++        let mut noticed = Vec::new();
++        let mut landed_first = None;
++        let offset = page - 0x40 - 4;
++        assert!(write_surface_bytes_noticed(&s, offset, &[9; 8], |r| {
++            landed_first.get_or_insert(byte_at(high + page - 4));
++            noticed.push(r);
++        }));
++        assert_eq!(
++            noticed,
++            [base + offset..base + offset + 8, high + page - 4..high + page, low..low + 4],
++            "a CPU write into the pages tells the trapping surfaces of the view and the runs"
++        );
++        assert_ne!(landed_first, Some(9), "before the bytes land");
++        assert_eq!((byte_at(high + page - 4), byte_at(low + 3)), (9, 9));
++        // SAFETY: the pages are ours, allocated above: the lend below reads them as it found them.
++        unsafe { *std::ptr::with_exposed_provenance_mut::<u8>(low.to_usize()) = 7 };
+         let split = (page - 0x40).to_usize();
+         let (mut before, mut at, mut landed) = (0, 0, 0);
+         lend_surface_bytes(&s, &mut |b| {

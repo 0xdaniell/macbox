@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:01:18 +0000
+Subject: [PATCH 07/25] census: the report script, and the QEMU fix
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/census_report.py | 189 +++++++++++++++++++++++
+ 1 file changed, 189 insertions(+)
+ create mode 100644 scripts/internal/census/census_report.py
+
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+new file mode 100644
+index 00000000..9b9fe2a2
+--- /dev/null
++++ b/scripts/internal/census/census_report.py
+@@ -0,0 +1,189 @@
++#!/usr/bin/env python3
++"""census_report.py: read a touch census's output (REIMS_VGPU_CENSUS=<dir>).
++
++  census_report.py <dir>                     every surface, from the census's start
++  census_report.py <dir> --mark LABEL        between the mark LABEL and the next mark
++  census_report.py <dir> --marks             the marks in the timeline, and each span's totals
++  census_report.py <dir> --disasm N          the top N RIPs, disassembled with objdump
++
++A mark is one line in <dir>/mark ("motionbench"), which the census reads within 50 ms. "every 1"
++there sets the re-arm period instead. A page counts once a window: touches/frame cannot exceed
++pages/window divided by the window's frames, so read `touched windows` with `every`.
++"""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import tempfile
++
++
++def lines(path):
++    if not os.path.exists(path):
++        return
++    with open(path) as f:
++        for line in f:
++            try:
++                yield json.loads(line)
++            except json.JSONDecodeError:
++                pass  # a line the VM's end cut short
++
++
++def read(directory):
++    surfaces, timeline = {}, []
++    header = {}
++    for r in lines(os.path.join(directory, "surfaces.jsonl")):
++        s = surfaces.setdefault(r["s"], {"uses": set()})
++        if r["ev"] == "use":
++            s["uses"].add((r["usage"], r["storage"]))
++        elif r["ev"] == "map":
++            s.update(r)
++        else:
++            s["end"] = r
++    for r in lines(os.path.join(directory, "ticks.jsonl")):
++        if "started" in r:
++            header = r
++        else:
++            timeline.append(r)
++    return header, surfaces, timeline
++
++
++def spans(timeline):
++    """The marks in order, each with its start and the next mark's time."""
++    marks = [r for r in timeline if "mark" in r and not r["mark"].startswith("every ")]
++    out = []
++    for i, m in enumerate(marks):
++        end = marks[i + 1]["t"] if i + 1 < len(marks) else float("inf")
++        out.append((m["mark"], m["t"], end))
++    return out
++
++
++FIELDS = ("presents", "traps", "writes", "upgrades", "pages_r", "pages_w", "pages_skip",
++          "windows_touched", "windows_saturated", "cpl0", "cpl3")
++
++
++def window_totals(timeline, start, end):
++    frames = 0
++    windows = [r["windows"] for r in timeline if "frames" in r and start <= r["t"] <= end]
++    per = {}
++    for r in timeline:
++        if not start <= r["t"] <= end:
++            continue
++        if "frames" in r:
++            frames += r["frames"]
++        elif "tick" in r:
++            p = per.setdefault(r["tick"], dict.fromkeys(FIELDS, 0) | {"rips": {}})
++            for k in FIELDS:
++                p[k] += r[k]
++            for rip, n in r["rips"]:
++                p["rips"][rip] = p["rips"].get(rip, 0) + n
++    return frames, (windows[-1] - windows[0] if len(windows) > 1 else 0), per
++
++
++def fmt(s):
++    flags = "".join(c for c, on in (("H", s.get("host_only")), ("R", s.get("read_only"))) if on)
++    return (f"{s.get('w', 0)}x{s.get('h', 0)} {s.get('format', '?')} {flags or '-'}"
++            f" prot={s.get('protection', 0)} addr={s.get('address_format', 0)}"
++            f" comp={s.get('compression', 0)}")
++
++
++def table(surfaces, per, frames, windows, every, rw):
++    print(f"frames {frames}, windows {windows}" + (f", one window every {every} frames" if every else ""))
++    print(f"{'surface':>7} {'facts':<44} {'present':>7} {'traps':>8} {'/frame':>8} {'win':>6}"
++          f" {'pages R':>8} {'pages W':>8} {'sat':>4} {'upg':>5} {'k/u':>9}  top RIPs")
++    rows = []
++    for serial, p in per.items():
++        rows.append((p["traps"], serial, p))
++    for _, serial, p in sorted(rows, key=lambda r: (-r[0], r[1])):
++        s = surfaces.get(serial, {})
++        top = sorted(p["rips"].items(), key=lambda kv: -kv[1])[:3]
++        rate = p["traps"] / frames if frames else 0
++        print(f"{serial:>7} {fmt(s):<44.44} {p['presents']:>7} {p['traps']:>8} {rate:>8.2f}"
++              f" {p['windows_touched']:>6} {p['pages_r']:>8}"
++              f" {p['pages_w'] if rw else '-':>8} {p['windows_saturated']:>4} {p['upgrades']:>5}"
++              f" {p['cpl0']:>4}/{p['cpl3']:<4}  " + " ".join(f"{r}:{n}" for r, n in top))
++    armed = [s for s in surfaces.values() if s.get("armed_pages")]
++    untouched = len(armed) - sum(1 for serial in per if surfaces.get(serial, {}).get("armed_pages"))
++    print(f"armed surfaces {len(armed)}, never touched in this span {untouched}")
++    uses = {}
++    for s in surfaces.values():
++        for u in s["uses"]:
++            uses[u] = uses.get(u, 0) + 1
++    if uses:
++        print("texture usage/storage over surfaces: " +
++              ", ".join(f"{u}/{m}:{n}" for (u, m), n in sorted(uses.items())))
++
++
++def life(surfaces):
++    """Whole-life totals, from the unmap records: surfaces that lived and went between ticks."""
++    print(f"{'surface':>7} {'facts':<44} {'frames':>7} {'presents':>8} {'traps':>8} {'writes':>7}"
++          f" {'win':>6} {'touched':>7}")
++    ended = [s for s in surfaces.values() if "end" in s and s["end"]["traps"]]
++    for s in sorted(ended, key=lambda s: -s["end"]["traps"])[:40]:
++        e = s["end"]
++        print(f"{e['s']:>7} {fmt(s):<44.44} {e['frames']:>7} {e['presents']:>8} {e['traps']:>8}"
++              f" {e['writes']:>7} {e['windows']:>6} {e['windows_touched']:>7}")
++
++
++def disasm(directory, count, timeline):
++    bytes_at = {r["rip"]: r for r in lines(os.path.join(directory, "rips.jsonl"))}
++    totals = {}
++    for r in timeline:
++        if "tick" in r:
++            for rip, n in r["rips"]:
++                totals[rip] = totals.get(rip, 0) + n
++    for rip, n in sorted(totals.items(), key=lambda kv: -kv[1])[:count]:
++        r = bytes_at.get(rip)
++        text = "(no bytes)"
++        if r and r["bytes"]:
++            with tempfile.NamedTemporaryFile(suffix=".bin") as f:
++                f.write(bytes.fromhex(r["bytes"]))
++                f.flush()
++                out = subprocess.run(["objdump", "-D", "-b", "binary", "-mi386:x86-64", f.name],
++                                     capture_output=True, text=True).stdout
++            found = [ln.split("\t", 2)[-1] for ln in out.splitlines() if ln.startswith("   0:")]
++            text = found[0] if found else r["bytes"]
++        print(f"{rip:>20} cpl{r['cpl'] if r else '?'} {n:>9}  {text}")
++
++
++def main():
++    a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
++    a.add_argument("dir")
++    a.add_argument("--mark")
++    a.add_argument("--marks", action="store_true")
++    a.add_argument("--disasm", type=int, default=0)
++    args = a.parse_args()
++    header, surfaces, timeline = read(args.dir)
++    if not header:
++        sys.exit(f"{args.dir}: no census output")
++    every, rw = header.get("every"), header.get("rw", 1)
++    health = [r for r in timeline if "frames" in r]
++    if health:
++        h = health[-1]
++        print(f"census pid {header.get('pid')}: traps {h['traps']}, writes {h['writes']},"
++              f" upgrades {h['upgrades']}, spurious {h['spurious']}, dropped {h['dropped']},"
++              f" errors {h['errors']}, off by fuse: {'YES' if h['dead'] else 'no'}")
++    if args.disasm:
++        disasm(args.dir, args.disasm, timeline)
++    elif args.marks:
++        for label, start, end in spans(timeline):
++            frames, windows, per = window_totals(timeline, start, end)
++            traps = sum(p["traps"] for p in per.values())
++            rate = traps / frames if frames else 0
++            print(f"{label:<30} frames {frames:>7} windows {windows:>6} surfaces touched"
++                  f" {len(per):>4} traps {traps:>9} ({rate:.2f}/frame)")
++    elif args.mark:
++        found = [s for s in spans(timeline) if s[0] == args.mark]
++        if not found:
++            sys.exit(f"no mark {args.mark!r}")
++        frames, windows, per = window_totals(timeline, found[-1][1], found[-1][2])
++        table(surfaces, per, frames, windows, every, rw)
++    else:
++        frames, windows, per = window_totals(timeline, 0, float("inf"))
++        table(surfaces, per, frames, windows, every, rw)
++        life(surfaces)
++
++
++if __name__ == "__main__":
++    main()

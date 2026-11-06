@@ -40,7 +40,7 @@ It runs with seccomp and AppArmor unconfined, because passt needs a user namespa
 
 `container/build-reims.sh` (run by `macbox build` in a throwaway container) checks out Reims vGPU,
 QEMU and metal2vulkan at the commits [versions.env](../versions.env) pins, applies
-[patches/](../patches/README.md), points Reims's Cargo at the patched metal2vulkan, and builds
+[patches/](../patches/README.md) to each of the three, points Reims's Cargo at the patched metal2vulkan, and builds
 `reims-ctl`, the library (`cargo xtask dist --platform vulkan`) and QEMU on it. Each QEMU goes into
 `~/.local/share/reims-ctl/qemu/<date>-<commit>-macbox` and `qemu/current` moves to it. A running VM
 keeps its QEMU until it restarts, and old builds stay for going back
@@ -59,8 +59,10 @@ and the QEMU command line; `reims-ctl command mac` (inside the container) prints
 - `--video-acceleration=false` (no VideoToolbox/M2 scaler devices), a borderless window,
   `REIMS_VGPU_STATS=1` (a line of frame statistics a second in `logs/qemu.log`).
 - Before each start: `WAYLAND_DISPLAY` (sway's, or the host's), and the GPU tuning:
-  `M2V_LIVE=$MACBOX_HOME/run/live.conf` with `host_rt_in_place=1`, and `M2V_ARL_FACTS` on an
-  Arrow Lake GPU ([performance.md](performance.md)).
+  `M2V_LIVE=$MACBOX_HOME/run/live.conf` with `host_rt_in_place=1`,
+  `REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1`, `M2V_ARL_FACTS` on an Arrow Lake GPU, and with
+  `MACBOX_COHERENT=on` the census and Coherent switches ([performance.md](performance.md)).
+  The disk's options in `extra_args` are written again, so a changed `MACBOX_DISK_CACHE` applies.
 
 The system disk starts on SATA, because macOS's installer may not find a disk on NVMe, and moves to
 NVMe with `macbox disk nvme` once macOS is installed.
@@ -130,7 +132,7 @@ versions.env              the pinned upstream commits
 docker/                   the image (Dockerfile, sway.conf)
 container/                scripts that run inside the container: build-reims.sh, display-up.sh, stream-up.sh
 lib/vmctl.py              screenshots, mouse and keyboard through QMP
-patches/                  the series on Reims vGPU and metal2vulkan
+patches/                  the series on Reims vGPU, metal2vulkan and QEMU
 guest/                    everything copied into macOS (macbox-guest and its tools)
 sims/                     the agent tools on the host (mac-sim, sim-fps, android-sim) and their user units
 skills/                   the simulators, phone-builds and macbox (setup) skills

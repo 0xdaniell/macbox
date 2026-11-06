@@ -1,0 +1,1670 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 21:48:54 +0000
+Subject: [PATCH 1/9] the touch census: trap the guest CPU's
+ first touch of large IOSurfaces
+
+Off unless REIMS_VGPU_CENSUS is set. Memslots move to a KVM-only view of guest RAM; arms poison
+through a user-mode-only userfaultfd; classifies read or write by write-protecting a trapped page
+and rerunning its instruction. Observation only: guest pages stay the truth.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/census.c          | 1283 +++++++++++++++++++++++++++++++++++
+ accel/kvm/kvm-all.c         |  109 ++-
+ accel/kvm/meson.build       |    1 +
+ hw/display/apple-gfx.c      |   67 ++
+ include/system/kvm_census.h |   91 +++
+ 5 files changed, 1543 insertions(+), 8 deletions(-)
+ create mode 100644 accel/kvm/census.c
+ create mode 100644 include/system/kvm_census.h
+
+diff --git a/accel/kvm/census.c b/accel/kvm/census.c
+new file mode 100644
+index 0000000000..1d77d3521a
+--- /dev/null
++++ b/accel/kvm/census.c
+@@ -0,0 +1,1283 @@
++/*
++ * LOCAL (Atlas): the touch census. How often does the guest CPU touch large IOSurfaces?
++ *
++ * Observation only: rendering stays in place and the guest's pages stay the truth, so nothing can
++ * go stale. With REIMS_VGPU_CENSUS unset this file makes no mapping, no userfaultfd and no thread.
++ *
++ * Memslots move to a view of guest RAM, the "KVM-only view": a second shared mapping of the same
++ * memfd, which only KVM ever uses. QEMU's devices, NVMe, virtio and every GPU import stay on the
++ * main mapping. No user-mode code here or in QEMU reads through the view: its address lives in
++ * this file and in the memslot, and QEMU's address spaces never see it. So a SIGBUS from a marker
++ * can only come from KVM's fault path inside KVM_RUN, on a vCPU thread. KVM's emulator and other
++ * kernel accesses never raise one: a failed copy becomes KVM_EXIT_MMIO at the RAM's gpa, which
++ * QEMU completes through the main mapping, correctly, or an -EFAULT (below).
++ *
++ * A page's cycle, on userfaultfd opened with UFFD_USER_MODE_ONLY, which vm.unprivileged_userfaultfd
++ * = 0 allows and which needs neither /dev/userfaultfd nor a capability:
++ *
++ *   armed   UFFDIO_POISON. Any guest access: KVM's hwpoison path, SIGBUS with the exact address.
++ *           The vCPU logs the touch, drops the marker and write-protects the page, then runs again.
++ *   held    Write-protected. The same instruction reruns: a read passes, which classifies it. A
++ *           write comes back at once as a bare -EFAULT, no address: the page is this vCPU's
++ *           pending page while RIP has not moved, and it opens.
++ *   open    Nothing on the page.
++ *
++ * A write to a page held since an earlier read gives -EFAULT with nothing to name it, so it
++ * opens every held page and counts one upgrade. Every Nth present the census's thread re-arms
++ * what was touched: WP off, then DONTNEED, then poison. That order matters: MADV_DONTNEED drops a
++ * poison marker but on a file mapping it keeps a uffd-wp one, and POISON refuses a slot that holds
++ * either (EEXIST).
++ *
++ * UFFDIO_POISON and UFFDIO_WRITEPROTECT work on PTEs, so 98k Reims views and the 12 GiB slot add no
++ * VMAs beyond this one mapping: arming splits nothing, and vm.max_map_count sees +1.
++ *
++ * Registering WP makes the view's read faults map read-only (vma_wants_writenotify), so the first
++ * write after a read of each page takes one extra host fault, once per page per mapping.
++ *
++ * Locks: the fault path takes none, and only touches per-page atomics, madvise and uffd ioctls. It
++ * queues no GPU work and calls nothing in Reims. census.lock guards the surfaces, never waits on a
++ * vCPU or the GPU, and is taken only on the rare -EFAULT with no pending page. Each page's word
++ * is the owner's: whoever moves it to ST_WORK alone changes that page's markers.
++ *
++ * A failure must never take the VM with it: an -EFAULT nothing answers disarms the whole census
++ * (census_fuse) before it is allowed to reach QEMU's fatal path.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/kvm.h>
++#include <linux/userfaultfd.h>
++#include <pthread.h>
++#include <sched.h>
++#include <semaphore.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "system/kvm_census.h"
++
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#endif
++
++#define PG 4096ULL
++#define PG_SHIFT 12
++#define RING_SIZE 8192 /* a power of two */
++#define TOP_RIPS 8
++#define RIP_SEEN_SLOTS (1 << 16)
++#define POISON_TRIES 4
++#define SPIN_LIMIT 100000 /* about 0.5 s of repeated SIGBUS on one page: real poison */
++/* An -EFAULT unanswered this long is no race: first the markers go, then QEMU's fatal path. */
++#define EFAULT_GAP_NS 5000000
++#define FUSE_AFTER_NS 20000000
++#define FATAL_AFTER_NS 120000000
++
++/* A page's word: the state's three bits, then the mapping id. 0 is a page never armed. */
++enum { ST_NONE, ST_ARMED, ST_HELD, ST_OPEN, ST_SKIP, ST_WORK, ST_STALE };
++#define PW(st, id) (((uint32_t)(st) << 29) | (id))
++#define PW_ST(w) ((w) >> 29)
++#define PW_ID(w) ((w) & 0x1fffffffu)
++
++enum { REC_TOUCH, REC_WRITE, REC_UPGRADE };
++
++typedef struct Rec {
++    uint64_t rip;
++    uint64_t cr3;
++    uint32_t page;
++    uint32_t serial;
++    uint16_t id;
++    uint8_t kind;
++    uint8_t cpl;
++    uint8_t ncode;
++    uint8_t code[15];
++} Rec;
++
++struct CensusVcpu {
++    int index;
++    int fd;
++    void *opaque;
++    CensusReadGpa *read_gpa;
++    /* The page this vCPU trapped on last, while its instruction may be rerunning. */
++    int64_t pending;
++    uint64_t pending_rip;
++    void *spin_addr;
++    uint32_t spins;
++    uint64_t efault_first;
++    uint64_t efault_last;
++    uint64_t seen[256];
++    _Atomic uint32_t head;
++    _Atomic uint32_t tail;
++    Rec ring[RING_SIZE];
++};
++
++typedef struct Run {
++    uint32_t first;
++    uint32_t count;
++} Run;
++
++typedef struct RipCount {
++    uint64_t rip;
++    uint64_t count;
++} RipCount;
++
++/* The running totals of a surface, and of the tick written next. */
++typedef struct Tally {
++    uint64_t traps, writes, upgrades;
++    uint64_t pages_r, pages_w, pages_skip;
++    uint64_t windows_touched, windows_saturated;
++    uint64_t cpl0, cpl3;
++    uint64_t vcpus;
++    RipCount rips[TOP_RIPS];
++} Tally;
++
++typedef struct Surface {
++    bool live;
++    uint32_t serial;
++    Run *runs;
++    uint32_t run_count;
++    uint64_t armed_pages;
++    uint64_t overlaps;
++    uint64_t foreign;
++    uint64_t presents_at_map;
++    uint64_t windows_at_map;
++    uint64_t max_window_pages;
++    uint64_t presents_at_tick;
++    Tally total;
++    Tally tick;
++    _Atomic uint64_t presents;
++    _Atomic uint32_t window_traps;
++    _Atomic uint32_t saturate;
++} Surface;
++
++typedef struct Line {
++    struct Line *next;
++    char text[];
++} Line;
++
++static struct {
++    int wanted; /* -1 not read yet */
++    bool active;
++    _Atomic bool dead;
++    char dir[3584];
++    uint8_t *view;
++    uint8_t *main_map;
++    uint64_t len;
++    uint64_t pages;
++    int uffd;
++    _Atomic uint32_t *pg;
++    Surface *surfaces;
++    CensusVcpu *vcpus[CENSUS_MAX_VCPUS];
++
++    pthread_mutex_t lock;
++    sem_t wake;
++    pthread_t thread;
++    Line *lines_head, **lines_tail;
++    FILE *ticks, *facts, *rips;
++    uint64_t *rips_seen;
++    uint32_t next_serial;
++
++    bool rw;
++    _Atomic uint32_t every;
++    uint32_t min_pixels;
++    uint32_t saturate_at;
++    uint32_t flush_ms;
++    uint32_t window_ms;
++
++    _Atomic uint64_t presents;
++    uint64_t presents_at_window;
++    uint64_t presents_at_tick;
++    uint64_t window_ns;
++    uint64_t windows;
++    uint64_t tick_ns;
++
++    _Atomic uint64_t traps, writes, upgrades, spurious, dropped, errors;
++    uint64_t overlaps;
++} census = {
++    .wanted = -1,
++    .uffd = -1,
++    .lock = PTHREAD_MUTEX_INITIALIZER,
++};
++
++static uint64_t now_ns(void)
++{
++    struct timespec t;
++
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000000000ULL + t.tv_nsec;
++}
++
++static uint32_t env_u32(const char *name, uint32_t fallback)
++{
++    const char *v = getenv(name);
++
++    return v && *v ? (uint32_t)strtoul(v, NULL, 0) : fallback;
++}
++
++bool census_wanted(void)
++{
++    if (census.wanted < 0) {
++        const char *dir = getenv(CENSUS_ENV);
++
++        census.wanted = dir && *dir;
++        if (census.wanted) {
++            snprintf(census.dir, sizeof(census.dir), "%s", dir);
++        }
++    }
++    return census.wanted;
++}
++
++bool census_active(void)
++{
++    return census.active;
++}
++
++bool census_view_holds(const void *addr)
++{
++    return census.view &&
++        (uint64_t)((const uint8_t *)addr - census.view) < census.len;
++}
++
++void *census_hva(void *ram)
++{
++    uint64_t off = (uint8_t *)ram - census.main_map;
++
++    return census.active && off < census.len ? census.view + off : ram;
++}
++
++void *census_main_addr(void *addr)
++{
++    return census_view_holds(addr) ?
++        census.main_map + ((uint8_t *)addr - census.view) : addr;
++}
++
++/* ---- markers ------------------------------------------------------------------------------ */
++
++static void count_error(const char *what, uint64_t page)
++{
++    if (atomic_fetch_add(&census.errors, 1) < 16) {
++        fprintf(stderr, "census: %s at page %#" PRIx64 ": %s\n", what, page, strerror(errno));
++    }
++}
++
++static int page_drop(uint64_t page, uint64_t count)
++{
++    return madvise(census.view + (page << PG_SHIFT), count << PG_SHIFT, MADV_DONTNEED);
++}
++
++static int page_wp(uint64_t page, uint64_t count, bool on)
++{
++    struct uffdio_writeprotect w = {
++        .range = { (uint64_t)census.view + (page << PG_SHIFT), count << PG_SHIFT },
++        /* The kernel takes DONTWAKE only for WP off. Nothing ever waits on this uffd. */
++        .mode = on ? UFFDIO_WRITEPROTECT_MODE_WP : UFFDIO_WRITEPROTECT_MODE_DONTWAKE,
++    };
++
++    int r;
++
++    for (int tries = 0; tries < POISON_TRIES; tries++) {
++        r = ioctl(census.uffd, UFFDIO_WRITEPROTECT, &w);
++        if (r == 0 || errno != EAGAIN) {
++            break;
++        }
++    }
++    return r;
++}
++
++static void store_pages(uint64_t first, uint64_t count, uint32_t state, uint32_t id)
++{
++    for (uint64_t p = first; p < first + count; p++) {
++        atomic_store(&census.pg[p], PW(state, id));
++    }
++}
++
++/*
++ * Poisons pages this thread owns (ST_WORK), then gives each its state: armed, or skipped for a
++ * page a vCPU faulted back in between the DONTNEED and the POISON, so that a marker exists only
++ * where the word says armed. EEXIST names that race, and the page's next window arms it. EAGAIN
++ * is a PTE table a concurrent MADV_DONTNEED just freed, and a retry finds a new one.
++ */
++static void poison_run(uint64_t first, uint64_t count, uint32_t id)
++{
++    uint64_t at = first, end = first + count;
++    int tries = 0;
++
++    while (at < end) {
++        struct uffdio_poison z = {
++            .range = { (uint64_t)census.view + (at << PG_SHIFT), (end - at) << PG_SHIFT },
++        };
++        uint64_t done;
++
++        if (ioctl(census.uffd, UFFDIO_POISON, &z) == 0) {
++            store_pages(at, end - at, ST_ARMED, id);
++            return;
++        }
++        done = z.updated > 0 ? (uint64_t)z.updated >> PG_SHIFT : 0;
++        store_pages(at, done, ST_ARMED, id);
++        at += done;
++        if (at == end) {
++            return;
++        }
++        if ((errno == EEXIST || errno == EAGAIN) && ++tries < POISON_TRIES) {
++            if (errno == EEXIST) {
++                page_drop(at, 1);
++            }
++            continue;
++        }
++        if (errno != EEXIST && errno != EAGAIN) {
++            count_error("poison", at);
++        }
++        store_pages(at, 1, ST_SKIP, id);
++        at++;
++        tries = 0;
++    }
++}
++
++static void arm_run(uint64_t first, uint64_t count, uint32_t id, bool any_held)
++{
++    if (any_held && page_wp(first, count, false)) {
++        count_error("WP off for arming", first);
++    }
++    page_drop(first, count);
++    poison_run(first, count, id);
++}
++
++/* ---- the fault path, on a vCPU's thread ----------------------------------------------------- */
++
++CensusVcpu *census_vcpu(int index, int fd, void *opaque, CensusReadGpa *read_gpa)
++{
++    CensusVcpu *vc;
++
++    if (index < 0 || index >= CENSUS_MAX_VCPUS) {
++        return NULL;
++    }
++    vc = census.vcpus[index];
++    if (!vc) {
++        vc = calloc(1, sizeof(*vc));
++        vc->index = index;
++        vc->fd = fd;
++        vc->opaque = opaque;
++        vc->read_gpa = read_gpa;
++        vc->pending = -1;
++        census.vcpus[index] = vc;
++    }
++    return vc;
++}
++
++static void ring_push(CensusVcpu *vc, const Rec *r)
++{
++    uint32_t head = atomic_load_explicit(&vc->head, memory_order_relaxed);
++    uint32_t tail = atomic_load_explicit(&vc->tail, memory_order_acquire);
++
++    if (head - tail == RING_SIZE) {
++        atomic_fetch_add(&census.dropped, 1);
++        return;
++    }
++    vc->ring[head & (RING_SIZE - 1)] = *r;
++    atomic_store_explicit(&vc->head, head + 1, memory_order_release);
++}
++
++/* RIP, CPL and CR3 at the access, and the bytes at RIP the first time this vCPU sees it. */
++static void snapshot(CensusVcpu *vc, Rec *r)
++{
++    struct kvm_regs regs;
++    struct kvm_sregs sregs;
++
++    if (ioctl(vc->fd, KVM_GET_REGS, &regs) == 0) {
++        r->rip = regs.rip;
++    }
++    if (ioctl(vc->fd, KVM_GET_SREGS, &sregs) == 0) {
++        r->cpl = sregs.cs.dpl;
++        r->cr3 = sregs.cr3;
++    }
++    if (vc->read_gpa && vc->seen[(r->rip ^ (r->rip >> 8)) & 255] != r->rip) {
++        unsigned have = 0;
++
++        vc->seen[(r->rip ^ (r->rip >> 8)) & 255] = r->rip;
++        while (have < sizeof(r->code)) {
++            uint64_t at = r->rip + have;
++            unsigned n = MIN(sizeof(r->code) - have, PG - (at & (PG - 1)));
++            struct kvm_translation t = { .linear_address = at };
++
++            if (ioctl(vc->fd, KVM_TRANSLATE, &t) || !t.valid) {
++                break;
++            }
++            vc->read_gpa(vc->opaque, t.physical_address, r->code + have, n);
++            have += n;
++        }
++        r->ncode = have;
++    }
++}
++
++int census_on_sigbus(CensusVcpu *vc, void **addr)
++{
++    uint64_t off = (uint8_t *)*addr - census.view;
++    uint64_t page;
++    uint32_t w, id;
++    Rec r = { .kind = REC_TOUCH };
++
++    if (!census.view || !vc || off >= census.len) {
++        return CENSUS_NOT_OURS;
++    }
++    page = off >> PG_SHIFT;
++    w = atomic_load(&census.pg[page]);
++    if (w == 0) {
++        *addr = census.main_map + off;
++        return CENSUS_NOT_OURS;
++    }
++    if (PW_ST(w) != ST_ARMED ||
++        !atomic_compare_exchange_strong(&census.pg[page], &w, PW(ST_WORK, PW_ID(w)))) {
++        /*
++         * Another vCPU took this page, or a thread is mid-way through its markers: the fault
++         * reruns. Only real poison on a page once armed keeps coming back.
++         */
++        if (vc->spin_addr == *addr) {
++            if (++vc->spins > SPIN_LIMIT) {
++                *addr = census.main_map + off;
++                return CENSUS_NOT_OURS;
++            }
++        } else {
++            vc->spin_addr = *addr;
++            vc->spins = 0;
++        }
++        atomic_fetch_add(&census.spurious, 1);
++        return CENSUS_HANDLED;
++    }
++    vc->spin_addr = NULL;
++    id = PW_ID(w);
++    snapshot(vc, &r);
++    page_drop(page, 1);
++    if (census.rw && page_wp(page, 1, true) == 0) {
++        vc->pending = page;
++        vc->pending_rip = r.rip;
++        atomic_store(&census.pg[page], PW(ST_HELD, id));
++    } else {
++        if (census.rw) {
++            count_error("WP on after a trap", page);
++        }
++        atomic_store(&census.pg[page], PW(ST_OPEN, id));
++    }
++    r.page = page;
++    r.id = id;
++    r.serial = census.surfaces[id].serial;
++    ring_push(vc, &r);
++    atomic_fetch_add(&census.traps, 1);
++    if (atomic_fetch_add(&census.surfaces[id].window_traps, 1) + 1 == census.saturate_at) {
++        atomic_store(&census.surfaces[id].saturate, 1);
++        sem_post(&census.wake);
++    }
++    return CENSUS_HANDLED;
++}
++
++/*
++ * Moves the pages of s in the states of mask to ST_WORK, and runs fn over each contiguous run of
++ * them; fn ends the work by giving each page its next state. wait: wait out a page another
++ * thread is working on, as an unmap must; otherwise that page is left for the next pass.
++ */
++typedef void RunFn(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg);
++
++static uint32_t take_pages(Surface *s, uint32_t id, uint32_t mask, bool wait, RunFn *fn, void *arg)
++{
++    uint32_t taken = 0;
++
++    for (uint32_t i = 0; i < s->run_count; i++) {
++        uint64_t first = 0, count = 0;
++        bool any_held = false;
++
++        for (uint64_t p = s->runs[i].first; p < s->runs[i].first + s->runs[i].count; p++) {
++            uint32_t w = atomic_load(&census.pg[p]);
++
++            while (wait && PW_ID(w) == id && PW_ST(w) == ST_WORK) {
++                sched_yield();
++                w = atomic_load(&census.pg[p]);
++            }
++            if (PW_ID(w) == id && (mask >> PW_ST(w) & 1) &&
++                atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
++                if (count && first + count != p) {
++                    fn(first, count, id, any_held, arg);
++                    count = 0;
++                    any_held = false;
++                }
++                first = count ? first : p;
++                count++;
++                taken++;
++                any_held |= PW_ST(w) == ST_HELD;
++            } else if (count) {
++                fn(first, count, id, any_held, arg);
++                count = 0;
++                any_held = false;
++            }
++        }
++        if (count) {
++            fn(first, count, id, any_held, arg);
++        }
++    }
++    return taken;
++}
++
++static void open_held(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    if (page_wp(first, count, false)) {
++        count_error("WP off", first);
++    }
++    store_pages(first, count, ST_OPEN, id);
++}
++
++/* Everything off: the unmap's and the reset's work, done before either returns. */
++static void clear_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    if (any_held) {
++        page_wp(first, count, false);
++    }
++    page_drop(first, count);
++    store_pages(first, count, ST_STALE, 0x1fffffffu);
++}
++
++#define MASK(st) (1u << (st))
++#define TOUCHED (MASK(ST_HELD) | MASK(ST_OPEN) | MASK(ST_SKIP))
++
++static void census_fuse(const char *why)
++{
++    if (atomic_exchange(&census.dead, true)) {
++        return;
++    }
++    fprintf(stderr, "census: %s: every marker dropped, the census is off\n", why);
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        Surface *s = &census.surfaces[id];
++
++        if (s->live) {
++            take_pages(s, id, MASK(ST_ARMED) | TOUCHED, true, clear_run, NULL);
++        }
++    }
++}
++
++bool census_on_efault(CensusVcpu *vc)
++{
++    Rec r = { .kind = REC_UPGRADE };
++    uint32_t opened = 0;
++    uint64_t now;
++
++    if (!census.active || !vc) {
++        return false;
++    }
++    snapshot(vc, &r);
++    if (vc->pending >= 0 && vc->pending_rip == r.rip) {
++        uint64_t page = vc->pending;
++        uint32_t w = atomic_load(&census.pg[page]);
++
++        vc->pending = -1;
++        if (PW_ST(w) == ST_HELD &&
++            atomic_compare_exchange_strong(&census.pg[page], &w, PW(ST_WORK, PW_ID(w)))) {
++            uint32_t id = PW_ID(w);
++
++            open_held(page, 1, id, false, NULL);
++            r.kind = REC_WRITE;
++            r.page = page;
++            r.id = id;
++            r.serial = census.surfaces[id].serial;
++            ring_push(vc, &r);
++            atomic_fetch_add(&census.writes, 1);
++            vc->efault_first = 0;
++            return true;
++        }
++    }
++    vc->pending = -1;
++    /* A write to a page held from an earlier read: no address, so every held page opens. */
++    pthread_mutex_lock(&census.lock);
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        Surface *s = &census.surfaces[id];
++
++        if (s->live) {
++            uint32_t n = take_pages(s, id, MASK(ST_HELD), false, open_held, NULL);
++
++            s->total.upgrades += n;
++            s->tick.upgrades += n;
++            opened += n;
++        }
++    }
++    if (opened) {
++        pthread_mutex_unlock(&census.lock);
++        vc->efault_first = 0;
++        r.page = opened;
++        ring_push(vc, &r);
++        atomic_fetch_add(&census.upgrades, 1);
++        return true;
++    }
++    /*
++     * Nothing was held: another thread had the page, and the -EFAULT should not return. Should it
++     * keep returning, something answers it that no write protection explains.
++     */
++    now = now_ns();
++    if (!vc->efault_first || now - vc->efault_last > EFAULT_GAP_NS) {
++        vc->efault_first = now;
++    }
++    vc->efault_last = now;
++    if (now - vc->efault_first > FUSE_AFTER_NS) {
++        census_fuse("an -EFAULT no held page explains");
++    }
++    pthread_mutex_unlock(&census.lock);
++    if (now - vc->efault_first > FATAL_AFTER_NS) {
++        return false;
++    }
++    usleep(20);
++    return true;
++}
++
++/* ---- surfaces, from the library's threads ------------------------------------------------- */
++
++static void queue_line(const char *format, ...)
++{
++    va_list a, b;
++    int n;
++    Line *line;
++
++    va_start(a, format);
++    va_copy(b, a);
++    n = vsnprintf(NULL, 0, format, a);
++    va_end(a);
++    line = malloc(sizeof(*line) + n + 1);
++    vsnprintf(line->text, n + 1, format, b);
++    va_end(b);
++    line->next = NULL;
++    *census.lines_tail = line;
++    census.lines_tail = &line->next;
++}
++
++static double census_time(void)
++{
++    return now_ns() / 1e9;
++}
++
++static void rip_add(RipCount *top, uint64_t rip)
++{
++    RipCount *low = &top[0];
++
++    for (int i = 0; i < TOP_RIPS; i++) {
++        if (top[i].rip == rip) {
++            top[i].count++;
++            return;
++        }
++        if (top[i].count < low->count) {
++            low = &top[i];
++        }
++    }
++    low->rip = rip;
++    low->count = 1;
++}
++
++static void drain_rec(const Rec *r, int vcpu)
++{
++    Surface *s = &census.surfaces[r->id];
++
++    if (r->ncode) {
++        uint64_t *slot = &census.rips_seen[(r->rip * 0x9e3779b97f4a7c15ULL) >> 48];
++
++        if (*slot != r->rip) {
++            char hex[sizeof(r->code) * 2 + 1];
++
++            *slot = r->rip;
++            for (int i = 0; i < r->ncode; i++) {
++                snprintf(hex + i * 2, 3, "%02x", r->code[i]);
++            }
++            queue_line("{\"rip\":\"%#" PRIx64 "\",\"cpl\":%u,\"cr3\":\"%#" PRIx64
++                       "\",\"bytes\":\"%s\"}\n", r->rip, r->cpl, r->cr3, hex);
++        }
++    }
++    if (r->kind == REC_UPGRADE) {
++        queue_line("{\"upgrade\":%u,\"t\":%.3f,\"rip\":\"%#" PRIx64 "\",\"vcpu\":%d}\n",
++                   r->page, census_time(), r->rip, vcpu);
++        return;
++    }
++    if (r->serial != s->serial) {
++        return;
++    }
++    if (r->kind == REC_WRITE) {
++        s->total.writes++;
++        s->tick.writes++;
++        return;
++    }
++    for (Tally *t = &s->total; ; t = &s->tick) {
++        t->traps++;
++        t->cpl0 += r->cpl == 0;
++        t->cpl3 += r->cpl != 0;
++        t->vcpus |= 1ULL << vcpu;
++        rip_add(t->rips, r->rip);
++        if (t == &s->tick) {
++            break;
++        }
++    }
++}
++
++static void drain_locked(void)
++{
++    for (int i = 0; i < CENSUS_MAX_VCPUS; i++) {
++        CensusVcpu *vc = census.vcpus[i];
++        uint32_t tail, head;
++
++        if (!vc) {
++            continue;
++        }
++        tail = atomic_load_explicit(&vc->tail, memory_order_relaxed);
++        head = atomic_load_explicit(&vc->head, memory_order_acquire);
++        while (tail != head) {
++            drain_rec(&vc->ring[tail & (RING_SIZE - 1)], i);
++            tail++;
++        }
++        atomic_store_explicit(&vc->tail, tail, memory_order_release);
++    }
++}
++
++static void rips_text(char *out, size_t size, const RipCount *top)
++{
++    size_t at = 0;
++
++    out[0] = 0;
++    for (int i = 0; i < TOP_RIPS && at + 48 < size; i++) {
++        if (top[i].count) {
++            at += snprintf(out + at, size - at, "%s[\"%#" PRIx64 "\",%" PRIu64 "]",
++                           at ? "," : "", top[i].rip, top[i].count);
++        }
++    }
++}
++
++static void surface_end(Surface *s, uint32_t id, const char *event)
++{
++    char rips[512];
++
++    rips_text(rips, sizeof(rips), s->total.rips);
++    queue_line("{\"ev\":\"%s\",\"t\":%.3f,\"s\":%u,\"id\":%u,\"traps\":%" PRIu64
++               ",\"writes\":%" PRIu64 ",\"upgrades\":%" PRIu64 ",\"pages_r\":%" PRIu64
++               ",\"pages_w\":%" PRIu64 ",\"pages_skip\":%" PRIu64 ",\"cpl0\":%" PRIu64
++               ",\"cpl3\":%" PRIu64 ",\"vcpus\":\"%#" PRIx64 "\",\"presents\":%" PRIu64
++               ",\"frames\":%" PRIu64 ",\"windows\":%" PRIu64 ",\"windows_touched\":%" PRIu64
++               ",\"windows_saturated\":%" PRIu64 ",\"max_window_pages\":%" PRIu64
++               ",\"rips\":[%s]}\n",
++               event, census_time(), s->serial, id, s->total.traps, s->total.writes,
++               s->total.upgrades, s->total.pages_r, s->total.pages_w, s->total.pages_skip,
++               s->total.cpl0, s->total.cpl3, s->total.vcpus, atomic_load(&s->presents),
++               atomic_load(&census.presents) - s->presents_at_map,
++               census.windows - s->windows_at_map, s->total.windows_touched,
++               s->total.windows_saturated, s->max_window_pages, rips);
++}
++
++static void surface_close(Surface *s, uint32_t id, const char *event)
++{
++    drain_locked();
++    take_pages(s, id, MASK(ST_ARMED) | TOUCHED, true, clear_run, NULL);
++    surface_end(s, id, event);
++    s->live = false;
++    free(s->runs);
++    s->runs = NULL;
++    s->run_count = 0;
++}
++
++void census_surface_mapped(const CensusSurface *f, const uint64_t *pages, size_t page_count,
++                           uint64_t page_size)
++{
++    Surface *s;
++    uint32_t id = f->mapping_id;
++    uint64_t pixels = f->width * f->height;
++    size_t capacity = page_count ? page_count : 1;
++
++    if (!census.active || atomic_load(&census.dead) || id == 0 || id >= CENSUS_MAX_SURFACES ||
++        pixels < census.min_pixels) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    s = &census.surfaces[id];
++    if (s->live) {
++        surface_close(s, id, "replaced");
++    }
++    atomic_store(&s->presents, 0);
++    atomic_store(&s->window_traps, 0);
++    atomic_store(&s->saturate, 0);
++    memset(&s->total, 0, sizeof(s->total));
++    memset(&s->tick, 0, sizeof(s->tick));
++    s->serial = ++census.next_serial;
++    s->armed_pages = s->overlaps = s->foreign = s->max_window_pages = 0;
++    s->presents_at_map = s->presents_at_tick = atomic_load(&census.presents);
++    s->windows_at_map = census.windows;
++    s->runs = calloc(capacity, sizeof(*s->runs));
++    s->live = true;
++
++    /* A page already armed for a surface over the same memory stays with that one. */
++    for (size_t i = 0; i < page_count; i++) {
++        uint64_t off = pages[i] - (uint64_t)census.main_map;
++        uint64_t first = off >> PG_SHIFT, count = page_size >> PG_SHIFT;
++
++        if (off >= census.len || off + page_size > census.len || off & (PG - 1)) {
++            s->foreign += count;
++            continue;
++        }
++        for (uint64_t p = first; p < first + count; p++) {
++            uint32_t w = atomic_load(&census.pg[p]);
++
++            if ((w != 0 && PW_ST(w) != ST_STALE) ||
++                !atomic_compare_exchange_strong(&census.pg[p], &w, PW(ST_WORK, id))) {
++                s->overlaps++;
++                census.overlaps++;
++                continue;
++            }
++            if (s->run_count && s->runs[s->run_count - 1].first +
++                s->runs[s->run_count - 1].count == p) {
++                s->runs[s->run_count - 1].count++;
++            } else {
++                if (s->run_count == capacity) {
++                    capacity *= 2;
++                    s->runs = realloc(s->runs, sizeof(*s->runs) * capacity);
++                }
++                s->runs[s->run_count].first = p;
++                s->runs[s->run_count].count = 1;
++                s->run_count++;
++            }
++            s->armed_pages++;
++        }
++    }
++    for (uint32_t i = 0; i < s->run_count; i++) {
++        arm_run(s->runs[i].first, s->runs[i].count, id, false);
++    }
++    queue_line("{\"ev\":\"map\",\"t\":%.3f,\"s\":%u,\"id\":%u,\"format\":\"%#x\",\"w\":%" PRIu64
++               ",\"h\":%" PRIu64 ",\"row\":%" PRIu64 ",\"alloc\":%" PRIu64 ",\"protection\":%"
++               PRIu64 ",\"address_format\":%u,\"compression\":%u,\"read_only\":%d,"
++               "\"host_only\":%d,\"armed_pages\":%" PRIu64 ",\"runs\":%u,\"overlaps\":%" PRIu64
++               ",\"foreign\":%" PRIu64 "}\n",
++               census_time(), s->serial, id, f->pixel_format, f->width, f->height,
++               f->bytes_per_row, f->alloc_size, f->protection_options, f->address_format,
++               f->compression_type, f->read_only, f->host_only, s->armed_pages, s->run_count,
++               s->overlaps, s->foreign);
++    pthread_mutex_unlock(&census.lock);
++}
++
++void census_surface_unmapped(uint32_t mapping_id)
++{
++    if (!census.active || mapping_id == 0 || mapping_id >= CENSUS_MAX_SURFACES) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    if (census.surfaces[mapping_id].live) {
++        surface_close(&census.surfaces[mapping_id], mapping_id, "unmap");
++    }
++    pthread_mutex_unlock(&census.lock);
++}
++
++void census_surface_used(uint32_t mapping_id, uint64_t usage, uint64_t storage_mode)
++{
++    if (!census.active || mapping_id == 0 || mapping_id >= CENSUS_MAX_SURFACES) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    if (census.surfaces[mapping_id].live) {
++        queue_line("{\"ev\":\"use\",\"s\":%u,\"usage\":\"%#" PRIx64 "\",\"storage\":%" PRIu64 "}\n",
++                   census.surfaces[mapping_id].serial, usage, storage_mode);
++    }
++    pthread_mutex_unlock(&census.lock);
++}
++
++void census_presented(uint64_t mapping_id)
++{
++    uint64_t n;
++
++    if (!census.active) {
++        return;
++    }
++    n = atomic_fetch_add(&census.presents, 1) + 1;
++    if (mapping_id > 0 && mapping_id < CENSUS_MAX_SURFACES &&
++        census.surfaces[mapping_id].live) {
++        atomic_fetch_add(&census.surfaces[mapping_id].presents, 1);
++    }
++    if (n % atomic_load(&census.every) == 0) {
++        sem_post(&census.wake);
++    }
++}
++
++void census_reset(void)
++{
++    if (!census.active) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        if (census.surfaces[id].live) {
++            surface_close(&census.surfaces[id], id, "reset");
++        }
++    }
++    for (int i = 0; i < CENSUS_MAX_VCPUS; i++) {
++        if (census.vcpus[i]) {
++            census.vcpus[i]->pending = -1;
++        }
++    }
++    pthread_mutex_unlock(&census.lock);
++}
++
++/* ---- the census's thread ------------------------------------------------------------------- */
++
++typedef struct WindowCount {
++    uint64_t r, w, skip;
++} WindowCount;
++
++static void rearm_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    arm_run(first, count, id, any_held);
++}
++
++static void count_pages(Surface *s, uint32_t id, WindowCount *c)
++{
++    for (uint32_t i = 0; i < s->run_count; i++) {
++        for (uint64_t p = s->runs[i].first; p < s->runs[i].first + s->runs[i].count; p++) {
++            uint32_t w = atomic_load(&census.pg[p]);
++
++            if (PW_ID(w) == id) {
++                c->r += PW_ST(w) == ST_HELD;
++                c->w += PW_ST(w) == ST_OPEN;
++                c->skip += PW_ST(w) == ST_SKIP;
++            }
++        }
++    }
++}
++
++static void saturate_run(uint64_t first, uint64_t count, uint32_t id, bool any_held, void *arg)
++{
++    page_drop(first, count);
++    store_pages(first, count, ST_SKIP, id);
++}
++
++/*
++ * A surface read whole in a window has answered for that window: the rest of its markers go at
++ * once, so that a recorder pays a few hundred traps a window rather than thousands.
++ */
++static void saturate_locked(void)
++{
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        Surface *s = &census.surfaces[id];
++
++        if (s->live && atomic_exchange(&s->saturate, 0)) {
++            take_pages(s, id, MASK(ST_ARMED), false, saturate_run, NULL);
++            s->total.windows_saturated++;
++            s->tick.windows_saturated++;
++        }
++    }
++}
++
++static void close_window_locked(void)
++{
++    census.windows++;
++    census.presents_at_window = atomic_load(&census.presents);
++    census.window_ns = now_ns();
++    if (atomic_load(&census.dead)) {
++        return;
++    }
++    drain_locked();
++    saturate_locked();
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        Surface *s = &census.surfaces[id];
++        WindowCount c = { 0 };
++        uint64_t pages;
++
++        if (!s->live || !atomic_exchange(&s->window_traps, 0)) {
++            continue;
++        }
++        count_pages(s, id, &c);
++        pages = c.r + c.w + c.skip;
++        s->total.pages_r += c.r;
++        s->tick.pages_r += c.r;
++        s->total.pages_w += c.w;
++        s->tick.pages_w += c.w;
++        s->total.pages_skip += c.skip;
++        s->tick.pages_skip += c.skip;
++        s->total.windows_touched++;
++        s->tick.windows_touched++;
++        s->max_window_pages = MAX(s->max_window_pages, pages);
++        take_pages(s, id, TOUCHED, false, rearm_run, NULL);
++        /* The lock is the fallback path's and the map's: never held for a whole pass of arming. */
++        pthread_mutex_unlock(&census.lock);
++        sched_yield();
++        pthread_mutex_lock(&census.lock);
++    }
++}
++
++void census_close_window(void)
++{
++    pthread_mutex_lock(&census.lock);
++    close_window_locked();
++    pthread_mutex_unlock(&census.lock);
++}
++
++static void tick_locked(void)
++{
++    uint64_t presents = atomic_load(&census.presents);
++    char rips[512];
++
++    drain_locked();
++    queue_line("{\"t\":%.3f,\"presents\":%" PRIu64 ",\"frames\":%" PRIu64 ",\"windows\":%" PRIu64
++               ",\"traps\":%" PRIu64 ",\"writes\":%" PRIu64 ",\"upgrades\":%" PRIu64
++               ",\"spurious\":%" PRIu64 ",\"dropped\":%" PRIu64 ",\"errors\":%" PRIu64
++               ",\"dead\":%d}\n",
++               census_time(), presents, presents - census.presents_at_tick, census.windows,
++               atomic_load(&census.traps), atomic_load(&census.writes),
++               atomic_load(&census.upgrades), atomic_load(&census.spurious),
++               atomic_load(&census.dropped), atomic_load(&census.errors),
++               (int)atomic_load(&census.dead));
++    census.presents_at_tick = presents;
++    for (uint32_t id = 1; id < CENSUS_MAX_SURFACES; id++) {
++        Surface *s = &census.surfaces[id];
++        uint64_t own;
++
++        if (!s->live) {
++            continue;
++        }
++        own = atomic_load(&s->presents);
++        if (s->tick.traps || s->tick.upgrades || s->tick.windows_touched) {
++            rips_text(rips, sizeof(rips), s->tick.rips);
++            queue_line("{\"tick\":%u,\"t\":%.3f,\"presents\":%" PRIu64 ",\"traps\":%" PRIu64
++                       ",\"writes\":%" PRIu64 ",\"upgrades\":%" PRIu64 ",\"pages_r\":%" PRIu64
++                       ",\"pages_w\":%" PRIu64 ",\"pages_skip\":%" PRIu64
++                       ",\"windows_touched\":%" PRIu64 ",\"windows_saturated\":%" PRIu64
++                       ",\"cpl0\":%" PRIu64 ",\"cpl3\":%" PRIu64 ",\"rips\":[%s]}\n",
++                       s->serial, census_time(), own - s->presents_at_tick, s->tick.traps,
++                       s->tick.writes, s->tick.upgrades, s->tick.pages_r, s->tick.pages_w,
++                       s->tick.pages_skip, s->tick.windows_touched, s->tick.windows_saturated,
++                       s->tick.cpl0, s->tick.cpl3, rips);
++            memset(&s->tick, 0, sizeof(s->tick));
++        }
++        s->presents_at_tick = own;
++    }
++}
++
++static void write_lines(void)
++{
++    Line *line;
++
++    pthread_mutex_lock(&census.lock);
++    line = census.lines_head;
++    census.lines_head = NULL;
++    census.lines_tail = &census.lines_head;
++    pthread_mutex_unlock(&census.lock);
++    while (line) {
++        Line *next = line->next;
++        FILE *to = census.ticks;
++
++        if (strncmp(line->text, "{\"ev\"", 5) == 0) {
++            to = census.facts;
++        } else if (strncmp(line->text, "{\"rip\"", 6) == 0) {
++            to = census.rips;
++        }
++        fputs(line->text, to);
++        free(line);
++        line = next;
++    }
++    fflush(census.ticks);
++    fflush(census.facts);
++    fflush(census.rips);
++}
++
++/* <dir>/mark: "every N" sets the re-arm period; anything else is a label in the timeline. */
++static void read_mark(void)
++{
++    char path[sizeof(census.dir) + 8], text[128] = "";
++    FILE *f;
++    size_t n;
++    unsigned long every;
++
++    snprintf(path, sizeof(path), "%s/mark", census.dir);
++    f = fopen(path, "r");
++    if (!f) {
++        return;
++    }
++    n = fread(text, 1, sizeof(text) - 1, f);
++    fclose(f);
++    unlink(path);
++    text[n] = 0;
++    text[strcspn(text, "\n")] = 0;
++    pthread_mutex_lock(&census.lock);
++    if (sscanf(text, "every %lu", &every) == 1 && every > 0) {
++        atomic_store(&census.every, every);
++        queue_line("{\"mark\":\"every %lu\",\"t\":%.3f}\n", every, census_time());
++    } else {
++        for (char *c = text; *c; c++) {
++            *c = *c == '"' || *c == '\\' || (unsigned char)*c < 32 ? '_' : *c;
++        }
++        tick_locked();
++        queue_line("{\"mark\":\"%s\",\"t\":%.3f}\n", text, census_time());
++    }
++    pthread_mutex_unlock(&census.lock);
++}
++
++static void *census_thread(void *unused)
++{
++    sigset_t all;
++
++    sigfillset(&all);
++    pthread_sigmask(SIG_BLOCK, &all, NULL);
++    pthread_setname_np(pthread_self(), "reims-census");
++    census.window_ns = census.tick_ns = now_ns();
++    for (;;) {
++        struct timespec until;
++        uint64_t now, every = atomic_load(&census.every);
++
++        clock_gettime(CLOCK_REALTIME, &until);
++        until.tv_nsec += 50000000;
++        if (until.tv_nsec >= 1000000000) {
++            until.tv_sec++;
++            until.tv_nsec -= 1000000000;
++        }
++        sem_timedwait(&census.wake, &until);
++        now = now_ns();
++        read_mark();
++        pthread_mutex_lock(&census.lock);
++        drain_locked();
++        saturate_locked();
++        if (atomic_load(&census.presents) - census.presents_at_window >= every ||
++            now - census.window_ns >= census.window_ms * 1000000ULL) {
++            close_window_locked();
++        }
++        if (now - census.tick_ns >= census.flush_ms * 1000000ULL) {
++            tick_locked();
++            census.tick_ns = now;
++        }
++        pthread_mutex_unlock(&census.lock);
++        write_lines();
++    }
++    return unused;
++}
++
++void census_flush(void)
++{
++    if (!census.active) {
++        return;
++    }
++    pthread_mutex_lock(&census.lock);
++    tick_locked();
++    pthread_mutex_unlock(&census.lock);
++    write_lines();
++}
++
++static void census_at_exit(void)
++{
++    census_flush();
++}
++
++void census_counts(CensusCounts *out)
++{
++    *out = (CensusCounts) {
++        .traps = atomic_load(&census.traps),
++        .writes = atomic_load(&census.writes),
++        .upgrades = atomic_load(&census.upgrades),
++        .spurious = atomic_load(&census.spurious),
++        .dropped = atomic_load(&census.dropped),
++        .errors = atomic_load(&census.errors),
++        .overlaps = census.overlaps,
++        .windows = census.windows,
++        .dead = atomic_load(&census.dead),
++    };
++}
++
++int census_page_state(const void *main_addr)
++{
++    uint64_t off = (const uint8_t *)main_addr - census.main_map;
++
++    return off < census.len ? (int)PW_ST(atomic_load(&census.pg[off >> PG_SHIFT])) : -1;
++}
++
++static FILE *open_output(const char *name)
++{
++    char path[sizeof(census.dir) + 32];
++
++    snprintf(path, sizeof(path), "%s/%s", census.dir, name);
++    return fopen(path, "ae");
++}
++
++static bool census_refuse(const char *what)
++{
++    fprintf(stderr, "census: %s: %s; the census is off\n", what, strerror(errno));
++    census.wanted = 0;
++    if (census.view) {
++        munmap(census.view, census.len);
++        census.view = NULL;
++    }
++    if (census.uffd >= 0) {
++        close(census.uffd);
++        census.uffd = -1;
++    }
++    return false;
++}
++
++bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len)
++{
++    struct uffdio_api api = {
++        .api = UFFD_API,
++        .features = UFFD_FEATURE_POISON | UFFD_FEATURE_WP_HUGETLBFS_SHMEM |
++                    UFFD_FEATURE_WP_UNPOPULATED,
++    };
++    struct uffdio_register reg = { .mode = UFFDIO_REGISTER_MODE_WP };
++
++    mkdir(census.dir, 0777);
++    census.ticks = open_output("ticks.jsonl");
++    census.facts = open_output("surfaces.jsonl");
++    census.rips = open_output("rips.jsonl");
++    if (!census.ticks || !census.facts || !census.rips) {
++        return census_refuse("the output directory");
++    }
++    census.uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
++    if (census.uffd < 0) {
++        return census_refuse("userfaultfd(UFFD_USER_MODE_ONLY)");
++    }
++    if (ioctl(census.uffd, UFFDIO_API, &api)) {
++        return census_refuse("UFFDIO_API, poison and shmem write protection");
++    }
++    census.view = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
++    if (census.view == MAP_FAILED) {
++        census.view = NULL;
++        return census_refuse("the view");
++    }
++    /* A fork's child, which only execs, needs none of this. */
++    madvise(census.view, len, MADV_DONTFORK);
++    reg.range.start = (uint64_t)census.view;
++    reg.range.len = len;
++    if (ioctl(census.uffd, UFFDIO_REGISTER, &reg)) {
++        return census_refuse("UFFDIO_REGISTER");
++    }
++    census.main_map = main_map;
++    census.len = len;
++    census.pages = len >> PG_SHIFT;
++    census.pg = calloc(census.pages, sizeof(*census.pg));
++    census.surfaces = calloc(CENSUS_MAX_SURFACES, sizeof(*census.surfaces));
++    census.rips_seen = calloc(RIP_SEEN_SLOTS, sizeof(*census.rips_seen));
++    if (!census.pg || !census.surfaces || !census.rips_seen) {
++        return census_refuse("memory");
++    }
++    census.lines_tail = &census.lines_head;
++    census.rw = env_u32("REIMS_VGPU_CENSUS_RW", 1);
++    census.every = env_u32("REIMS_VGPU_CENSUS_EVERY", 32);
++    census.min_pixels = env_u32("REIMS_VGPU_CENSUS_MIN_PIXELS", 1000000);
++    census.saturate_at = env_u32("REIMS_VGPU_CENSUS_SATURATE", 256);
++    census.flush_ms = env_u32("REIMS_VGPU_CENSUS_FLUSH_MS", 5000);
++    census.window_ms = env_u32("REIMS_VGPU_CENSUS_WINDOW_MS", 2000);
++    if (!census.every) {
++        census.every = 1;
++    }
++    sem_init(&census.wake, 0, 0);
++    census.active = true;
++    if (pthread_create(&census.thread, NULL, census_thread, NULL)) {
++        census.active = false;
++        return census_refuse("the census's thread");
++    }
++    atexit(census_at_exit);
++    queue_line("{\"started\":%.3f,\"pid\":%d,\"bytes\":%" PRIu64 ",\"rw\":%d,\"every\":%u,"
++               "\"min_pixels\":%u,\"saturate\":%u}\n", census_time(), getpid(), len, census.rw,
++               census.every, census.min_pixels, census.saturate_at);
++    fprintf(stderr, "census: on, writing to %s: %" PRIu64 " MiB view at %p\n", census.dir,
++            len >> 20, census.view);
++    return true;
++}
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 83cbd120a8..77952192cb 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -47,6 +47,7 @@
+ #include "qapi/qapi-types-common.h"
+ #include "qapi/qapi-visit-common.h"
+ #include "system/reset.h"
++#include "system/kvm_census.h"
+ #include "qemu/guest-random.h"
+ #include "system/hw_accel.h"
+ #include "kvm-cpus.h"
+@@ -366,6 +367,77 @@ int kvm_physical_memory_addr_from_host(KVMState *s, void *ram,
+     return ret;
+ }
+ 
++/* LOCAL (Atlas): reads guest memory for the census's instruction bytes. */
++static void kvm_census_read_gpa(void *opaque, uint64_t gpa, void *buf, unsigned len)
++{
++    address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, buf, len);
++}
++
++static CensusVcpu *kvm_census_vcpu(CPUState *cpu)
++{
++    return census_vcpu(cpu->cpu_index, cpu->kvm_fd, cpu, kvm_census_read_gpa);
++}
++
++/*
++ * REIMS_VGPU_CENSUS_SELFTEST=<offset>:<length>, in hex, bytes of the RAM block named "ram": arms
++ * a surface no library told of, so that a guest with no GPU device can drive the census.
++ */
++static void kvm_census_selftest(void)
++{
++    const char *test = getenv("REIMS_VGPU_CENSUS_SELFTEST");
++    uint64_t offset, length;
++    RAMBlock *block;
++    g_autofree uint64_t *pages = NULL;
++    CensusSurface facts = { .mapping_id = 1, .width = 4096, .height = 4096 };
++
++    if (!test || sscanf(test, "%" SCNx64 ":%" SCNx64, &offset, &length) != 2) {
++        return;
++    }
++    block = qemu_ram_block_by_name("ram");
++    if (!block) {
++        return;
++    }
++    pages = g_new(uint64_t, length >> 12);
++    for (uint64_t i = 0; i < length >> 12; i++) {
++        pages[i] = (uint64_t)block->host + offset + (i << 12);
++    }
++    census_surface_mapped(&facts, pages, length >> 12, 4096);
++}
++
++static void kvm_census_reset(void *opaque)
++{
++    census_reset();
++    kvm_census_selftest();
++}
++
++/*
++ * LOCAL (Atlas): the address KVM gets for main-mapping address ram: the census's KVM-only view
++ * for a memslot of guest RAM, when the census is on (accel/kvm/census.c); otherwise ram, and
++ * nothing is mapped. slot->ram stays the main mapping's, for kvm_physical_memory_addr_from_host.
++ * ROMs, pflash and every other block have no fd of this kind, or are too small to hold a surface.
++ */
++static void *kvm_census_hva(void *ram)
++{
++    ram_addr_t offset;
++    RAMBlock *block;
++
++    if (likely(!census_wanted())) {
++        return ram;
++    }
++    if (!census_active()) {
++        block = qemu_ram_block_from_host(ram, false, &offset);
++        if (!block || block->fd < 0 || !qemu_ram_is_shared(block) ||
++            block->page_size != 4096 || block->used_length < 256 * MiB) {
++            return ram;
++        }
++        if (!census_start(block->fd, block->fd_offset, block->host, block->used_length)) {
++            return ram;
++        }
++        qemu_register_reset(kvm_census_reset, NULL);
++    }
++    return census_hva(ram);
++}
++
+ static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new)
+ {
+     KVMState *s = kvm_state;
+@@ -374,7 +446,7 @@ static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, boo
+ 
+     mem.slot = slot->slot | (kml->as_id << 16);
+     mem.guest_phys_addr = slot->start_addr;
+-    mem.userspace_addr = (unsigned long)slot->ram;
++    mem.userspace_addr = (unsigned long)kvm_census_hva(slot->ram);
+     mem.flags = slot->flags;
+     mem.guest_memfd = slot->guest_memfd;
+     mem.guest_memfd_offset = slot->guest_memfd_offset;
+@@ -3474,11 +3546,23 @@ int kvm_cpu_exec(CPUState *cpu)
+ 
+ #ifdef KVM_HAVE_MCE_INJECTION
+         if (unlikely(have_sigbus_pending)) {
+-            bql_lock();
+-            kvm_arch_on_sigbus_vcpu(cpu, pending_sigbus_code,
+-                                    pending_sigbus_addr);
+-            have_sigbus_pending = false;
+-            bql_unlock();
++            /* LOCAL (Atlas): a census marker runs the vCPU again, off the BQL. */
++            if (census_active() && kvm_census_vcpu(cpu) &&
++                census_on_sigbus(kvm_census_vcpu(cpu), &pending_sigbus_addr) ==
++                CENSUS_HANDLED) {
++                have_sigbus_pending = false;
++                if (run_ret == -EINTR) {
++                    ret = 0;
++                    continue;
++                }
++            } else {
++                qatomic_set(&cpu->exit_request, true);
++                bql_lock();
++                kvm_arch_on_sigbus_vcpu(cpu, pending_sigbus_code,
++                                        pending_sigbus_addr);
++                have_sigbus_pending = false;
++                bql_unlock();
++            }
+         }
+ #endif
+ 
+@@ -3489,6 +3573,12 @@ int kvm_cpu_exec(CPUState *cpu)
+                 ret = EXCP_INTERRUPT;
+                 break;
+             }
++            /* LOCAL (Atlas): a write to a page the census holds write-protected. */
++            if (run_ret == -EFAULT && run->exit_reason != KVM_EXIT_MEMORY_FAULT &&
++                census_active() && census_on_efault(kvm_census_vcpu(cpu))) {
++                ret = 0;
++                continue;
++            }
+             if (!(run_ret == -EFAULT && run->exit_reason == KVM_EXIT_MEMORY_FAULT)) {
+                 fprintf(stderr, "error: kvm run failed %s\n",
+                         strerror(-run_ret));
+@@ -3993,7 +4083,10 @@ int kvm_on_sigbus_vcpu(CPUState *cpu, int code, void *addr)
+     have_sigbus_pending = true;
+     pending_sigbus_addr = addr;
+     pending_sigbus_code = code;
+-    qatomic_set(&cpu->exit_request, true);
++    /* LOCAL (Atlas): the census's markers are answered on the way out of KVM_RUN. */
++    if (!census_view_holds(addr)) {
++        qatomic_set(&cpu->exit_request, true);
++    }
+     return 0;
+ #else
+     return 1;
+@@ -4009,7 +4102,7 @@ int kvm_on_sigbus(int code, void *addr)
+      * we can only get action optional here.
+      */
+     assert(code != BUS_MCEERR_AR);
+-    kvm_arch_on_sigbus_vcpu(first_cpu, code, addr);
++    kvm_arch_on_sigbus_vcpu(first_cpu, code, census_main_addr(addr));
+     return 0;
+ #else
+     return 1;
+diff --git a/accel/kvm/meson.build b/accel/kvm/meson.build
+index 397a1fe1fd..a154754a04 100644
+--- a/accel/kvm/meson.build
++++ b/accel/kvm/meson.build
+@@ -5,3 +5,4 @@ kvm_ss.add(files(
+ ))
+ 
+ specific_ss.add_all(when: 'CONFIG_KVM', if_true: kvm_ss)
++system_ss.add(when: 'CONFIG_LINUX', if_true: files('census.c'))
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index de8a240f95..935c5850d1 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -32,6 +32,9 @@
+ #include "ui/input.h"
+ #include "apple-gfx.h"
+ #include "trace.h"
++#ifdef __linux__
++#include "system/kvm_census.h"
++#endif
+ 
+ static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
+     { 1920, 1080, 60 },
+@@ -1001,6 +1004,69 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
+     return true;
+ }
+ 
++#ifdef __linux__
++/*
++ * LOCAL (Atlas): the library's map, unmap, texture and present news for the touch census
++ * (accel/kvm/census.c). The two surface calls run on the IOSurface device's thread; presented on a
++ * present's, where it takes no lock.
++ */
++static void apple_gfx_census_mapped(void *ctx, const RvgCensusSurface *surface,
++                                    const uint64_t *pages, size_t page_count,
++                                    uint64_t page_size)
++{
++    CensusSurface facts = {
++        .mapping_id = surface->mapping_id,
++        .pixel_format = surface->pixel_format,
++        .width = surface->width,
++        .height = surface->height,
++        .bytes_per_row = surface->bytes_per_row,
++        .alloc_size = surface->alloc_size,
++        .protection_options = surface->protection_options,
++        .address_format = surface->address_format,
++        .compression_type = surface->compression_type,
++        .read_only = surface->read_only,
++        .host_only = surface->host_only,
++    };
++
++    census_surface_mapped(&facts, pages, page_count, page_size);
++}
++
++static void apple_gfx_census_unmapped(void *ctx, uint32_t mapping_id)
++{
++    census_surface_unmapped(mapping_id);
++}
++
++static void apple_gfx_census_used(void *ctx, uint32_t mapping_id, uint64_t usage,
++                                  uint64_t storage_mode)
++{
++    census_surface_used(mapping_id, usage, storage_mode);
++}
++
++static void apple_gfx_census_presented(void *ctx, uint64_t mapping_id)
++{
++    census_presented(mapping_id);
++}
++
++static void apple_gfx_census_register(void)
++{
++    static const RvgCensusCallbacks callbacks = {
++        .struct_size = sizeof(RvgCensusCallbacks),
++        .mapped = apple_gfx_census_mapped,
++        .unmapped = apple_gfx_census_unmapped,
++        .used = apple_gfx_census_used,
++        .presented = apple_gfx_census_presented,
++    };
++
++    if (census_active()) {
++        rvg_census_set_callbacks(&callbacks);
++    }
++}
++#else
++static void apple_gfx_census_register(void)
++{
++}
++#endif
++
+ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+                               RvgDeviceConfig *config, Error **errp)
+ {
+@@ -1093,6 +1159,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+         s->displays[i].cursor_show = true;
+     }
+ 
++    apple_gfx_census_register();
+     status = rvg_device_create(config, &s->pgdev);
+     if (status != RVG_OK) {
+         error_setg(errp, "apple-gfx: rvg_device_create: %s",
+diff --git a/include/system/kvm_census.h b/include/system/kvm_census.h
+new file mode 100644
+index 0000000000..e242236452
+--- /dev/null
++++ b/include/system/kvm_census.h
+@@ -0,0 +1,91 @@
++/*
++ * LOCAL (Atlas): the touch census. See accel/kvm/census.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef KVM_CENSUS_H
++#define KVM_CENSUS_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define CENSUS_ENV "REIMS_VGPU_CENSUS"
++#define CENSUS_MAX_SURFACES 8192
++#define CENSUS_MAX_VCPUS 64
++
++/* What a surface's map tells the census, the descriptor's fields as they came. */
++typedef struct CensusSurface {
++    uint32_t mapping_id;
++    uint32_t pixel_format;
++    uint64_t width;
++    uint64_t height;
++    uint64_t bytes_per_row;
++    uint64_t alloc_size;
++    uint64_t protection_options;
++    uint32_t address_format;
++    uint32_t compression_type;
++    bool read_only;
++    bool host_only;
++} CensusSurface;
++
++typedef struct CensusVcpu CensusVcpu;
++
++/* Reads guest memory for the instruction bytes a record keeps; never armed memory. */
++typedef void CensusReadGpa(void *opaque, uint64_t gpa, void *buf, unsigned len);
++
++/* REIMS_VGPU_CENSUS is set, and nothing has refused it yet. */
++bool census_wanted(void);
++/* The view exists and traps are being counted. */
++bool census_active(void);
++
++/*
++ * Maps the KVM-only view of [main, main + len), the mapping of fd at offset, registers it with
++ * userfaultfd and starts the census's thread. On failure, says why on stderr and turns the census
++ * off; memslots then stay on the main mapping and the VM runs as it would without the variable.
++ */
++bool census_start(int fd, uint64_t offset, void *main_map, uint64_t len);
++/* The address memslots use for main-mapping address ram: the view's when it holds ram. */
++void *census_hva(void *ram);
++/* Whether addr lies in the view. Async-signal-safe. */
++bool census_view_holds(const void *addr);
++/* The main mapping's address for a view address, or addr itself. */
++void *census_main_addr(void *addr);
++
++CensusVcpu *census_vcpu(int index, int fd, void *opaque, CensusReadGpa *read_gpa);
++
++enum { CENSUS_NOT_OURS, CENSUS_HANDLED };
++/*
++ * On the vCPU's thread, outside the signal handler, after KVM_RUN returned. CENSUS_HANDLED: run
++ * the vCPU again. CENSUS_NOT_OURS: not a marker of the census's, as for real poison, and *addr
++ * is the address to go on with, the main mapping's for an address in the view.
++ */
++int census_on_sigbus(CensusVcpu *vc, void **addr);
++/* KVM_RUN gave a bare -EFAULT: true when the census answers for it, and the vCPU runs again. */
++bool census_on_efault(CensusVcpu *vc);
++
++/* The guest's reset: every marker goes. vCPUs are stopped. */
++void census_reset(void);
++
++/* From the library's threads. None waits on a vCPU, and presented takes no lock. */
++void census_surface_mapped(const CensusSurface *facts, const uint64_t *pages, size_t page_count,
++                           uint64_t page_size);
++void census_surface_unmapped(uint32_t mapping_id);
++void census_surface_used(uint32_t mapping_id, uint64_t usage, uint64_t storage_mode);
++void census_presented(uint64_t mapping_id);
++
++/* Writes everything counted so far. For a test: the census's thread does this on its own. */
++void census_flush(void);
++
++/* What a test reads. */
++typedef struct CensusCounts {
++    uint64_t traps, writes, upgrades, spurious, dropped, overlaps, errors, windows, dead;
++} CensusCounts;
++void census_counts(CensusCounts *out);
++/* Runs the end of a window now, whatever the presents count. */
++void census_close_window(void);
++/* Whether the page at this main-mapping address carries a marker of the census's, by its state. */
++int census_page_state(const void *main_addr);
++
++#endif

@@ -1,7 +1,7 @@
-From 0d31d29c8ceccc9bb17e4920ff543dbd112c62a5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 16:13:56 +0000
-Subject: [PATCH 2/5] read the release's pixel format table
+Subject: [PATCH 02/34] read the release's pixel format table
  without a device
 
 Reims answers whether Metal describes a pixel format, the format's name

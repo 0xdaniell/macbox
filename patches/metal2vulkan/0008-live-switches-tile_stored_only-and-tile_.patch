@@ -1,0 +1,520 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 18:45:32 +0000
+Subject: [PATCH 08/34] live switches tile_stored_only and
+ tile_narrow_barriers; lane gpu_cost
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/render.rs     |   1 +
+ .../src/render/tile_dispatch.rs               |  40 +++-
+ .../src/render/tile_writes.rs                 | 136 ++++++++++++
+ crates/metal2vulkan-runtime/src/tracker.rs    |  30 +++
+ .../src/runtime_lane.rs                       |   1 +
+ .../src/runtime_lane/gpu_cost.rs              | 195 ++++++++++++++++++
+ 6 files changed, 393 insertions(+), 10 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/render/tile_writes.rs
+ create mode 100644 crates/metal2vulkan-validation/src/runtime_lane/gpu_cost.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index de475813..89c399b5 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -413,6 +413,7 @@ mod shadows;
+ mod snapshot;
+ mod table_facts;
+ mod tessellation_scan;
++mod tile_writes; // LOCAL (Atlas)
+ mod tile_dispatch;
+ mod tile_memory;
+ mod untouched;
+diff --git a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs b/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
+index 5bb661dc..f2741878 100644
+--- a/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
++++ b/crates/metal2vulkan-runtime/src/render/tile_dispatch.rs
+@@ -154,6 +154,8 @@ pub(super) struct TileDispatch {
+     /// attachment holds them: their origin and extent, inside the scratch images' extent (the
+     /// pixels every dispatch of the pass covers, from the origin).
+     copied: [[u32; 2]; 2],
++    /// LOCAL (Atlas): what the switches of `render/tile_writes.rs` took as the dispatch was made.
++    economy: super::tile_writes::Economy,
+     layout: vk::PipelineLayout,
+     sets: Vec<vk::DescriptorSet>,
+     /// The dynamic offsets set 0 is bound with (`binding::dynamic_writes`).
+@@ -175,6 +177,17 @@ pub(super) struct TileDispatch {
+ /// back, and the scratch's image.
+ pub(super) type Staging = (vk::Image, (vk::ImageCopy, vk::ImageCopy), vk::Image);
+ 
++/// LOCAL (Atlas): the barrier that ends the copies in or the dispatch where
++/// [`Economy::narrow`](super::tile_writes::Economy) holds: from what just ran alone, the barriers
++/// around it ordering the rest (`render/tile_writes.rs`).
++fn scratch_barrier(narrow: bool, narrowed: Barrier) -> Barrier {
++    if narrow {
++        narrowed
++    } else {
++        Barrier::everything()
++    }
++}
++
+ impl TileDispatch {
+     /// The copies of each staged attachment of `layout` (the pass's, as it ends: a stand-in that
+     /// arrived after the dispatch is what the pass renders) into its scratch and back, over the
+@@ -217,6 +230,7 @@ impl TileDispatch {
+     ) {
+         // SAFETY: the caller's contract.
+         unsafe {
++            let narrow = self.economy.narrow;
+             Barrier::everything().record(raw, command_buffer);
+             for (own, (into, _), scratch) in copies {
+                 raw.cmd_copy_image(
+@@ -228,7 +242,7 @@ impl TileDispatch {
+                     std::slice::from_ref(into),
+                 );
+             }
+-            Barrier::everything().record(raw, command_buffer);
++            scratch_barrier(narrow, Barrier::copied_to_dispatch()).record(raw, command_buffer);
+             if let Some(push) = raw.push_descriptor().filter(|_| !self.pushed.is_empty()) {
+                 binding::push_set(
+                     push,
+@@ -268,16 +282,19 @@ impl TileDispatch {
+                 }
+                 raw.cmd_dispatch(command_buffer, *x, *y, *z);
+             }
+-            Barrier::everything().record(raw, command_buffer);
+-            for (own, (_, back), scratch) in copies {
+-                raw.cmd_copy_image(
++            // LOCAL (Atlas): nothing to copy back from a dispatch that wrote no staged cell.
++            if self.economy.copies_back {
++                scratch_barrier(narrow, Barrier::dispatched_to_copy()).record(raw, command_buffer);
++                for (own, (_, back), scratch) in copies {
++                    raw.cmd_copy_image(
+                     command_buffer,
+-                    *scratch,
+-                    vk::ImageLayout::GENERAL,
+-                    *own,
+-                    vk::ImageLayout::GENERAL,
+-                    std::slice::from_ref(back),
+-                );
++                        *scratch,
++                        vk::ImageLayout::GENERAL,
++                        *own,
++                        vk::ImageLayout::GENERAL,
++                        std::slice::from_ref(back),
++                    );
++                }
+             }
+             Barrier::everything().record(raw, command_buffer);
+         }
+@@ -1199,6 +1216,8 @@ impl RenderLowering {
+             None => None,
+         };
+         // Recording starts here: nothing below can be refused.
++        let economy =
++            super::tile_writes::Economy::now(&variant.pipeline().stage.spirv, cells.is_some());
+         self.scratch.extend(made);
+         self.tile_imageblock |= aliased_past;
+         if let Some(made) = made_imageblock {
+@@ -1220,6 +1239,7 @@ impl RenderLowering {
+             after: self.earlier.len() + 1,
+             staged,
+             copied,
++            economy,
+             layout: objects.layout(),
+             sets: set.into_iter().collect(),
+             offsets,
+diff --git a/crates/metal2vulkan-runtime/src/render/tile_writes.rs b/crates/metal2vulkan-runtime/src/render/tile_writes.rs
+new file mode 100644
+index 00000000..b8e11ef1
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/render/tile_writes.rs
+@@ -0,0 +1,136 @@
++//! LOCAL (Atlas): less work around a tile dispatch, under live switches, both off by default.
++//!
++//! - **`tile_stored_only`.** Three of the five tile functions a Tahoe WindowServer frame runs read
++//!   the imageblock and write only a texture of their own: the translator stores no cell of such a
++//!   function (`lower::access::tile`'s `Pass::Store` skips a slot it did not store), so the scratch
++//!   holds what was copied into it, and its copy back rewrites the attachment's own texels. Under
++//!   the switch a dispatch that writes no staged image copies nothing back. Decided from the
++//!   stage's final SPIR-V ([`writes_staged`]), conservatively: only where every image the module
++//!   writes is of `Unknown` format, which a staged attachment never is
++//!   (`lower::access::tile::storage_format` declares its format), and nothing takes a texel
++//!   pointer. A function that stores the pass's imageblock cells writes through its own storage,
++//!   which the copies do not touch: it keeps them, as it does any attachment staged beside.
++//! - **`tile_narrow_barriers`.** A dispatch's copies and scratch sat between four barriers from
++//!   everything to everything. The first orders everything before against everything after, its
++//!   second scope holding the copies and the dispatch; the last orders the dispatch's and the
++//!   copies' writes against everything after. The two between need only move the scratch's bytes:
++//!   transfer writes to the dispatch's shader accesses, and its shader writes to the copies back.
++//!   Under the switch they are those. The first and the last stay.
++//!
++//! The switches are read as a dispatch is encoded; the dispatch keeps what it read.
++
++/// What a dispatch does around itself (the module docs).
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Economy {
++    /// The scratch is copied back after the dispatch.
++    pub(super) copies_back: bool,
++    /// The two barriers inside the dispatch's copies are narrowed.
++    pub(super) narrow: bool,
++}
++
++impl Economy {
++    /// The dispatch of a stage of `spirv`, `cells` where it stages the pass's imageblock storage.
++    pub(super) fn now(spirv: &[u32], cells: bool) -> Economy {
++        let stored_only = crate::live::on("tile_stored_only", false);
++        Economy {
++            copies_back: !stored_only || cells || writes_staged(spirv),
++            narrow: crate::live::on("tile_narrow_barriers", false),
++        }
++    }
++}
++
++const OP_TYPE_IMAGE: u32 = 25;
++const OP_LOAD: u32 = 61;
++const OP_IMAGE_TEXEL_POINTER: u32 = 60;
++const OP_IMAGE_WRITE: u32 = 99;
++/// `ImageFormat::Unknown`.
++const FORMAT_UNKNOWN: u32 = 0;
++
++/// Whether a module of `spirv` may write an image of a declared format, or reach one's texels
++/// through a pointer: `true` wherever the walk cannot tell, a staged attachment's image being one
++/// of a declared format (the module docs).
++pub(super) fn writes_staged(spirv: &[u32]) -> bool {
++    use std::collections::{HashMap, HashSet};
++    let Some(mut rest) = spirv.get(5..) else {
++        return true;
++    };
++    // The image types of no declared format, and the loads of them.
++    let mut unknown = HashSet::new();
++    let mut loaded = HashMap::new();
++    let mut written = Vec::new();
++    while let Some(&head) = rest.first() {
++        let (words, op) = ((head >> 16) as usize, head & 0xffff);
++        if words == 0 || words > rest.len() {
++            return true;
++        }
++        let at = &rest[..words];
++        match op {
++            OP_TYPE_IMAGE if words >= 9 => {
++                if at[8] == FORMAT_UNKNOWN {
++                    unknown.insert(at[1]);
++                }
++            }
++            OP_LOAD if words >= 4 => {
++                loaded.insert(at[2], at[1]);
++            }
++            OP_IMAGE_WRITE if words >= 2 => written.push(at[1]),
++            OP_IMAGE_TEXEL_POINTER => return true,
++            _ => {}
++        }
++        rest = &rest[words..];
++    }
++    written
++        .iter()
++        .any(|image| !loaded.get(image).is_some_and(|ty| unknown.contains(ty)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::writes_staged;
++
++    fn op(code: u32, operands: &[u32]) -> Vec<u32> {
++        let mut words = vec![((operands.len() as u32 + 1) << 16) | code];
++        words.extend(operands);
++        words
++    }
++
++    fn module(format: u32, write: Vec<u32>) -> Vec<u32> {
++        let mut m = vec![0x0723_0203, 0x0001_0500, 0, 100, 0];
++        // %1 = OpTypeImage %2 2D 0 0 0 2 <format>
++        m.extend(op(25, &[1, 2, 1, 0, 0, 0, 2, format]));
++        // %3 = OpLoad %1 %4
++        m.extend(op(61, &[1, 3, 4]));
++        m.extend(write);
++        m
++    }
++
++    #[test]
++    fn a_write_of_a_declared_format_counts() {
++        assert!(writes_staged(&module(33, op(99, &[3, 5, 6]))));
++    }
++
++    #[test]
++    fn a_write_of_no_declared_format_does_not() {
++        assert!(!writes_staged(&module(0, op(99, &[3, 5, 6]))));
++    }
++
++    #[test]
++    fn no_write_does_not() {
++        assert!(!writes_staged(&module(33, Vec::new())));
++    }
++
++    #[test]
++    fn an_image_it_cannot_trace_counts() {
++        assert!(writes_staged(&module(0, op(99, &[9, 5, 6]))));
++    }
++
++    #[test]
++    fn a_texel_pointer_counts() {
++        assert!(writes_staged(&module(0, op(60, &[7, 8, 3, 5, 6]))));
++    }
++
++    #[test]
++    fn a_torn_module_counts() {
++        assert!(writes_staged(&[0x0723_0203, 0, 0, 0, 0, 5 << 16]));
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index 37ab4133..2724bb88 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -402,6 +402,36 @@ impl Barrier {
+         }
+     }
+ 
++    /// LOCAL (Atlas): from a tile dispatch's copies into its scratch to the dispatch, which reads
++    /// and writes the scratch (`render/tile_writes.rs`).
++    pub(super) fn copied_to_dispatch() -> Barrier {
++        Barrier {
++            src: Access::new(
++                vk::PipelineStageFlags2::ALL_TRANSFER,
++                vk::AccessFlags2::TRANSFER_WRITE,
++            ),
++            dst: Access::new(
++                vk::PipelineStageFlags2::COMPUTE_SHADER,
++                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
++            ),
++        }
++    }
++
++    /// LOCAL (Atlas): from a tile dispatch to the copies back from its scratch
++    /// (`render/tile_writes.rs`).
++    pub(super) fn dispatched_to_copy() -> Barrier {
++        Barrier {
++            src: Access::new(
++                vk::PipelineStageFlags2::COMPUTE_SHADER,
++                vk::AccessFlags2::SHADER_WRITE,
++            ),
++            dst: Access::new(
++                vk::PipelineStageFlags2::ALL_TRANSFER,
++                vk::AccessFlags2::TRANSFER_READ,
++            ),
++        }
++    }
++
+     /// From a fill's writes (`vkCmdFillBuffer`) to the dispatches after it, which read or write
+     /// what it wrote, as an indirect command too.
+     pub(super) fn after_fill() -> Barrier {
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane.rs b/crates/metal2vulkan-validation/src/runtime_lane.rs
+index c2394df6..613e8e37 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane.rs
+@@ -518,6 +518,7 @@ mod host_copied_textures;
+ mod host_memory;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+ mod host_rt_frames;
++mod gpu_cost;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ mod in_place_textures;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/gpu_cost.rs b/crates/metal2vulkan-validation/src/runtime_lane/gpu_cost.rs
+new file mode 100644
+index 00000000..ead4119f
+--- /dev/null
++++ b/crates/metal2vulkan-validation/src/runtime_lane/gpu_cost.rs
+@@ -0,0 +1,195 @@
++//! LOCAL (Atlas): what the parts of a WindowServer frame's full-target work cost on the device the
++//! cfg selects, and what the switches of `render/tile_writes.rs` change: report only, run by name.
++//!
++//! `GPU-COST` lines give the median GPU time of one command buffer of one pass.
++//!
++//! - **The render area**: a 40x40 scissored draw into a 3200x1800 target, loaded and stored, against
++//!   the same draw into a 64x64 one: the most a smaller render area could save.
++//! - **A memoryless color**: the same pass with a 3200x1800 memoryless `RGBA16Float` beside it,
++//!   which no draw writes.
++//! - **A tile dispatch** over 960x1856 pixels of 16x16 tiles, read-only (`cfb_tn_read4`) and
++//!   writing (`cfb_tn_round4`), under each setting.
++
++use super::no_copy_textures::{blending, floats, staged};
++use super::tile_states::on_device;
++use crate::air_library::AirLibrary;
++use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan::pipeline::{StageSource, TileRenderPipelineDescriptor};
++use metal2vulkan_devtools::{engine_dir, llvm_assemble};
++use metal2vulkan_runtime::{
++    live, CommandQueue, CpuCacheMode, HazardTrackingMode, Device, LoadAction, PipelineOptions, RenderPassDescriptor,
++    RenderPipelineState, ResourceOptions, ScissorRect, Size, StorageMode, StoreAction, Texture,
++    TextureDescriptor,
++};
++use std::time::Duration;
++
++const WAIT: Duration = Duration::from_secs(10);
++const WARM: usize = 8;
++const RUNS: usize = 60;
++
++fn median(mut values: Vec<f64>) -> f64 {
++    values.sort_by(f64::total_cmp);
++    values[values.len() / 2]
++}
++
++/// The median GPU time in microseconds of a command buffer `encode` fills.
++fn timed(
++    queue: &CommandQueue,
++    mut encode: impl FnMut(&metal2vulkan_runtime::CommandBuffer),
++) -> f64 {
++    let mut times = Vec::new();
++    for run in 0..WARM + RUNS {
++        let command_buffer = queue.command_buffer().unwrap();
++        encode(&command_buffer);
++        command_buffer.commit().unwrap();
++        command_buffer.wait_until_completed_for(WAIT).unwrap();
++        assert_eq!(command_buffer.error(), None);
++        if run >= WARM {
++            times.push(
++                (command_buffer.gpu_end_time().unwrap() - command_buffer.gpu_start_time().unwrap()) * 1e6,
++            );
++        }
++    }
++    median(times)
++}
++
++fn target(device: &Device, format: PixelFormat, w: u64, h: u64, mode: Option<StorageMode>) -> Texture {
++    let mut d = TextureDescriptor::texture_2d(format, w, h, false);
++    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    d.resource_options = ResourceOptions::private();
++    if mode == Some(StorageMode::Memoryless) {
++        d.usage = TextureUsage::RENDER_TARGET;
++        d.resource_options = ResourceOptions::new(
++            StorageMode::Memoryless,
++            CpuCacheMode::DefaultCache,
++            HazardTrackingMode::Default,
++        );
++    }
++    device.new_texture(&d).unwrap()
++}
++
++/// The target a linear image of the device's own memory, as an in-place surface's form.
++fn linear(device: &Device, w: u64, h: u64) -> Texture {
++    let row = w * 4;
++    let own = device.new_buffer(row * h, ResourceOptions::private()).unwrap();
++    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, w, h, false);
++    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    d.resource_options = own.resource_options();
++    own.new_texture(&d, 0, row).unwrap()
++}
++
++#[test]
++#[ignore = "a release-mode measurement: run by name"]
++fn gpu_cost_probe() {
++    on_device(|device: &Device| {
++        let queue = device.new_command_queue().unwrap();
++        let blend = blending(device, PixelFormat::BGRA8Unorm);
++        let whole = staged(device, &floats([-1.0, -1.0, 1.0, 1.0]));
++        let color = staged(device, &floats([0.2, 0.4, 0.6, 0.5]));
++        let big = target(device, PixelFormat::BGRA8Unorm, 3200, 1800, None);
++        let small = target(device, PixelFormat::BGRA8Unorm, 64, 64, None);
++        let flat = linear(device, 3200, 1800);
++        let held = target(
++            device,
++            PixelFormat::RGBA16Float,
++            3200,
++            1800,
++            Some(StorageMode::Memoryless),
++        );
++        let run = |name: &str, c0: &Texture, c1: Option<&Texture>, draw: Option<u64>| {
++            let us = timed(&queue, |command_buffer| {
++                let mut pass = RenderPassDescriptor::new();
++                let a = &mut pass.color_attachments[0];
++                a.texture = Some(c0.clone());
++                a.load_action = LoadAction::Load;
++                a.store_action = StoreAction::Store;
++                if let Some(c1) = c1 {
++                    let a = &mut pass.color_attachments[1];
++                    a.texture = Some(c1.clone());
++                    a.load_action = LoadAction::Clear;
++                    a.store_action = StoreAction::DontCare;
++                }
++                let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
++                encoder.set_render_pipeline_state(&blend).unwrap();
++                encoder.set_vertex_buffer(Some(&whole), 0, 0).unwrap();
++                encoder.set_fragment_buffer(Some(&color), 0, 0).unwrap();
++                if let Some(side) = draw {
++                    encoder
++                        .set_scissor_rect(ScissorRect {
++                            x: 0,
++                            y: 0,
++                            width: side,
++                            height: side,
++                        })
++                        .unwrap();
++                }
++                encoder
++                    .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++                    .unwrap();
++                encoder.end_encoding().unwrap();
++            });
++            eprintln!("GPU-COST {name}: {us:.1} us");
++        };
++        for round in 0..2 {
++            eprintln!("GPU-COST round {round}");
++            run("64x64 target, 40x40 draw", &small, None, Some(40));
++            run("3200x1800 target, 40x40 draw", &big, None, Some(40));
++            run("3200x1800 linear target, 40x40 draw", &flat, None, Some(40));
++            run("3200x1800 + memoryless, 40x40 draw", &big, Some(&held), Some(40));
++            run("3200x1800 linear + memoryless, 40x40 draw", &flat, Some(&held), Some(40));
++            run("3200x1800 target, full blend", &big, None, None);
++            run("3200x1800 linear target, full blend", &flat, None, None);
++        }
++
++        let tile = |entry: &str| -> RenderPipelineState {
++            let bitcode = llvm_assemble(&engine_dir().join("cfb_tile_norm.ll")).unwrap();
++            let library = device.new_library_with_air(&bitcode).unwrap();
++            let function = library.new_function_with_name(entry).unwrap();
++            let mut d = TileRenderPipelineDescriptor::new(StageSource::Function(
++                function.function_descriptor(),
++            ));
++            d.color_attachment_formats[0] = Some(PixelFormat::RGBA8Unorm);
++            d.threadgroup_size_matches_tile_size = true;
++            device
++                .new_tile_render_pipeline_state(&d, &PipelineOptions::default())
++                .unwrap()
++        };
++        let (w, h) = (960u64, 1856u64);
++        let attachment = target(device, PixelFormat::RGBA8Unorm, w, h, None);
++        let cells = device
++            .new_buffer(16 * (16 * h + w + 64), ResourceOptions::private())
++            .unwrap();
++        for round in 0..3 {
++            for (entry, state) in [
++                ("cfb_tn_read4", tile("cfb_tn_read4")),
++                ("cfb_tn_round4", tile("cfb_tn_round4")),
++            ] {
++                for (stored, narrow) in [("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")] {
++                    live::set("tile_stored_only", Some(stored));
++                    live::set("tile_narrow_barriers", Some(narrow));
++                    let us = timed(&queue, |command_buffer| {
++                        let mut pass = RenderPassDescriptor::new();
++                        let a = &mut pass.color_attachments[0];
++                        a.texture = Some(attachment.clone());
++                        a.load_action = LoadAction::Load;
++                        a.store_action = StoreAction::Store;
++                        pass.tile_width = 16;
++                        pass.tile_height = 16;
++                        let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
++                        encoder.set_render_pipeline_state(&state).unwrap();
++                        encoder.set_tile_buffer(Some(&cells), 0, 0).unwrap();
++                        encoder
++                            .dispatch_threads_per_tile(Size::new(16, 16, 1))
++                            .unwrap();
++                        encoder.end_encoding().unwrap();
++                    });
++                    eprintln!(
++                        "GPU-COST tile round {round} {entry} stored_only={stored} narrow={narrow}: {us:.1} us"
++                    );
++                }
++            }
++        }
++        live::set("tile_stored_only", None);
++        live::set("tile_narrow_barriers", None);
++    });
++}

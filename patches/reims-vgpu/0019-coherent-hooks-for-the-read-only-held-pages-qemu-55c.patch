@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 06:33:19 +0000
+Subject: [PATCH 19/25] coherent: hooks for the read-only held pages; qemu
+ 55c70690f1
+
+RvgCoherentHooks gains probe, and open takes a list. The harness now runs with
+an in-kernel irqchip and can run a guest with interrupts on: t_write_interrupts_on
+hangs on the old census, as the guest did, and the race runs both ways. Tests with
+IF=0 and no irqchip took the synchronous path that hid this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/include/reims_vgpu.h |  5 +++-
+ crates/reims-vgpu-c/src/coherent.rs      | 29 ++++++++++++++++++++----
+ scripts/internal/census/census_test.c    | 12 ++++++++--
+ scripts/internal/census/coherent_test.c  | 29 +++++++++++++++++++++---
+ 4 files changed, 65 insertions(+), 10 deletions(-)
+
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index 3e4f9ea6..4c23a873 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -393,9 +393,12 @@ typedef struct {
+   // Into up to `room` of `came`, the pages a CPU reached as their markers moved: how many.
+   size_t (*hold)(void *ctx, const uint64_t *addrs, size_t n, bool open_too, uint64_t *came,
+                  size_t room);
+-  void (*open)(void *ctx, uint64_t addr);
++  void (*open)(void *ctx, const uint64_t *addrs, size_t n);
+   void (*freeze)(void *ctx, const uint64_t *addrs, size_t n);
+   void (*thaw)(void *ctx, const uint64_t *addrs, size_t n);
++  // A write in flight made to name its page: held pages armed and armed pages writable. Refused as
++  // `arm`'s, how many.
++  size_t (*probe)(void *ctx, const uint64_t *addrs, size_t n, uint64_t *refused, size_t room);
+ } RvgCoherentHooks;
+ 
+ // The touch census's callbacks.
+diff --git a/crates/reims-vgpu-c/src/coherent.rs b/crates/reims-vgpu-c/src/coherent.rs
+index 25278ac4..5985496e 100644
+--- a/crates/reims-vgpu-c/src/coherent.rs
++++ b/crates/reims-vgpu-c/src/coherent.rs
+@@ -44,9 +44,18 @@ pub struct RvgCoherentHooks {
+             room: usize,
+         ) -> usize,
+     >,
+-    pub open: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addr: u64)>,
++    pub open: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addrs: *const u64, n: usize)>,
+     pub freeze: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addrs: *const u64, n: usize)>,
+     pub thaw: Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, addrs: *const u64, n: usize)>,
++    pub probe: Option<
++        unsafe extern "C-unwind" fn(
++            ctx: *mut c_void,
++            addrs: *const u64,
++            n: usize,
++            refused: *mut u64,
++            room: usize,
++        ) -> usize,
++    >,
+ }
+ 
+ // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
+@@ -139,6 +148,18 @@ mod on {
+             refused
+         }
+ 
++        fn probe(&self, pages: &[u64]) -> Vec<u64> {
++            let mut refused = vec![0; pages.len()];
++            let Some(probe) = self.0.probe else {
++                return Vec::new();
++            };
++            let (at, count, to) = (pages.as_ptr(), pages.len(), refused.as_mut_ptr());
++            // SAFETY: as above, with what lives across the call.
++            let found = unsafe { probe(self.0.ctx, at, count, to, count) };
++            refused.truncate(found);
++            refused
++        }
++
+         fn hold(&self, pages: &[u64], open_too: bool) -> Vec<u64> {
+             let mut came = vec![0; pages.len()];
+             let Some(hold) = self.0.hold else {
+@@ -151,10 +172,10 @@ mod on {
+             came
+         }
+ 
+-        fn open(&self, page: u64) {
++        fn open(&self, pages: &[u64]) {
+             if let Some(open) = self.0.open {
+-                // SAFETY: as above.
+-                unsafe { open(self.0.ctx, page) };
++                // SAFETY: as above, with what lives across the call.
++                unsafe { open(self.0.ctx, pages.as_ptr(), pages.len()) };
+             }
+         }
+ 
+diff --git a/scripts/internal/census/census_test.c b/scripts/internal/census/census_test.c
+index 9d70f624..eae3d8ae 100644
+--- a/scripts/internal/census/census_test.c
++++ b/scripts/internal/census/census_test.c
+@@ -105,12 +105,19 @@ static void vcpu_init(struct vcpu *c, int id) {
+     struct kvm_xcrs x = {.nr_xcrs = 1};
+     x.xcrs[0].xcr = 0; x.xcrs[0].value = 7;
+     if (ioctl(c->fd, KVM_SET_XCRS, &x)) DIE("xcrs");
++    struct kvm_mp_state runnable = {.mp_state = KVM_MP_STATE_RUNNABLE}; // No SIPI comes here.
++    if (ioctl(c->fd, KVM_SET_MP_STATE, &runnable)) DIE("mp state");
+     c->vc = census_vcpu(id, c->fd, NULL, read_gpa);
+ }
+ 
++// RFLAGS for the next setr: as a guest's user code runs, with interrupts on, where KVM may answer a
++// fault it cannot resolve at once by an asynchronous page fault instead of an -EFAULT.
++static uint64_t guest_rflags = 2;
++static unsigned guest_alarm = 60;
++
+ static void setr(struct vcpu *c, uint64_t rip, uint64_t rax, uint64_t rbx, uint64_t rcx, uint64_t rdx,
+                  uint64_t rsi, uint64_t rdi) {
+-    struct kvm_regs r = {.rip = rip, .rflags = 2, .rsp = STACK, .rax = rax, .rbx = rbx, .rcx = rcx,
++    struct kvm_regs r = {.rip = rip, .rflags = guest_rflags, .rsp = STACK, .rax = rax, .rbx = rbx, .rcx = rcx,
+                          .rdx = rdx, .rsi = rsi, .rdi = rdi};
+     if (ioctl(c->fd, KVM_SET_REGS, &r)) DIE("set regs");
+ }
+@@ -128,7 +135,7 @@ static int run_guest(struct vcpu *c, int *mmio_exits) {
+     sigset_t bus, old;
+     sigemptyset(&bus); sigaddset(&bus, SIGBUS);
+     for (;;) {
+-        alarm(60);
++        alarm(guest_alarm);
+         pthread_sigmask(SIG_UNBLOCK, &bus, &old);
+         int r = ioctl(c->fd, KVM_RUN, 0);
+         int e = r < 0 ? errno : 0;
+@@ -504,6 +511,7 @@ static void setup(char **argv, uint64_t mib) {
+     vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
+     if (vmfd < 0) DIE("vm");
+     ioctl(vmfd, KVM_SET_TSS_ADDR, 0xfffbd000);
++    if (ioctl(vmfd, KVM_CREATE_IRQCHIP, 0)) DIE("irqchip"); // QEMU's is in the kernel too.
+     s0 = mmap(0, S0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+     memcpy(s0 + CODE, g_start, g_end - g_start);
+     uint64_t *pml4 = (uint64_t *)(s0 + 0x1000), *pdpt = (uint64_t *)(s0 + 0x2000);
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+index 28978dc3..16eb14f0 100644
+--- a/scripts/internal/census/coherent_test.c
++++ b/scripts/internal/census/coherent_test.c
+@@ -76,7 +76,7 @@ static void on_fault(void *ctx, uint64_t addr, bool write) {
+     }
+     census_coh_hold(&page, 1, false, NULL, 0);
+     if (write) {
+-        census_coh_open(page);
++        census_coh_open(&page, 1);
+         note(&page, 1);
+         s.writes++;
+     }
+@@ -93,7 +93,7 @@ static void on_probe(void *ctx) {
+     s.probed_at = now_ns();
+     s.probes++;
+     list_all(list);
+-    size_t found = census_coh_arm(list, PAGES, list, PAGES);
++    size_t found = census_coh_probe(list, PAGES, list, PAGES);
+     s.came += found;
+     note(list, found);
+     pthread_mutex_unlock(&s.lock);
+@@ -194,6 +194,23 @@ static void t_write(struct vcpu *c) {
+     census_surface_unmapped(2);
+ }
+ 
++// What macOS's user code does: with interrupts on, a write to a held page. The harness's guest ran
++// with them off, where KVM never tries the fault asynchronously.
++static void t_write_interrupts_on(struct vcpu *c) {
++    printf("[write] with interrupts on a write to a held page still reaches the library\n");
++    surface(30, 0xe00000);
++    guest_rflags = 0x202;
++    guest_alarm = 5;
++    int writes = s.writes;
++    setr(c, STUB(g_write), 0x7777, gpa(3), 0, 0, 0, 0);
++    int r = run_guest(c, 0);
++    guest_alarm = 60;
++    CHECK(r == RUN_IO && s.writes == writes + 1, "the write trapped (%d)", s.writes - writes);
++    CHECK(*(uint64_t *)(main_map + s.off + 3 * PG) == 0x7777, "and landed");
++    guest_rflags = 2;
++    census_surface_unmapped(30);
++}
++
+ static void t_frozen(struct vcpu *c) {
+     printf("[frozen] a page poisoned while open stops the guest until it thaws\n");
+     surface(3, 0x300000);
+@@ -324,7 +341,9 @@ static void t_coherent_race(uint64_t mib) {
+     atomic_store(&race_stop, 0);
+     for (int i = 0; i < R + W; i++) {
+         memset(&g[i], 0, sizeof g[i]);
+-        vcpu_init(&g[i].c, 20 + i);
++        static int next_vcpu = 20;
++
++        vcpu_init(&g[i].c, next_vcpu++);
+         g[i].id = i - R;
+         pthread_create(&th[i], 0, i < R ? reader : writer, &g[i]);
+     }
+@@ -692,12 +711,16 @@ int main(int argc, char **argv) {
+     vcpu_init(&c, 0);
+     t_read(&c);
+     t_write(&c);
++    t_write_interrupts_on(&c);
+     t_frozen(&c);
+     t_kernel_copy(&c);
+     t_emulator_read(&c);
+     t_stale_page(&c);
+     t_unmap_reset(&c);
+     t_coherent_race(mib);
++    guest_rflags = 0x202;
++    t_coherent_race(mib);
++    guest_rflags = 2;
+     t_arm_window();
+     t_coherent_cost(&c);
+     t_scattered();

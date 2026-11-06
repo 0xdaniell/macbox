@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:11:40 +0000
+Subject: [PATCH 12/34] surface_lazy: register a surface that leaves writes
+ ahead; a second texture over the pages keeps it from doing so
+
+A surface registered only as it left a standing, so writes left ahead by one
+that had none could not be found by any reader. Two textures over one surface
+learn of each other's writes from the copy back: neither leaves any ahead, and
+a copy back recorded in an unordered encoder now reaches note_writes under the
+new switches, where surface_lazy alone left it to the next resync.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/encoder.rs    |  8 ++
+ crates/metal2vulkan-runtime/src/shadow.rs     | 11 ++-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 96 ++++++++++++++-----
+ .../src/runtime_lane/surface_present.rs       | 46 +++++++++
+ 4 files changed, 133 insertions(+), 28 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index fd64a5b6..10dc6b45 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -1678,6 +1678,10 @@ impl EncoderCore {
+         };
+         record(self.device().shared().vk(), raw);
+         self.uses.record(stages, tracked, None);
++        // LOCAL (Atlas): this way past `track`, as a copy back of another texture over the bytes.
++        if writes_truth {
++            crate::shadow_lazy::note_copy_back(tracked);
++        }
+         self.touch(uses);
+     }
+ 
+@@ -1710,6 +1714,10 @@ impl EncoderCore {
+             let aliased = self.aliased(&uses);
+             let tracked = aliased.as_deref().unwrap_or(&uses);
+             let before = run.before(tracked, copy.writes_truth());
++            // LOCAL (Atlas): as in `shadow_command`.
++            if copy.writes_truth() {
++                crate::shadow_lazy::note_copy_back(tracked);
++            }
+             // SAFETY: the held command buffer is recording outside a render pass instance (the
+             // caller ended the one before), and only this encoder records it; its commands retain
+             // the shadowed textures (and their views) and the rows' set until it completes, and
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 2853f759..2c2917fd 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -2181,7 +2181,9 @@ impl<M> ShadowSync<M> {
+             return;
+         }
+         let writes = |carried: &Carried| {
+-            (uses.iter()).any(|used| !used.write.is_empty() && carried.copies.meets(used))
++            // LOCAL (Atlas): its own copy back recorded late leaves the image as it was.
++            let own = (carried.copies.lazy.as_ref()).is_some_and(|lazy| lazy.own_thread());
++            !own && (uses.iter()).any(|used| !used.write.is_empty() && carried.copies.meets(used))
+         };
+         self.carry.entries.retain(|carried| !writes(carried));
+     }
+@@ -2784,11 +2786,14 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             let entry = &self.entries[i];
+             let alone = (self.entries.iter().enumerate())
+                 .all(|(j, other)| j == i || !other.copies.shares_truth(&entry.copies));
++            let (key, range) = entry.copies.truth();
++            let truth = (key, entry.copies.alias(), range);
+             let left = alone
+                 && entry.merge.is_none()
+                 && !entry.two_ways
+-                && (entry.copies.lazy.as_ref())
+-                    .is_some_and(|lazy| lazy.defer(&entry.copies, entry.area, self.carry.id));
++                && (entry.copies.lazy.as_ref()).is_some_and(|lazy| {
++                    lazy.defer(&entry.copies, truth, entry.area, self.carry.id)
++                });
+             match left {
+                 true => {
+                     let entry = &mut self.entries[i];
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 013f6559..5aefa2df 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -26,6 +26,10 @@
+ //!   pages as they read them shadowed or in place, at every command buffer's completion, and a
+ //!   later command's read through another import is ordered after the copy by the tracker.
+ //!
++//! **What it does not see either**, this switch alone: another texture's copy back in an unordered
++//! encoder, until the next resync. `surface_lazy_scoped` and `surface_lazy_present` see it
++//! ([`note_copy_back`]).
++//!
+ //! **What it cannot see**: a write of the guest's CPU into the pages between command buffers, which
+ //! reaches the host through no call. Metal shows it to a later command buffer. Here the image misses
+ //! it until the next copy in: at least every `surface_lazy_resync_ms` (default 250, 0 never) a
+@@ -65,9 +69,14 @@
+ //! Each moves only what committed command buffers wrote: a write stays out of every copy back
+ //! until its commit returns, as a copy back recorded before it runs before it.
+ //!
++//! **Two textures' images over one surface** each learn of the other's writes from its copy back,
++//! so neither leaves any ahead once both are registered: the counts' `shared`.
++//!
+ //! **Who can read stale bytes**, each for at most that bound and only of a surface left ahead: the
+ //! guest's CPU through its own mapping of the pages, which reaches the host through no call, and a
+-//! host reader of the pages that goes through no command buffer. Under the switch a CPU write into
++//! host reader of the pages that goes through no command buffer, and a shader that reaches the
++//! pages through addresses alone, with no use of them named, as an untracked resource may. Under
++//! the switch a CPU write into
+ //! the pages that lies inside the rectangle is overwritten by the copy back, where
+ //! `surface_lazy` alone keeps it unless a command buffer runs meanwhile.
+ //!
+@@ -121,6 +130,8 @@ static IN_BY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+ /// How many surfaces hold writes ahead in their images: every hook returns at once while none does.
+ static AHEAD: AtomicUsize = AtomicUsize::new(0);
+ static DEFERRED: AtomicU64 = AtomicU64::new(0);
++/// The copies back not left ahead, a second texture's image lying over the same pages.
++static SHARED: AtomicU64 = AtomicU64::new(0);
+ static FLUSHES: AtomicU64 = AtomicU64::new(0);
+ static FLUSHED_WHOLE: AtomicU64 = AtomicU64::new(0);
+ static FLUSHED_TEXELS: AtomicU64 = AtomicU64::new(0);
+@@ -301,6 +312,17 @@ pub(super) fn note_writes(uses: &[Use<ResourceKey>]) {
+     }
+ }
+ 
++/// Note a copy back recorded past [`note_writes`]: a command of an unordered encoder. A standing of
++/// another texture's image over the bytes must drop with it, which `surface_lazy` alone leaves to
++/// the next resync: the new switches close that.
++pub(crate) fn note_copy_back(uses: &[Use<ResourceKey>]) {
++    if ANY.load(Ordering::Relaxed)
++        && (crate::live::on(SCOPED, false) || crate::live::on(PRESENT, false))
++    {
++        note_writes(uses);
++    }
++}
++
+ /// Whether any surface holds writes ahead in its image, one atomic read.
+ pub(crate) fn ahead() -> bool {
+     AHEAD.load(Ordering::Relaxed) > 0
+@@ -329,13 +351,12 @@ pub(crate) fn after_commit(id: u64) {
+         return;
+     }
+     for lazy in surfaces() {
+-        if let Some(left) = lazy.pending.lock().unwrap().as_mut() {
+-            left.committed(id);
+-        }
++        let moved = (lazy.pending.lock().unwrap().as_mut()).is_some_and(|left| left.committed(id));
+         let wants =
+             lazy.flush_after
+                 .compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+-        if wants.is_ok() {
++        // A texture that came beside it while this command buffer was open reads the copy back.
++        if wants.is_ok() || (moved && lazy.beside_another()) {
+             lazy.flush();
+         }
+     }
+@@ -431,8 +452,8 @@ fn report() {
+     eprintln!(
+         "surface_lazy: taken {taken} refused {refused} resyncs {resyncs} | refused: touched {} \
+          written {} epoch {} own {} uncommitted {} no-standing {} | in: first {} beyond-held {} \
+-         changed {} bounded {} | ahead: deferred {} flushes {} whole {} texels {} discarded {} \
+-         presents {} unmatched {}",
++         changed {} bounded {} | ahead: deferred {} shared {} flushes {} whole {} texels {} \
++         discarded {} presents {} unmatched {}",
+         by[Refused::Touched as usize],
+         by[Refused::Written as usize],
+         by[Refused::Epoch as usize],
+@@ -444,6 +465,7 @@ fn report() {
+         copied[2],
+         copied[3],
+         read(&DEFERRED),
++        read(&SHARED),
+         read(&FLUSHES),
+         read(&FLUSHED_WHOLE),
+         read(&FLUSHED_TEXELS),
+@@ -511,15 +533,17 @@ struct Pending {
+ }
+ 
+ impl Pending {
+-    /// Note that the command buffer of identity `id` committed.
+-    fn committed(&mut self, id: u64) {
+-        if let Some(at) = self.open.iter().position(|(open, _)| *open == id) {
+-            let (_, area) = self.open.swap_remove(at);
+-            self.settled = Some(match self.settled {
+-                Some(settled) => bounding(settled, area),
+-                None => area,
+-            });
+-        }
++    /// Note that the command buffer of identity `id` committed: whether it wrote here.
++    fn committed(&mut self, id: u64) -> bool {
++        let Some(at) = self.open.iter().position(|(open, _)| *open == id) else {
++            return false;
++        };
++        let (_, area) = self.open.swap_remove(at);
++        self.settled = Some(match self.settled {
++            Some(settled) => bounding(settled, area),
++            None => area,
++        });
++        true
+     }
+ }
+ 
+@@ -641,7 +665,7 @@ impl Lazy {
+     }
+ 
+     /// Whether this thread records this surface's own copy back.
+-    fn own_thread(&self) -> bool {
++    pub(super) fn own_thread(&self) -> bool {
+         OWN.with(Cell::get) == std::ptr::from_ref(self)
+     }
+ 
+@@ -671,8 +695,9 @@ impl Lazy {
+     /// Leave what an encoder of the command buffer of identity `id` wrote inside `area`, `None` for
+     /// anywhere, ahead in the image: whether it does, else its copy back goes as ever.
+     pub(super) fn defer(
+-        &self,
++        self: &Arc<Self>,
+         copies: &Arc<ShadowCopies>,
++        truth: (ResourceKey, Option<ResourceKey>, UseRange),
+         area: Option<[u32; 4]>,
+         id: u64,
+     ) -> bool {
+@@ -681,6 +706,13 @@ impl Lazy {
+         {
+             return false;
+         }
++        // What it leaves ahead only hooks that find it can bring back, standing or not.
++        self.register(truth);
++        // Another texture's image over these pages learns of a write through the copy back.
++        if self.beside_another() {
++            SHARED.fetch_add(1, Ordering::Relaxed);
++            return false;
++        }
+         let Some(holds) = self.keeps.get() else {
+             return false;
+         };
+@@ -722,6 +754,15 @@ impl Lazy {
+         true
+     }
+ 
++    /// Whether another registered texture's image lies over its pages.
++    fn beside_another(self: &Arc<Self>) -> bool {
++        let beside = |other: &Arc<Lazy>| {
++            !Arc::ptr_eq(other, self)
++                && (self.pages.as_ref()).is_some_and(|pages| other.over(pages))
++        };
++        surfaces().iter().any(beside)
++    }
++
+     /// `pending` was emptied.
+     fn left_behind(&self) {
+         self.ahead.store(false, Ordering::Relaxed);
+@@ -801,6 +842,17 @@ impl Lazy {
+         }
+     }
+ 
++    /// Make it one of the surfaces every hook looks through, its truth `truth`.
++    fn register(self: &Arc<Self>, truth: (ResourceKey, Option<ResourceKey>, UseRange)) {
++        if self.truth.set(truth).is_ok() {
++            let mut all = registry().write().unwrap();
++            all.retain(|lazy| lazy.strong_count() > 0);
++            all.push(Arc::downgrade(self));
++            ACTIVE.store(all.len(), Ordering::Relaxed);
++            ANY.store(true, Ordering::Relaxed);
++        }
++    }
++
+     /// Leave the image's standing: `id`'s encoder ended with the image holding the truth, inside
+     /// `held` where given, stale inside `stale`. Its own copies back are behind it.
+     pub(super) fn stand(
+@@ -811,13 +863,7 @@ impl Lazy {
+         held: Option<[u32; 4]>,
+         stale: Option<[u32; 4]>,
+     ) {
+-        if self.truth.set((key, alias, range)).is_ok() {
+-            let mut all = registry().write().unwrap();
+-            all.retain(|lazy| lazy.strong_count() > 0);
+-            all.push(Arc::downgrade(self));
+-            ACTIVE.store(all.len(), Ordering::Relaxed);
+-            ANY.store(true, Ordering::Relaxed);
+-        }
++        self.register((key, alias, range));
+         *self.stood.lock().unwrap() = Some(Stood {
+             id,
+             touched,
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_present.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_present.rs
+index bf273946..1a1e3d8a 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_present.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_present.rs
+@@ -216,6 +216,52 @@ fn surface_present_passes_of_one_command_buffer_end_in_the_pages() {
+     });
+ }
+ 
++#[test]
++fn surface_present_two_textures_of_a_surface_see_each_others_writes() {
++    switches(true, true, false, 60_000);
++    on_surface(|case| {
++        let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
++        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        d.resource_options = case.buffer.resource_options();
++        let other = case
++            .buffer
++            .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, ROW, false))
++            .unwrap();
++        let left = ScissorRect { x: 0, y: 0, width: WIDTH / 2, height: HEIGHT };
++        let right = ScissorRect { x: WIDTH / 2, y: 0, width: WIDTH / 2, height: HEIGHT };
++        let red = staged(case.device, &floats4(RED));
++        let green = staged(case.device, &floats4(GREEN));
++        let rects = std::slice::from_ref(&case.rect);
++        // Across command buffers, then inside one, each texture over what the other wrote.
++        for apart in [true, false] {
++            let mut command_buffer = case.queue.command_buffer().unwrap();
++            for (texture, color, damage) in [
++                (&case.texture, &red, left),
++                (&other, &green, right),
++                (&case.texture, &green, left),
++                (&other, &red, right),
++            ] {
++                pass(&command_buffer, texture, &case.opaque, rects, color, Some(damage));
++                if apart {
++                    run(&command_buffer);
++                    command_buffer = case.queue.command_buffer().unwrap();
++                }
++            }
++            run(&command_buffer);
++            case.texture.surface_presented();
++            other.surface_presented();
++            case.pages_become(5, 5, GREEN_TEXEL);
++            case.pages_become(WIDTH - 5, 5, RED_TEXEL);
++            // The next round's writes start from these.
++            case.draw(RED, Some(left));
++            case.draw(GREEN, Some(right));
++            let read = gpu_read(&case.queue, &case.other_import(), 0..ROW);
++            assert_eq!(read[..4], RED_TEXEL);
++            assert_eq!(read[read.len() - 4..], GREEN_TEXEL);
++        }
++    });
++}
++
+ #[test]
+ fn surface_present_the_clock_copies_back_after_the_guest_goes_idle() {
+     switches(true, true, false, 20);

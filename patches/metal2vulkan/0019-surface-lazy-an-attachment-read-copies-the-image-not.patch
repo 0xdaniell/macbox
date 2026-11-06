@@ -1,0 +1,519 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 10:07:25 +0000
+Subject: [PATCH 19/34] surface lazy: an attachment read copies the image, not
+ the bytes
+
+On Sim, every 1206x2622 surface has one guest texture. The second image beside
+each is the attachment read's usage shadow: a draw samples at its own pixel the
+surface its pass renders. That shadow's truth was the bytes, with a Lazy of its
+own, so the attachment copied back before each read (not alone in its encoder),
+beside_another refused the rest, and the shadow copied in again.
+
+For a lazy surface, whose image holds every usage, the shadow's truth is now
+that image. The encoder brings the image current first, inside what the copy
+reads, also for a clear or a pass that names only the copy; a copy into the
+image leaves the copy behind, and it goes to no later encoder, whose byte writes
+it could not see.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/shadow.rs     | 59 ++++++++++++-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  3 +-
+ .../metal2vulkan-runtime/src/tests/shadow.rs  | 83 ++++++++++++++++++
+ .../src/texture/attached_reads.rs             |  4 +-
+ .../src/texture/usage_shadow.rs               | 32 ++++++-
+ .../src/texture/view_shadow.rs                | 12 ++-
+ .../src/runtime_lane/surface_coherent.rs      | 86 ++++++++++++++++++-
+ 7 files changed, 270 insertions(+), 9 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index b84969b5..fbf6af58 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -302,6 +302,10 @@ pub(super) enum ShadowSource {
+         /// The buffer the copies go through where Vulkan copies no texels between the two
+         /// images' formats (an alpha format and another, `image_plan::copies_between`).
+         through: Option<ImageThrough>,
++        /// LOCAL (Atlas): the copies of the shadow `image` itself is, where this one reads a lazy
++        /// surface's image (`texture/attached_reads.rs`): that image must hold the bytes first,
++        /// and each copy into it leaves this one behind ([`ShadowSync::before`]).
++        over: Option<Arc<ShadowCopies>>,
+     },
+     /// A surface's two planes in a buffer's bytes, which the shadow holds the texels Metal reads
+     /// of (`ycbcr.rs`): its copy in converts them, and it is never copied back.
+@@ -696,6 +700,14 @@ impl ShadowCopies {
+         }
+     }
+ 
++    /// LOCAL (Atlas): the shadow whose image this one copies ([`ShadowSource::Image`]'s `over`).
++    fn over(&self) -> Option<&Arc<ShadowCopies>> {
++        match &self.source {
++            ShadowSource::Image { over, .. } => over.as_ref(),
++            _ => None,
++        }
++    }
++
+     /// Whether a render pass that reaches no tile and loads this shadow's texture leaves it to
+     /// its truth, which keeps every texel: an image of a buffer's bytes (`ShadowTarget::Image`),
+     /// which the texture's own image holds, and a two-plane YCbCr texture's render shadow,
+@@ -1821,6 +1833,34 @@ fn merged_back(shadow: &ShadowUse) -> bool {
+     shadow.writes && !shadow.overwrites && shadow.copies.merges_back()
+ }
+ 
++/// LOCAL (Atlas): `shadows` with, first, a read of the shadow each copies the image of, inside what
++/// the copy reads, where one does: `None` where none does. Whatever the command does to that image
++/// (a clear takes no copy in, a pass that reaches no tile no use at all), the copy reads it as the
++/// truth, as a copy of the bytes would.
++fn reads_truths(shadows: &[ShadowUse]) -> Option<Vec<ShadowUse>> {
++    if !shadows.iter().any(|shadow| shadow.copies.over().is_some()) {
++        return None;
++    }
++    let mut with = Vec::with_capacity(shadows.len() + 1);
++    for shadow in shadows {
++        if let Some(over) = shadow.copies.over() {
++            let read = ShadowUse {
++                copies: Arc::clone(over),
++                writes: false,
++                overwrites: false,
++                kept: false,
++                area: None,
++                loads: shadow.loads,
++            };
++            join(&mut with, &read);
++        }
++    }
++    for shadow in shadows {
++        join(&mut with, shadow);
++    }
++    Some(with)
++}
++
+ /// Whether a command that uses the shadowed textures `shadows` and has `uses` writes the bytes
+ /// of `shadows[i]` two ways: through it, and through `uses` or another shadowed texture over
+ /// them (the module's rules).
+@@ -2226,7 +2266,9 @@ impl<M> ShadowSync<M> {
+             // The image holds the truth as this command buffer's commands left it, whether or
+             // not this command buffer may carry it on.
+             (entry.copies.stood).store(carry.id, Ordering::Relaxed);
+-            if touched != entry.met {
++            // LOCAL (Atlas): a copy of another shadow's image knows no write of that image's truth
++            // but through that shadow's entry, which a later encoder makes anew.
++            if touched != entry.met || entry.copies.over().is_some() {
+                 continue;
+             }
+             carry.entries.push(Carried {
+@@ -2473,6 +2515,9 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+         uses: &[Use<ResourceKey>],
+         mut merge: impl FnMut(&ShadowCopies, bool, Option<[u32; 4]>) -> Result<M, Error>,
+     ) -> Result<Vec<ShadowCopy<M>>, Error> {
++        // LOCAL (Atlas): a shadow that copies another's image needs that image current first.
++        let with_truths = reads_truths(shadows);
++        let shadows = with_truths.as_deref().unwrap_or(shadows);
+         // A copy back of an image's shadow would replace the other alias's writes, and only a
+         // buffer's bytes laid out as the texture's are merged: such a command is refused before
+         // any merge is made (a rotated texture's too).
+@@ -2608,6 +2653,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             let carried = entry.carried;
+             entry.carried = false;
+             let took = carried && cause.is_none() && !overwrites;
++            let mut moved = false;
+             if let Some(cause) = cause {
+                 if !overwrites {
+                     let copy = ShadowCopy {
+@@ -2624,6 +2670,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     }
+                     copies.push(copy);
+                     entry.only_read = false;
++                    moved = true;
+                 }
+                 entry.standing = Standing::Current;
+                 entry.held = needs;
+@@ -2659,12 +2706,22 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     }
+                     copies.push(copy);
+                     entry.only_read = false;
++                    moved = true;
+                 }
+             }
+             // The command writes every texel before it reads any.
+             if overwrites {
+                 entry.held = None;
+             }
++            // LOCAL (Atlas): the copy above changed the image a shadow of it copied.
++            if moved {
++                let key = shadow.copies.shadow_key;
++                for other in &mut self.entries {
++                    if other.copies.over().is_some_and(|over| over.shadow_key == key) {
++                        other.lose(Lost::Written);
++                    }
++                }
++            }
+             // What the first copy in of this use moved, or would have moved where the carry took
+             // it off: the copy `before` pushes above, or the one it would have pushed.
+             let first = (took || (cause == Some(CopyCause::First) && !overwrites)).then(|| {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 0cc1eaff..1f4d8b3e 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -70,7 +70,8 @@
+ //! until its commit returns, as a copy back recorded before it runs before it.
+ //!
+ //! **Two textures' images over one surface** each learn of the other's writes from its copy back,
+-//! so neither leaves any ahead once both are registered: the counts' `shared`.
++//! so neither leaves any ahead once both are registered: the counts' `shared`. A draw that samples
++//! the surface it renders is no such pair: it reads a copy of the image (`texture/usage_shadow.rs`).
+ //!
+ //! **Who can read stale bytes**, each for at most that bound and only of a surface left ahead: the
+ //! guest's CPU through its own mapping of the pages, which reaches the host through no call, and a
+diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+index cb943ca2..625b1dfd 100644
+--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
+@@ -1422,6 +1422,7 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
+             shadow: vk::Image::null(),
+             regions: Vec::new(),
+             through: None,
++            over: None,
+         },
+         shadow_key: ResourceKey::new(),
+         shadow_range: range,
+@@ -1579,6 +1580,88 @@ fn image_shadow(image: ResourceKey, level: u32, layers: u32) -> Arc<ShadowCopies
+     Arc::new(copies)
+ }
+ 
++/// LOCAL (Atlas): a shadow of `texture`'s own image, as an attachment read of a lazy surface takes
++/// (`texture/usage_shadow.rs`).
++fn image_of(texture: &Arc<ShadowCopies>) -> Arc<ShadowCopies> {
++    let mut copies = Arc::into_inner(image_shadow(texture.shadow_key, 0, 1)).expect("one holder");
++    if let ShadowSource::Image { over, .. } = &mut copies.source {
++        *over = Some(Arc::clone(texture));
++    }
++    Arc::new(copies)
++}
++
++/// A copy of a shadow's image reads that image as the truth: the image takes the bytes first,
++/// though the command names only the copy, though it clears the image, and wherever the copy reads
++/// past what the command does to the image.
++#[test]
++fn a_copy_of_a_shadows_image_copies_that_shadow_in_first() {
++    let buffer = ResourceKey::new();
++    let t = cut_shadow(buffer, 0..1024);
++    let s = image_of(&t);
++    let mut sync = ShadowSync::default();
++    assert_eq!(
++        command(&mut sync, &[(&s, false)], &[]),
++        [(t.shadow_key, true), (s.shadow_key, true)]
++    );
++
++    let (mut cleared, cleared_use) = through(&t, true);
++    cleared.overwrites = true;
++    let (read, read_use) = through(&s, false);
++    let (shadows, uses) = ([cleared, read], [cleared_use, read_use]);
++    let copies = ShadowSync::<u32>::default()
++        .before(&shadows, &uses, |_, _, _| Ok(0))
++        .unwrap();
++    // A keep follows: such a texture merges what it writes back.
++    assert_eq!(named(&copies[..2]), [(t.shadow_key, true), (s.shadow_key, true)]);
++
++    let (mut drawn, drawn_use) = through(&t, true);
++    (drawn.area, drawn.loads) = (Some([10, 10, 20, 20]), Some([10, 10, 20, 20]));
++    let (mut read, read_use) = through(&s, false);
++    read.loads = Some([9, 9, 21, 21]);
++    let (shadows, uses) = ([drawn, read], [drawn_use, read_use]);
++    let copies = ShadowSync::<u32>::default()
++        .before(&shadows, &uses, |_, _, _| Ok(0))
++        .unwrap();
++    assert_eq!(
++        (copies[0].area, copies[1].area),
++        (Some([9, 9, 21, 21]), Some([9, 9, 21, 21]))
++    );
++}
++
++/// What changes the image goes on to its copy: a write of the bytes reaches the image at its next
++/// copy in, and only that says the copy is behind.
++#[test]
++fn a_copy_in_of_a_shadows_image_leaves_a_copy_of_it_behind() {
++    let buffer = ResourceKey::new();
++    let t = cut_shadow(buffer, 0..1024);
++    let s = image_of(&t);
++    let mut sync = ShadowSync::default();
++    command(&mut sync, &[(&s, false)], &[]);
++    assert_eq!(command(&mut sync, &[(&s, false)], &[]), []);
++    assert_eq!(command(&mut sync, &[], &[bytes(buffer, 0..4, true)]), []);
++    assert_eq!(
++        command(&mut sync, &[(&s, false)], &[]),
++        [(t.shadow_key, true), (s.shadow_key, true)]
++    );
++}
++
++/// A copy of a shadow's image goes to no later encoder: the bytes' writes it would miss there are
++/// that shadow's to see.
++#[test]
++fn a_copy_of_a_shadows_image_is_carried_to_no_later_encoder() {
++    let buffer = ResourceKey::new();
++    let t = cut_shadow(buffer, 0..1024);
++    let s = image_of(&t);
++    let mut sync = ShadowSync::default();
++    command(&mut sync, &[(&s, false)], &[]);
++    let mut next: ShadowSync<u32> = ShadowSync::carrying(sync.ended());
++    next.wrote(&[bytes(buffer, 0..4, true)]);
++    assert_eq!(
++        command(&mut next, &[(&s, false)], &[]),
++        [(t.shadow_key, true), (s.shadow_key, true)]
++    );
++}
++
+ /// Each copy's step (into the shadow, or not), area, and why a copy in is made.
+ fn causes(copies: &[ShadowCopy<u32>]) -> Vec<(bool, Option<[u32; 4]>, Option<CopyCause>)> {
+     copies
+diff --git a/crates/metal2vulkan-runtime/src/texture/attached_reads.rs b/crates/metal2vulkan-runtime/src/texture/attached_reads.rs
+index fe4f68b5..659bc34f 100644
+--- a/crates/metal2vulkan-runtime/src/texture/attached_reads.rs
++++ b/crates/metal2vulkan-runtime/src/texture/attached_reads.rs
+@@ -38,7 +38,9 @@
+ //!   in before each instance whose draws read the shadow, after the instances before it wrote
+ //!   the attachment; before the first, ahead of the pass's load actions. Each such draw counts
+ //!   (`WorkCounts::attachment_reads_through_copies`, the shadow served or not), and so does each
+-//!   copy (`WorkCounts::shadow_copies`). It is exact and announces nothing.
++//!   copy (`WorkCounts::shadow_copies`). It is exact and announces nothing. LOCAL (Atlas): a lazy
++//!   surface's copy takes the texture's image as its truth, not the bytes, so the attachment's
++//!   writes need not go back to the bytes for it (`shadow_lazy.rs`, `ShadowCopies::over`).
+ //! - **Only what the instances drew.** A copy after the pass's first instance, of a buffer's
+ //!   bytes or of an image's one level and slice, where the instances since the last copy changed
+ //!   them only by their draws into a color attachment the pass loads (the encoder's load,
+diff --git a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+index 75d4b62e..1af00981 100644
+--- a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+@@ -13,7 +13,9 @@
+ //!   (`ShadowSource::Image`, as a shadowed view's, `texture/view_shadow.rs`), or, for a texture
+ //!   over a buffer (an aliasing or a shadow image), the buffer's bytes (`ShadowSource::Bytes`,
+ //!   a second shadow of them, `shadow.rs`). The encoders copy the truth in before a command that
+-//!   binds the shadow and back after it writes through it, by `shadow.rs`'s rules.
++//!   binds the shadow and back after it writes through it, by `shadow.rs`'s rules. LOCAL (Atlas):
++//!   a lazy surface's shadow, whose image holds every usage, so that only attachment reads take
++//!   this one, copies that image instead (`shadow_lazy.rs`, `ShadowSource::Image`'s `over`).
+ //! - **Bindings.** A slot binding (a compute dispatch's, a draw's, a tile dispatch's) whose
+ //!   descriptor needs the storage or sampled usage the texture's image and its usage both lack
+ //!   writes the shadow's view and names the shadow in its uses; every other binding of the
+@@ -234,6 +236,32 @@ impl Texture {
+         if record.presented.rotation != 0 {
+             return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
+         }
++        // LOCAL (Atlas): a lazy surface's image, where only an attachment read takes the shadow:
++        // copied from the bytes it would leave that image's writes to go back for it, each frame.
++        if let Storage::Shadow { image, copies, .. } = &self.0.storage {
++            let both = ImageUsageFlags::SAMPLED | ImageUsageFlags::STORAGE;
++            if copies.lazy.is_some() && image.plan().usage.contains(both) {
++                let root = &self.root().0.record;
++                let over = Some(Arc::clone(copies));
++                match device.image_shadow(call, image, root, &wider, refused, over) {
++                    Ok(image) => {
++                        let copies = match &image.owner {
++                            Owner::ViewShadow(shadow) => Arc::clone(&shadow.copies),
++                            _ => return Err(internal("an image shadow without its copies")),
++                        };
++                        return Ok(UsageShadow {
++                            image: image.shared(),
++                            copies,
++                            truth: "its image",
++                            announced: AtomicBool::new(false),
++                        });
++                    }
++                    // Formats no image copy joins: through the bytes, as any shadow.
++                    Err(Error::Unsupported(_)) => {}
++                    Err(error) => return Err(error),
++                }
++            }
++        }
+         let (image, copies, truth) = match &self.0.storage {
+             Storage::Image(image) => {
+                 let base = match &image.owner {
+@@ -245,7 +273,7 @@ impl Texture {
+                     | Owner::HeapShadow(_) => return Err(refused()),
+                 };
+                 let image =
+-                    device.image_shadow(call, base, &self.root().0.record, &wider, refused)?;
++                    device.image_shadow(call, base, &self.root().0.record, &wider, refused, None)?;
+                 let copies = match &image.owner {
+                     Owner::ViewShadow(shadow) => Arc::clone(&shadow.copies),
+                     _ => return Err(internal("an image shadow without its copies")),
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index c73065f2..739b98de 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -313,7 +313,7 @@ impl Device {
+     ) -> Result<Image, Error> {
+         let apart =
+             || Error::Unsupported(self.apart_refusal(Some(base.as_ref()), view.pixel_format));
+-        let image = self.image_shadow(call, base, texture, view, apart)?;
++        let image = self.image_shadow(call, base, texture, view, apart, None)?;
+         self.shared().counts.view_shadow_made();
+         let reinterpreting =
+             !self.shared().view_reinterpretation && self.reinterprets(base, view.pixel_format);
+@@ -354,7 +354,8 @@ impl Device {
+     /// record of the texture `base` was made for, whose copies move the levels and layers `view`
+     /// presents (`ShadowSource::Image`). Refused `refused()` where the copies cannot serve the pair
+     /// (no transfer usage, formats whose copy units differ), and as `new_texture` refuses the
+-    /// image.
++    /// image. LOCAL (Atlas): `over` is the copies of the shadow `base` is, where it is one: this
++    /// image then lies in private memory, as any shadow of a surface's bytes does.
+     pub(super) fn image_shadow(
+         &self,
+         call: &'static str,
+@@ -362,6 +363,7 @@ impl Device {
+         texture: &ViewRecord,
+         view: &ViewRecord,
+         refused: impl Fn() -> Error,
++        over: Option<Arc<ShadowCopies>>,
+     ) -> Result<Image, Error> {
+         let layout = TextureLayout {
+             texture_type: texture.texture_type,
+@@ -462,7 +464,10 @@ impl Device {
+         );
+         let shadow_range = range(aspects);
+         let mut descriptor = TextureDescriptor::texture_2d(view.pixel_format, 1, 1, false);
+-        descriptor.resource_options = base.options;
++        descriptor.resource_options = match over {
++            Some(_) => ResourceOptions::private(),
++            None => base.options,
++        };
+         descriptor.allow_gpu_optimized_contents = base.allow_gpu_optimized_contents;
+         let image =
+             self.new_image_owned(plan, &layout, &descriptor, identity, |placement, raw| {
+@@ -474,6 +479,7 @@ impl Device {
+                         shadow: raw,
+                         regions,
+                         through,
++                        over,
+                     },
+                     shadow_key: identity.key,
+                     shadow_range,
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index a8a89694..d9393d7a 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -3,6 +3,7 @@
+ //! page faults first, as the guest's CPU would. Beside them, a lane pins down what loses writes
+ //! under `surface_lazy_present` alone, and the same steps under the traps.
+ 
++use super::attachment_reads::function;
+ use super::first_use_writes::CHECK_WAIT;
+ use super::host_memory::{gpu_read, run, Mapping};
+ use super::host_rt_frames::{pass, surface_buffer};
+@@ -12,9 +13,10 @@ use crate::gpu::TEST_DEVICE;
+ use metal2vulkan::device::HostPageTexturePolicy;
+ use super::pitched_surfaces::{bgra8_sampling, drawn_small, sampled_bgra8};
+ use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor};
+ use metal2vulkan_runtime::shadow_coherent::{self, Pages};
+ use metal2vulkan_runtime::{
+-    live, Buffer, CommandBuffer, CommandQueue, Device, IoSurfacePlane, LoadAction,
++    live, Buffer, CommandBuffer, CommandQueue, Device, IoSurfacePlane, LoadAction, PipelineOptions,
+     RenderPassDescriptor, RenderPipelineState, ResourceOptions, ScissorRect, StoreAction,
+     Texture, TextureDescriptor,
+ };
+@@ -226,6 +228,15 @@ impl Case<'_> {
+     }
+ }
+ 
++/// The bytes reach `texel` at `x`, `y` once the clock copied them back.
++fn wait_for_pages(case: &Case<'_>, x: u64, y: u64, texel: [u8; 4]) {
++    let start = Instant::now();
++    while case.behind(x, y) != texel && start.elapsed() < SOON {
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    assert_eq!(case.behind(x, y), texel);
++}
++
+ fn rects_blending(device: &Device) -> RenderPipelineState {
+     rects(device, PixelFormat::BGRA8Unorm, true)
+ }
+@@ -459,6 +470,53 @@ fn surface_coherent_a_second_texture_reads_each_cpu_write() {
+     });
+ }
+ 
++/// A draw that reads the surface it renders reads a copy of the image, not of the pages: what lies
++/// ahead in the image stays there, though the draw reads it, and comes back at the guest's read.
++#[test]
++fn surface_coherent_a_draw_that_reads_its_surface_leaves_it_ahead() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(5, 5), RED_TEXEL);
++        for _ in 0..3 {
++            case.draw(GREEN, None);
++            case.reads_itself(LoadAction::Load, [0, 0, 8, 8]);
++            assert_eq!(case.behind(1, 1), RED_TEXEL, "nothing went through the pages");
++        }
++        assert_eq!(case.count("flushes"), 0, "no GPU work for the pages");
++        assert_eq!(case.read(1, 1), GREEN_TEXEL, "the draw read what lay ahead");
++        assert_eq!(case.read(100, 100), GREEN_TEXEL);
++    });
++}
++
++/// A pass that clears the surface and reads it reads it as it was, a CPU write of it among that:
++/// its image takes the write though the clear would need no copy in.
++#[test]
++fn surface_coherent_a_clear_that_reads_its_surface_reads_a_cpu_write() {
++    on_surface(true, |case| {
++        case.draw(GREEN, None);
++        case.read(0, 0);
++        case.write(7, 7, [1, 2, 3, 4]);
++        case.reads_itself(LoadAction::Clear, [0, 0, 16, 16]);
++        assert_eq!(case.read(7, 7), [1, 2, 3, 4]);
++        assert_eq!(case.read(1, 1), GREEN_TEXEL);
++        assert_eq!(case.read(100, 100), [0, 0, 0, 255], "cleared outside the draw");
++    });
++}
++
++/// Without traps the image holds only what its commands asked for: a draw that reads past what its
++/// pass loads gets it all the same.
++#[test]
++fn surface_lazy_a_draw_that_reads_its_surface_reads_past_its_scissor() {
++    on_surface(false, |case| {
++        case.draw(GREEN, None);
++        wait_for_pages(&case, 1, 1, GREEN_TEXEL);
++        case.reads_itself(LoadAction::Load, [4, 4, 8, 8]);
++        case.draw(RED, scissor(4, 4, 4, 4));
++        wait_for_pages(&case, 5, 5, RED_TEXEL);
++        assert_eq!(case.behind(3, 3), GREEN_TEXEL);
++    });
++}
++
+ /// A CPU writer down the whole surface stops once: a probe per page would stall it for a surface
+ /// this size, and on a real guest every probe walks every tracked surface.
+ #[test]
+@@ -1031,6 +1089,32 @@ impl Case<'_> {
+         self.read(x, y)
+     }
+ 
++    /// One command buffer of a pass, loaded as `load` and stored, whose one draw over the pixels
++    /// `[x0, y0, x1, y1)` writes what it reads of the surface at its own pixel.
++    fn reads_itself(&self, load: LoadAction, [x0, y0, x1, y1]: [u64; 4]) {
++        let mut d = RenderPipelineDescriptor::new(function(self.device, "tob_rect", "tob_renders.ll"));
++        d.fragment = Some(function(self.device, "tob_read", "tob_renders.ll"));
++        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
++        let state = (self.device.new_render_pipeline_state(&d, &PipelineOptions::default())).unwrap();
++        let mut descriptor = RenderPassDescriptor::new();
++        let attachment = &mut descriptor.color_attachments[0];
++        attachment.texture = self.texture.clone();
++        attachment.load_action = load;
++        attachment.store_action = StoreAction::Store;
++        let (x, y) = (
++            |p: u64| p as f32 / WIDTH as f32 * 2.0 - 1.0,
++            |p: u64| 1.0 - p as f32 / HEIGHT as f32 * 2.0,
++        );
++        let command_buffer = self.queue.command_buffer().unwrap();
++        let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
++        encoder.set_render_pipeline_state(&state).unwrap();
++        encoder.set_vertex_bytes(&floats4([x(x0), y(y1), x(x1), y(y0)]), 0).unwrap();
++        encoder.set_fragment_texture(self.texture.as_ref(), 0).unwrap();
++        encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0).unwrap();
++        encoder.end_encoding().unwrap();
++        run(&command_buffer);
++    }
++
+     fn other_import(&self) -> Buffer {
+         surface_buffer(self.device, &self.mapping, self.len)
+     }

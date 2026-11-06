@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:11:41 +0000
+Subject: [PATCH 09/25] tell the platform which texture the
+ display presents
+
+metal2vulkan's surface_lazy_present leaves a displayed surface's writes out of
+its bytes until a present. A default no-op on the Texture trait.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-core/src/display/frame.rs     | 4 ++++
+ crates/reims-vgpu-core/src/platform/resource.rs | 4 ++++
+ crates/reims-vgpu-vulkan/src/gpu/resource.rs    | 4 ++++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/crates/reims-vgpu-core/src/display/frame.rs b/crates/reims-vgpu-core/src/display/frame.rs
+index c0391480..e28a308e 100644
+--- a/crates/reims-vgpu-core/src/display/frame.rs
++++ b/crates/reims-vgpu-core/src/display/frame.rs
+@@ -73,6 +73,10 @@ impl<P: Platform> DisplayCore<P> {
+         color_matrix: Option<&dyn ColorMatrix>,
+         completion: Box<dyn FnOnce() + Send>,
+     ) -> RaiseResult<()> {
++        // LOCAL (Atlas): before the display's lock, as this may commit a command buffer.
++        if let Some(frame) = &frame {
++            frame.presented();
++        }
+         let mut g = self.display_mutex.lock();
+         // present: frames in flight, waited for next
+         crate::trace::event(
+diff --git a/crates/reims-vgpu-core/src/platform/resource.rs b/crates/reims-vgpu-core/src/platform/resource.rs
+index 06f98fc4..ca6f92c6 100644
+--- a/crates/reims-vgpu-core/src/platform/resource.rs
++++ b/crates/reims-vgpu-core/src/platform/resource.rs
+@@ -81,6 +81,10 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
+ /// `didModifyData` (SPI) is not declared: only the tiled EFI path, which nothing reaches, would
+ /// send it (D33).
+ pub trait Texture<P: Platform>: GpuResource<P> {
++    /// LOCAL (Atlas): not a Metal call. The display is about to show the texture's bytes, for a
++    /// platform that leaves a surface's writes out of them until then (metal2vulkan's
++    /// `shadow_lazy.rs`).
++    fn presented(&self) {}
+     /// sel: arrayLength
+     fn array_length(&self) -> u64;
+     /// sel: depth
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+index 549138bc..546fcd99 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
+@@ -1274,6 +1274,10 @@ fn at(index: u64) -> rt::IdPlacement {
+ }
+ 
+ impl Texture<VulkanPlatform> for VulkanTexture {
++    fn presented(&self) {
++        plain(|| self.raw.surface_presented());
++    }
++
+     fn array_length(&self) -> u64 {
+         plain(|| self.raw.array_length())
+     }

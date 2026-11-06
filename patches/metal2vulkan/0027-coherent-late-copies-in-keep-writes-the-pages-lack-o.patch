@@ -1,0 +1,619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 15:27:30 +0000
+Subject: [PATCH 27/34] coherent: late copies in keep writes the pages lack,
+ one per wait, own standings after a wait
+
+Three limits ec9bab82 left in the held batch's copy in (shadow::LateCopies), each a lane
+that failed at ec9bab82:
+
+- A write in flight (taking_late waits for nothing under the scheduler's lock). Another
+  command buffer's write over the surface ran on the GPU, not completed; the guest wrote
+  beside it and set the event. The copy in of the guest's whole rectangle from the pages put
+  their older bytes over the write in the image, which then went to the pages: lost.
+  Now, where a record still open or running meets the rectangle, taking_late holds the pages
+  and copies in the texels the CPU changed alone (each open page against its snapshot), as
+  rectangles (at most LATE_RECTS = 64, then bands, then the rectangle, counted busy). A texel
+  both wrote is a race Metal leaves undefined. No wait: the GPU orders the copy after the
+  writer; only the pages lacked its bytes. Counted busy still: a GPU copy back in flight, a
+  page with no snapshot, a shadow whose copy in is not cut.
+  Lane surface_coherent_a_late_copy_in_keeps_a_write_in_flight.
+- An encoder after a wait for a shared event over a surface an earlier encoder of the same
+  command buffer left writes ahead in: its standing was refused (OwnBuffer), so it copied in
+  every texel from the pages at its use, losing those writes, with or without a CPU write
+  (and a CPU write before the signal then lost the GPU's write over it to the merge). Now,
+  after such a wait, a trapping surface's own standing is taken as a carried one is
+  (Lazy::take's waited), with no copy in at encoding; the batch's late copy in takes what the
+  CPU wrote, by changed texels where the command buffer's own record meets them (noted
+  with left_open_by). Lane surface_coherent_a_late_copy_in_keeps_the_command_buffers_own_writes.
+- One note per surface: each wait for a shared event notes the surface again, with the part
+  it waits at (State::recorded's length), and a batch takes the notes from waits before its
+  end. The second of two waits left its batch with no copy in once the first limit was fixed.
+  Lane surface_coherent_each_wait_copies_in_what_came_before_its_signal.
+
+Cost where nothing changed: none. With a CPU write before the signal and a write the pages
+lack over it, a compare of the snapshot pages under the scheduler's lock (memcmp per page,
+per texel only on changed pages).
+
+Left: a standing taken after a wait (another command buffer's, or now its own) knows nothing of
+a GPU write of the surface's bytes through another import encoded after it and ordered before
+the signal; as before.
+
+Lanes (ANV): the three new ones fail at ec9bab82 and pass here. Filters "surface" and "event":
+158 passed, 1 failed, 5 ignored (155 + the three; the failure is
+ycbcr_textures::textures_over_any_surface_read_what_metal_reads, as before). Runtime unit tests
+(shadow, batches, command_buffer, exit_guard, coherent, lazy): 135 passed, 1 failed:
+exit_guard, the same two submit.rs Stamps lines as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/mod.rs                 |   5 +-
+ .../src/command_buffer/submit.rs              |   4 +-
+ crates/metal2vulkan-runtime/src/shadow.rs     |  57 ++++--
+ .../src/shadow_coherent.rs                    | 165 ++++++++++++++++--
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  67 +++++--
+ .../src/runtime_lane/surface_coherent.rs      | 114 ++++++++++++
+ 6 files changed, 359 insertions(+), 53 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index e636538b..6d3b46ca 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1302,10 +1302,11 @@ impl State {
+     /// LOCAL (Atlas): the work encoded next waits for a shared event, which the host may set
+     /// after a CPU write a trapping surface's copy in must take (`shadow::LateCopies`).
+     pub(super) fn shadows_wait_for_shared_event(&mut self) {
+-        (self.shadow_carry.get_or_insert_with(ShadowCarry::default)).waits_for_shared_event();
++        let part = self.recorded.len();
++        (self.shadow_carry.get_or_insert_with(ShadowCarry::default)).waits_for_shared_event(part);
+     }
+ 
+-        pub(super) fn shadows_not_carried(&mut self) {
++    pub(super) fn shadows_not_carried(&mut self) {
+         if let Some(carry) = &mut self.shadow_carry {
+             carry.clear();
+         }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index f415cc30..7c41b410 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1197,7 +1197,7 @@ impl CommandBufferShared {
+             return Ok(());
+         };
+         let recorded = &state.recorded[range.clone()];
+-        let shadows = carry.take_late(|copies| {
++        let shadows = carry.take_late(range.end, |copies| {
+             (recorded.iter()).any(|part| {
+                 (part.summary.lazy_uses())
+                     .any(|used| used.key == copies.shadow_key || copies.meets(used))
+@@ -1208,7 +1208,7 @@ impl CommandBufferShared {
+         }
+         let id = carry.id();
+         let copies: Vec<_> = (shadows.iter())
+-            .filter_map(|copies| crate::shadow_lazy::late_copy_in(copies, id))
++            .flat_map(|(left, copies)| crate::shadow_lazy::late_copy_in(copies, id, *left))
+             .collect();
+         if copies.is_empty() {
+             return Ok(());
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index a7ab6828..b508e291 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -2331,11 +2331,18 @@ pub(super) struct ShadowCarry {
+ /// at its use: that copy reads the pages as the GPU runs it.
+ ///
+ /// [`Coherent::taking`]: super::shadow_coherent
++///
++/// Each wait starts its own notes: a surface taken after two waits copies in at each, with the
++/// first batch from its wait's place on that uses it, so a CPU write before the later signal is
++/// not left to the earlier batch's copy.
+ #[derive(Default)]
+ pub(super) struct LateCopies {
+-    /// The command buffer waits for a shared event before the work encoded from here on.
+-    waited: bool,
+-    shadows: Vec<Arc<ShadowCopies>>,
++    /// The command buffer's part (`command_buffer::State::recorded`) the last wait for a shared
++    /// event holds back: the work encoded from here on waits for it.
++    since: Option<usize>,
++    /// Each surface noted, with the part of the wait it was noted after, and whether an earlier
++    /// encoder of the command buffer had left writes ahead in its image then.
++    shadows: Vec<(usize, bool, Arc<ShadowCopies>)>,
+ }
+ 
+ impl Default for ShadowCarry {
+@@ -2396,22 +2403,28 @@ impl ShadowCarry {
+         self.entries.clear();
+     }
+ 
+-    /// LOCAL (Atlas): the work encoded from here on waits for a shared event ([`LateCopies`]).
+-    pub(super) fn waits_for_shared_event(&mut self) {
+-        self.late.waited = true;
++    /// LOCAL (Atlas): the work encoded from part `part` on waits for a shared event
++    /// ([`LateCopies`]).
++    pub(super) fn waits_for_shared_event(&mut self, part: usize) {
++        self.late.since = Some(part);
+     }
+ 
+-    /// LOCAL (Atlas): the shadows of the late copies in ([`LateCopies`]) that `met` says a batch
+-    /// going now uses, taken out: each goes with the first such batch.
+-    pub(super) fn take_late(&mut self, met: impl Fn(&ShadowCopies) -> bool) -> Vec<Arc<ShadowCopies>> {
++    /// LOCAL (Atlas): the shadows of the late copies in ([`LateCopies`]) that a batch of parts
++    /// ending at `end` takes: noted after a wait before that end, and used by the batch (`met`).
++    /// Each goes with the first such batch.
++    pub(super) fn take_late(
++        &mut self,
++        end: usize,
++        met: impl Fn(&ShadowCopies) -> bool,
++    ) -> Vec<(bool, Arc<ShadowCopies>)> {
+         if self.late.shadows.is_empty() {
+             return Vec::new();
+         }
+-        let (taken, kept) = std::mem::take(&mut self.late.shadows)
++        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.late.shadows)
+             .into_iter()
+-            .partition(|copies| met(copies));
++            .partition(|(from, _, copies)| *from < end && met(copies));
+         self.late.shadows = kept;
+-        taken
++        taken.into_iter().map(|(_, left, copies)| (left, copies)).collect()
+     }
+ }
+ 
+@@ -2449,20 +2462,26 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                 // LOCAL (Atlas): an earlier command buffer's image, where nothing wrote its bytes
+                 // since (`shadow_lazy.rs`).
+                 let lazily = match (&carried, &copies.lazy) {
+-                    (None, Some(lazy)) => lazy.take(self.carry.id, met),
++                    (None, Some(lazy)) => {
++                        lazy.take(self.carry.id, met, self.carry.late.since.is_some())
++                    }
+                     _ => None,
+                 };
+                 // LOCAL (Atlas): a trapping surface's standing taken after a wait for a shared
+                 // event: the CPU may write before the signal, which the batch copies in as it
+-                // goes ([`LateCopies`]). Not over writes an earlier encoder of this command
+-                // buffer left ahead, which the copy in would replace with the pages' bytes.
+-                if let (Some(_), Some(lazy), true) = (&lazily, &copies.lazy, self.carry.late.waited) {
++                // goes ([`LateCopies`]), once per wait. A standing this command buffer's own
++                // earlier encoder left is taken after the wait too (`Lazy::take`): its copy in is
++                // the batch's alone, which takes the texels the CPU changed where any write the
++                // pages lack meets them (`shadow_coherent::Coherent::taking_late`).
++                if let (Some(_), Some(lazy), Some(since)) = (&lazily, &copies.lazy, self.carry.late.since) {
+                     let late = &mut self.carry.late.shadows;
+                     if lazy.whole_image()
+-                        && !late.iter().any(|known| known.shadow_key == copies.shadow_key)
+-                        && !lazy.left_open_by(self.carry.id)
++                        && !(late.iter()).any(|(from, _, known)| {
++                            *from == since && known.shadow_key == copies.shadow_key
++                        })
+                     {
+-                        late.push(Arc::clone(copies));
++                        let left = lazy.left_open_by(self.carry.id);
++                        late.push((since, left, Arc::clone(copies)));
+                     }
+                 }
+                 let only_read = lazily.is_some() && (copies.lazy.as_ref())
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 44e4d1f0..c8f5d54b 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -105,6 +105,9 @@ const HOLD_MAX_S: u64 = 30;
+ const RECORDS: usize = 8;
+ const PROBE_GIVEN_UP: Duration = Duration::from_millis(1);
+ const DEFAULT_WAIT_MS: u64 = 50;
++/// The rectangles a late copy in takes of the texels the guest changed, at most
++/// ([`Coherent::taking_late`]).
++const LATE_RECTS: usize = 64;
+ /// The closed surfaces' lines kept between reports.
+ const ENDED_KEPT: usize = 256;
+ /// A GPU copy of a surface, per MiB: 2.97 ms for 5.76 Mtexels of 4 bytes (`STUDY-virt.md`).
+@@ -1160,26 +1163,162 @@ impl Coherent {
+ 
+     /// A held batch of the command buffer `id` is about to go, whose encoders took the image's
+     /// standing as they were encoded ([`taking`](Self::taking)): where the guest's CPU wrote
+-    /// since, before the signal the batch waited for, the rectangle its copy in takes, recorded
++    /// since, before the signal the batch waited for, the rectangles its copy in takes, recorded
+     /// at the batch's start (`command_buffer/submit.rs`). Called under the scheduler's lock, it
+-    /// waits for no record: a write of another command buffer still running over the rectangle
+-    /// is counted (`overwrite_risk`, [`Fallback::LateCopyInBusy`]), as a bounded wait past its
+-    /// bound is. The command buffer's own records run after the copy.
+-    pub(crate) fn taking_late(&self, id: u64) -> Option<[u32; 4]> {
++    /// waits for no record. Where a write the pages lack meets the guest's rectangle, a record of
++    /// any command buffer still open or running (another one's in flight, or an earlier encoder
++    /// of this one that left its writes ahead), a copy of the rectangle would put the pages'
++    /// older bytes over it in the image. So then the rectangles are the texels the CPU changed
++    /// alone: each open page against its snapshot, after the pages are held, so no write lands
++    /// past the compare. A texel both wrote is a race Metal leaves undefined too. Counted as busy
++    /// (`overwrite_risk`, [`Fallback::LateCopyInBusy`]) is what that cannot cover: a GPU copy
++    /// back in flight, a page the guest reached with no snapshot, a shadow whose copy in is not
++    /// cut to a rectangle (`cut` false), or changes too scattered for [`LATE_RECTS`].
++    ///
++    /// The command buffer's own record (`id`) counts only where an earlier encoder of it left
++    /// writes ahead before the wait (`left`): the rest of its writes run after the copy.
++    pub(crate) fn taking_late(&self, id: u64, left: bool, cut: bool) -> Vec<[u32; 4]> {
+         let mut state = self.lock();
+         if !state.tracked || state.closed {
+-            return None;
++            return Vec::new();
++        }
++        let Some(area) = state.guest else {
++            return Vec::new();
++        };
++        let ahead = |state: &State, rects: &[[u32; 4]]| {
++            (state.open.iter().chain(&state.running))
++                .filter(|record| left || record.id != id)
++                .any(|record| rects.iter().any(|rect| meet(record.area, *rect)))
++        };
++        let behind = ahead(&state, &[area]);
++        let mut busy = state.flushing != 0 && !state.snapshots.is_empty();
++        let mut rects = vec![area];
++        if behind && cut && !state.snapshots.is_empty() {
++            self.sync_done(&mut state, SyncBy::CopyIn);
++            let list: Vec<u64> = state.snapshots.keys().copied().collect();
++            let came = pages().map(|mark| mark.hold(&list, true)).unwrap_or_default();
++            let (changed, whole) = self.changed(&state, area);
++            rects = changed;
++            busy |= whole && ahead(&state, &rects);
++            state.guest = None;
++            // A page the guest reached as the marks moved came with no snapshot: its rectangle
++            // goes to the next copy in, as `take_guest`'s does.
++            self.note_came(&mut state, came);
++            state.snapshots.clear();
++            state.opened = false;
++        } else {
++            busy |= behind;
++            self.take_guest(&mut state);
+         }
+-        let area = state.guest?;
+-        let busy = state.flushing != 0
+-            || (state.running.iter()).any(|record| record.id != id && meet(record.area, area));
+-        if busy && !state.snapshots.is_empty() {
++        if busy {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyInBusy);
+         }
+-        self.take_guest(&mut state);
+-        count(Fallback::LateCopyIn);
+-        Some(area)
++        if !rects.is_empty() {
++            count(Fallback::LateCopyIn);
++        }
++        rects
++    }
++
++    /// The rectangles of `area`'s texels the guest changed against its open pages' snapshots,
++    /// and whether they are coarser than that: a page in `area` with no snapshot takes its whole
++    /// rectangle, and past [`LATE_RECTS`] each band of rows changed takes its bounds, then
++    /// `area` alone.
++    fn changed(&self, state: &State, area: [u32; 4]) -> (Vec<[u32; 4]>, bool) {
++        let layout = &self.layout;
++        let texel = layout.texel;
++        let mut coarse = false;
++        // Whether the bytes `[from, to)` are as their pages' snapshots hold them: `None` where a
++        // page has none.
++        let same = |from: u64, to: u64| -> Option<bool> {
++            let mut at = from;
++            while at < to {
++                let page = at & !(PAGE - 1);
++                let end = to.min(page + PAGE);
++                let was = state.snapshots.get(&page)?;
++                let was = &was[(at - page) as usize..(end - page) as usize];
++                // SAFETY: `[at, end)` lies in the surface's mapping, in pages held: no write of
++                // the guest moves them meanwhile.
++                let now = unsafe { std::slice::from_raw_parts(at as *const u8, was.len()) };
++                if was != now {
++                    return Some(false);
++                }
++                at = end;
++            }
++            Some(true)
++        };
++        // Per row, the runs of texels changed: `(y, x0, x1)`, ascending.
++        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
++        for y in area[1]..area[3] {
++            let row = layout.at(0, y);
++            let mut run: Option<u32> = None;
++            let mut x = area[0];
++            while x < area[2] {
++                // The texels that start in this texel's page.
++                let page = layout.at(x, y) & !(PAGE - 1);
++                let past = ((page + PAGE - row).div_ceil(texel) as u32).clamp(x + 1, area[2]);
++                let span = same(layout.at(x, y), layout.at(past - 1, y) + texel);
++                for tx in x..past {
++                    let changed = match span {
++                        Some(true) => false,
++                        Some(false) => {
++                            let at = layout.at(tx, y);
++                            same(at, at + texel) != Some(true)
++                        }
++                        None => {
++                            coarse = true;
++                            true
++                        }
++                    };
++                    match (changed, run) {
++                        (true, None) => run = Some(tx),
++                        (false, Some(from)) => {
++                            runs.push((y, from, tx));
++                            run = None;
++                        }
++                        _ => {}
++                    }
++                }
++                x = past;
++            }
++            if let Some(from) = run {
++                runs.push((y, from, area[2]));
++            }
++        }
++        // Runs of one span on consecutive rows join.
++        let mut rects: Vec<[u32; 4]> = Vec::new();
++        let mut open: Vec<usize> = Vec::new();
++        let mut row = None;
++        for (y, x0, x1) in runs.iter().copied() {
++            if row != Some(y) {
++                open.retain(|at| rects[*at][3] == y);
++                row = Some(y);
++            }
++            match (open.iter()).find(|at| rects[**at][0] == x0 && rects[**at][2] == x1 && rects[**at][3] == y) {
++                Some(at) => rects[*at][3] = y + 1,
++                None => {
++                    open.push(rects.len());
++                    rects.push([x0, y, x1, y + 1]);
++                }
++            }
++        }
++        if rects.len() > LATE_RECTS {
++            coarse = true;
++            let mut bands: Vec<[u32; 4]> = Vec::new();
++            for (y, x0, x1) in runs {
++                match bands.last_mut() {
++                    Some(band) if band[3] >= y => {
++                        *band = [band[0].min(x0), band[1], band[2].max(x1), band[3].max(y + 1)];
++                    }
++                    _ => bands.push([x0, y, x1, y + 1]),
++                }
++            }
++            rects = bands;
++            if rects.len() > LATE_RECTS {
++                rects = vec![area];
++            }
++        }
++        (rects, coarse)
+     }
+ 
+     /// A GPU copy back of what ran is about to record: everything done went on the CPU, and what
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 76e0986b..15164b8b 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -513,21 +513,32 @@ pub(crate) fn signalled_by<M>(id: u64) -> Option<Vec<(Arc<Lazy>, ShadowCopy<M>,
+ 
+ /// The copy in a held batch of the command buffer `id` takes as it goes, of a trapping surface
+ /// an encoder of it took the standing of after a wait for a shared event (`shadow::LateCopies`):
+-/// what the guest's CPU wrote since that encoding, before the signal. `None` where it wrote
+-/// nothing, or the surface no longer traps.
+-pub(crate) fn late_copy_in(copies: &Arc<ShadowCopies>, id: u64) -> Option<ShadowCopy> {
+-    let lazy = copies.lazy.as_ref()?;
+-    let area = lazy.coherent()?.taking_late(id)?;
+-    let copy = ShadowCopy {
+-        copies: Arc::clone(copies),
+-        step: Step::Into,
+-        kept: false,
+-        area: Some(area),
+-        cause: Some(CopyCause::Bounded),
+-        moves: None,
++/// what the guest's CPU wrote since that encoding, before the signal, one copy per rectangle
++/// ([`Coherent::taking_late`](super::shadow_coherent)). None where it wrote nothing, or the
++/// surface no longer traps.
++/// `left`: an earlier encoder of it left writes ahead in the image before the wait.
++pub(crate) fn late_copy_in(copies: &Arc<ShadowCopies>, id: u64, left: bool) -> Vec<ShadowCopy> {
++    let Some(lazy) = copies.lazy.as_ref() else {
++        return Vec::new();
+     };
+-    lazy.copied_in(CopyCause::Bounded, copy.texels_copied_in());
+-    Some(copy)
++    let Some(coherent) = lazy.coherent() else {
++        return Vec::new();
++    };
++    let list: Vec<ShadowCopy> = (coherent.taking_late(id, left, copies.cuts()).into_iter())
++        .map(|area| ShadowCopy {
++            copies: Arc::clone(copies),
++            step: Step::Into,
++            kept: false,
++            area: Some(area),
++            cause: Some(CopyCause::Bounded),
++            moves: None,
++        })
++        .collect();
++    let texels = list.iter().map(ShadowCopy::texels_copied_in).sum();
++    if !list.is_empty() {
++        lazy.copied_in(CopyCause::Bounded, texels);
++    }
++    list
+ }
+ 
+ /// The copies back a command of the command buffer `id` needs before it, its uses `uses`: of what
+@@ -1175,14 +1186,28 @@ impl Lazy {
+ 
+     /// Where the image stands for an encoder that met `touched`, of a command buffer of identity
+     /// `id`: `Some((held, stale))` where it needs no copy in (the module docs).
+-    pub(super) fn take(&self, id: u64, touched: u64) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
++    ///
++    /// LOCAL (Atlas): with `waited` (the command buffer waits for a shared event before this
++    /// encoder, `shadow::LateCopies`), a trapping surface's standing its own earlier encoder left
++    /// is taken too, as a carried one would be, and its copy in waits for the batch to go: a copy
++    /// in of the pages now would replace what those encoders left ahead, which the pages lack, and
++    /// the batch's copy in takes what the CPU wrote, keeping the rest
++    /// (`shadow_coherent::Coherent::taking_late`).
++    pub(super) fn take(
++        &self,
++        id: u64,
++        touched: u64,
++        waited: bool,
++    ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
+         // Tracked from here: nothing its copy in reads can change unseen.
+         let coherent = self.coherent().filter(|coherent| coherent.tracks());
+         if coherent.is_none() {
+             self.seal_beside();
+         }
+-        let taken = self.take_standing(id, touched, coherent.is_some());
++        let own = waited && coherent.is_some() && self.stood_by(id);
++        let taken = self.take_standing(id, touched, coherent.is_some(), own);
+         match coherent {
++            Some(_) if own => taken,
+             Some(coherent) => {
+                 let stale = coherent.taking(taken.is_none());
+                 taken.map(|(held, was)| (held, bounding_stale(was, stale)))
+@@ -1206,11 +1231,17 @@ impl Lazy {
+         }
+     }
+ 
++    /// Whether its standing is one an encoder of the command buffer `id` left.
++    fn stood_by(&self, id: u64) -> bool {
++        (*self.stood.lock().unwrap()).is_some_and(|stood| stood.id == id)
++    }
++
+     fn take_standing(
+         &self,
+         id: u64,
+         touched: u64,
+         tracked: bool,
++        own: bool,
+     ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>)> {
+         report();
+         let Some(stood) = *self.stood.lock().unwrap() else {
+@@ -1223,8 +1254,10 @@ impl Lazy {
+             Some(Refused::Written)
+         } else if stood.epoch != EPOCH.load(Ordering::Relaxed) {
+             Some(Refused::Epoch)
+-        } else if stood.id == id {
++        } else if stood.id == id && !own {
+             Some(Refused::OwnBuffer)
++        } else if own {
++            None
+         } else if !committed_ids().lock().unwrap().contains(&stood.id) {
+             Some(Refused::Uncommitted)
+         } else {
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 031fc9ba..d8070e0c 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -1722,3 +1722,117 @@ fn surface_coherent_a_cpu_write_before_a_signal_reaches_a_waiting_command() {
+         );
+     });
+ }
++
++/// Wait, a bounded time, until a held batch went with a copy in (`late_copies_in` past `from`).
++fn wait_for_late_copy(from: u64) {
++    let start = Instant::now();
++    while shadow_coherent::fallback_counts().late_copies_in <= from && start.elapsed() < SOON {
++        std::thread::sleep(Duration::from_millis(2));
++    }
++}
++
++/// A blend of nothing over the case's texture (within `damage`), after a wait for `hold` at 1.
++fn blend_after(
++    case: &Case<'_>,
++    command_buffer: &CommandBuffer,
++    hold: &SharedEvent,
++    damage: Option<ScissorRect>,
++) {
++    let color = staged(case.device, &floats4([0.0; 4]));
++    let rects = std::slice::from_ref(&case.rect);
++    let blending = rects_blending(case.device);
++    command_buffer.encode_wait_for_event(hold.into(), 1).unwrap();
++    pass(command_buffer, case.texture(), &blending, rects, &color, damage);
++}
++
++/// A held batch's copy in (`shadow::LateCopies`) while another command buffer's write over the
++/// surface ran on the GPU and its command buffer had not completed (it waits for an event after
++/// its pass): the guest wrote beside that write, then set the event the reader waited for. The
++/// copy in takes the guest's texels alone, so the write in flight stays in the image.
++#[test]
++fn surface_coherent_a_late_copy_in_keeps_a_write_in_flight() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let other = case.device.new_command_queue().unwrap();
++        let gate = case.device.new_shared_event().unwrap();
++        let writer = other.command_buffer().unwrap();
++        case.pass(&writer, GREEN, scissor(0, 7, 64, 1));
++        writer.encode_wait_for_event((&gate).into(), 1).unwrap();
++        writer.commit().unwrap();
++        // Its pass runs on the GPU meanwhile; nothing the guest can see says when.
++        std::thread::sleep(Duration::from_millis(100));
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        let late = shadow_coherent::fallback_counts().late_copies_in;
++        case.write(9, 100, [1, 2, 3, 4]);
++        hold.set_signaled_value(1);
++        wait_for_late_copy(late);
++        gate.set_signaled_value(1);
++        for command_buffer in [&writer, &waiting] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        assert_eq!(shadow_coherent::fallback_counts().late_copies_in, late + 1);
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the guest's write");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the write in flight");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "the older texels");
++    });
++}
++
++/// Two waits for shared events in one command buffer, each before a draw over the surface: the
++/// guest writes before each signal, the second time after the first batch went and beside its
++/// draw, and each draw sees the write before its own signal, the first draw's texels kept. Each
++/// wait notes the surface again (`shadow::LateCopies`): one note per surface left the second
++/// batch with no copy in.
++#[test]
++fn surface_coherent_each_wait_copies_in_what_came_before_its_signal() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let one = case.device.new_shared_event().unwrap();
++        let two = case.device.new_shared_event().unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        blend_after(&case, &command_buffer, &one, scissor(0, 0, WIDTH, 1));
++        blend_after(&case, &command_buffer, &two, scissor(0, 3, WIDTH, 1));
++        command_buffer.commit().unwrap();
++        let late = shadow_coherent::fallback_counts().late_copies_in;
++        case.write(5, 0, [1, 2, 3, 4]);
++        one.set_signaled_value(1);
++        wait_for_late_copy(late);
++        case.write(5, 3, [5, 6, 7, 8]);
++        two.set_signaled_value(1);
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(5, 0), [1, 2, 3, 0], "the write before the first signal");
++        assert_eq!(case.read(5, 3), [5, 6, 7, 0], "the write before the second");
++        assert_eq!(case.read(6, 3), [0, 0, 255, 0], "the older texels");
++    });
++}
++
++/// A command buffer draws over a part of the surface, waits for a shared event, then draws over
++/// all of it: the guest writes beside the first draw and sets the event. The second draw sees
++/// both, so the copy in takes the guest's texels and keeps the first draw's in the image. Before,
++/// the wait let the second draw take no standing (its own command buffer's), and its copy in of
++/// the whole surface from the pages lost the first draw's texels, CPU write or not.
++#[test]
++fn surface_coherent_a_late_copy_in_keeps_the_command_buffers_own_writes() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let command_buffer = case.queue.command_buffer().unwrap();
++        case.pass(&command_buffer, GREEN, scissor(0, 7, 64, 1));
++        blend_after(&case, &command_buffer, &hold, None);
++        command_buffer.commit().unwrap();
++        let late = shadow_coherent::fallback_counts().late_copies_in;
++        case.write(9, 100, [1, 2, 3, 4]);
++        hold.set_signaled_value(1);
++        command_buffer.wait_until_completed_for(SOON).unwrap();
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the guest's write");
++        assert_eq!(case.read(8, 7), [0, 255, 0, 0], "the first draw");
++        assert_eq!(case.read(0, 0), [0, 0, 255, 0], "the older texels");
++        assert_eq!(shadow_coherent::fallback_counts().late_copies_in, late + 1);
++    });
++}
++

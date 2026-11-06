@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 04:11:12 +0000
+Subject: [PATCH 17/25] the NVMe boot test's BAR clear of the
+ Q35 MMCONFIG window
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/guest/dma.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/internal/census/guest/dma.c b/scripts/internal/census/guest/dma.c
+index 56097df2..74225868 100644
+--- a/scripts/internal/census/guest/dma.c
++++ b/scripts/internal/census/guest/dma.c
+@@ -76,7 +76,7 @@ static void nvme_up(void) {
+     phase = phase_a = 1;
+     for (int d = 0; d < 32 && !nv; d++)
+         if (cfg(d, 8) >> 8 == 0x010802) {
+-            nv = reachable(d, 0xb0000000u);
++            nv = reachable(d, 0xc0000000u);
+             cfgw(d, 4, cfg(d, 4) | 6);
+         }
+     if (!nv) die(0x43);

@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 04:59:01 +0000
+Subject: [PATCH 18/25] the census report reads a build before
+ the ledger
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/internal/census/census_report.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/internal/census/census_report.py b/scripts/internal/census/census_report.py
+index 635a81c0..96167622 100644
+--- a/scripts/internal/census/census_report.py
++++ b/scripts/internal/census/census_report.py
+@@ -161,10 +161,11 @@ def coherent(directory, wanted):
+               f" {r['demotions']:>6} {r['writes']:>6} {cost['detect'] / 1e3:>7.1f}"
+               f" {cost['sync'] / 1e3:>7.1f} {cost['fetch'] / 1e3:>7.1f} {cost['total'] / 1e3:>7.1f}"
+               f" {cost['eager_would'] / 1e3:>8.1f} {'yes' if r['pays'] else 'NO'}")
++    costed = [r for r in found.values() if "spent_ns" in r]  # a build before the ledger has none
+     print("per sync in ms (sync_ns holds the copy and the hold), and what spent and saved came to")
+     print(f"{'surface':>12} {'defers':>7} {'syncs':>6} {'copy':>6} {'hold':>6} {'arm':>6} {'MB/s':>6}"
+           f" {'spent ms':>9} {'saved ms':>9}  synced by")
+-    for r in sorted(found.values(), key=lambda r: -r["spent_ns"])[:40]:
++    for r in sorted(costed, key=lambda r: -r["spent_ns"])[:40]:
+         syncs = r["regions"] or 1
+         speed = r["bytes_detiled"] / r["copy_ns"] * 1e3 if r["copy_ns"] else 0
+         by = " ".join(f"{k}:{n}" for k, n in r["sync_by"].items() if n)

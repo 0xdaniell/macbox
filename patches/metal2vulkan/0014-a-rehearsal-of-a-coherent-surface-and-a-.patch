@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 02:23:00 +0000
+Subject: [PATCH 14/34] a rehearsal of a coherent surface, and a
+ merge a device cannot lose
+
+Rehearsal runs a surface through every step a texture's command buffers make with
+no GPU, for a boot test on a guest that runs no Metal. A merge changes a texel by
+compare and swap: a device's DMA does not stop at a frozen page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/shadow_coherent.rs                    | 67 ++++++++++++++++---
+ 1 file changed, 58 insertions(+), 9 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 22172ac7..5ff37213 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -53,10 +53,40 @@ use super::shadow::bounding;
+ use super::shadow_lazy::Lazy;
+ use std::collections::{BTreeMap, HashSet};
+ use std::ops::Range;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
+ use std::time::{Duration, Instant};
+ 
++/// A surface with no GPU: every step a texture's command buffers make, for a boot test on a guest
++/// that can run no Metal (`rvg_coherent_rehearse`). `read` stands in for the image.
++pub struct Rehearsal(Arc<Coherent>);
++
++impl Rehearsal {
++    pub fn new(layout: Layout, read: Reader) -> Rehearsal {
++        Rehearsal(Coherent::new(layout, read, Weak::new()))
++    }
++
++    /// Whether the surface traps.
++    pub fn track(&self) -> bool {
++        self.0.tracks()
++    }
++
++    /// One command buffer `id` over `area`, its running as long as `running`, and with `take` the
++    /// next use of the image: whether the surface still lives.
++    pub fn frame(&self, id: u64, area: [u32; 4], running: Duration, take: bool) -> bool {
++        if self.0.defers(id, Some(area)) {
++            self.0.committed(id);
++            std::thread::sleep(running);
++            self.0.completing(id);
++        }
++        if let Some(stale) = take.then(|| self.0.taking(false)).flatten() {
++            self.0.copied_in(texels(stale));
++        }
++        self.0.presented();
++        self.0.is_live()
++    }
++}
++
+ /// The live switch.
+ const SWITCH: &str = "surface_coherent";
+ /// The display samples a surface's image instead of its pages.
+@@ -127,17 +157,17 @@ fn knob(name: &str, default: u64) -> u64 {
+ 
+ /// Copies an image's rectangle `[x0, y0, x1, y1)` to bytes laid out in rows of the given texels,
+ /// on the host: whether it did.
+-pub(crate) type Reader = Box<dyn Fn([u32; 4], *mut u8, u32) -> bool + Send + Sync>;
++pub type Reader = Box<dyn Fn([u32; 4], *mut u8, u32) -> bool + Send + Sync>;
+ 
+ /// A surface's texels in host pages.
+ #[derive(Clone, Copy, Debug)]
+-pub(crate) struct Layout {
++pub struct Layout {
+     /// The host address of the first texel's byte.
+-    pub(crate) base: u64,
+-    pub(crate) row: u64,
+-    pub(crate) texel: u64,
+-    pub(crate) width: u32,
+-    pub(crate) height: u32,
++    pub base: u64,
++    pub row: u64,
++    pub texel: u64,
++    pub width: u32,
++    pub height: u32,
+ }
+ 
+ impl Layout {
+@@ -625,8 +655,27 @@ impl Coherent {
+                     match state.snapshots.get_mut(&page) {
+                         Some(snapshot) => {
+                             let was = &mut snapshot[offset..(offset + texel).min(PAGE as usize)];
+-                            if bytes[..was.len()] == *was {
++                            // A device's DMA goes on through a frozen page: a texel changes as a
++                            // whole here, or stays what it wrote.
++                            let same = if let (0, Ok(new), Ok(old)) = (
++                                at % 4 + (texel as u64 ^ 4),
++                                <[u8; 4]>::try_from(&source[..was.len()]),
++                                <[u8; 4]>::try_from(&*was),
++                            ) {
++                                let word = (at as *mut u32).cast::<AtomicU32>();
++                                (*word).compare_exchange(
++                                    u32::from_ne_bytes(old),
++                                    u32::from_ne_bytes(new),
++                                    Ordering::Relaxed,
++                                    Ordering::Relaxed,
++                                ).is_ok()
++                            } else if bytes[..was.len()] == *was {
+                                 bytes[..was.len()].copy_from_slice(&source[..was.len()]);
++                                true
++                            } else {
++                                false
++                            };
++                            if same {
+                                 was.copy_from_slice(&source[..was.len()]);
+                             }
+                         }

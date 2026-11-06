@@ -70,6 +70,8 @@ else
   git -C "$R" submodule update -q --init vendor/qemu
   git -C "$R/vendor/qemu" fetch -q origin "$QEMU_REF" 2>/dev/null || true
   git -C "$R/vendor/qemu" checkout -q -f --detach "$QEMU_REF"
+  git -C "$R/vendor/qemu" am --abort >/dev/null 2>&1 || true
+  apply "$R/vendor/qemu" "$MACBOX_REPO/patches/qemu"
   SUFFIX=-macbox
 fi
 COMMIT=$(git -C "$R" rev-parse --short HEAD)

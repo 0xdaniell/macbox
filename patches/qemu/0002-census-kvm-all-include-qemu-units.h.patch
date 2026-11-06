@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:01:18 +0000
+Subject: [PATCH 2/9] census: kvm-all: include qemu/units.h
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/kvm-all.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 77952192cb..7a84a3e33b 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -20,6 +20,7 @@
+ #include <linux/kvm.h>
+ 
+ #include "qemu/atomic.h"
++#include "qemu/units.h"
+ #include "qemu/option.h"
+ #include "qemu/config-file.h"
+ #include "qemu/error-report.h"

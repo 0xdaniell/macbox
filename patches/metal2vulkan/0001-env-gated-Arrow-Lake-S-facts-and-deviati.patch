@@ -1,7 +1,7 @@
-From c7c4784cc0e261d58ddfb3f650f70401e8abc13b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 15:48:23 +0000
-Subject: [PATCH 1/5] env-gated Arrow Lake-S facts and
+Subject: [PATCH 01/34] env-gated Arrow Lake-S facts and
  deviations (M2V_ARL_FACTS)
 
 ---
@@ -16,13 +16,13 @@ index 26020bce..36e1d7a6 100644
  /// `intel-irisxe-rplp-anv`).
  pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
  
-+/// macbox: the `deviceID` of the Intel Graphics of Arrow Lake-S (Xe-LPG). Every fact and
++/// LOCAL (Atlas): the `deviceID` of the Intel Graphics of Arrow Lake-S (Xe-LPG). Every fact and
 +/// deviation any Intel row names applies to it only while `M2V_ARL_FACTS` names it
 +/// ([`arl_gate`]): a comma list of `DriverFact` and `DriverDeviation` names, or `all`. Unset,
 +/// it takes none, as a GPU no row names.
 +pub(crate) const INTEL_ARL_S: u32 = 0x7d67;
 +
-+/// macbox: the device-specific facts measured on Raptor Lake's ANV that Arrow Lake-S may
++/// LOCAL (Atlas): the device-specific facts measured on Raptor Lake's ANV that Arrow Lake-S may
 +/// take, each only as `M2V_ARL_FACTS` names it (the Intel rows of every vendor stay in `MEASURED`).
 +const ARL_FACTS: &[DriverFact] = &[
 +    DriverFact::RobustIndexFetchReadsZero,
@@ -39,7 +39,7 @@ index 26020bce..36e1d7a6 100644
 +    DriverFact::InterlockOrdersDraws,
 +];
 +
-+/// macbox: the deviations measured on Raptor Lake's ANV that Arrow Lake-S may take, each
++/// LOCAL (Atlas): the deviations measured on Raptor Lake's ANV that Arrow Lake-S may take, each
 +/// only as `M2V_ARL_FACTS` names it.
 +const ARL_DEVIATIONS: &[DriverDeviation] = &[
 +    DriverDeviation::MetalFloatDenormals,
@@ -48,13 +48,13 @@ index 26020bce..36e1d7a6 100644
 +    DriverDeviation::MetalDepth16Stores,
 +];
 +
-+/// macbox: whether `M2V_ARL_FACTS` names `name` (a `Debug` name) or `all`.
++/// LOCAL (Atlas): whether `M2V_ARL_FACTS` names `name` (a `Debug` name) or `all`.
 +pub(crate) fn arl_named(name: &str) -> bool {
 +    let Ok(list) = std::env::var("M2V_ARL_FACTS") else { return false };
 +    list.split(',').map(str::trim).any(|n| n == "all" || n == name)
 +}
 +
-+/// macbox: on Arrow Lake-S under ANV, `set` plus `extra`, kept only as `M2V_ARL_FACTS`
++/// LOCAL (Atlas): on Arrow Lake-S under ANV, `set` plus `extra`, kept only as `M2V_ARL_FACTS`
 +/// names each; elsewhere `set` as it is.
 +fn arl_gate<F: Copy + Ord + std::fmt::Debug>(
 +    description: &DeviceDescription,

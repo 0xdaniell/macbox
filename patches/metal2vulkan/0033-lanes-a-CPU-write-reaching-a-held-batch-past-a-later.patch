@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 4 Nov 2026 05:52:51 +0000
+Subject: [PATCH 33/34] lanes: a CPU write reaching a held batch past a later
+ command buffer of its queue (reproduces, ignored)
+
+Fails on f17fa833: no late copy in, (9,100) reads [0,0,255,0].
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime_lane/surface_coherent.rs      | 32 +++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index cfa9d696..ec44be05 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -2215,3 +2215,35 @@ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part_e
+         assert_eq!(case.read(9, 100), [1, 2, 3, 4], "the write, after the reader's draw");
+     });
+ }
++
++/// LOCAL (Atlas): found by lane B (`surface_inherit_a_held_batch_...`, inheritance off): a
++/// guest CPU write made while a held batch waits for its signal is lost where another command
++/// buffer of the same queue, over the surface, is committed after the write and before the
++/// signal.
++#[test]
++#[ignore = "fails on f17fa833: write lost, fix pending (lane A)"]
++fn surface_coherent_a_cpu_write_reaches_a_held_batch_past_a_later_command_buffer_of_its_queue() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        let late = shadow_coherent::fallback_counts().late_copies_in;
++        case.write(9, 100, [1, 2, 3, 4]);
++        let after = case.queue.command_buffer().unwrap();
++        case.pass(&after, GREEN, scissor(0, 7, 64, 1));
++        after.commit().unwrap();
++        hold.set_signaled_value(1);
++        wait_for_late_copy(late);
++        for command_buffer in [&waiting, &after] {
++            command_buffer.wait_until_completed_for(SOON).unwrap();
++        }
++        let lates = shadow_coherent::fallback_counts().late_copies_in - late;
++        eprintln!("HELD-PAST-LATER late copies in {lates}, (9,100) {:?}", case.read(9, 100));
++        assert_eq!(case.read(9, 100), [1, 2, 3, 0], "the guest's write, under the held blend");
++        assert_eq!(case.read(8, 7), GREEN_TEXEL);
++    });
++}
++

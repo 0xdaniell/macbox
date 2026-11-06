@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 23:16:10 +0000
+Subject: [PATCH 31/34] coherent: split plan_left_planned from plan_left; lanes
+ for a reader planned in part
+
+r2 counted plan_left 34 (= plan_copies_back): each late batch's copy back
+left a record of a command buffer with an unplanned batch. That is exact
+where none of it is planned (plan_left). Where it is planned in part, its
+planned writes land only at its completion, over the batch's write through
+another import unless the reader's work after its wait uses the surface
+(path 4 copies it in): counted plan_left_planned. Lane
+..._planned_in_part passes; ..._planned_in_part_elsewhere_after shows the
+gap and is ignored until records keep their areas by part.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/shadow_coherent.rs                    |  65 +++++++++---
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  58 ++++++----
+ .../src/runtime_lane/surface_coherent.rs      | 100 ++++++++++++++++++
+ 3 files changed, 185 insertions(+), 38 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 55497598..55a1cfd7 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -228,9 +228,13 @@ pub(crate) enum Fallback {
+     /// orders it before the batch, or no copy back may run without a wait, and it lands at its
+     /// completion as ever.
+     PlanLeft,
++    /// As `PlanLeft`, a record left whose command buffer the scheduler planned in part: its planned
++    /// writes may lie before the batch and land only at its completion, over what the batch wrote
++    /// of the bytes where they meet (lane `..._planned_in_part_elsewhere_after`). Not closed yet.
++    PlanLeftPlanned,
+ }
+ 
+-const FALLBACKS: usize = Fallback::PlanLeft as usize + 1;
++const FALLBACKS: usize = Fallback::PlanLeftPlanned as usize + 1;
+ static FALLBACK: [AtomicU64; FALLBACKS] = [const { AtomicU64::new(0) }; FALLBACKS];
+ /// The late copies in's compares of snapshot pages, every surface's ([`Coherent::taking_late`]):
+ /// how many, and their ns in all and at most. Under the scheduler's lock, so the VM's smoke check
+@@ -314,6 +318,8 @@ pub struct CoherentFallbackCounts {
+     pub plan_copies_back: u64,
+     /// Such batches that met what ran, held, or a surface with open snapshots: left.
+     pub plan_left: u64,
++    /// Of what such batches left, records whose command buffer was planned in part.
++    pub plan_left_planned: u64,
+ }
+ 
+ /// The counts of [`CoherentFallbackCounts`] so far.
+@@ -349,6 +355,7 @@ pub fn fallback_counts() -> CoherentFallbackCounts {
+         plan_syncs: read(Fallback::PlanSync),
+         plan_copies_back: read(Fallback::PlanCopyBack),
+         plan_left: read(Fallback::PlanLeft),
++        plan_left_planned: read(Fallback::PlanLeftPlanned),
+     }
+ }
+ 
+@@ -606,6 +613,17 @@ struct State {
+     owed: Vec<(u64, u64, u64)>,
+ }
+ 
++/// LOCAL (Atlas): what a batch planned after its commit takes of a trapping surface
++/// ([`Coherent::before_late_batch`]).
++#[derive(Default)]
++pub(crate) struct LateBatch {
++    /// A copy back to record at its start: its mark and the sequence it covers.
++    pub(crate) flush: Option<(u64, u64)>,
++    /// The areas of records it leaves whose command buffers the scheduler planned in part
++    /// (counted, [`Fallback::PlanLeftPlanned`]).
++    pub(crate) left_planned: Vec<[u32; 4]>,
++}
++
+ /// A surface's trap coherence, beside its [`Lazy`].
+ pub(crate) struct Coherent {
+     state: Mutex<State>,
+@@ -1526,10 +1544,11 @@ impl Coherent {
+     /// its completion). What runs held for an event is not ordered before the batch by Metal
+     /// either, and lands at its completion as ever; open snapshots ask a wait, which the
+     /// scheduler's lock cannot take: both left, counted.
+-    pub(crate) fn before_late_batch(&self, id: u64) -> Option<(u64, u64)> {
++    pub(crate) fn before_late_batch(&self, id: u64) -> LateBatch {
++        let mut late = LateBatch::default();
+         let mut state = self.lock();
+         if state.closed || !state.tracked {
+-            return None;
++            return late;
+         }
+         if !state.done.is_empty() {
+             count(Fallback::PlanSync);
+@@ -1538,11 +1557,11 @@ impl Coherent {
+         let flushed_to = state.flushed_to;
+         let others = |record: &&Record| record.id != id && record.seq > flushed_to;
+         if !state.running.iter().any(|record| others(&record)) {
+-            return None;
++            return late;
+         }
+         if !state.snapshots.is_empty() {
+             count(Fallback::PlanLeft);
+-            return None;
++            return late;
+         }
+         let held = (state.running.iter())
+             .filter(others)
+@@ -1551,17 +1570,32 @@ impl Coherent {
+             .min();
+         let mark = state.seq;
+         let through = held.map_or(mark, |seq| seq - 1);
+-        if through <= flushed_to {
+-            count(Fallback::PlanLeft);
+-            return None;
+-        }
++        // What it leaves: records from the first held one on. One whose command buffer the
++        // scheduler planned in part (or whole, past the held one) may hold writes Metal orders
++        // before the batch, which land only at its completion: the batch's own writes of the bytes
++        // must reach the image after it ([`LateBatch::left_planned`]). One with none of it planned
++        // holds none (`PlanLeft`).
+         if held.is_some() {
+-            count(Fallback::PlanLeft);
++            late.left_planned = (state.running.iter())
++                .filter(others)
++                .filter(|record| record.seq > through)
++                .filter(|record| {
++                    !super::shadow_lazy::unplanned(record.id)
++                        || super::shadow_lazy::parts_planned(record.id)
++                })
++                .map(|record| record.area)
++                .collect();
++            if late.left_planned.is_empty() {
++                count(Fallback::PlanLeft);
++            }
++        }
++        if through > flushed_to {
++            // In flight beside any copy back of `flushing`: `owed` keeps the surface busy meanwhile.
++            count(Fallback::PlanCopyBack);
++            state.owed.push((id, mark, through));
++            late.flush = Some((mark, through));
+         }
+-        // In flight beside any copy back of `flushing`: `owed` keeps the surface busy meanwhile.
+-        count(Fallback::PlanCopyBack);
+-        state.owed.push((id, mark, through));
+-        Some((mark, through))
++        late
+     }
+ 
+     /// LOCAL (Atlas): the copy back [`before_late_batch`](Self::before_late_batch) asked of the
+@@ -1946,7 +1980,7 @@ fn process_line(label: &str) -> String {
+          \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+          \"late_beside\":{},\"late_beside_unplanned\":{},\"late_beside_held\":{},\
+          \"late_beside_uncommitted\":{},\"plan_syncs\":{},\"plan_copies_back\":{},\
+-         \"plan_left\":{},\"flushes_held_back\":{},\
++         \"plan_left\":{},\"plan_left_planned\":{},\"flushes_held_back\":{},\
+          \"signals_behind_arm\":{},\"met_untracked\":{},\"flush_nothing_left\":{},\
+          \"host_reads\":{},\"host_reads_synced\":{},\"host_writes\":{},\"host_writes_opened\":{},\
+          \"demotions\":{},\"closed_by_overlap\":{},\"closed_by_marks\":{},\"retired_dead\":{},\
+@@ -1964,6 +1998,7 @@ fn process_line(label: &str) -> String {
+         c.plan_syncs,
+         c.plan_copies_back,
+         c.plan_left,
++        c.plan_left_planned,
+         c.flushes_held_back,
+         c.signals_behind_arm,
+         c.met_untracked,
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index fce5d182..47c4576b 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -264,6 +264,12 @@ pub(crate) fn ordered(id: u64, part: usize) -> Order {
+     }
+ }
+ 
++/// LOCAL (Atlas): whether the scheduler planned any part of the command buffer `id`, which has a
++/// batch it has not planned ([`planned_through`]).
++pub(crate) fn parts_planned(id: u64) -> bool {
++    (plans().lock().unwrap().through.get(&id)).is_some_and(|&through| through > 0)
++}
++
+ /// Whether the command buffer `id` was committed and has a batch the scheduler has not planned.
+ pub(crate) fn unplanned(id: u64) -> bool {
+     plans().lock().unwrap().unplanned.contains(&id)
+@@ -671,21 +677,20 @@ pub(crate) fn late_copy_in(
+     list
+ }
+ 
+-/// LOCAL (Atlas): the copies back a batch of the command buffer `id` planned after its commit (it
+-/// waited for an event), its parts' uses `uses`, takes first, of the trapping surfaces whose bytes
+-/// they meet ([`Coherent::before_late_batch`]): its commit's copy back ([`met_by`]) covered what
+-/// ran then, and what completed or went since lies before the batch too. Under the scheduler's
+-/// lock; nothing waits. With each, what it holds until it completes.
++/// LOCAL (Atlas): the copies a batch of the command buffer `id` planned after its commit (it waited
++/// for an event), its parts' uses `uses`, takes of the trapping surfaces whose bytes they meet
++/// ([`Coherent::before_late_batch`]): its commit's copy back ([`met_by`]) covered what ran then,
++/// and what completed or went since lies before the batch too: the copies back, with what each
++/// holds until it completes. Under the scheduler's lock; nothing waits.
+ pub(crate) fn before_late_batch<'a>(
+     id: u64,
+     uses: impl Fn() -> Vec<&'a Use<ResourceKey>>,
+ ) -> Vec<(ShadowCopy, Vec<Hold>)> {
++    let mut before = Vec::new();
+     if !ahead() {
+-        return Vec::new();
++        return before;
+     }
+     let uses = uses();
+-
+-    let mut copies = Vec::new();
+     for lazy in surfaces() {
+         let Some(coherent) = lazy.coherent() else {
+             continue;
+@@ -693,23 +698,30 @@ pub(crate) fn before_late_batch<'a>(
+         if lazy.own_thread() || !uses.iter().any(|used| lazy.meets(used)) {
+             continue;
+         }
+-        let Some((mark, _)) = coherent.before_late_batch(id) else {
+-            continue;
+-        };
++        let late = coherent.before_late_batch(id);
+         let left = (lazy.pending.lock().unwrap().as_ref())
+-            .and_then(|left| Some((left.settled?, left.copies.clone(), left.holds.clone())));
+-        let Some((area, held, holds)) = left else {
+-            count(Fallback::FlushNothingLeft);
+-            coherent.late_batch_failed(id, mark);
+-            continue;
+-        };
+-        let copy: ShadowCopy = copy_back_of(held, area);
+-        coherent.flush_recorded(copy.texels_back() * 4);
+-        FLUSHES.fetch_add(1, Ordering::Relaxed);
+-        FLUSHED_TEXELS.fetch_add(copy.texels_back(), Ordering::Relaxed);
+-        copies.push((copy, holds));
++            .map(|left| (left.settled, left.copies.clone(), left.holds.clone()));
++        if let Some((mark, _)) = late.flush {
++            match &left {
++                Some((Some(area), held, holds)) => {
++                    let copy: ShadowCopy = copy_back_of(held.clone(), *area);
++                    coherent.flush_recorded(copy.texels_back() * 4);
++                    FLUSHES.fetch_add(1, Ordering::Relaxed);
++                    FLUSHED_TEXELS.fetch_add(copy.texels_back(), Ordering::Relaxed);
++                    before.push((copy, holds.clone()));
++                }
++                _ => {
++                    count(Fallback::FlushNothingLeft);
++                    coherent.late_batch_failed(id, mark);
++                }
++            }
++        }
++        // A record it leaves holds planned writes that land only at its completion: counted.
++        if !late.left_planned.is_empty() {
++            count(Fallback::PlanLeftPlanned);
++        }
+     }
+-    copies
++    before
+ }
+ 
+ /// The copies back a command of the command buffer `id` needs before it, its uses `uses`: of what
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index f2faeb89..d9e35825 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -2113,3 +2113,103 @@ fn surface_coherent_a_late_batch_through_another_import_copies_back_what_runs_fi
+         assert!(!report.contains("\"sync_errors\":1"), "{report}");
+     });
+ }
++
++/// A reader's record left out of a late batch's copy back while its command buffer is planned in
++/// part (`shadow_coherent::Fallback::PlanLeftPlanned`): it draws over a row, signals the writer,
++/// then waits for a gate before more work. The writer, released by that signal, writes the row
++/// through another import: Metal orders the write after the draw, and the reader's later work
++/// (another row) after the gate leaves it.
++#[test]
++fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part() {
++    on_surface(true, |case| {
++        let other_buffer = case.other_import();
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let before = shadow_coherent::fallback_counts();
++        let first = case.device.new_shared_event().unwrap();
++        let gate = case.device.new_shared_event().unwrap();
++        let reader = case.queue.command_buffer().unwrap();
++        case.pass(&reader, GREEN, scissor(0, 100, 16, 1));
++        reader.encode_signal_event((&first).into(), 1).unwrap();
++        reader.encode_wait_for_event((&gate).into(), 1).unwrap();
++        case.pass(&reader, GREEN, scissor(0, 200, 16, 1));
++        reader.commit().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let writer = other.command_buffer().unwrap();
++        writer.encode_wait_for_event((&first).into(), 1).unwrap();
++        let bytes: Vec<u8> = (0..16).flat_map(|_| [1u8, 2, 3, 4]).collect();
++        let source = staged(case.device, &bytes);
++        let mut blit = writer.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&source, 0, &other_buffer, 100 * ROW, 64).unwrap();
++        blit.end_encoding().unwrap();
++        writer.commit().unwrap();
++        writer.wait_until_completed_for(SOON).unwrap();
++        gate.set_signaled_value(1);
++        reader.wait_until_completed_for(SOON).unwrap();
++        let after = shadow_coherent::fallback_counts();
++        eprintln!(
++            "PARTLY sync/back/left/left_planned={}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
++            after.plan_syncs - before.plan_syncs,
++            after.plan_copies_back - before.plan_copies_back,
++            after.plan_left - before.plan_left,
++            after.plan_left_planned - before.plan_left_planned,
++            after.late_copies_in_busy - before.late_copies_in_busy,
++            shadow_coherent::report("partly").contains("\"overwrite_risk\":0"),
++            case.read(9, 100),
++            case.read(9, 200),
++        );
++        assert_eq!(case.read(9, 100), [1, 2, 3, 4], "the write, after the reader's draw");
++        assert_eq!(case.read(9, 200), GREEN_TEXEL, "the reader's work after the gate");
++    });
++}
++
++/// As above, the reader's work after the gate leaving the surface: no copy in after its wait
++/// takes the write, and the record lands its draw over it at its completion. A known gap, counted
++/// `plan_left_planned`; closing it needs each record's area by part.
++#[test]
++#[ignore = "known gap: plan_left_planned (ADOPT.md, known limits)"]
++fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part_elsewhere_after() {
++    on_surface(true, |case| {
++        let other_buffer = case.other_import();
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let before = shadow_coherent::fallback_counts();
++        let first = case.device.new_shared_event().unwrap();
++        let gate = case.device.new_shared_event().unwrap();
++        let reader = case.queue.command_buffer().unwrap();
++        case.pass(&reader, GREEN, scissor(0, 100, 16, 1));
++        reader.encode_signal_event((&first).into(), 1).unwrap();
++        reader.encode_wait_for_event((&gate).into(), 1).unwrap();
++        // Its work after the gate leaves the surface: no copy in after the wait.
++        let (from, to) = (staged(case.device, &[7u8; 64]), staged(case.device, &[0u8; 64]));
++        let mut blit = reader.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&from, 0, &to, 0, 64).unwrap();
++        blit.end_encoding().unwrap();
++        reader.commit().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let writer = other.command_buffer().unwrap();
++        writer.encode_wait_for_event((&first).into(), 1).unwrap();
++        let bytes: Vec<u8> = (0..16).flat_map(|_| [1u8, 2, 3, 4]).collect();
++        let source = staged(case.device, &bytes);
++        let mut blit = writer.blit_command_encoder().unwrap();
++        blit.copy_from_buffer_to_buffer(&source, 0, &other_buffer, 100 * ROW, 64).unwrap();
++        blit.end_encoding().unwrap();
++        writer.commit().unwrap();
++        writer.wait_until_completed_for(SOON).unwrap();
++        gate.set_signaled_value(1);
++        reader.wait_until_completed_for(SOON).unwrap();
++        let after = shadow_coherent::fallback_counts();
++        eprintln!(
++            "PARTLY-ELSEWHERE sync/back/left/left_planned={}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
++            after.plan_syncs - before.plan_syncs,
++            after.plan_copies_back - before.plan_copies_back,
++            after.plan_left - before.plan_left,
++            after.plan_left_planned - before.plan_left_planned,
++            after.late_copies_in_busy - before.late_copies_in_busy,
++            shadow_coherent::report("partly").contains("\"overwrite_risk\":0"),
++            case.read(9, 100),
++            case.read(9, 200),
++        );
++        assert_eq!(case.read(9, 100), [1, 2, 3, 4], "the write, after the reader's draw");
++    });
++}

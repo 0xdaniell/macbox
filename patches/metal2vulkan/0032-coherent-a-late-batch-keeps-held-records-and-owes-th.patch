@@ -1,0 +1,507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 23:27:36 +0000
+Subject: [PATCH 32/34] coherent: a late batch keeps held records and owes them
+ the copy in of its writes
+
+A late batch's copy back now covers every running record. Records held for
+an event (a batch not planned) are kept (State::kept): they still land at
+their completion, and their command buffer owes its next batch a copy in of
+what other imports wrote since the late batch's first kept write
+(shadow_lazy::owed_copies_in, through path 4's beside_since/taking_beside),
+so the record's landing carries the write instead of covering it.
+
+Closes the gap of lane ..._planned_in_part_elsewhere_after (reader writes,
+signals, waits, then works off the surface; the writer's write was lost).
+plan_left now counts kept records (exact); plan_left_planned only writes the
+surface did not keep or open snapshots (gate 0); plan_owed_copies_in counts
+the copies in. Demotion does not close it: it lands running records at
+completion too.
+
+Lanes: 10 late/held lanes pass; surface+event 170 passed, 1 known failure
+(ycbcr_textures), as at base; runtime unit tests 73 passed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/submit.rs              |  46 ++++++
+ .../src/shadow_coherent.rs                    | 153 ++++++++++++------
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  71 +++++++-
+ .../src/runtime_lane/surface_coherent.rs      |  12 +-
+ 4 files changed, 226 insertions(+), 56 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index fe00c8ce..3b0831a6 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -464,6 +464,7 @@ impl CommandBufferShared {
+         if waited {
+             self.record_copies_back_before(&mut state, range.clone())?;
+         }
++        self.record_owed_copies_in(&mut state, range.clone())?;
+         self.record_late_copies_in(&mut state, range.clone())?;
+         // No work of an encoder that recorded nothing for a command (a buffer it named was
+         // detached), nor of one whose submission failed rebound or detached, goes to the queue.
+@@ -1276,6 +1277,51 @@ impl CommandBufferShared {
+         Ok(())
+     }
+ 
++    /// LOCAL (Atlas): the copies in a late batch's copy back left this command buffer owing
++    /// (`shadow_lazy::owed_copies_in`), at the start of batch `range`'s first part, as
++    /// [`record_late_copies_in`](Self::record_late_copies_in) records its own.
++    fn record_owed_copies_in(
++        &self,
++        state: &mut State,
++        range: std::ops::Range<usize>,
++    ) -> Result<(), CommandBufferError> {
++        if range.is_empty() || !crate::shadow_coherent::owes_copies_in() {
++            return Ok(());
++        }
++        let Some(id) = state.shadow_carry.as_ref().map(|carry| carry.id()) else {
++            return Ok(());
++        };
++        let copies = crate::shadow_lazy::owed_copies_in(id);
++        if copies.is_empty() {
++            return Ok(());
++        }
++        let device = &self.device;
++        let mut uses = Vec::new();
++        for copy in &copies {
++            uses.extend(copy.uses_with(None));
++        }
++        let mut aliased = Vec::new();
++        if device.shared().aliases.augment_into(&uses, &mut aliased) {
++            uses = aliased;
++        }
++        let raw = self.record_raw(state, |_, buffer| {
++            let vk = device.shared().vk();
++            // SAFETY: as `record_late_copies_in`'s.
++            unsafe {
++                for copy in &copies {
++                    copy.record(vk, buffer, None);
++                }
++                Barrier::everything().record(vk, buffer);
++            }
++            Ok(())
++        })?;
++        let first = &mut state.recorded[range.start];
++        first.raws.insert(0, raw);
++        first.summary.join(Summary::outside_encoders(uses));
++        state.retained.push(Box::new(copies));
++        Ok(())
++    }
++
+     fn record_late_copies_in(
+         &self,
+         state: &mut State,
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 55a1cfd7..91af0e1f 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -224,17 +224,27 @@ pub(crate) enum Fallback {
+     PlanSync,
+     /// Such a batch: a copy back of what runs, planned, recorded at the batch's start.
+     PlanCopyBack,
+-    /// Such a batch: what runs is held for an event, or the pages hold open snapshots: nothing
+-    /// orders it before the batch, or no copy back may run without a wait, and it lands at its
+-    /// completion as ever.
++    /// Such a batch: a record held for an event kept for its completion (its next batch copies in
++    /// what the batch wrote, [`PlanOwedCopyIn`](Self::PlanOwedCopyIn)), or open snapshots met by a
++    /// batch writing nothing of the bytes: exact.
+     PlanLeft,
+-    /// As `PlanLeft`, a record left whose command buffer the scheduler planned in part: its planned
+-    /// writes may lie before the batch and land only at its completion, over what the batch wrote
+-    /// of the bytes where they meet (lane `..._planned_in_part_elsewhere_after`). Not closed yet.
++    /// Such a batch writing the bytes through other imports in a way the surface did not keep, with
++    /// a record held, or with open snapshots (no copy back may meet those without a wait): a
++    /// record's landing may cover the write. The gate is 0.
+     PlanLeftPlanned,
++    /// A held record's next batch copied in other imports' writes since a late batch that kept it.
++    PlanOwedCopyIn,
+ }
+ 
+-const FALLBACKS: usize = Fallback::PlanLeftPlanned as usize + 1;
++const FALLBACKS: usize = Fallback::PlanOwedCopyIn as usize + 1;
++
++/// LOCAL (Atlas): entries of [`State::owed_in`] over every surface, one atomic read for a batch.
++static OWED_IN: AtomicU64 = AtomicU64::new(0);
++
++/// LOCAL (Atlas): whether any command buffer owes a copy in at its next batch.
++pub(crate) fn owes_copies_in() -> bool {
++    OWED_IN.load(Ordering::Relaxed) > 0
++}
+ static FALLBACK: [AtomicU64; FALLBACKS] = [const { AtomicU64::new(0) }; FALLBACKS];
+ /// The late copies in's compares of snapshot pages, every surface's ([`Coherent::taking_late`]):
+ /// how many, and their ns in all and at most. Under the scheduler's lock, so the VM's smoke check
+@@ -316,10 +326,12 @@ pub struct CoherentFallbackCounts {
+     pub plan_syncs: u64,
+     /// Such batches that carried a copy back of what ran, planned.
+     pub plan_copies_back: u64,
+-    /// Such batches that met what ran, held, or a surface with open snapshots: left.
++    /// Such batches that kept a held record (owed a copy in), or met open snapshots writing nothing.
+     pub plan_left: u64,
+-    /// Of what such batches left, records whose command buffer was planned in part.
++    /// Such batches whose writes may be covered by a record's landing (gate 0).
+     pub plan_left_planned: u64,
++    /// Held records' next batches that copied in what a late batch wrote.
++    pub plan_owed_copies_in: u64,
+ }
+ 
+ /// The counts of [`CoherentFallbackCounts`] so far.
+@@ -356,6 +368,7 @@ pub fn fallback_counts() -> CoherentFallbackCounts {
+         plan_copies_back: read(Fallback::PlanCopyBack),
+         plan_left: read(Fallback::PlanLeft),
+         plan_left_planned: read(Fallback::PlanLeftPlanned),
++        plan_owed_copies_in: read(Fallback::PlanOwedCopyIn),
+     }
+ }
+ 
+@@ -611,6 +624,13 @@ struct State {
+     /// LOCAL (Atlas): copies back recorded in a batch ([`Coherent::before_late_batch`]): the
+     /// command buffer, the mark and the sequence covered, for its completion.
+     owed: Vec<(u64, u64, u64)>,
++    /// LOCAL (Atlas): records of a sequence a copy back covered (`flushed_to` past them) that it
++    /// left, held for an event: they land at their completion still ([`Coherent::before_late_batch`]).
++    kept: Vec<u64>,
++    /// LOCAL (Atlas): the command buffers of those records, each with the [`Lazy`] write count
++    /// after which what other command buffers wrote through other imports goes into the image at
++    /// the start of its next batch (`shadow_lazy::owed_copies_in`).
++    owed_in: Vec<(u64, u64)>,
+ }
+ 
+ /// LOCAL (Atlas): what a batch planned after its commit takes of a trapping surface
+@@ -619,9 +639,18 @@ struct State {
+ pub(crate) struct LateBatch {
+     /// A copy back to record at its start: its mark and the sequence it covers.
+     pub(crate) flush: Option<(u64, u64)>,
+-    /// The areas of records it leaves whose command buffers the scheduler planned in part
+-    /// (counted, [`Fallback::PlanLeftPlanned`]).
+-    pub(crate) left_planned: Vec<[u32; 4]>,
++}
++
++/// LOCAL (Atlas): what a batch planned after its commit wrote of a trapping surface's bytes
++/// through other imports ([`Coherent::before_late_batch`]).
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Writes {
++    /// Nothing.
++    None,
++    /// Writes kept by the surface (`shadow_lazy`'s `Beside`), the first making this count.
++    Since(u64),
++    /// Writes it did not keep.
++    Unknown,
+ }
+ 
+ /// A surface's trap coherence, beside its [`Lazy`].
+@@ -857,7 +886,7 @@ impl Coherent {
+             }),
+         };
+         if let Some(record) = found {
+-            if record.seq > state.flushed_to {
++            if record.seq > state.flushed_to || state.kept.contains(&record.seq) {
+                 self.finish_record(&mut state, record);
+             }
+             self.moved.notify_all();
+@@ -931,6 +960,7 @@ impl Coherent {
+         };
+         let start = Instant::now();
+         let done = std::mem::take(&mut state.done);
++        state.kept.retain(|seq| !done.iter().any(|record| record.seq == *seq));
+         let mut list = Vec::new();
+         for record in &done {
+             let area = record.area;
+@@ -1380,7 +1410,12 @@ impl Coherent {
+         self.sync_done(&mut state, SyncBy::CopyIn);
+         let busy = (state.open.iter().chain(&state.running))
+             .filter(|record| left || record.id != id)
+-            .filter(|record| record.seq == 0 || record.seq > state.flushed_to || record.id == id)
++            .filter(|record| {
++                record.seq == 0
++                    || record.seq > state.flushed_to
++                    || state.kept.contains(&record.seq)
++                    || record.id == id
++            })
+             .any(|record| areas.iter().any(|area| meet(record.area, *area)));
+         if busy {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+@@ -1544,7 +1579,7 @@ impl Coherent {
+     /// its completion). What runs held for an event is not ordered before the batch by Metal
+     /// either, and lands at its completion as ever; open snapshots ask a wait, which the
+     /// scheduler's lock cannot take: both left, counted.
+-    pub(crate) fn before_late_batch(&self, id: u64) -> LateBatch {
++    pub(crate) fn before_late_batch(&self, id: u64, writes: Writes) -> LateBatch {
+         let mut late = LateBatch::default();
+         let mut state = self.lock();
+         if state.closed || !state.tracked {
+@@ -1555,49 +1590,70 @@ impl Coherent {
+             self.sync_done(&mut state, SyncBy::GpuReader);
+         }
+         let flushed_to = state.flushed_to;
+-        let others = |record: &&Record| record.id != id && record.seq > flushed_to;
++        let kept = state.kept.clone();
++        let others = |record: &&Record| {
++            record.id != id && (record.seq > flushed_to || kept.contains(&record.seq))
++        };
+         if !state.running.iter().any(|record| others(&record)) {
+             return late;
+         }
+         if !state.snapshots.is_empty() {
+-            count(Fallback::PlanLeft);
++            count(match writes {
++                Writes::None => Fallback::PlanLeft,
++                _ => Fallback::PlanLeftPlanned,
++            });
+             return late;
+         }
+-        let held = (state.running.iter())
++        // The copy covers every record running, ordered after what of each the scheduler planned.
++        // One held for an event (its command buffer has a batch not planned) is kept: it lands at
++        // its completion as ever, and as that lands its whole area after the batch's writes of
++        // the bytes, its next batch first copies in what other command buffers wrote through
++        // other imports since `since` (the batch's first kept write), as path 4 does
++        // (`shadow_lazy::owed_copies_in`); not known, it is counted and left.
++        let held: Vec<(u64, u64)> = (state.running.iter())
+             .filter(others)
+             .filter(|record| super::shadow_lazy::unplanned(record.id))
+-            .map(|record| record.seq)
+-            .min();
+-        let mark = state.seq;
+-        let through = held.map_or(mark, |seq| seq - 1);
+-        // What it leaves: records from the first held one on. One whose command buffer the
+-        // scheduler planned in part (or whole, past the held one) may hold writes Metal orders
+-        // before the batch, which land only at its completion: the batch's own writes of the bytes
+-        // must reach the image after it ([`LateBatch::left_planned`]). One with none of it planned
+-        // holds none (`PlanLeft`).
+-        if held.is_some() {
+-            late.left_planned = (state.running.iter())
+-                .filter(others)
+-                .filter(|record| record.seq > through)
+-                .filter(|record| {
+-                    !super::shadow_lazy::unplanned(record.id)
+-                        || super::shadow_lazy::parts_planned(record.id)
+-                })
+-                .map(|record| record.area)
+-                .collect();
+-            if late.left_planned.is_empty() {
+-                count(Fallback::PlanLeft);
+-            }
++            .map(|record| (record.id, record.seq))
++            .collect();
++        if !held.is_empty() {
++            count(match writes {
++                Writes::Unknown => Fallback::PlanLeftPlanned,
++                _ => Fallback::PlanLeft,
++            });
+         }
+-        if through > flushed_to {
+-            // In flight beside any copy back of `flushing`: `owed` keeps the surface busy meanwhile.
+-            count(Fallback::PlanCopyBack);
+-            state.owed.push((id, mark, through));
+-            late.flush = Some((mark, through));
++        for (record, seq) in &held {
++            if !state.kept.contains(seq) {
++                state.kept.push(*seq);
++            }
++            let Writes::Since(since) = writes else {
++                continue;
++            };
++            match state.owed_in.iter_mut().find(|owed| owed.0 == *record) {
++                Some(owed) => owed.1 = owed.1.min(since),
++                None => {
++                    state.owed_in.push((*record, since));
++                    OWED_IN.fetch_add(1, Ordering::Relaxed);
++                }
++            }
+         }
++        let mark = state.seq;
++        // In flight beside any copy back of `flushing`: `owed` keeps the surface busy meanwhile.
++        count(Fallback::PlanCopyBack);
++        state.owed.push((id, mark, mark));
++        late.flush = Some((mark, mark));
+         late
+     }
+ 
++    /// LOCAL (Atlas): the write count after which the next batch of the command buffer `id` copies
++    /// in other imports' writes ([`State::owed_in`]), taken.
++    pub(crate) fn take_owed_in(&self, id: u64) -> Option<u64> {
++        let mut state = self.lock();
++        let at = state.owed_in.iter().position(|owed| owed.0 == id)?;
++        let (_, since) = state.owed_in.swap_remove(at);
++        OWED_IN.fetch_sub(1, Ordering::Relaxed);
++        Some(since)
++    }
++
+     /// LOCAL (Atlas): the copy back [`before_late_batch`](Self::before_late_batch) asked of the
+     /// batch of the command buffer `id` was not recorded after all.
+     pub(crate) fn late_batch_failed(&self, id: u64, mark: u64) {
+@@ -1627,7 +1683,8 @@ impl Coherent {
+             state.flushing = 0;
+         }
+         state.flushed_to = state.flushed_to.max(through);
+-        let (gone, kept): (Vec<_>, Vec<_>) = state.done.iter().partition(|r| r.seq <= through);
++        let (gone, kept): (Vec<_>, Vec<_>) = (state.done.iter())
++            .partition(|r| r.seq <= through && !state.kept.contains(&r.seq));
+         state.done = kept;
+         if let Some(mark) = pages() {
+             let mut list: Vec<u64> =
+@@ -1980,7 +2037,8 @@ fn process_line(label: &str) -> String {
+          \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+          \"late_beside\":{},\"late_beside_unplanned\":{},\"late_beside_held\":{},\
+          \"late_beside_uncommitted\":{},\"plan_syncs\":{},\"plan_copies_back\":{},\
+-         \"plan_left\":{},\"plan_left_planned\":{},\"flushes_held_back\":{},\
++         \"plan_left\":{},\"plan_left_planned\":{},\
++         \"plan_owed_copies_in\":{},\"flushes_held_back\":{},\
+          \"signals_behind_arm\":{},\"met_untracked\":{},\"flush_nothing_left\":{},\
+          \"host_reads\":{},\"host_reads_synced\":{},\"host_writes\":{},\"host_writes_opened\":{},\
+          \"demotions\":{},\"closed_by_overlap\":{},\"closed_by_marks\":{},\"retired_dead\":{},\
+@@ -1999,6 +2057,7 @@ fn process_line(label: &str) -> String {
+         c.plan_copies_back,
+         c.plan_left,
+         c.plan_left_planned,
++        c.plan_owed_copies_in,
+         c.flushes_held_back,
+         c.signals_behind_arm,
+         c.met_untracked,
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 47c4576b..602ef013 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -698,7 +698,7 @@ pub(crate) fn before_late_batch<'a>(
+         if lazy.own_thread() || !uses.iter().any(|used| lazy.meets(used)) {
+             continue;
+         }
+-        let late = coherent.before_late_batch(id);
++        let late = coherent.before_late_batch(id, lazy.writes_of(id, &uses));
+         let left = (lazy.pending.lock().unwrap().as_ref())
+             .map(|left| (left.settled, left.copies.clone(), left.holds.clone()));
+         if let Some((mark, _)) = late.flush {
+@@ -716,12 +716,54 @@ pub(crate) fn before_late_batch<'a>(
+                 }
+             }
+         }
+-        // A record it leaves holds planned writes that land only at its completion: counted.
+-        if !late.left_planned.is_empty() {
++    }
++    before
++}
++
++/// LOCAL (Atlas): the copies in the batch of the command buffer `id` going now takes first, of
++/// each trapping surface a late batch's copy back kept a record of it for
++/// ([`Coherent::before_late_batch`]): what other command buffers wrote through other imports
++/// since, in parts the scheduler planned (path 4's `Lazy::beside_since`, `Coherent::taking_beside`).
++/// Its record's landing at completion then carries them. Under the scheduler's lock.
++pub(crate) fn owed_copies_in(id: u64) -> Vec<ShadowCopy> {
++    let mut list = Vec::new();
++    if !crate::shadow_coherent::owes_copies_in() {
++        return list;
++    }
++    for lazy in surfaces() {
++        let Some(coherent) = lazy.coherent() else {
++            continue;
++        };
++        let Some(since) = coherent.take_owed_in(id) else {
++            continue;
++        };
++        let held = (lazy.pending.lock().unwrap().as_ref()).map(|left| left.copies.clone());
++        let Some(Ok(copies)) = held.map(|held| held.downcast::<ShadowCopies>()) else {
+             count(Fallback::PlanLeftPlanned);
++            continue;
++        };
++        let beside = lazy.beside_since(since, id, coherent);
++        let areas = coherent.taking_beside(id, false, beside);
++        if areas.is_empty() {
++            continue;
++        }
++        count(Fallback::PlanOwedCopyIn);
++        let mut texels = 0;
++        for area in areas {
++            let copy = ShadowCopy {
++                copies: Arc::clone(&copies),
++                step: Step::Into,
++                kept: false,
++                area: Some(area),
++                cause: Some(CopyCause::Bounded),
++                moves: None,
++            };
++            texels += copy.texels_copied_in();
++            list.push(copy);
+         }
++        lazy.copied_in(CopyCause::Bounded, texels);
+     }
+-    before
++    list
+ }
+ 
+ /// The copies back a command of the command buffer `id` needs before it, its uses `uses`: of what
+@@ -1481,6 +1523,27 @@ impl Lazy {
+         true
+     }
+ 
++    /// LOCAL (Atlas): what the command buffer `id`, its uses `uses`, wrote of its bytes through
++    /// other imports, as [`Beside`] kept it.
++    fn writes_of(&self, id: u64, uses: &[&Use<ResourceKey>]) -> crate::shadow_coherent::Writes {
++        use crate::shadow_coherent::Writes;
++        if !uses.iter().any(|used| !used.write.is_empty() && self.meets(used)) {
++            return Writes::None;
++        }
++        let beside = self.beside.lock().unwrap();
++        match (beside.writes.iter()).filter(|write| write.id == id).map(|write| write.count).min() {
++            // A joined entry's count is its last write's: the one before it is past its first.
++            Some(count) => {
++                let before = (beside.writes.iter())
++                    .take_while(|write| write.count < count)
++                    .map(|write| write.count)
++                    .last();
++                Writes::Since(before.unwrap_or(beside.lost))
++            }
++            None => Writes::Unknown,
++        }
++    }
++
+     /// LOCAL (Atlas): the write that made `count` lies in its command buffer's parts before `end`.
+     fn beside_recorded(&self, count: u64, id: u64, end: usize) {
+         let mut beside = self.beside.lock().unwrap();
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index d9e35825..cfa9d696 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -2148,11 +2148,12 @@ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part()
+         reader.wait_until_completed_for(SOON).unwrap();
+         let after = shadow_coherent::fallback_counts();
+         eprintln!(
+-            "PARTLY sync/back/left/left_planned={}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
++            "PARTLY sync/back/left/left_planned/owed={}/{}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
+             after.plan_syncs - before.plan_syncs,
+             after.plan_copies_back - before.plan_copies_back,
+             after.plan_left - before.plan_left,
+             after.plan_left_planned - before.plan_left_planned,
++            after.plan_owed_copies_in - before.plan_owed_copies_in,
+             after.late_copies_in_busy - before.late_copies_in_busy,
+             shadow_coherent::report("partly").contains("\"overwrite_risk\":0"),
+             case.read(9, 100),
+@@ -2164,10 +2165,10 @@ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part()
+ }
+ 
+ /// As above, the reader's work after the gate leaving the surface: no copy in after its wait
+-/// takes the write, and the record lands its draw over it at its completion. A known gap, counted
+-/// `plan_left_planned`; closing it needs each record's area by part.
++/// takes the write, and the record would land its draw over it at its completion; the writer's
++/// late batch keeps the record and owes its next batch the copy in
++/// (`shadow_lazy::owed_copies_in`).
+ #[test]
+-#[ignore = "known gap: plan_left_planned (ADOPT.md, known limits)"]
+ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part_elsewhere_after() {
+     on_surface(true, |case| {
+         let other_buffer = case.other_import();
+@@ -2200,11 +2201,12 @@ fn surface_coherent_a_late_batch_keeps_its_write_past_a_reader_planned_in_part_e
+         reader.wait_until_completed_for(SOON).unwrap();
+         let after = shadow_coherent::fallback_counts();
+         eprintln!(
+-            "PARTLY-ELSEWHERE sync/back/left/left_planned={}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
++            "PARTLY-ELSEWHERE sync/back/left/left_planned/owed={}/{}/{}/{}/{} busy={} risk {} (9,100)={:?} (9,200)={:?}",
+             after.plan_syncs - before.plan_syncs,
+             after.plan_copies_back - before.plan_copies_back,
+             after.plan_left - before.plan_left,
+             after.plan_left_planned - before.plan_left_planned,
++            after.plan_owed_copies_in - before.plan_owed_copies_in,
+             after.late_copies_in_busy - before.late_copies_in_busy,
+             shadow_coherent::report("partly").contains("\"overwrite_risk\":0"),
+             case.read(9, 100),

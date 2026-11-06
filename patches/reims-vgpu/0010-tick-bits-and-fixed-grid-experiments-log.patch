@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 31 Oct 2026 22:01:09 +0000
+Subject: [PATCH 10/25] tick bits and fixed grid experiments,
+ log the guest's enabled bits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/display/guest_display/vblank.rs       | 56 ++++++++++++++++---
+ 1 file changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/vblank.rs b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+index df45dc39..ce8344a6 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/vblank.rs
+@@ -19,6 +19,10 @@
+ //! - **The period** is the host's modes' highest refresh rate, 24 to 240 Hz, else 60 Hz.
+ //!   `REIMS_VGPU_VBLANK_HZ`, 24 to 1000, replaces it and leaves the modes as they are, so the
+ //!   ticks can run faster than the rate the guest was told.
++//! - **Experiments:** `REIMS_VGPU_VBLANK_BITS` is the mask a tick raises, 2 (present) unless set;
++//!   a bit the guest has not enabled is not raised, except 2, as before. `REIMS_VGPU_VBLANK_GRID=1`
++//!   keeps the first schedule, so presents no longer move the ticks. Each change of the guest's
++//!   enabled bits seen by a tick is logged.
+ //! - **A late tick** (the thread was not run on time) raises once and goes on from the newest due
+ //!   point: no burst.
+ //!
+@@ -27,7 +31,7 @@
+ //! present> <guest's enabledInterrupts>`), and the first tick of the process logs the guest's
+ //! enabled interrupt bits, so a run shows whether the guest takes the bit at all.
+ 
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Arc, OnceLock, Weak};
+ use std::time::Duration;
+ 
+@@ -42,6 +46,11 @@ pub const ENV_VAR: &str = "REIMS_VGPU_VBLANK";
+ /// The variable: the ticks' rate in Hz, instead of the modes' (module doc).
+ pub const HZ_ENV_VAR: &str = "REIMS_VGPU_VBLANK_HZ";
+ 
++/// The variable: the interrupt bits a tick raises (module doc).
++pub const BITS_ENV_VAR: &str = "REIMS_VGPU_VBLANK_BITS";
++/// The variable: `1` keeps the ticks on a fixed grid (module doc).
++pub const GRID_ENV_VAR: &str = "REIMS_VGPU_VBLANK_GRID";
++
+ /// The refresh rate without a usable mode.
+ const DEFAULT_HZ: f64 = 60.0;
+ /// The lowest refresh rate taken from a mode.
+@@ -68,6 +77,26 @@ fn env_hz() -> Option<f64> {
+     })
+ }
+ 
++/// The bits a tick raises (read once).
++fn tick_bits() -> u32 {
++    static BITS: OnceLock<u32> = OnceLock::new();
++    *BITS.get_or_init(|| {
++        std::env::var(BITS_ENV_VAR)
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(INTERRUPT_PRESENT)
++    })
++}
++
++/// Whether presents leave the ticks' schedule alone (read once).
++fn fixed_grid() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os(GRID_ENV_VAR).is_some_and(|v| v == "1"))
++}
++
++/// The guest's enabled bits at the last tick, to log changes.
++static LAST_ENABLED: AtomicU32 = AtomicU32::new(u32::MAX);
++
+ /// Whether the first tick of the process was logged.
+ static FIRST_TICK_LOGGED: AtomicBool = AtomicBool::new(false);
+ 
+@@ -151,10 +180,12 @@ impl Vblank {
+     /// thread is to be started (the first present).
+     pub(crate) fn presented(&self, now_ns: u64) -> bool {
+         let mut s = self.state.lock();
+-        s.last_present = Some(now_ns);
+-        s.epoch = s.epoch.wrapping_add(1);
+-        s.ticks = 0;
+-        self.cv.notify_all();
++        if !fixed_grid() || s.last_present.is_none() {
++            s.last_present = Some(now_ns);
++            s.epoch = s.epoch.wrapping_add(1);
++            s.ticks = 0;
++            self.cv.notify_all();
++        }
+         let start = !s.started && !s.stopped;
+         s.started = true;
+         start
+@@ -296,11 +327,22 @@ impl<P: Platform> GuestDisplay<P> {
+             return;
+         }
+         let p = self.page(&l);
+-        p.fetch_or(sp::RAISED_INTERRUPTS, INTERRUPT_PRESENT);
+         let enabled = p.load(sp::ENABLED_INTERRUPTS);
+-        if enabled & INTERRUPT_PRESENT != 0 {
++        let bits = tick_bits();
++        let raise = bits & (enabled | INTERRUPT_PRESENT);
++        if raise != 0 {
++            p.fetch_or(sp::RAISED_INTERRUPTS, raise);
++        }
++        if enabled & raise != 0 {
+             self.poke();
+         }
++        if LAST_ENABLED.swap(enabled, Ordering::Relaxed) != enabled {
++            log::info!(
++                "guest display on port {}: the guest enables interrupts {enabled:#x}, tick {}",
++                self.port,
++                tick.k
++            );
++        }
+         let raised = vb.count();
+         drop(l);
+         // vblank: schedule points since the last present, the guest's enabled interrupt bits

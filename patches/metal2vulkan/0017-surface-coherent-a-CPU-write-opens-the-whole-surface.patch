@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 1 Nov 2026 06:33:18 +0000
+Subject: [PATCH 17/34] surface coherent: a CPU write opens the whole surface
+
+A write costs a probe of every tracked surface before its page is known. A CPU
+writer going down a surface paid that once a page: MercuryPosterExtension's
+alpha fill stopped at every page of the wallpaper. The first write now holds
+and snapshots every page and opens them all, so a writer stops once, and the
+copy in takes the whole surface. The ledger pays for it.
+
+Pages::probe is new: it is what names a write's page now that held pages are
+read-only, and arm alone cannot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/shadow_coherent.rs                    | 58 +++++++++++--------
+ .../src/runtime_lane/surface_coherent.rs      | 31 ++++++++--
+ 2 files changed, 60 insertions(+), 29 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 985ce191..f3468992 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -27,9 +27,10 @@
+ //! once it completes. Completed work is never lost: a batch's writes are visible to the host at
+ //! its completion (`tracker.rs`), and the record is dropped only after its copy.
+ //!
+-//! **A CPU write** never loses to a sync. The write stops before it lands, so the page's snapshot
+-//! is what the guest overwrote: a later sync over the open page keeps every texel that differs
+-//! from the snapshot ([`Coherent::merge`]). A GPU copy back over an open page cannot merge, so
++//! **A CPU write** never loses to a sync. The write stops before it lands, and opens the whole
++//! surface: a CPU writer covers it page by page, and each page would cost a probe of every surface.
++//! So each page's snapshot is what the guest overwrote: a later sync over the open pages keeps
++//! every texel that differs from it ([`Coherent::merge`]). A GPU copy back over an open page cannot merge, so
+ //! [`Coherent::before_flush`] waits for the records, a bounded time, and syncs on the CPU; past
+ //! the bound it counts `overwrite_risk`. Writing also demotes the surface to the shadow's own keep
+ //! and merge.
+@@ -121,8 +122,13 @@ pub trait Pages: Send + Sync {
+     /// Armed pages, and open ones with `open_too`, held; the pages a CPU may have reached as the
+     /// markers moved come back.
+     fn hold(&self, pages: &[u64], open_too: bool) -> Vec<u64>;
+-    /// A held page opened to the guest's write.
+-    fn open(&self, page: u64);
++    /// A write in flight, whose page the host has not been told, made to name it: held pages armed
++    /// and armed pages writable, so its rerun traps with its address. What [`arm`](Self::arm)
++    /// leaves cannot do that: a write to a read-only page fails before it reaches the marker.
++    /// Returns what `arm` returns.
++    fn probe(&self, pages: &[u64]) -> Vec<u64>;
++    /// Held pages opened to the guest's writes.
++    fn open(&self, pages: &[u64]);
+     /// Open pages poisoned, while a sync merges into them.
+     fn freeze(&self, pages: &[u64]);
+     /// Frozen pages open again.
+@@ -816,30 +822,32 @@ impl Coherent {
+             return;
+         }
+         self.counts.writes.fetch_add(1, Ordering::Relaxed);
+-        if let Some(area) = self.layout.area_of(page) {
+-            // A running write needs no wait: the merge at its completion keeps this one. A GPU
+-            // copy back already on its way cannot merge.
+-            let (settled, clear) = self.wait_settled(state, None);
+-            state = settled;
+-            self.sync_done(&mut state, SyncBy::Trap);
+-            if !clear {
+-                self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+-            }
+-            state.guest = Some(match state.guest {
+-                Some(guest) => bounding(Some(guest), Some(area)).unwrap_or(guest),
+-                None => area,
+-            });
++        // A running write needs no wait: the merge at its completion keeps this one. A GPU copy
++        // back already on its way cannot merge.
++        let (settled, clear) = self.wait_settled(state, None);
++        state = settled;
++        self.sync_done(&mut state, SyncBy::Trap);
++        if !clear {
++            self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
+         }
++        state.guest = Some(self.layout.whole());
+         state.wrote_at = Some(Instant::now());
+-        if !state.snapshots.contains_key(&page) {
+-            // SAFETY: the page lies in the surface's mapping; the guest's write stopped before it.
+-            let was = unsafe { std::slice::from_raw_parts(page as *const u8, PAGE as usize) };
+-            state.snapshots.insert(page, was.into());
++        let start = Instant::now();
++        let every = self.all_pages();
++        if let Some(mark) = &mark {
++            mark.hold(&every, false);
++        }
++        for page in &every {
++            if !state.snapshots.contains_key(page) {
++                // SAFETY: the page lies in the surface's mapping; held, no guest write reaches it.
++                let was = unsafe { std::slice::from_raw_parts(*page as *const u8, PAGE as usize) };
++                state.snapshots.insert(*page, was.into());
++            }
+         }
+         if let Some(mark) = &mark {
+-            mark.hold(&[page], false);
+-            mark.open(page);
++            mark.open(&every);
+         }
++        self.charge(&mut state, start.elapsed().as_nanos() as u64);
+     }
+ 
+     /// An encoder is about to use the image: where the guest wrote is stale in it, and comes back
+@@ -960,7 +968,7 @@ impl Coherent {
+         state.probed_at = Some(Instant::now());
+         self.counts.probes.fetch_add(1, Ordering::Relaxed);
+         if let Some(mark) = pages() {
+-            let refused = mark.arm(&self.all_pages());
++            let refused = mark.probe(&self.all_pages());
+             self.note_came(&mut state, refused);
+         }
+     }
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 143ca0a8..871c9ef6 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -90,10 +90,16 @@ impl Pages for Fake {
+         std::mem::take(&mut *self.came.lock().unwrap())
+     }
+ 
+-    fn open(&self, page: u64) {
++    fn probe(&self, list: &[u64]) -> Vec<u64> {
++        self.arm(list)
++    }
++
++    fn open(&self, list: &[u64]) {
+         let mut pages = self.pages.lock().unwrap();
+-        if pages.get(&page) == Some(&Mark::Held) {
+-            pages.insert(page, Mark::Open);
++        for page in list {
++            if pages.get(page) == Some(&Mark::Held) {
++                pages.insert(*page, Mark::Open);
++            }
+         }
+     }
+ 
+@@ -422,11 +428,28 @@ fn surface_coherent_cpu_write_then_gpu_read() {
+         // A later write opens it again.
+         case.write(7, 7, [5, 6, 7, 8]);
+         assert_eq!(case.through_image(7, 7), [5, 6, 7, 0]);
+-        // Its rectangle alone: the first use's and the pages' own rows.
+         assert_eq!(case.count("copy_ins"), 3);
+     });
+ }
+ 
++/// A CPU writer down the whole surface stops once: a probe per page would stall it for a surface
++/// this size, and on a real guest every probe walks every tracked surface.
++#[test]
++fn surface_coherent_a_cpu_writer_stops_once() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        case.read(0, 0);
++        case.draw(GREEN, None);
++        for y in 0..HEIGHT {
++            case.write(1, y, [1, 2, 3, 4]);
++        }
++        assert_eq!(case.count("writes"), 1);
++        assert_eq!(case.through_image(1, 0), [1, 2, 3, 0], "the image took the writes");
++        assert_eq!(case.through_image(1, HEIGHT - 1), [1, 2, 3, 0]);
++        assert_eq!(case.through_image(0, HEIGHT - 1), [0, 255, 0, 0], "and what the GPU made holds");
++    });
++}
++
+ #[test]
+ fn surface_coherent_gpu_write_then_cpu_read_then_gpu_again() {
+     on_surface(true, |case| {

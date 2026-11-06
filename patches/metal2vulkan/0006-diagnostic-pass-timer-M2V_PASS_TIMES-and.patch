@@ -1,0 +1,3090 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 16:50:52 +0000
+Subject: [PATCH 06/34] diagnostic:pass timer (M2V_PASS_TIMES)
+ and image census (M2V_IMAGE_LOG)
+
+Two default-off diagnostics in metal2vulkan-runtime, to find where a macOS
+guest's GPU time goes on the Arrow Lake iGPU (Mesa's INTEL_MEASURE crashes
+with this runtime). Each switch is read once; unset, nothing changes: no
+query pool, no command, no line. Self-contained: two new modules
+(pass_times.rs, image_log.rs) and small hooks, each marked
+"LOCAL (Atlas) diagnostic", so the commit can be dropped.
+
+M2V_PASS_TIMES=<dir>: a command buffer begun while <dir>/on exists (checked
+once, as it begins recording) gets vkCmdWriteTimestamp(ALL_COMMANDS) pairs
+around each unit of GPU work, cut at the recorder's routed entry points so
+every recording site is covered: each render pass instance (each instance
+of a split pass), each run of dispatches, each run of transfers. Queries
+come from the diagnostic's own pools, reset on the host. As the command
+buffer completes (completion turn, after its GPU times) one CSV line per
+unit goes to <dir>/passes-<pid>.csv:
+host_ns,cb_seq,unit_seq,kind,cb_label,encoder_label,attachments,split,draws,gpu_ns
+with the kind (render-pass, guest-<encoder>, pass:/internal:<site>), the
+queue's label, the encoder's kind and place, each attachment (role, format,
+extent, samples, load/store, memoryless, image purpose), the split (i/n,
+cause, inline or secondary, why not inline) and the draws/dispatches.
+
+M2V_IMAGE_LOG=<file>: one CSV line per vkCreateImage (purpose, format,
+extent, mips, layers, samples, tiling, DRM modifier, usage, create flags,
+format list, external handle types, chained structures, memory
+requirements), per vkBindImageMemory (the memory's kind: own, host-pages,
+dma-buf, dedicated) and per vkDestroyImage: the fields Mesa ANV's CCS
+rules read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/buffer_texture.rs                     |    4 +
+ .../src/command_buffer/completion.rs          |    2 +
+ .../src/command_buffer/mod.rs                 |   66 +-
+ crates/metal2vulkan-runtime/src/creation.rs   |   63 +-
+ .../src/device/functions.rs                   |  179 +++
+ crates/metal2vulkan-runtime/src/device/mod.rs |    8 +
+ crates/metal2vulkan-runtime/src/encoder.rs    |   10 +
+ crates/metal2vulkan-runtime/src/image_log.rs  |  925 +++++++++++++
+ crates/metal2vulkan-runtime/src/lib.rs        |    4 +
+ crates/metal2vulkan-runtime/src/pass_times.rs | 1194 +++++++++++++++++
+ .../src/pending_dispatch.rs                   |    2 +
+ .../src/recorder/thunks.rs                    |   20 +-
+ crates/metal2vulkan-runtime/src/release.rs    |    2 +
+ crates/metal2vulkan-runtime/src/render.rs     |    7 +
+ .../src/render/inline_first.rs                |   23 +
+ .../src/render/inline_splits.rs               |    5 +
+ .../src/render/pass_steps.rs                  |   11 +
+ crates/metal2vulkan-runtime/src/texture.rs    |   27 +
+ 18 files changed, 2535 insertions(+), 17 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/image_log.rs
+ create mode 100644 crates/metal2vulkan-runtime/src/pass_times.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index b062a79b..45801900 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -296,6 +296,8 @@ impl Buffer {
+         offset: u64,
+         bytes_per_row: u64,
+     ) -> Result<Texture, Error> {
++        // LOCAL (Atlas) diagnostic: the image census's purpose (`image_log.rs`).
++        let _purpose = crate::image_log::api("buffer-texture");
+         self.texture_over(
+             "new_texture",
+             descriptor,
+@@ -434,6 +436,8 @@ impl Buffer {
+         descriptor: &TextureDescriptor,
+         plane: IoSurfacePlane,
+     ) -> Result<Texture, Error> {
++        // LOCAL (Atlas) diagnostic: the image census's purpose (`image_log.rs`).
++        let _purpose = crate::image_log::api("iosurface-plane");
+         if plane.client_direction.is_some() {
+             return Err(Error::AppleOnly(AppleOnly::SurfaceClientDirection));
+         }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index 635861b6..cc2497bb 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -453,6 +453,8 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+         for buffer in &ending {
+             buffer.read_stamps();
+             buffer.place_gpu_times();
++            // LOCAL (Atlas) diagnostic: the pass timer's units (`pass_times.rs`).
++            buffer.read_pass_times();
+         }
+     }
+     drop(device);
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index ac0260ac..b08a9994 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -746,6 +746,8 @@ pub(super) struct State {
+     /// The device's trail mark as it completed (`trails.rs`): its waiters return once no trail
+     /// numbered below is open. 0 before, which waits for none.
+     trail_mark: u64,
++    /// LOCAL (Atlas) diagnostic: its pass timer's capture (`pass_times.rs`).
++    pub(super) pass_times: crate::pass_times::CbSlot,
+ }
+ 
+ /// A batch whose end went into its last `VkCommandBuffer` ([`State::folds`]).
+@@ -1855,6 +1857,8 @@ impl CommandBuffer {
+                 replaying_predication: None,
+                 predicated: false,
+                 trail_mark: 0,
++                // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++                pass_times: Default::default(),
+             }),
+             changed: Condvar::new(),
+             gate: Arc::default(),
+@@ -1950,6 +1954,11 @@ impl CommandBuffer {
+         self.state().uploads.bytes()
+     }
+ 
++    /// LOCAL (Atlas) diagnostic: the key the pass timer finds its capture by (`pass_times.rs`).
++    pub(crate) fn pass_times_key(&self) -> usize {
++        self.0.address()
++    }
++
+     /// Whether `waiting` holds this command buffer.
+     pub(crate) fn is(&self, waiting: &dyn Waiting) -> bool {
+         self.0.address() == waiting.address()
+@@ -3707,12 +3716,48 @@ impl CommandBufferShared {
+         level: vk::CommandBufferLevel,
+     ) -> Result<vk::CommandBuffer, Error> {
+         if let Some(pool) = &state.rerun_pool {
+-            return hand_out(&self.device, &mut lock(pool), level);
+-        }
+-        match self.deferred(state, level)? {
+-            Some(raw) => Ok(raw),
+-            None => self.allocate(state, level),
+-        }
++            let raw = hand_out(&self.device, &mut lock(pool), level)?;
++            // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++            self.pass_times_handed_out(state, raw);
++            return Ok(raw);
++        }
++        let raw = match self.deferred(state, level)? {
++            Some(raw) => raw,
++            None => self.allocate(state, level)?,
++        };
++        // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++        self.pass_times_handed_out(state, raw);
++        Ok(raw)
++    }
++
++    /// LOCAL (Atlas) diagnostic: `raw`, handed out, goes to the pass timer's capture of this
++    /// command buffer, decided as it is first asked (`pass_times.rs`).
++    fn pass_times_handed_out(&self, state: &mut State, raw: vk::CommandBuffer) {
++        let key = self.address();
++        crate::pass_times::handed_out(&self.device, &self.queue, key, &mut state.pass_times, raw);
++    }
++
++    /// LOCAL (Atlas) diagnostic: read the pass timer's units, now that its work completed and its
++    /// GPU times were placed: in the completion turn, inside its section (`pass_times.rs`).
++    pub(super) fn read_pass_times(&self) {
++        let mut state = lock(&self.state);
++        let Some(capture) = state.pass_times.take() else {
++            return;
++        };
++        let start = match (state.times.stamped, state.times.gpu) {
++            (Stamped::Read(Some((ticks, _))), Some((host, _))) => Some((ticks, host)),
++            _ => None,
++        };
++        let pair = state.times.pair.map(|reading| reading.pair);
++        let completed = state.times.completed;
++        drop(state);
++        let placement = crate::pass_times::Placement {
++            clock: self.device.shared().timing.clock(),
++            pair,
++            start,
++            completed,
++        };
++        crate::pass_times::read(capture, placement);
+     }
+ 
+     /// A deferred command buffer of `level` of its replays, where the device records them so and
+@@ -3748,16 +3793,23 @@ impl CommandBufferShared {
+         state: &mut State,
+         level: vk::CommandBufferLevel,
+     ) -> Result<vk::CommandBuffer, Error> {
+-        hand_out(&self.device, self.pool(state)?, level)
++        let raw = hand_out(&self.device, self.pool(state)?, level)?;
++        // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++        self.pass_times_handed_out(state, raw);
++        Ok(raw)
+     }
+ 
+     /// [`CommandBuffer::encoder_primary`]: a deferred one where the device records them so, to
+     /// begin, whose replay takes the primary its replays' pool holds begun ahead (`recorder`).
+     fn encoder_primary(&self, state: &mut State) -> Result<(vk::CommandBuffer, bool), Error> {
+         if let Some(raw) = self.deferred(state, vk::CommandBufferLevel::PRIMARY)? {
++            // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++            self.pass_times_handed_out(state, raw);
+             return Ok((raw, false));
+         }
+         if let Some(buffer) = self.pool(state)?.take_begun() {
++            // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++            self.pass_times_handed_out(state, buffer);
+             return Ok((buffer, true));
+         }
+         Ok((self.allocate_raw(state)?, false))
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+index 1d760a06..b4eac3f0 100644
+--- a/crates/metal2vulkan-runtime/src/creation.rs
++++ b/crates/metal2vulkan-runtime/src/creation.rs
+@@ -38,7 +38,13 @@ pub(crate) unsafe fn image(
+ ) -> Result<vk::Image, Error> {
+     vk_made(VkMaking::Image, Location::caller());
+     // SAFETY: the caller's.
+-    unsafe { device.create_image(info, None) }.map_err(vulkan)
++    let made = unsafe { device.create_image(info, None) }.map_err(vulkan);
++    // LOCAL (Atlas) diagnostic: the image census (`image_log.rs`).
++    if let Ok(image) = made {
++        // SAFETY: the caller's; `image` was just made by `device`.
++        unsafe { crate::image_log::image_made(device, info, image, Location::caller()) };
++    }
++    made
+ }
+ 
+ /// A `VkImage` of `info`, made by `device`, or the driver's refusal of it: an image whose making
+@@ -57,7 +63,12 @@ pub(crate) unsafe fn image_or_refusal(
+     vk_made(VkMaking::Image, Location::caller());
+     // SAFETY: the caller's.
+     match unsafe { device.create_image(info, None) } {
+-        Ok(raw) => Ok(Ok(raw)),
++        Ok(raw) => {
++            // LOCAL (Atlas) diagnostic: the image census (`image_log.rs`).
++            // SAFETY: the caller's; `raw` was just made by `device`.
++            unsafe { crate::image_log::image_made(device, info, raw, Location::caller()) };
++            Ok(Ok(raw))
++        }
+         Err(vk::Result::ERROR_DEVICE_LOST) => Err(Error::DeviceLost),
+         Err(refusal) => Ok(Err(refusal)),
+     }
+@@ -92,7 +103,12 @@ pub(crate) unsafe fn image_view(
+ ) -> VkResult<vk::ImageView> {
+     vk_made(VkMaking::ImageView, Location::caller());
+     // SAFETY: the caller's.
+-    unsafe { device.create_image_view(info, None) }
++    let made = unsafe { device.create_image_view(info, None) };
++    // LOCAL (Atlas) diagnostic: the object registry (`image_log.rs`).
++    if let Ok(view) = made {
++        crate::image_log::view_made(info, view);
++    }
++    made
+ }
+ 
+ /// `VkDeviceMemory` of `info`, allocated by `device`: one call of `vkAllocateMemory`, counted
+@@ -110,7 +126,13 @@ pub(crate) unsafe fn allocate_memory(
+ ) -> VkResult<vk::DeviceMemory> {
+     vk_made(VkMaking::Memory, Location::caller());
+     // SAFETY: the caller's.
+-    unsafe { device.allocate_memory(info, None) }
++    let made = unsafe { device.allocate_memory(info, None) };
++    // LOCAL (Atlas) diagnostic: the image census's memory kinds (`image_log.rs`).
++    if let Ok(memory) = made {
++        // SAFETY: the caller's: `info` and its chain are valid.
++        unsafe { crate::image_log::memory_made(info, memory) };
++    }
++    made
+ }
+ 
+ /// `image` bound to `memory` at `offset`.
+@@ -128,7 +150,12 @@ pub(crate) unsafe fn bind_image(
+ ) -> VkResult<()> {
+     vk_made(VkMaking::ImageBinding, Location::caller());
+     // SAFETY: the caller's.
+-    unsafe { device.bind_image_memory(image, memory, offset) }
++    let bound = unsafe { device.bind_image_memory(image, memory, offset) };
++    // LOCAL (Atlas) diagnostic: the image census (`image_log.rs`).
++    if bound.is_ok() {
++        crate::image_log::image_bound(image, memory, offset);
++    }
++    bound
+ }
+ 
+ /// `buffer` bound to `memory` at `offset`.
+@@ -154,12 +181,19 @@ pub(crate) unsafe fn bind_buffer(
+ /// # Safety
+ ///
+ /// As `vkCreateRenderPass`'s: `device` is live, and `info` and its chain are valid for it.
++#[track_caller]
+ pub(crate) unsafe fn render_pass(
+     device: &ash::Device,
+     info: &vk::RenderPassCreateInfo<'_>,
+ ) -> Result<vk::RenderPass, Error> {
+     // SAFETY: the caller's.
+-    unsafe { device.create_render_pass(info, None) }.map_err(vulkan)
++    let made = unsafe { device.create_render_pass(info, None) }.map_err(vulkan);
++    // LOCAL (Atlas) diagnostic: the object registry (`image_log.rs`).
++    if let Ok(pass) = made {
++        // SAFETY: the caller's: `info` is valid.
++        unsafe { crate::image_log::render_pass_made(info, pass, Location::caller()) };
++    }
++    made
+ }
+ 
+ /// A `VkRenderPass` of `info` (`vkCreateRenderPass2`), made by `device`.
+@@ -168,12 +202,19 @@ pub(crate) unsafe fn render_pass(
+ ///
+ /// As `vkCreateRenderPass2`'s: `device` is live and of Vulkan 1.2 or later, and `info` and its
+ /// chain are valid for it.
++#[track_caller]
+ pub(crate) unsafe fn render_pass2(
+     device: &ash::Device,
+     info: &vk::RenderPassCreateInfo2<'_>,
+ ) -> Result<vk::RenderPass, Error> {
+     // SAFETY: the caller's.
+-    unsafe { device.create_render_pass2(info, None) }.map_err(vulkan)
++    let made = unsafe { device.create_render_pass2(info, None) }.map_err(vulkan);
++    // LOCAL (Atlas) diagnostic: the object registry (`image_log.rs`).
++    if let Ok(pass) = made {
++        // SAFETY: the caller's: `info` and its chain are valid.
++        unsafe { crate::image_log::render_pass2_made(info, pass, Location::caller()) };
++    }
++    made
+ }
+ 
+ /// A `VkFramebuffer` of `info`, made by `device`.
+@@ -186,5 +227,11 @@ pub(crate) unsafe fn framebuffer(
+     info: &vk::FramebufferCreateInfo<'_>,
+ ) -> Result<vk::Framebuffer, Error> {
+     // SAFETY: the caller's.
+-    unsafe { device.create_framebuffer(info, None) }.map_err(vulkan)
++    let made = unsafe { device.create_framebuffer(info, None) }.map_err(vulkan);
++    // LOCAL (Atlas) diagnostic: the object registry (`image_log.rs`).
++    if let Ok(framebuffer) = made {
++        // SAFETY: the caller's: `info` is valid.
++        unsafe { crate::image_log::framebuffer_made(info, framebuffer) };
++    }
++    made
+ }
+diff --git a/crates/metal2vulkan-runtime/src/device/functions.rs b/crates/metal2vulkan-runtime/src/device/functions.rs
+index be874eac..72ef34e8 100644
+--- a/crates/metal2vulkan-runtime/src/device/functions.rs
++++ b/crates/metal2vulkan-runtime/src/device/functions.rs
+@@ -147,6 +147,8 @@ impl Vk {
+         regions: &[vk::BufferCopy],
+     ) {
+         (self.copies).count("vkCmdCopyBuffer", Location::caller(), regions.len());
++        // LOCAL (Atlas) diagnostic: the caller's place, for the pass timer (`pass_times.rs`).
++        crate::pass_times::site(Location::caller());
+         let splits = regions
+             .iter()
+             .filter(|region| split(region).is_some())
+@@ -194,6 +196,8 @@ impl Vk {
+         regions: &[vk::BufferImageCopy],
+     ) {
+         (self.copies).count("vkCmdCopyBufferToImage", Location::caller(), regions.len());
++        // LOCAL (Atlas) diagnostic: the caller's place, for the pass timer (`pass_times.rs`).
++        crate::pass_times::site(Location::caller());
+         // SAFETY: the caller's contract.
+         unsafe {
+             (self.device).cmd_copy_buffer_to_image(command_buffer, src, dst, layout, regions);
+@@ -216,6 +220,8 @@ impl Vk {
+         regions: &[vk::BufferImageCopy],
+     ) {
+         (self.copies).count("vkCmdCopyImageToBuffer", Location::caller(), regions.len());
++        // LOCAL (Atlas) diagnostic: the caller's place, for the pass timer (`pass_times.rs`).
++        crate::pass_times::site(Location::caller());
+         // SAFETY: the caller's contract.
+         unsafe {
+             (self.device).cmd_copy_image_to_buffer(command_buffer, src, layout, dst, regions);
+@@ -238,6 +244,8 @@ impl Vk {
+         regions: &[vk::ImageCopy],
+     ) {
+         (self.copies).count("vkCmdCopyImage", Location::caller(), regions.len());
++        // LOCAL (Atlas) diagnostic: the caller's place, for the pass timer (`pass_times.rs`).
++        crate::pass_times::site(Location::caller());
+         // SAFETY: the caller's contract.
+         unsafe {
+             (self.device).cmd_copy_image(command_buffer, src, src_layout, dst, dst_layout, regions);
+@@ -245,6 +253,177 @@ impl Vk {
+     }
+ }
+ 
++/// LOCAL (Atlas) diagnostic: the commands the pass timer labels a unit of work by, each noting its
++/// caller's place for the command's entry point to take (`pass_times.rs`), then `ash`'s. A caller
++/// holding the `ash::Device` itself records through `ash`'s, unnoted.
++impl Vk {
++    /// `vkCmdDispatch`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_dispatch`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_dispatch(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        x: u32,
++        y: u32,
++        z: u32,
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_dispatch(command_buffer, x, y, z) }
++    }
++
++    /// `vkCmdDispatchIndirect`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_dispatch_indirect`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_dispatch_indirect(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        buffer: vk::Buffer,
++        offset: vk::DeviceSize,
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_dispatch_indirect(command_buffer, buffer, offset) }
++    }
++
++    /// `vkCmdFillBuffer`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_fill_buffer`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_fill_buffer(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        buffer: vk::Buffer,
++        offset: vk::DeviceSize,
++        size: vk::DeviceSize,
++        data: u32,
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_fill_buffer(command_buffer, buffer, offset, size, data) }
++    }
++
++    /// `vkCmdUpdateBuffer`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_update_buffer`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_update_buffer(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        buffer: vk::Buffer,
++        offset: vk::DeviceSize,
++        data: &[u8],
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_update_buffer(command_buffer, buffer, offset, data) }
++    }
++
++    /// `vkCmdClearColorImage`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_clear_color_image`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_clear_color_image(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        image: vk::Image,
++        layout: vk::ImageLayout,
++        color: &vk::ClearColorValue,
++        ranges: &[vk::ImageSubresourceRange],
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_clear_color_image(command_buffer, image, layout, color, ranges) }
++    }
++
++    /// `vkCmdClearDepthStencilImage`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_clear_depth_stencil_image`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_clear_depth_stencil_image(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        image: vk::Image,
++        layout: vk::ImageLayout,
++        value: &vk::ClearDepthStencilValue,
++        ranges: &[vk::ImageSubresourceRange],
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe {
++            (self.device).cmd_clear_depth_stencil_image(
++                command_buffer,
++                image,
++                layout,
++                value,
++                ranges,
++            )
++        }
++    }
++
++    /// `vkCmdBlitImage`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_blit_image`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_blit_image(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        src: vk::Image,
++        src_layout: vk::ImageLayout,
++        dst: vk::Image,
++        dst_layout: vk::ImageLayout,
++        regions: &[vk::ImageBlit],
++        filter: vk::Filter,
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe {
++            (self.device).cmd_blit_image(
++                command_buffer,
++                src,
++                src_layout,
++                dst,
++                dst_layout,
++                regions,
++                filter,
++            )
++        }
++    }
++
++    /// `vkCmdBeginRenderPass`, its caller's place noted.
++    ///
++    /// # Safety
++    ///
++    /// As `ash::Device::cmd_begin_render_pass`'s.
++    #[track_caller]
++    pub(crate) unsafe fn cmd_begin_render_pass(
++        &self,
++        command_buffer: vk::CommandBuffer,
++        begin: &vk::RenderPassBeginInfo<'_>,
++        contents: vk::SubpassContents,
++    ) {
++        crate::pass_times::site(Location::caller());
++        // SAFETY: the caller's.
++        unsafe { (self.device).cmd_begin_render_pass(command_buffer, begin, contents) }
++    }
++}
++
+ impl Deref for Vk {
+     type Target = ash::Device;
+ 
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 70a18c56..acc27e6b 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -451,6 +451,8 @@ pub(super) struct DeviceShared {
+     pub(super) residency: super::host_residency::Sweeper,
+     /// How its command buffers are timed on the GPU (`gpu_time.rs`).
+     pub(super) timing: Timing,
++    /// LOCAL (Atlas) diagnostic: the pass timer, where `M2V_PASS_TIMES` is set (`pass_times.rs`).
++    pub(super) pass_times: Option<Arc<crate::pass_times::DeviceTimes>>,
+     /// Its Vulkan views may present an image in another component layout: it has no portability
+     /// subset, or the subset's `imageViewFormatReinterpretation` is enabled, by the runtime on a
+     /// device it made or, on an adopted one, by the consumer, who says so
+@@ -741,6 +743,10 @@ impl Drop for DeviceShared {
+             // Nor a timestamp slot: each command buffer gave its slot back as it finished, or
+             // with its state.
+             self.timing.release(self.vk());
++            // LOCAL (Atlas) diagnostic: the pass timer's pools (`pass_times.rs`).
++            if let Some(times) = &self.pass_times {
++                times.release(self.vk());
++            }
+         }
+         // Nor a kept barrier command buffer: the queues are idle.
+         self.scheduler.release_kept(self.vk());
+@@ -1825,6 +1831,8 @@ impl Device {
+             #[cfg(unix)]
+             residency: Default::default(),
+             timing,
++            // LOCAL (Atlas) diagnostic: the pass timer (`pass_times.rs`).
++            pass_times: crate::pass_times::DeviceTimes::new(timestamp_bits > 0, owned),
+             view_reinterpretation,
+             generated_commands,
+             host_image_copy,
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index f4ecfa6c..5b217e85 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -428,6 +428,14 @@ impl EncoderCore {
+         if let Some(problem) = state.refusal() {
+             return Err(invalid(call, problem));
+         }
++        // LOCAL (Atlas) diagnostic: the pass timer's encoder (`pass_times.rs`).
++        crate::pass_times::encoder_opened(
++            command_buffer.device(),
++            command_buffer.command_queue(),
++            command_buffer.pass_times_key(),
++            &mut state.pass_times,
++            kind,
++        );
+         // The pool's primary begun ahead where it holds one (`spares.rs`).
+         let (raw, begun) = command_buffer.encoder_primary(&mut state)?;
+         let shared = command_buffer.device().shared();
+@@ -1058,6 +1066,8 @@ impl EncoderCore {
+             // SAFETY: as in `barrier`.
+             unsafe { barrier.record(device, raw) };
+         }
++        // LOCAL (Atlas) diagnostic: the program's command, to the pass timer (`pass_times.rs`).
++        let _scope = crate::pass_times::scope(crate::pass_times::Tag::Guest);
+         record(device, raw);
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/image_log.rs b/crates/metal2vulkan-runtime/src/image_log.rs
+new file mode 100644
+index 00000000..36639493
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/image_log.rs
+@@ -0,0 +1,925 @@
++//! LOCAL (Atlas) diagnostic: the image census, `M2V_IMAGE_LOG=<file>`, and the registry of the
++//! objects a render pass instance names, which the pass timer (`pass_times.rs`) labels its
++//! attachments from. Default off; the whole module can be dropped with its hooks (each marked
++//! `LOCAL (Atlas) diagnostic`).
++//!
++//! - **The switch** is read once. Unset (or empty), nothing is recorded, no line is formatted, and
++//!   no Vulkan call is added. Set, the census appends to the file it names (made if missing).
++//! - **What the census writes.** One CSV line per event, every line the same columns
++//!   ([`HEADER`]), written as it happens (a `write` per line: image creation is rare next to the
++//!   work it serves, and the lines survive the process being killed):
++//!   - `create`, per `VkImage` the runtime makes (`creation::image`, `creation::image_or_refusal`,
++//!     the one door to `vkCreateImage`; the device's priming makes its own and is not logged): the
++//!     image, its purpose (`api`: the program's call that made it where one is on the stack,
++//!     `texture`, `heap-texture`, `buffer-texture`, `iosurface-plane`; `origin`: where the
++//!     texture paths' image making was called from, with the texture's storage mode; `site`: the
++//!     call of `creation::image` itself), format, extent, mip levels, array layers, samples,
++//!     tiling (and the DRM format modifier or modifier list chained), usage, create flags, the
++//!     chained `VkImageFormatListCreateInfo` (`-` where none is chained, else its view formats),
++//!     the external memory handle types chained, any other structure chained, and the image's
++//!     memory requirements (size, alignment, memory types; `vkGetImageMemoryRequirements`, not
++//!     asked of a `DISJOINT` image).
++//!   - `bind`, per `vkBindImageMemory` (`creation::bind_image`): the memory and offset, and what
++//!     the memory is as the runtime allocated it (`creation::allocate_memory`): an import of host
++//!     pages (`host-pages`), of a dma-buf (`dma-buf`) or another fd, an export, or its own, and
++//!     whether dedicated to an image.
++//!   - `destroy`, per `vkDestroyImage` (`release::object`).
++//! - **The registry** (kept while either switch is on): each image's extent, usage and purpose,
++//!   each view's image and base level, each render pass's attachments (subpass 0's roles) and its
++//!   making's site, each framebuffer's extent and views, and each memory's kind; entries go as
++//!   their objects are released. A handle the driver reuses is registered again as it is made.
++
++use ash::vk;
++use ash::vk::Handle;
++use std::cell::Cell;
++use std::collections::HashMap;
++use std::fmt::Write as _;
++use std::io::Write as _;
++use std::panic::Location;
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, LazyLock, Mutex, OnceLock};
++
++/// The census's columns, its file's first line.
++pub(crate) const HEADER: &str = "host_ns,event,image,api,origin,site,storage,format,width,height,\
++depth,mips,layers,samples,tiling,drm_modifier,usage,flags,format_list,external,chained,mem_size,\
++mem_align,mem_types,bind_memory,bind_offset,memory_kind\n";
++
++/// The census file, where `M2V_IMAGE_LOG` names one: read once.
++fn census_path() -> Option<&'static Path> {
++    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
++    PATH.get_or_init(|| {
++        std::env::var_os("M2V_IMAGE_LOG")
++            .filter(|value| !value.is_empty())
++            .map(PathBuf::from)
++    })
++    .as_deref()
++}
++
++/// Whether the census is on.
++pub(crate) fn census_on() -> bool {
++    census_path().is_some()
++}
++
++/// Whether the registry is kept: either diagnostic is on.
++pub(crate) fn registry_on() -> bool {
++    census_on() || crate::pass_times::on()
++}
++
++/// The host's clock now, in nanoseconds (`CLOCK_MONOTONIC_RAW`, the runtime's GPU times' clock).
++#[cfg(not(unix))]
++pub(crate) fn host_ns() -> u64 {
++    0
++}
++
++/// The host's clock now, in nanoseconds (`CLOCK_MONOTONIC_RAW`, the runtime's GPU times' clock).
++#[cfg(unix)]
++pub(crate) fn host_ns() -> u64 {
++    let mut now = libc::timespec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    // SAFETY: `now` is a valid timespec for the call to fill.
++    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut now) } != 0 {
++        return 0;
++    }
++    (now.tv_sec as u64) * 1_000_000_000 + now.tv_nsec as u64
++}
++
++/// `file:line` of `at`, its path from the crate's `src/` on.
++pub(crate) fn short(at: &Location<'_>) -> String {
++    let file = at.file();
++    let file = match file.rfind("/src/") {
++        Some(i) => &file[i + 5..],
++        None => file,
++    };
++    format!("{file}:{}", at.line())
++}
++
++/// The bits of `raw` by their registry names in `known`, less `prefix` and `_BIT`, `|`-joined;
++/// bits no name holds in hex; `0` for none. (`ash` is built without its `Debug` impls.)
++fn flag_names<'a>(raw: u32, known: impl Iterator<Item = (u32, &'a str)>, prefix: &str) -> String {
++    if raw == 0 {
++        return "0".to_owned();
++    }
++    let mut names = Vec::new();
++    let mut rest = raw;
++    for (bit, name) in known {
++        if bit.count_ones() == 1 && rest & bit != 0 {
++            names.push(name.trim_start_matches(prefix).replace("_BIT", ""));
++            rest &= !bit;
++        }
++    }
++    if rest != 0 {
++        names.push(format!("0x{rest:x}"));
++    }
++    names.join("|")
++}
++
++/// `format`'s registry name less `VK_FORMAT_`, else its number.
++pub(crate) fn format_name(format: vk::Format) -> String {
++    match metal2vulkan::vk::Format::from_raw(format.as_raw()).name() {
++        Some(name) => name.trim_start_matches("VK_FORMAT_").to_owned(),
++        None => format!("format{}", format.as_raw()),
++    }
++}
++
++fn tiling_name(tiling: vk::ImageTiling) -> String {
++    match metal2vulkan::vk::ImageTiling::from_raw(tiling.as_raw()).name() {
++        Some(name) => name.trim_start_matches("VK_IMAGE_TILING_").to_owned(),
++        None => format!("tiling{}", tiling.as_raw()),
++    }
++}
++
++fn usage_names(usage: vk::ImageUsageFlags) -> String {
++    let known = metal2vulkan::vk::ImageUsageFlags::KNOWN.iter();
++    flag_names(
++        usage.as_raw(),
++        known.map(|(v, n)| (v.as_raw(), *n)),
++        "VK_IMAGE_USAGE_",
++    )
++}
++
++fn create_names(flags: vk::ImageCreateFlags) -> String {
++    let known = metal2vulkan::vk::ImageCreateFlags::KNOWN.iter();
++    flag_names(
++        flags.as_raw(),
++        known.map(|(v, n)| (v.as_raw(), *n)),
++        "VK_IMAGE_CREATE_",
++    )
++}
++
++fn external_names(types: vk::ExternalMemoryHandleTypeFlags) -> String {
++    use vk::ExternalMemoryHandleTypeFlags as T;
++    let known = [
++        (T::OPAQUE_FD, "OPAQUE_FD"),
++        (T::OPAQUE_WIN32, "OPAQUE_WIN32"),
++        (T::OPAQUE_WIN32_KMT, "OPAQUE_WIN32_KMT"),
++        (T::D3D11_TEXTURE, "D3D11_TEXTURE"),
++        (T::D3D11_TEXTURE_KMT, "D3D11_TEXTURE_KMT"),
++        (T::D3D12_HEAP, "D3D12_HEAP"),
++        (T::D3D12_RESOURCE, "D3D12_RESOURCE"),
++        (T::HOST_ALLOCATION_EXT, "HOST_ALLOCATION"),
++        (
++            T::HOST_MAPPED_FOREIGN_MEMORY_EXT,
++            "HOST_MAPPED_FOREIGN_MEMORY",
++        ),
++        (T::DMA_BUF_EXT, "DMA_BUF"),
++    ];
++    flag_names(
++        types.as_raw(),
++        known.iter().map(|(v, n)| (v.as_raw(), *n)),
++        "",
++    )
++}
++
++fn load_name(op: vk::AttachmentLoadOp) -> String {
++    match op {
++        vk::AttachmentLoadOp::LOAD => "LOAD".into(),
++        vk::AttachmentLoadOp::CLEAR => "CLEAR".into(),
++        vk::AttachmentLoadOp::DONT_CARE => "DONT_CARE".into(),
++        vk::AttachmentLoadOp::NONE_KHR => "NONE".into(),
++        other => format!("load{}", other.as_raw()),
++    }
++}
++
++fn store_name(op: vk::AttachmentStoreOp) -> String {
++    match op {
++        vk::AttachmentStoreOp::STORE => "STORE".into(),
++        vk::AttachmentStoreOp::DONT_CARE => "DONT_CARE".into(),
++        vk::AttachmentStoreOp::NONE => "NONE".into(),
++        other => format!("store{}", other.as_raw()),
++    }
++}
++
++/// What the registry holds of an image.
++pub(crate) struct ImageEntry {
++    extent: vk::Extent3D,
++    usage: vk::ImageUsageFlags,
++    /// Its purpose, short: the program's call, else the texture path's caller, else the site.
++    purpose: Arc<str>,
++}
++
++/// A render pass attachment's role in subpass 0.
++#[derive(Clone, Copy)]
++enum Role {
++    Color(u32),
++    Resolve(u32),
++    DepthStencil,
++    DepthStencilResolve,
++    Input(u32),
++    Other(u32),
++}
++
++/// A render pass's attachment, as made.
++#[derive(Clone, Copy)]
++struct PassAttachment {
++    role: Role,
++    format: vk::Format,
++    samples: u32,
++    load: vk::AttachmentLoadOp,
++    store: vk::AttachmentStoreOp,
++    stencil_load: vk::AttachmentLoadOp,
++    stencil_store: vk::AttachmentStoreOp,
++}
++
++/// A render pass, as made.
++struct PassEntry {
++    attachments: Vec<PassAttachment>,
++    site: &'static Location<'static>,
++}
++
++/// A framebuffer, as made.
++struct FramebufferEntry {
++    width: u32,
++    height: u32,
++    views: Vec<u64>,
++}
++
++/// The objects registered.
++#[derive(Default)]
++struct Registry {
++    images: HashMap<u64, Arc<ImageEntry>>,
++    views: HashMap<u64, (u64, u32)>,
++    passes: HashMap<u64, Arc<PassEntry>>,
++    framebuffers: HashMap<u64, Arc<FramebufferEntry>>,
++    memories: HashMap<u64, &'static str>,
++}
++
++static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(Mutex::default);
++
++fn registry() -> std::sync::MutexGuard<'static, Registry> {
++    REGISTRY
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++thread_local! {
++    /// The program's call making a texture on this thread, the outermost.
++    static API: Cell<Option<&'static str>> = const { Cell::new(None) };
++    /// Where the texture paths' image making was called from, and the texture's storage mode.
++    static ORIGIN: Cell<Option<(&'static Location<'static>, &'static str)>> =
++        const { Cell::new(None) };
++}
++
++/// A purpose set on this thread until dropped ([`api`], [`origin`]).
++pub(crate) struct PurposeGuard(Option<Restore>);
++
++enum Restore {
++    Api(Option<&'static str>),
++    Origin(Option<(&'static Location<'static>, &'static str)>),
++}
++
++impl Drop for PurposeGuard {
++    fn drop(&mut self) {
++        match self.0.take() {
++            Some(Restore::Api(previous)) => API.with(|api| api.set(previous)),
++            Some(Restore::Origin(previous)) => ORIGIN.with(|origin| origin.set(previous)),
++            None => {}
++        }
++    }
++}
++
++/// The program's call `name` makes textures on this thread until the guard drops: the census's
++/// `api`. The outermost call holds.
++pub(crate) fn api(name: &'static str) -> PurposeGuard {
++    if !registry_on() {
++        return PurposeGuard(None);
++    }
++    let previous = API.with(|api| api.get());
++    if previous.is_some() {
++        return PurposeGuard(None);
++    }
++    API.with(|api| api.set(Some(name)));
++    PurposeGuard(Some(Restore::Api(previous)))
++}
++
++/// The texture paths' image making called from `at`, for a texture of `storage` mode, until the
++/// guard drops: the census's `origin`. The innermost holds.
++pub(crate) fn origin(at: &'static Location<'static>, storage: &'static str) -> PurposeGuard {
++    if !registry_on() {
++        return PurposeGuard(None);
++    }
++    let previous = ORIGIN.with(|origin| origin.replace(Some((at, storage))));
++    PurposeGuard(Some(Restore::Origin(previous)))
++}
++
++/// The census's line writer.
++static CENSUS: Mutex<Option<std::fs::File>> = Mutex::new(None);
++
++/// Append `line` to the census, opening it (and heading a new one) at the first.
++fn census_line(line: &str) {
++    let Some(path) = census_path() else {
++        return;
++    };
++    let mut file = CENSUS
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    if file.is_none() {
++        let opened = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(path);
++        match opened {
++            Ok(mut opened) => {
++                if opened.metadata().map(|m| m.len() == 0).unwrap_or(false) {
++                    let _ = opened.write_all(HEADER.as_bytes());
++                }
++                *file = Some(opened);
++            }
++            Err(error) => {
++                eprintln!("metal2vulkan: M2V_IMAGE_LOG: cannot open {path:?}: {error}");
++                return;
++            }
++        }
++    }
++    if let Some(file) = file.as_mut() {
++        let _ = file.write_all(line.as_bytes());
++    }
++}
++
++/// The structures chained to `next`, as a walk of their headers.
++///
++/// # Safety
++///
++/// `next` is null or a valid chain of Vulkan structures.
++unsafe fn chain(mut next: *const std::ffi::c_void) -> Vec<*const vk::BaseInStructure<'static>> {
++    let mut all = Vec::new();
++    while !next.is_null() {
++        let base = next.cast::<vk::BaseInStructure<'static>>();
++        all.push(base);
++        // SAFETY: the caller's.
++        next = unsafe { (*base).p_next }.cast();
++    }
++    all
++}
++
++/// A slice of `count` from `ptr`, empty where null.
++///
++/// # Safety
++///
++/// `ptr` is null or points at `count` valid values.
++unsafe fn slice<'a, T>(ptr: *const T, count: u32) -> &'a [T] {
++    match ptr.is_null() || count == 0 {
++        true => &[],
++        // SAFETY: the caller's.
++        false => unsafe { std::slice::from_raw_parts(ptr, count as usize) },
++    }
++}
++
++/// Note `image`, made of `info` by `device` at `site` (`creation::image`): registered, and in the
++/// census its `create` line.
++///
++/// # Safety
++///
++/// `info` and its chain are valid; `image` is `device`'s, live.
++pub(crate) unsafe fn image_made(
++    device: &ash::Device,
++    info: &vk::ImageCreateInfo<'_>,
++    image: vk::Image,
++    site: &'static Location<'static>,
++) {
++    if !registry_on() {
++        return;
++    }
++    let api = API.with(|api| api.get());
++    let origin = ORIGIN.with(|origin| origin.get());
++    let site = short(site);
++    let origin_at = origin.map(|(at, _)| short(at));
++    let purpose: Arc<str> = match (api, &origin_at) {
++        (Some(api), _) => api.into(),
++        (None, Some(at)) => format!("<{at}").into(),
++        (None, None) => site.clone().into(),
++    };
++    let entry = ImageEntry {
++        extent: info.extent,
++        usage: info.usage,
++        purpose,
++    };
++    registry().images.insert(image.as_raw(), Arc::new(entry));
++    if !census_on() {
++        return;
++    }
++    let mut format_list = "-".to_owned();
++    let mut external = "0".to_owned();
++    let mut drm_modifier = "-".to_owned();
++    let mut chained = Vec::new();
++    // SAFETY: the caller's: `info`'s chain is valid.
++    for base in unsafe { chain(info.p_next) } {
++        // SAFETY: each is a valid structure of its `s_type`.
++        unsafe {
++            match (*base).s_type {
++                vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO => {
++                    let list = &*base.cast::<vk::ImageFormatListCreateInfo<'static>>();
++                    let formats = slice(list.p_view_formats, list.view_format_count);
++                    let names: Vec<String> = formats.iter().map(|f| format_name(*f)).collect();
++                    format_list = format!("{}:{}", formats.len(), names.join("|"));
++                }
++                vk::StructureType::EXTERNAL_MEMORY_IMAGE_CREATE_INFO => {
++                    let ext = &*base.cast::<vk::ExternalMemoryImageCreateInfo<'static>>();
++                    external = external_names(ext.handle_types);
++                }
++                vk::StructureType::IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT => {
++                    let explicit =
++                        &*base.cast::<vk::ImageDrmFormatModifierExplicitCreateInfoEXT<'static>>();
++                    drm_modifier = format!(
++                        "0x{:x}:planes={}",
++                        explicit.drm_format_modifier, explicit.drm_format_modifier_plane_count
++                    );
++                }
++                vk::StructureType::IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT => {
++                    let list =
++                        &*base.cast::<vk::ImageDrmFormatModifierListCreateInfoEXT<'static>>();
++                    let all = slice(list.p_drm_format_modifiers, list.drm_format_modifier_count);
++                    let names: Vec<String> = all.iter().map(|m| format!("0x{m:x}")).collect();
++                    drm_modifier = format!("list:{}", names.join("|"));
++                }
++                other => chained.push(format!("sType{}", other.as_raw())),
++            }
++        }
++    }
++    let requirements = match info.flags.contains(vk::ImageCreateFlags::DISJOINT) {
++        true => None,
++        // SAFETY: `image` is `device`'s, live, not disjoint.
++        false => Some(unsafe { device.get_image_memory_requirements(image) }),
++    };
++    crate::exit_guard::called(crate::exit_guard::Call::GetImageMemoryRequirements);
++    let (size, align, types) = match requirements {
++        Some(r) => (
++            r.size.to_string(),
++            r.alignment.to_string(),
++            format!("0x{:x}", r.memory_type_bits),
++        ),
++        None => ("-".into(), "-".into(), "-".into()),
++    };
++    let chained = match chained.is_empty() {
++        true => "-".to_owned(),
++        false => chained.join("|").replace(',', ";"),
++    };
++    let (origin_at, storage) = match origin {
++        Some((_, storage)) => (origin_at.unwrap_or_default(), storage),
++        None => ("-".to_owned(), "-"),
++    };
++    let mut line = String::with_capacity(256);
++    let _ = writeln!(
++        line,
++        "{},create,0x{:x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,",
++        host_ns(),
++        image.as_raw(),
++        api.unwrap_or("-"),
++        origin_at,
++        site,
++        storage,
++        format_name(info.format),
++        info.extent.width,
++        info.extent.height,
++        info.extent.depth,
++        info.mip_levels,
++        info.array_layers,
++        info.samples.as_raw(),
++        tiling_name(info.tiling),
++        drm_modifier,
++        usage_names(info.usage),
++        create_names(info.flags),
++        format_list,
++        external,
++        chained,
++        size,
++        align,
++        types,
++    );
++    census_line(&line);
++}
++
++/// Note `memory`, allocated of `info` (`creation::allocate_memory`): its kind registered.
++///
++/// # Safety
++///
++/// `info` and its chain are valid.
++pub(crate) unsafe fn memory_made(info: &vk::MemoryAllocateInfo<'_>, memory: vk::DeviceMemory) {
++    if !census_on() {
++        return;
++    }
++    let mut kind = "own";
++    let mut dedicated = false;
++    // SAFETY: the caller's.
++    for base in unsafe { chain(info.p_next) } {
++        // SAFETY: each is a valid structure of its `s_type`.
++        unsafe {
++            match (*base).s_type {
++                vk::StructureType::IMPORT_MEMORY_HOST_POINTER_INFO_EXT => kind = "host-pages",
++                vk::StructureType::IMPORT_MEMORY_FD_INFO_KHR => {
++                    let fd = &*base.cast::<vk::ImportMemoryFdInfoKHR<'static>>();
++                    kind = match fd.handle_type {
++                        vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT => "dma-buf",
++                        _ => "fd-import",
++                    };
++                }
++                vk::StructureType::EXPORT_MEMORY_ALLOCATE_INFO if kind == "own" => {
++                    kind = "own-export"
++                }
++                vk::StructureType::MEMORY_DEDICATED_ALLOCATE_INFO => {
++                    let info = &*base.cast::<vk::MemoryDedicatedAllocateInfo<'static>>();
++                    dedicated = info.image != vk::Image::null();
++                }
++                _ => {}
++            }
++        }
++    }
++    let kind = match (kind, dedicated) {
++        ("own", true) => "own-dedicated",
++        ("own-export", true) => "own-export-dedicated",
++        ("dma-buf", true) => "dma-buf-dedicated",
++        ("host-pages", true) => "host-pages-dedicated",
++        (kind, _) => kind,
++    };
++    registry().memories.insert(memory.as_raw(), kind);
++}
++
++/// Note `image` bound to `memory` at `offset` (`creation::bind_image`): the census's `bind` line.
++pub(crate) fn image_bound(image: vk::Image, memory: vk::DeviceMemory, offset: vk::DeviceSize) {
++    if !census_on() {
++        return;
++    }
++    let kind = registry()
++        .memories
++        .get(&memory.as_raw())
++        .copied()
++        .unwrap_or("unknown");
++    let line = format!(
++        "{},bind,0x{:x},,,,,,,,,,,,,,,,,,,,,,0x{:x},{},{}\n",
++        host_ns(),
++        image.as_raw(),
++        memory.as_raw(),
++        offset,
++        kind
++    );
++    census_line(&line);
++}
++
++/// Note `view`, made of `info` (`creation::image_view`).
++pub(crate) fn view_made(info: &vk::ImageViewCreateInfo<'_>, view: vk::ImageView) {
++    if !registry_on() {
++        return;
++    }
++    let entry = (info.image.as_raw(), info.subresource_range.base_mip_level);
++    registry().views.insert(view.as_raw(), entry);
++}
++
++/// Note `pass`, made of `info` (`creation::render_pass`) at `site`.
++///
++/// # Safety
++///
++/// `info` is valid.
++pub(crate) unsafe fn render_pass_made(
++    info: &vk::RenderPassCreateInfo<'_>,
++    pass: vk::RenderPass,
++    site: &'static Location<'static>,
++) {
++    if !crate::pass_times::on() {
++        return;
++    }
++    // SAFETY: the caller's.
++    let (descriptions, subpasses) = unsafe {
++        (
++            slice(info.p_attachments, info.attachment_count),
++            slice(info.p_subpasses, info.subpass_count),
++        )
++    };
++    let mut roles: Vec<Option<Role>> = vec![None; descriptions.len()];
++    if let Some(subpass) = subpasses.first() {
++        // SAFETY: the caller's: subpass 0's references are valid.
++        unsafe {
++            let colors = slice(subpass.p_color_attachments, subpass.color_attachment_count);
++            note_roles(&mut roles, colors.iter().map(|r| r.attachment), Role::Color);
++            if !subpass.p_resolve_attachments.is_null() {
++                let resolves = slice(
++                    subpass.p_resolve_attachments,
++                    subpass.color_attachment_count,
++                );
++                note_roles(
++                    &mut roles,
++                    resolves.iter().map(|r| r.attachment),
++                    Role::Resolve,
++                );
++            }
++            let inputs = slice(subpass.p_input_attachments, subpass.input_attachment_count);
++            note_roles(&mut roles, inputs.iter().map(|r| r.attachment), Role::Input);
++            if let Some(depth) = subpass.p_depth_stencil_attachment.as_ref() {
++                note_role(&mut roles, depth.attachment, Role::DepthStencil);
++            }
++        }
++    }
++    let attachments = descriptions
++        .iter()
++        .enumerate()
++        .map(|(i, d)| PassAttachment {
++            role: roles[i].unwrap_or(Role::Other(i as u32)),
++            format: d.format,
++            samples: d.samples.as_raw(),
++            load: d.load_op,
++            store: d.store_op,
++            stencil_load: d.stencil_load_op,
++            stencil_store: d.stencil_store_op,
++        })
++        .collect();
++    let entry = PassEntry { attachments, site };
++    registry().passes.insert(pass.as_raw(), Arc::new(entry));
++}
++
++/// Note `pass`, made of `info` (`creation::render_pass2`) at `site`.
++///
++/// # Safety
++///
++/// `info` and its subpasses' chains are valid.
++pub(crate) unsafe fn render_pass2_made(
++    info: &vk::RenderPassCreateInfo2<'_>,
++    pass: vk::RenderPass,
++    site: &'static Location<'static>,
++) {
++    if !crate::pass_times::on() {
++        return;
++    }
++    // SAFETY: the caller's.
++    let (descriptions, subpasses) = unsafe {
++        (
++            slice(info.p_attachments, info.attachment_count),
++            slice(info.p_subpasses, info.subpass_count),
++        )
++    };
++    let mut roles: Vec<Option<Role>> = vec![None; descriptions.len()];
++    if let Some(subpass) = subpasses.first() {
++        // SAFETY: the caller's: subpass 0's references and chain are valid.
++        unsafe {
++            let colors = slice(subpass.p_color_attachments, subpass.color_attachment_count);
++            note_roles(&mut roles, colors.iter().map(|r| r.attachment), Role::Color);
++            if !subpass.p_resolve_attachments.is_null() {
++                let resolves = slice(
++                    subpass.p_resolve_attachments,
++                    subpass.color_attachment_count,
++                );
++                note_roles(
++                    &mut roles,
++                    resolves.iter().map(|r| r.attachment),
++                    Role::Resolve,
++                );
++            }
++            let inputs = slice(subpass.p_input_attachments, subpass.input_attachment_count);
++            note_roles(&mut roles, inputs.iter().map(|r| r.attachment), Role::Input);
++            if let Some(depth) = subpass.p_depth_stencil_attachment.as_ref() {
++                note_role(&mut roles, depth.attachment, Role::DepthStencil);
++            }
++            for base in chain(subpass.p_next) {
++                if (*base).s_type == vk::StructureType::SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE {
++                    let resolve =
++                        &*base.cast::<vk::SubpassDescriptionDepthStencilResolve<'static>>();
++                    if let Some(at) = resolve.p_depth_stencil_resolve_attachment.as_ref() {
++                        note_role(&mut roles, at.attachment, Role::DepthStencilResolve);
++                    }
++                }
++            }
++        }
++    }
++    let attachments = descriptions
++        .iter()
++        .enumerate()
++        .map(|(i, d)| PassAttachment {
++            role: roles[i].unwrap_or(Role::Other(i as u32)),
++            format: d.format,
++            samples: d.samples.as_raw(),
++            load: d.load_op,
++            store: d.store_op,
++            stencil_load: d.stencil_load_op,
++            stencil_store: d.stencil_store_op,
++        })
++        .collect();
++    let entry = PassEntry { attachments, site };
++    registry().passes.insert(pass.as_raw(), Arc::new(entry));
++}
++
++/// Give each attachment of `indices` its role, `role` of its place among them.
++fn note_roles(
++    roles: &mut [Option<Role>],
++    indices: impl Iterator<Item = u32>,
++    role: impl Fn(u32) -> Role,
++) {
++    for (place, index) in indices.enumerate() {
++        note_role(roles, index, role(place as u32));
++    }
++}
++
++/// Give attachment `index` `role`, where it is one and has none yet.
++fn note_role(roles: &mut [Option<Role>], index: u32, role: Role) {
++    if let Some(slot) = roles.get_mut(index as usize) {
++        slot.get_or_insert(role);
++    }
++}
++
++/// Note `framebuffer`, made of `info` (`creation::framebuffer`).
++///
++/// # Safety
++///
++/// `info` is valid.
++pub(crate) unsafe fn framebuffer_made(
++    info: &vk::FramebufferCreateInfo<'_>,
++    framebuffer: vk::Framebuffer,
++) {
++    if !crate::pass_times::on() {
++        return;
++    }
++    let imageless = info.flags.contains(vk::FramebufferCreateFlags::IMAGELESS);
++    let views = match imageless {
++        true => Vec::new(),
++        // SAFETY: the caller's.
++        false => unsafe { slice(info.p_attachments, info.attachment_count) }
++            .iter()
++            .map(|view| view.as_raw())
++            .collect(),
++    };
++    let entry = FramebufferEntry {
++        width: info.width,
++        height: info.height,
++        views,
++    };
++    registry()
++        .framebuffers
++        .insert(framebuffer.as_raw(), Arc::new(entry));
++}
++
++/// Forget the object `raw` released by `call` (`release::object`); an image's release is the
++/// census's `destroy` line.
++pub(crate) fn released(call: crate::exit_guard::Call, raw: u64) {
++    use crate::exit_guard::Call;
++    if !registry_on() {
++        return;
++    }
++    let mut registry = registry();
++    match call {
++        Call::DestroyImage => {
++            registry.images.remove(&raw);
++            drop(registry);
++            if census_on() {
++                census_line(&format!(
++                    "{},destroy,0x{raw:x},,,,,,,,,,,,,,,,,,,,,,,,\n",
++                    host_ns()
++                ));
++            }
++        }
++        Call::DestroyImageView => {
++            registry.views.remove(&raw);
++        }
++        Call::DestroyRenderPass => {
++            registry.passes.remove(&raw);
++        }
++        Call::DestroyFramebuffer => {
++            registry.framebuffers.remove(&raw);
++        }
++        Call::FreeMemory => {
++            registry.memories.remove(&raw);
++        }
++        _ => {}
++    }
++}
++
++/// One attachment of a render pass instance, resolved as it begins.
++struct Attached {
++    pass: PassAttachment,
++    extent: Option<(u32, u32)>,
++    memoryless: bool,
++    purpose: Option<Arc<str>>,
++}
++
++/// What the pass timer records of a render pass instance's objects as it begins: its attachments,
++/// each with its image's extent, whether it is memoryless (a transient attachment) and its purpose,
++/// and where its pass was made. Formatted only once its command buffer completed ([`format`]).
++pub(crate) struct PassLabel {
++    attached: Vec<Attached>,
++    site: Option<&'static Location<'static>>,
++    extent: (u32, u32),
++}
++
++impl PassLabel {
++    /// Where the pass was made, short.
++    pub(crate) fn site(&self) -> Option<String> {
++        self.site.map(short)
++    }
++
++    /// The attachments, `|`-joined: each its role, format, extent, samples, load/store (and the
++    /// stencil's where it has one), `memoryless`, and `@` its image's purpose.
++    pub(crate) fn format(&self) -> String {
++        let mut out = String::new();
++        for (i, a) in self.attached.iter().enumerate() {
++            if i > 0 {
++                out.push('|');
++            }
++            let p = &a.pass;
++            let _ = match p.role {
++                Role::Color(j) => write!(out, "c{j}"),
++                Role::Resolve(j) => write!(out, "r{j}"),
++                Role::DepthStencil => write!(out, "ds"),
++                Role::DepthStencilResolve => write!(out, "dsr"),
++                Role::Input(j) => write!(out, "in{j}"),
++                Role::Other(j) => write!(out, "a{j}"),
++            };
++            let (w, h) = a.extent.unwrap_or(self.extent);
++            let _ = write!(
++                out,
++                ":{}:{w}x{h}:s{}:{}/{}",
++                format_name(p.format),
++                p.samples,
++                load_name(p.load),
++                store_name(p.store)
++            );
++            if matches!(p.role, Role::DepthStencil | Role::DepthStencilResolve)
++                && has_stencil(p.format)
++            {
++                let _ = write!(
++                    out,
++                    ":st={}/{}",
++                    load_name(p.stencil_load),
++                    store_name(p.stencil_store)
++                );
++            }
++            if a.memoryless {
++                out.push_str(":memoryless");
++            }
++            if let Some(purpose) = &a.purpose {
++                let _ = write!(out, "@{purpose}");
++            }
++        }
++        if out.is_empty() {
++            out.push('-');
++        }
++        out.replace(',', ";")
++    }
++}
++
++/// Whether `format` has a stencil aspect.
++fn has_stencil(format: vk::Format) -> bool {
++    matches!(
++        format,
++        vk::Format::S8_UINT
++            | vk::Format::D16_UNORM_S8_UINT
++            | vk::Format::D24_UNORM_S8_UINT
++            | vk::Format::D32_SFLOAT_S8_UINT
++    )
++}
++
++/// The label of a render pass instance of `pass` and `framebuffer`, of `area`, as it begins.
++pub(crate) fn pass_label(
++    pass: vk::RenderPass,
++    framebuffer: vk::Framebuffer,
++    area: vk::Extent2D,
++) -> PassLabel {
++    let registry = registry();
++    let pass = registry.passes.get(&pass.as_raw()).cloned();
++    let framebuffer = registry.framebuffers.get(&framebuffer.as_raw()).cloned();
++    let extent = framebuffer
++        .as_ref()
++        .map_or((area.width, area.height), |f| (f.width, f.height));
++    let Some(pass) = pass else {
++        return PassLabel {
++            attached: Vec::new(),
++            site: None,
++            extent,
++        };
++    };
++    let attached = pass
++        .attachments
++        .iter()
++        .enumerate()
++        .map(|(i, attachment)| {
++            let view = framebuffer.as_ref().and_then(|f| f.views.get(i)).copied();
++            let image = view.and_then(|v| registry.views.get(&v)).copied();
++            let entry = image.and_then(|(image, mip)| {
++                registry
++                    .images
++                    .get(&image)
++                    .map(|entry| (Arc::clone(entry), mip))
++            });
++            match entry {
++                Some((entry, mip)) => Attached {
++                    pass: *attachment,
++                    extent: Some((
++                        (entry.extent.width >> mip).max(1),
++                        (entry.extent.height >> mip).max(1),
++                    )),
++                    memoryless: entry
++                        .usage
++                        .contains(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT),
++                    purpose: Some(Arc::clone(&entry.purpose)),
++                },
++                None => Attached {
++                    pass: *attachment,
++                    extent: None,
++                    memoryless: false,
++                    purpose: None,
++                },
++            }
++        })
++        .collect();
++    PassLabel {
++        attached,
++        site: Some(pass.site),
++        extent,
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index ca076571..9cdcc6a5 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -125,6 +125,8 @@ mod host_rt;
+ #[cfg(unix)]
+ mod host_shared_pointers;
+ mod image_barrier;
++// LOCAL (Atlas) diagnostic: the image census and object registry (M2V_IMAGE_LOG).
++mod image_log;
+ mod image_plan;
+ mod in_place;
+ mod in_place_check;
+@@ -158,6 +160,8 @@ mod nan_clear;
+ mod neutral;
+ mod noted_apart;
+ mod owned_kernel;
++// LOCAL (Atlas) diagnostic: the pass timer (M2V_PASS_TIMES).
++mod pass_times;
+ mod pending_dispatch;
+ mod pipeline;
+ mod pixel_format_info;
+diff --git a/crates/metal2vulkan-runtime/src/pass_times.rs b/crates/metal2vulkan-runtime/src/pass_times.rs
+new file mode 100644
+index 00000000..ca083acb
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/pass_times.rs
+@@ -0,0 +1,1194 @@
++//! LOCAL (Atlas) diagnostic: the pass timer, `M2V_PASS_TIMES=<dir>`. GPU timestamps around each
++//! unit of GPU work the runtime records, read once its command buffer completed, one CSV line per
++//! unit appended to `<dir>/passes-<pid>.csv`. Default off; the whole module can be dropped with its
++//! hooks (each marked `LOCAL (Atlas) diagnostic`).
++//!
++//! - **The switch** is read once. Unset (or empty), nothing changes: no query pool, no command,
++//!   no line; each hook is one check of a `OnceLock`.
++//! - **The window.** Set, a command buffer is captured only where the file `<dir>/on` exists as the
++//!   runtime begins recording it (its first encoder's opening, or its first `VkCommandBuffer`
++//!   handed out): checked once per command buffer. `touch <dir>/on` opens a window, `rm` closes
++//!   it; the first command buffer begun after the close flushes the lines held.
++//! - **Where the timestamps go.** Every routed command passes the recorder's entry points
++//!   (`recorder/thunks.rs`), whatever the runtime records it from (an encoder, its own kernels, a
++//!   pass's steps, a commit's work, the lowering thread), so the units are cut there, on each
++//!   `VkCommandBuffer` the captured command buffer handed out: a render pass instance
++//!   (`vkCmdBeginRenderPass` to `vkCmdEndRenderPass`, each instance of a split pass its own); a run
++//!   of dispatches; a run of transfer commands (copies, blits, clears, fills, updates, query result
++//!   copies). A run goes on while the commands are of its class and its label (below) and the
++//!   barriers and binds between are part of it; another unit, or the `VkCommandBuffer`'s end, ends
++//!   it. Each unit writes a `vkCmdWriteTimestamp` at `ALL_COMMANDS` before its first command and
++//!   after its last, into two queries of a block of the diagnostic's own pools ([`BLOCK`] queries,
++//!   [`POOL_BLOCKS`] blocks a pool), each block reset on the host as a command buffer takes it
++//!   (`hostQueryReset`, which every device the runtime made enables), else by a
++//!   `vkCmdResetQueryPool` before the unit's start. The scheduler's own command buffers of
++//!   barriers (and the runtime's GPU-time timestamps) are no unit.
++//! - **Labels**, all known where the unit is recorded:
++//!   - `kind`: `render-pass` (an instance of a render encoder's pass: inline first, inline after a
++//!     split, or in secondaries; `render/inline_first.rs`, `inline_splits.rs`, `pass_steps.rs`),
++//!     `render-pass-resolve` (the pass's instance of no draws that resolves it), `pass:<site>`
++//!     (another render pass the runtime records, at the place it began it where that goes through
++//!     the device's `Vk` door, else where its `VkRenderPass` was made); `guest-<encoder>` (a
++//!     command of the program's encoder: `EncoderCore::command_*`, a pending dispatch), suffixed
++//!     with its class where that is not the encoder's own (`guest-blit:compute`); else
++//!     `internal:<site>/<command>`, the place that recorded its first command where it went
++//!     through the device's `Vk` door (`device/functions.rs`), else the command alone.
++//!   - `cb_label`: the command queue's label (no program's label reaches the runtime: Metal's
++//!     `label` of a command buffer and of an encoder are not part of Reims's guest protocol, and
++//!     the runtime keeps neither). `encoder_label`: the encoder's kind and place in its command
++//!     buffer (`render#3`), for the `VkCommandBuffer`s handed out while it was the last opened.
++//!   - `attachments`, for a render pass instance: each attachment's role in subpass 0
++//!     (`c0`, `r0`, `ds`, `dsr`, `in0`), format, extent, samples, load/store ops (the stencil's
++//!     too), `memoryless` where its image is a transient attachment, and `@` its image's purpose
++//!     (`image_log.rs`: the program's call that made it, else the place inside the runtime).
++//!   - `split`, for a render encoder's instance: `i/n` among the encoder's instances, the split
++//!     cause that began it (`work_counts::Split`; `first` for the first, `run` past the causes
++//!     counted), how it records (`inline`, `inline-split`, `secondary`), and for the first, why
++//!     the pass's first instance did not record inline (`work_counts::NotInline`).
++//!   - `draws`: the draws of a render pass instance (its secondaries' too), the dispatches of a
++//!     run of them, the commands of a run of transfers.
++//! - **Read as it completed**, in the completion turn after its GPU times (`completion.rs`):
++//!   `vkGetQueryPoolResults` per block, without waiting, a unit whose timestamps are not both
++//!   available (a command buffer that failed or never ran) has no `gpu_ns`. `host_ns` is the
++//!   unit's start on the host's clock (`CLOCK_MONOTONIC_RAW`): placed by the calibration pair the
++//!   command buffer's GPU times took where the device has one, else from its placed GPU start.
++//!   The lines are held and appended every [`FLUSH_LINES`] lines or [`FLUSH_AFTER`] at the next
++//!   completion, as a window closes, and as the device drops.
++
++use crate::command_buffer::CommandBuffer;
++use crate::exit_guard::{self, Call};
++use crate::gpu_time::{GpuClock, Pair};
++use crate::image_log::{self, PassLabel};
++use crate::used_resources::EncoderKind;
++use crate::work_counts::{NotInline, Split};
++use crate::{CommandQueue, Device};
++use ash::vk;
++use ash::vk::Handle;
++use std::cell::Cell;
++use std::collections::HashMap;
++use std::fmt::Write as _;
++use std::io::Write as _;
++use std::panic::Location;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, Weak};
++use std::time::{Duration, Instant};
++
++/// Queries of a block a command buffer takes at once: 32 units.
++const BLOCK: u32 = 64;
++
++/// Blocks of a query pool.
++const POOL_BLOCKS: u32 = 64;
++
++/// Lines held before they are appended.
++const FLUSH_LINES: usize = 256;
++
++/// Time after which the next completion appends the lines held.
++const FLUSH_AFTER: Duration = Duration::from_millis(500);
++
++/// The CSV's columns, its first line.
++const HEADER: &str =
++    "host_ns,cb_seq,unit_seq,kind,cb_label,encoder_label,attachments,split,draws,gpu_ns\n";
++
++/// The directory `M2V_PASS_TIMES` names: read once.
++fn dir() -> Option<&'static Path> {
++    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
++    DIR.get_or_init(|| {
++        std::env::var_os("M2V_PASS_TIMES")
++            .filter(|value| !value.is_empty())
++            .map(PathBuf::from)
++    })
++    .as_deref()
++}
++
++/// Whether the pass timer is on.
++#[inline]
++pub(crate) fn on() -> bool {
++    dir().is_some()
++}
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++/// The captures alive: the entry points do nothing more while there is none.
++static LIVE: AtomicUsize = AtomicUsize::new(0);
++
++/// The next captured command buffer's number.
++static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
++
++/// Each `VkCommandBuffer` a captured command buffer handed out, to its capture.
++static RAWS: LazyLock<Mutex<HashMap<u64, Weak<Capture>>>> = LazyLock::new(Mutex::default);
++
++/// Each captured command buffer, by its address, to its capture.
++static BY_KEY: LazyLock<Mutex<HashMap<usize, Weak<Capture>>>> = LazyLock::new(Mutex::default);
++
++/// What the code recording a unit says it is, on its thread ([`scope`]).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Tag {
++    /// A command of the program's encoder.
++    Guest,
++    /// A render pass instance of a render encoder's pass, begun at the given place.
++    Pass(PassAt),
++}
++
++/// Where a render encoder's pass instance began.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum PassAt {
++    /// Its first instance, inline (`render/inline_first.rs`).
++    Inline,
++    /// An instance after a split, inline (`render/inline_splits.rs`).
++    InlineSplit,
++    /// An instance whose draws a secondary holds (`render/pass_steps.rs`).
++    Instance,
++    /// The instance of no draws that resolves the pass (`render/pass_steps.rs`).
++    Resolve,
++}
++
++thread_local! {
++    static SCOPE: Cell<Option<Tag>> = const { Cell::new(None) };
++    static SITE: Cell<Option<&'static Location<'static>>> = const { Cell::new(None) };
++}
++
++/// A tag set on this thread until dropped ([`scope`]).
++pub(crate) struct Scope(Option<Option<Tag>>);
++
++impl Drop for Scope {
++    fn drop(&mut self) {
++        if let Some(previous) = self.0.take() {
++            SCOPE.with(|scope| scope.set(previous));
++        }
++    }
++}
++
++/// Tag what this thread records with `tag` until the scope drops: the innermost holds.
++pub(crate) fn scope(tag: Tag) -> Scope {
++    if !on() {
++        return Scope(None);
++    }
++    Scope(Some(SCOPE.with(|scope| scope.replace(Some(tag)))))
++}
++
++/// The place `at` records the next command on this thread (`Vk`'s commands,
++/// `device/functions.rs`); the command's entry point takes it.
++#[inline]
++pub(crate) fn site(at: &'static Location<'static>) {
++    if on() {
++        SITE.with(|site| site.set(Some(at)));
++    }
++}
++
++/// A unit's class.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Class {
++    Pass,
++    Compute,
++    Transfer,
++}
++
++/// A slot's own timestamp commands (`recorder/thunks.rs`), which the units record through: into a
++/// deferred command buffer's log as any command, else the driver's.
++#[derive(Clone, Copy)]
++pub(crate) struct Stamps {
++    pub(crate) write:
++        unsafe extern "system" fn(vk::CommandBuffer, vk::PipelineStageFlags, vk::QueryPool, u32),
++    pub(crate) reset: unsafe extern "system" fn(vk::CommandBuffer, vk::QueryPool, u32, u32),
++}
++
++/// A block of queries.
++#[derive(Clone, Copy)]
++struct Block {
++    pool: vk::QueryPool,
++    first: u32,
++}
++
++#[derive(Default)]
++struct Blocks {
++    pools: Vec<vk::QueryPool>,
++    free: Vec<Block>,
++    /// The device refused a pool: no more are asked for.
++    refused: bool,
++}
++
++/// The lines held, and where they go.
++struct Out {
++    path: PathBuf,
++    file: Option<std::fs::File>,
++    held: String,
++    lines: usize,
++    flushed: Instant,
++}
++
++impl Out {
++    fn flush(&mut self) {
++        self.flushed = Instant::now();
++        if self.held.is_empty() {
++            return;
++        }
++        if self.file.is_none() {
++            let opened = std::fs::OpenOptions::new()
++                .create(true)
++                .append(true)
++                .open(&self.path);
++            match opened {
++                Ok(mut file) => {
++                    if file.metadata().map(|m| m.len() == 0).unwrap_or(false) {
++                        let _ = file.write_all(HEADER.as_bytes());
++                    }
++                    self.file = Some(file);
++                }
++                Err(error) => {
++                    eprintln!(
++                        "metal2vulkan: M2V_PASS_TIMES: cannot open {:?}: {error}",
++                        self.path
++                    );
++                    self.held.clear();
++                    self.lines = 0;
++                    return;
++                }
++            }
++        }
++        if let Some(file) = self.file.as_mut() {
++            let _ = file.write_all(self.held.as_bytes());
++        }
++        self.held.clear();
++        self.lines = 0;
++    }
++}
++
++/// A device's pass timer: its query pools and its lines (`DeviceShared::pass_times`).
++pub(crate) struct DeviceTimes {
++    host_reset: bool,
++    blocks: Mutex<Blocks>,
++    out: Mutex<Out>,
++}
++
++impl DeviceTimes {
++    /// The pass timer of a device whose queue family writes timestamps where `timestamps`, which
++    /// resets queries on the host where `host_reset`: `None` while the switch is off.
++    pub(crate) fn new(timestamps: bool, host_reset: bool) -> Option<Arc<DeviceTimes>> {
++        let dir = dir()?;
++        if !timestamps {
++            eprintln!("metal2vulkan: M2V_PASS_TIMES: the device's queue writes no timestamps");
++            return None;
++        }
++        let path = dir.join(format!("passes-{}.csv", std::process::id()));
++        Some(Arc::new(DeviceTimes {
++            host_reset,
++            blocks: Mutex::default(),
++            out: Mutex::new(Out {
++                path,
++                file: None,
++                held: String::new(),
++                lines: 0,
++                flushed: Instant::now(),
++            }),
++        }))
++    }
++
++    /// A block of queries, reset: a free one, else one of a pool made now; `None` once the device
++    /// refused a pool.
++    ///
++    /// # Safety
++    ///
++    /// `device` is the live device of this timer.
++    unsafe fn take(&self, device: &ash::Device) -> Option<Block> {
++        let mut blocks = lock(&self.blocks);
++        let block = match blocks.free.pop() {
++            Some(block) => block,
++            None => {
++                if blocks.refused {
++                    return None;
++                }
++                let info = vk::QueryPoolCreateInfo::default()
++                    .query_type(vk::QueryType::TIMESTAMP)
++                    .query_count(BLOCK * POOL_BLOCKS);
++                // SAFETY: the caller's; `info` is valid.
++                let made = unsafe { device.create_query_pool(&info, None) };
++                exit_guard::called(Call::CreateQueryPool);
++                let Ok(pool) = made else {
++                    blocks.refused = true;
++                    eprintln!("metal2vulkan: M2V_PASS_TIMES: the device refused a query pool");
++                    return None;
++                };
++                blocks.pools.push(pool);
++                let rest = (1..POOL_BLOCKS).rev().map(|i| Block {
++                    pool,
++                    first: i * BLOCK,
++                });
++                blocks.free.extend(rest);
++                Block { pool, first: 0 }
++            }
++        };
++        drop(blocks);
++        if self.host_reset {
++            // SAFETY: the device enables `hostQueryReset`; the block is free: its last holder's
++            // work completed, or never ran, and nothing else uses it.
++            unsafe { device.reset_query_pool(block.pool, block.first, BLOCK) };
++            exit_guard::called(Call::ResetQueryPool);
++        }
++        Some(block)
++    }
++
++    fn give_back(&self, blocks: Vec<Block>) {
++        if !blocks.is_empty() {
++            lock(&self.blocks).free.extend(blocks);
++        }
++    }
++
++    fn append(&self, text: &str, lines: usize) {
++        let mut out = lock(&self.out);
++        out.held.push_str(text);
++        out.lines += lines;
++        if out.lines >= FLUSH_LINES || out.flushed.elapsed() >= FLUSH_AFTER {
++            out.flush();
++        }
++    }
++
++    /// Append the lines held.
++    pub(crate) fn flush(&self) {
++        lock(&self.out).flush();
++    }
++
++    /// Release the pools, at the device's teardown, its lines appended first.
++    ///
++    /// # Safety
++    ///
++    /// `device` is the live device of this timer, and none of its command buffers is pending.
++    pub(crate) unsafe fn release(&self, device: &ash::Device) {
++        self.flush();
++        let pools = {
++            let mut blocks = lock(&self.blocks);
++            blocks.free.clear();
++            blocks.refused = true;
++            std::mem::take(&mut blocks.pools)
++        };
++        for pool in pools {
++            // SAFETY: the caller's.
++            unsafe { crate::release::object(device, pool) };
++        }
++    }
++}
++
++impl Drop for DeviceTimes {
++    fn drop(&mut self) {
++        self.flush();
++    }
++}
++
++/// A command buffer's capture, its state's (`State::pass_times`): undecided until it begins
++/// recording, then captured or not.
++#[derive(Default)]
++pub(crate) struct CbSlot {
++    decided: bool,
++    capture: Option<Arc<Capture>>,
++}
++
++impl CbSlot {
++    /// Its capture, taken to be read.
++    pub(crate) fn take(&mut self) -> Option<Arc<Capture>> {
++        self.capture.take()
++    }
++}
++
++/// What an encoder of a captured command buffer told.
++struct EncoderNote {
++    kind: EncoderKind,
++    causes: Vec<Split>,
++    not_inline: Option<NotInline>,
++}
++
++/// A `VkCommandBuffer` of a captured command buffer.
++#[derive(Default)]
++struct RawState {
++    /// The encoder last opened as it was handed out.
++    encoder: Option<u32>,
++    /// Its unit open.
++    open: Option<usize>,
++    /// A secondary's draws not yet in a unit.
++    pending_draws: u32,
++    /// The render pass instance that executed it, a secondary.
++    parent: Option<usize>,
++}
++
++/// A unit of work.
++struct Unit {
++    class: Class,
++    tag: Option<Tag>,
++    site: Option<&'static Location<'static>>,
++    command: &'static str,
++    encoder: Option<u32>,
++    label: Option<PassLabel>,
++    count: u32,
++    /// Its block's index in the capture's and its start query's offset in it.
++    block: usize,
++    offset: u32,
++}
++
++#[derive(Default)]
++struct CaptureState {
++    units: Vec<Unit>,
++    blocks: Vec<Block>,
++    used: u32,
++    out_of_queries: bool,
++    encoders: Vec<EncoderNote>,
++    current: Option<u32>,
++    raws: HashMap<u64, RawState>,
++}
++
++/// A captured command buffer.
++pub(crate) struct Capture {
++    times: Arc<DeviceTimes>,
++    device: Device,
++    seq: u64,
++    key: usize,
++    queue_label: String,
++    state: Mutex<CaptureState>,
++}
++
++impl Drop for Capture {
++    fn drop(&mut self) {
++        let me: *const Capture = self;
++        let state = self
++            .state
++            .get_mut()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        {
++            let mut raws = lock(&RAWS);
++            for raw in state.raws.keys() {
++                if raws.get(raw).is_some_and(|w| std::ptr::eq(w.as_ptr(), me)) {
++                    raws.remove(raw);
++                }
++            }
++        }
++        {
++            let mut keys = lock(&BY_KEY);
++            if keys
++                .get(&self.key)
++                .is_some_and(|w| std::ptr::eq(w.as_ptr(), me))
++            {
++                keys.remove(&self.key);
++            }
++        }
++        self.times.give_back(std::mem::take(&mut state.blocks));
++        LIVE.fetch_sub(1, Ordering::Relaxed);
++    }
++}
++
++impl CaptureState {
++    /// Two queries for a unit: its block's index and the start's offset.
++    fn queries(&mut self, capture: &Capture) -> Option<(usize, u32)> {
++        if self.out_of_queries {
++            return None;
++        }
++        if self.blocks.is_empty() || self.used + 2 > BLOCK {
++            let device = capture.device.shared().vk();
++            // SAFETY: the capture's device is live.
++            match unsafe { capture.times.take(device) } {
++                Some(block) => {
++                    self.blocks.push(block);
++                    self.used = 0;
++                }
++                None => {
++                    self.out_of_queries = true;
++                    return None;
++                }
++            }
++        }
++        let offset = self.used;
++        self.used += 2;
++        Some((self.blocks.len() - 1, offset))
++    }
++}
++
++/// Begin `slot`'s capture where it is undecided: a capture where the device's timer is on and
++/// `<dir>/on` exists.
++fn decide<'a>(
++    slot: &'a mut CbSlot,
++    device: &Device,
++    queue: &CommandQueue,
++    key: usize,
++) -> Option<&'a Arc<Capture>> {
++    if !slot.decided {
++        slot.decided = true;
++        slot.capture = start(device, queue, key);
++    }
++    slot.capture.as_ref()
++}
++
++fn start(device: &Device, queue: &CommandQueue, key: usize) -> Option<Arc<Capture>> {
++    let times = device.shared().pass_times.as_ref()?;
++    let dir = dir()?;
++    if !dir.join("on").exists() {
++        times.flush();
++        return None;
++    }
++    let label = queue.label().unwrap_or_else(|| "-".to_owned());
++    let capture = Arc::new(Capture {
++        times: Arc::clone(times),
++        device: device.clone(),
++        seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
++        key,
++        queue_label: label.replace(',', ";"),
++        state: Mutex::default(),
++    });
++    LIVE.fetch_add(1, Ordering::Relaxed);
++    lock(&BY_KEY).insert(key, Arc::downgrade(&capture));
++    Some(capture)
++}
++
++/// An encoder of `kind` opens on the command buffer at `key` of `device` and `queue`, whose capture
++/// `slot` holds (`EncoderCore::open`): `VkCommandBuffer`s handed out from now on are its.
++pub(crate) fn encoder_opened(
++    device: &Device,
++    queue: &CommandQueue,
++    key: usize,
++    slot: &mut CbSlot,
++    kind: EncoderKind,
++) {
++    if !on() {
++        return;
++    }
++    let Some(capture) = decide(slot, device, queue, key) else {
++        return;
++    };
++    let mut state = lock(&capture.state);
++    state.current = Some(state.encoders.len() as u32);
++    state.encoders.push(EncoderNote {
++        kind,
++        causes: Vec::new(),
++        not_inline: None,
++    });
++}
++
++/// The command buffer at `key` of `device` and `queue`, whose capture `slot` holds, handed out
++/// `raw` (`CommandBufferShared::allocate_deferred` and kin).
++pub(crate) fn handed_out(
++    device: &Device,
++    queue: &CommandQueue,
++    key: usize,
++    slot: &mut CbSlot,
++    raw: vk::CommandBuffer,
++) {
++    if !on() {
++        return;
++    }
++    let Some(capture) = decide(slot, device, queue, key) else {
++        // A handle a capture still alive handed out before goes to no capture now.
++        if LIVE.load(Ordering::Relaxed) > 0 {
++            lock(&RAWS).remove(&raw.as_raw());
++        }
++        return;
++    };
++    {
++        let mut state = lock(&capture.state);
++        let encoder = state.current;
++        state.raws.insert(
++            raw.as_raw(),
++            RawState {
++                encoder,
++                ..RawState::default()
++            },
++        );
++    }
++    lock(&RAWS).insert(raw.as_raw(), Arc::downgrade(capture));
++}
++
++/// The capture of the command buffer at `key`.
++fn by_key(key: usize) -> Option<Arc<Capture>> {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return None;
++    }
++    lock(&BY_KEY).get(&key)?.upgrade()
++}
++
++/// A render encoder of `command_buffer` split its pass for `cause` (`render.rs`).
++pub(crate) fn note_split(command_buffer: &CommandBuffer, cause: Split) {
++    if !on() {
++        return;
++    }
++    let Some(capture) = by_key(command_buffer.pass_times_key()) else {
++        return;
++    };
++    let mut state = lock(&capture.state);
++    if let Some(at) = state.current {
++        if let Some(note) = state.encoders.get_mut(at as usize) {
++            note.causes.push(cause);
++        }
++    }
++}
++
++/// A render encoder of `command_buffer` did not record its pass's first instance inline, for
++/// `why` (`render.rs`, `render/inline_first.rs`).
++pub(crate) fn note_not_inline(command_buffer: &CommandBuffer, why: NotInline) {
++    if !on() {
++        return;
++    }
++    let Some(capture) = by_key(command_buffer.pass_times_key()) else {
++        return;
++    };
++    let mut state = lock(&capture.state);
++    if let Some(at) = state.current {
++        if let Some(note) = state.encoders.get_mut(at as usize) {
++            note.not_inline.get_or_insert(why);
++        }
++    }
++}
++
++/// The capture `raw` was handed out by.
++fn capture_of(raw: vk::CommandBuffer) -> Option<Arc<Capture>> {
++    lock(&RAWS).get(&raw.as_raw())?.upgrade()
++}
++
++/// Open a unit on `cb`: its start written.
++///
++/// # Safety
++///
++/// `cb` is recording outside a render pass instance, by the caller alone; `st` are its slot's.
++unsafe fn open(
++    st: Stamps,
++    cb: vk::CommandBuffer,
++    capture: &Capture,
++    state: &mut CaptureState,
++    mut unit: Unit,
++) -> Option<usize> {
++    let (block, offset) = state.queries(capture)?;
++    let Block { pool, first } = state.blocks[block];
++    // SAFETY: the caller's; the queries are the capture's, reset on the host or here.
++    unsafe {
++        if !capture.times.host_reset {
++            (st.reset)(cb, pool, first + offset, 2);
++        }
++        (st.write)(
++            cb,
++            vk::PipelineStageFlags::ALL_COMMANDS,
++            pool,
++            first + offset,
++        );
++    }
++    unit.block = block;
++    unit.offset = offset;
++    state.units.push(unit);
++    Some(state.units.len() - 1)
++}
++
++/// Close unit `index` on `cb`: its end written.
++///
++/// # Safety
++///
++/// As [`open`]'s.
++unsafe fn close(st: Stamps, cb: vk::CommandBuffer, state: &CaptureState, index: usize) {
++    let unit = &state.units[index];
++    let Block { pool, first } = state.blocks[unit.block];
++    // SAFETY: the caller's.
++    unsafe {
++        (st.write)(
++            cb,
++            vk::PipelineStageFlags::ALL_COMMANDS,
++            pool,
++            first + unit.offset + 1,
++        )
++    };
++}
++
++/// Before `vkCmdBeginRenderPass` of `begin` on `cb`: the open run closed, a render pass unit
++/// opened.
++///
++/// # Safety
++///
++/// As the command's: `cb` recording outside a render pass, `begin` valid; `st` are its slot's.
++pub(crate) unsafe fn begin_pass(
++    st: Stamps,
++    cb: vk::CommandBuffer,
++    begin: *const vk::RenderPassBeginInfo<'_>,
++) {
++    let site = SITE.with(Cell::take);
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let tag = SCOPE.with(Cell::get);
++    // SAFETY: the caller's.
++    let label = unsafe { begin.as_ref() }.map(|begin| {
++        image_log::pass_label(
++            begin.render_pass,
++            begin.framebuffer,
++            begin.render_area.extent,
++        )
++    });
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(raw) = state.raws.get_mut(&cb.as_raw()) else {
++        return;
++    };
++    let encoder = raw.encoder;
++    if let Some(open) = raw.open.take() {
++        // SAFETY: the caller's.
++        unsafe { close(st, cb, state, open) };
++    }
++    let unit = Unit {
++        class: Class::Pass,
++        tag,
++        site,
++        command: "vkCmdBeginRenderPass",
++        encoder,
++        label,
++        count: 0,
++        block: 0,
++        offset: 0,
++    };
++    // SAFETY: the caller's.
++    let opened = unsafe { open(st, cb, &capture, state, unit) };
++    if let Some(raw) = state.raws.get_mut(&cb.as_raw()) {
++        raw.open = opened;
++    }
++}
++
++/// After `vkCmdEndRenderPass` on `cb`: its render pass unit closed.
++///
++/// # Safety
++///
++/// As the command's; `st` are its slot's.
++pub(crate) unsafe fn end_pass(st: Stamps, cb: vk::CommandBuffer) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(open) = state.raws.get_mut(&cb.as_raw()).and_then(|r| r.open.take()) else {
++        return;
++    };
++    // SAFETY: the caller's: the pass ended.
++    unsafe { close(st, cb, state, open) };
++}
++
++/// Before `vkEndCommandBuffer` of `cb`: its open unit closed.
++///
++/// # Safety
++///
++/// As the command's; `st` are its slot's.
++pub(crate) unsafe fn end(st: Stamps, cb: vk::CommandBuffer) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(open) = state.raws.get_mut(&cb.as_raw()).and_then(|r| r.open.take()) else {
++        return;
++    };
++    // SAFETY: the caller's.
++    unsafe { close(st, cb, state, open) };
++}
++
++/// Before a dispatch or transfer `command` of `class` on `cb`: counted in the open run where it
++/// is of its class and label, else the run closed and another opened.
++///
++/// # Safety
++///
++/// As the command's: `cb` recording outside a render pass instance; `st` are its slot's.
++pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, command: &'static str) {
++    let site = SITE.with(Cell::take);
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let tag = SCOPE.with(Cell::get);
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(raw) = state.raws.get_mut(&cb.as_raw()) else {
++        return;
++    };
++    let encoder = raw.encoder;
++    // The program's own commands of its encoder's class run on whatever records them; other
++    // work runs by its place.
++    let kind = encoder
++        .and_then(|e| state.encoders.get(e as usize))
++        .map(|n| n.kind);
++    let natural = tag == Some(Tag::Guest) && natural(kind, class);
++    if let Some(at) = raw.open {
++        let unit = &mut state.units[at];
++        let same = unit.class == class
++            && unit.tag == tag
++            && unit.encoder == encoder
++            && (natural || (unit.site == site && unit.command == command));
++        // A command inside a render pass instance (none of these may be) counts in it.
++        if same || unit.class == Class::Pass {
++            unit.count += 1;
++            return;
++        }
++        raw.open = None;
++        // SAFETY: the caller's.
++        unsafe { close(st, cb, state, at) };
++    }
++    let unit = Unit {
++        class,
++        tag,
++        site,
++        command,
++        encoder,
++        label: None,
++        count: 1,
++        block: 0,
++        offset: 0,
++    };
++    // SAFETY: the caller's.
++    let opened = unsafe { open(st, cb, &capture, state, unit) };
++    if let Some(raw) = state.raws.get_mut(&cb.as_raw()) {
++        raw.open = opened;
++    }
++}
++
++/// Before a draw on `cb`: counted in its render pass instance, or the one that executes it.
++pub(crate) fn draw(cb: vk::CommandBuffer) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(raw) = state.raws.get_mut(&cb.as_raw()) else {
++        return;
++    };
++    match raw.open.or(raw.parent) {
++        Some(at) => state.units[at].count += 1,
++        None => raw.pending_draws += 1,
++    }
++}
++
++/// Before `vkCmdExecuteGeneratedCommandsEXT` on `cb`: a draw inside a render pass instance, else a
++/// dispatch.
++///
++/// # Safety
++///
++/// As [`work`]'s.
++pub(crate) unsafe fn generated(st: Stamps, cb: vk::CommandBuffer, command: &'static str) {
++    let in_pass = LIVE.load(Ordering::Relaxed) > 0
++        && capture_of(cb).is_some_and(|capture| {
++            let state = lock(&capture.state);
++            let open = state.raws.get(&cb.as_raw()).and_then(|r| r.open);
++            let in_pass = open.is_some_and(|at| state.units[at].class == Class::Pass);
++            in_pass
++        });
++    match in_pass {
++        true => {
++            SITE.with(Cell::take);
++            draw(cb);
++        }
++        // SAFETY: the caller's.
++        false => unsafe { work(st, cb, Class::Compute, command) },
++    }
++}
++
++/// Before `vkCmdExecuteCommands` of `count` secondaries at `buffers` on `cb`: their draws counted
++/// in its render pass instance, and their later ones.
++///
++/// # Safety
++///
++/// `buffers` points at `count` command buffers.
++pub(crate) unsafe fn execute(cb: vk::CommandBuffer, count: u32, buffers: *const vk::CommandBuffer) {
++    if LIVE.load(Ordering::Relaxed) == 0 || buffers.is_null() {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(at) = state.raws.get(&cb.as_raw()).and_then(|r| r.open) else {
++        return;
++    };
++    // SAFETY: the caller's.
++    let secondaries = unsafe { std::slice::from_raw_parts(buffers, count as usize) };
++    let mut draws = 0;
++    for secondary in secondaries {
++        if let Some(raw) = state.raws.get_mut(&secondary.as_raw()) {
++            draws += std::mem::take(&mut raw.pending_draws);
++            raw.parent = Some(at);
++        }
++    }
++    state.units[at].count += draws;
++}
++
++/// The routed commands' hooks (`recorder/thunks.rs`): `before` a command is logged or called, and
++/// `after`; a command named nowhere here has none.
++macro_rules! hook {
++    (before cmd_begin_render_pass, $st:expr, $cb:ident, $begin:ident, $contents:ident) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::begin_pass($st, $cb, $begin) }
++        }
++    };
++    (after cmd_end_render_pass, $st:expr, $cb:ident) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::end_pass($st, $cb) }
++        }
++    };
++    (before end_command_buffer, $st:expr, $cb:ident) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::end($st, $cb) }
++        }
++    };
++    (before cmd_execute_commands, $st:expr, $cb:ident, $count:ident, $buffers:ident) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::execute($cb, $count, $buffers) }
++        }
++    };
++    (before cmd_execute_generated_commands, $st:expr, $cb:ident $(, $a:ident)*) => {
++        if $crate::pass_times::on() {
++            unsafe {
++                $crate::pass_times::generated($st, $cb, "vkCmdExecuteGeneratedCommandsEXT")
++            }
++        }
++    };
++    (before cmd_draw, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_indexed, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_indexed_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_mesh_tasks, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_mesh_tasks_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_draw_mesh_tasks_indirect_count, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw $cb)
++    };
++    (before cmd_dispatch, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Compute, "vkCmdDispatch")
++    };
++    (before cmd_dispatch_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Compute, "vkCmdDispatchIndirect")
++    };
++    (before cmd_preprocess_generated_commands, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Compute, "vkCmdPreprocessGeneratedCommandsEXT")
++    };
++    (before cmd_copy_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyBuffer")
++    };
++    (before cmd_copy_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyImage")
++    };
++    (before cmd_blit_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdBlitImage")
++    };
++    (before cmd_copy_buffer_to_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyBufferToImage")
++    };
++    (before cmd_copy_image_to_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyImageToBuffer")
++    };
++    (before cmd_update_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdUpdateBuffer")
++    };
++    (before cmd_fill_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdFillBuffer")
++    };
++    (before cmd_clear_color_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdClearColorImage")
++    };
++    (before cmd_clear_depth_stencil_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdClearDepthStencilImage")
++    };
++    (before cmd_copy_query_pool_results, $st:expr, $cb:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyQueryPoolResults")
++    };
++    (@draw $cb:ident) => {
++        if $crate::pass_times::on() {
++            $crate::pass_times::draw($cb)
++        }
++    };
++    (@work $st:expr, $cb:ident, $class:ident, $name:literal) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::work($st, $cb, $crate::pass_times::Class::$class, $name) }
++        }
++    };
++    ($phase:ident $command:ident, $($rest:tt)*) => {};
++}
++pub(crate) use hook;
++
++/// Where a completed command buffer's units are placed on the host's clock ([`read`]).
++pub(crate) struct Placement<'a> {
++    /// The device's clock.
++    pub(crate) clock: Option<&'a GpuClock>,
++    /// The calibration pair its GPU times took.
++    pub(crate) pair: Option<Pair>,
++    /// Its GPU start's timestamp and host time, where read and placed.
++    pub(crate) start: Option<(u64, u64)>,
++    /// The host time its completion was seen.
++    pub(crate) completed: u64,
++}
++
++/// Whether a command of `class` is one an encoder of `kind` is made for.
++fn natural(kind: Option<EncoderKind>, class: Class) -> bool {
++    matches!(
++        (kind, class),
++        (Some(EncoderKind::Compute), Class::Compute) | (Some(EncoderKind::Blit), Class::Transfer)
++    )
++}
++
++/// The encoder kind's name.
++fn kind_name(kind: EncoderKind) -> &'static str {
++    match kind {
++        EncoderKind::Blit => "blit",
++        EncoderKind::Compute => "compute",
++        EncoderKind::Render => "render",
++        EncoderKind::ResourceState => "resource-state",
++    }
++}
++
++/// Read `capture`'s units, its command buffer completed, and append their lines: in the
++/// completion turn, inside its section (`command_buffer/mod.rs`, `read_pass_times`).
++pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
++    let state = lock(&capture.state);
++    if state.units.is_empty() {
++        return;
++    }
++    let device = capture.device.shared().vk();
++    // Each block's queries: value and availability.
++    let mut values: Vec<Vec<[u64; 2]>> = Vec::with_capacity(state.blocks.len());
++    for block in &state.blocks {
++        let mut results = vec![[0u64; 2]; BLOCK as usize];
++        // SAFETY: the block's queries were reset, and those written were written by work that
++        // completed; 64-bit values with availability, two words each.
++        let read = unsafe {
++            device.get_query_pool_results(
++                block.pool,
++                block.first,
++                &mut results,
++                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
++            )
++        };
++        exit_guard::called(Call::GetQueryPoolResults);
++        if !matches!(read, Ok(()) | Err(vk::Result::NOT_READY)) {
++            results.iter_mut().for_each(|r| *r = [0, 0]);
++        }
++        values.push(results);
++    }
++    let value = |block: usize, query: u32| {
++        let [value, available] = values[block][query as usize];
++        (available != 0).then_some(value)
++    };
++    let place = |ticks: u64| match (placement.clock, placement.pair, placement.start) {
++        (Some(clock), Some(pair), _) => clock.place(pair, ticks),
++        (Some(clock), None, Some((start, host))) => host + clock.duration(start, ticks),
++        _ => placement.completed,
++    };
++    // Each encoder's render pass instances, for `i/n`.
++    let instance = |unit: &Unit| match unit.tag {
++        Some(Tag::Pass(at)) => unit.class == Class::Pass && at != PassAt::Resolve,
++        _ => false,
++    };
++    let mut totals: HashMap<Option<u32>, u32> = HashMap::new();
++    for unit in state.units.iter().filter(|u| instance(u)) {
++        *totals.entry(unit.encoder).or_default() += 1;
++    }
++    let mut counted: HashMap<Option<u32>, u32> = HashMap::new();
++    let mut out = String::with_capacity(state.units.len() * 160);
++    for (index, unit) in state.units.iter().enumerate() {
++        let begin = value(unit.block, unit.offset);
++        let end = value(unit.block, unit.offset + 1);
++        let gpu = match (begin, end, placement.clock) {
++            (Some(begin), Some(end), Some(clock)) => clock.duration(begin, end).to_string(),
++            _ => String::new(),
++        };
++        let host = begin.map_or(placement.completed, place);
++        let note = unit.encoder.and_then(|e| state.encoders.get(e as usize));
++        let encoder = match (unit.encoder, note) {
++            (Some(e), Some(note)) => format!("{}#{e}", kind_name(note.kind)),
++            _ => "-".to_owned(),
++        };
++        let kind = match (unit.class, unit.tag) {
++            (Class::Pass, Some(Tag::Pass(PassAt::Resolve))) => "render-pass-resolve".to_owned(),
++            (Class::Pass, Some(Tag::Pass(_))) => "render-pass".to_owned(),
++            (Class::Pass, _) => {
++                let made = unit.label.as_ref().and_then(PassLabel::site);
++                let at = unit.site.map(image_log::short).or(made);
++                format!("pass:{}", at.as_deref().unwrap_or("?"))
++            }
++            (class, Some(Tag::Guest)) => {
++                let encoder = note.map_or("?", |n| kind_name(n.kind));
++                let what = match class {
++                    Class::Compute => "compute",
++                    _ => "transfer",
++                };
++                match (natural(note.map(|n| n.kind), class), unit.site) {
++                    (true, _) => format!("guest-{encoder}"),
++                    (false, Some(at)) => format!(
++                        "guest-{encoder}:{what}@{}/{}",
++                        image_log::short(at),
++                        unit.command
++                    ),
++                    (false, None) => format!("guest-{encoder}:{what}/{}", unit.command),
++                }
++            }
++            (_, _) => match unit.site {
++                Some(at) => format!("internal:{}/{}", image_log::short(at), unit.command),
++                None => format!("internal:{}", unit.command),
++            },
++        };
++        let attachments = unit
++            .label
++            .as_ref()
++            .map_or_else(|| "-".to_owned(), PassLabel::format);
++        let split = match unit.tag {
++            _ if instance(unit) => {
++                let n = totals.get(&unit.encoder).copied().unwrap_or(1);
++                let i = {
++                    let i = counted.entry(unit.encoder).or_default();
++                    *i += 1;
++                    *i
++                };
++                let cause = match i {
++                    1 => "first".to_owned(),
++                    _ => note
++                        .and_then(|n| n.causes.get(i as usize - 2))
++                        .map_or_else(|| "run".to_owned(), |c| format!("{c:?}")),
++                };
++                let records = match unit.tag {
++                    Some(Tag::Pass(PassAt::Inline)) => "inline",
++                    Some(Tag::Pass(PassAt::InlineSplit)) => "inline-split",
++                    _ => "secondary",
++                };
++                let not_inline = match (i, note.and_then(|n| n.not_inline)) {
++                    (1, Some(why)) => format!(";not-inline={why:?}"),
++                    _ => String::new(),
++                };
++                format!("{i}/{n}:{cause};{records}{not_inline}")
++            }
++            Some(Tag::Pass(PassAt::Resolve)) => "resolve".to_owned(),
++            _ => "-".to_owned(),
++        };
++        let _ = writeln!(
++            out,
++            "{host},{},{index},{kind},{},{encoder},{attachments},{},{},{gpu}",
++            capture.seq,
++            capture.queue_label,
++            split.replace(',', ";"),
++            unit.count,
++        );
++    }
++    let lines = state.units.len();
++    drop(state);
++    capture.times.append(&out, lines);
++}
+diff --git a/crates/metal2vulkan-runtime/src/pending_dispatch.rs b/crates/metal2vulkan-runtime/src/pending_dispatch.rs
+index b79bb1de..39e17ba3 100644
+--- a/crates/metal2vulkan-runtime/src/pending_dispatch.rs
++++ b/crates/metal2vulkan-runtime/src/pending_dispatch.rs
+@@ -75,6 +75,8 @@ impl Recording {
+         command_buffer: vk::CommandBuffer,
+         pipelines: &[Arc<RawPipeline>],
+     ) {
++        // LOCAL (Atlas) diagnostic: the program's dispatch, to the pass timer (`pass_times.rs`).
++        let _scope = crate::pass_times::scope(crate::pass_times::Tag::Guest);
+         // SAFETY: the caller's contract; the gates lie in the command buffer's arena.
+         unsafe {
+             if let Some(preprocess) = &self.preprocess {
+diff --git a/crates/metal2vulkan-runtime/src/recorder/thunks.rs b/crates/metal2vulkan-runtime/src/recorder/thunks.rs
+index 0690463b..1c9970ba 100644
+--- a/crates/metal2vulkan-runtime/src/recorder/thunks.rs
++++ b/crates/metal2vulkan-runtime/src/recorder/thunks.rs
+@@ -170,12 +170,16 @@ macro_rules! commands {
+                 command_buffer: vk::CommandBuffer,
+                 $($a: $t,)*
+             ) $(-> $r)? {
++                // LOCAL (Atlas) diagnostic: the pass timer's hook (`pass_times.rs`).
++                crate::pass_times::hook!(before $f, stamps::<S>(), command_buffer $(, $a)*);
+                 // A deferred command buffer's command goes into its log (`recorder`).
+                 // SAFETY: the caller records `command_buffer` alone (Vulkan's external
+                 // synchronization); its arguments are as the command takes them.
+                 let logged =
+                     unsafe { super::handles::record(command_buffer, |log| log.$f($($a,)*)) };
+                 if let Some(logged) = logged {
++                    // LOCAL (Atlas) diagnostic: the pass timer's hook (`pass_times.rs`).
++                    crate::pass_times::hook!(after $f, stamps::<S>(), command_buffer $(, $a)*);
+                     return logged;
+                 }
+                 let real = REAL.$f[S].load(Ordering::Acquire);
+@@ -184,18 +188,30 @@ macro_rules! commands {
+                 }
+                 // SAFETY: the slot's device's driver gave this command (`store`), of this
+                 // signature; the caller's arguments are as the command takes them.
+-                unsafe {
++                let answer = unsafe {
+                     let real = std::mem::transmute::<
+                         *mut c_void,
+                         unsafe extern "system" fn(vk::CommandBuffer, $($t,)*) $(-> $r)?,
+                     >(real);
+                     real(command_buffer, $($a,)*)
+-                }
++                };
++                // LOCAL (Atlas) diagnostic: the pass timer's hook (`pass_times.rs`).
++                crate::pass_times::hook!(after $f, stamps::<S>(), command_buffer $(, $a)*);
++                answer
+             }
+         )*
+     };
+ }
+ 
++/// LOCAL (Atlas) diagnostic: slot `S`'s own timestamp commands, which the pass timer records its
++/// units' timestamps through (`pass_times.rs`).
++fn stamps<const S: usize>() -> crate::pass_times::Stamps {
++    crate::pass_times::Stamps {
++        write: cmd_write_timestamp::<S>,
++        reset: cmd_reset_query_pool::<S>,
++    }
++}
++
+ commands! {
+     v1_0 {
+         BeginCommandBuffer begin_command_buffer c"vkBeginCommandBuffer"
+diff --git a/crates/metal2vulkan-runtime/src/release.rs b/crates/metal2vulkan-runtime/src/release.rs
+index b8f18a02..684d84ec 100644
+--- a/crates/metal2vulkan-runtime/src/release.rs
++++ b/crates/metal2vulkan-runtime/src/release.rs
+@@ -142,6 +142,8 @@ macro_rules! released {
+                 const CALL: Call = Call::$call;
+ 
+                 unsafe fn destroy(self, device: &ash::Device, _: Door) {
++                    // LOCAL (Atlas) diagnostic: the image census and registry (`image_log.rs`).
++                    crate::image_log::released(Call::$call, vk::Handle::as_raw(self));
+                     // SAFETY: the caller's.
+                     unsafe { device.$method(self, None) }
+                 }
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index ba3449ed..de475813 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1811,6 +1811,11 @@ impl CommandBuffer {
+             None => EncoderCore::open(self, CALL, EncoderKind::Render, false)?,
+             Some(_) => EncoderCore::replaying(self, false)?,
+         };
++        // LOCAL (Atlas) diagnostic: why the pass's first instance does not record inline, to the
++        // pass timer (`pass_times.rs`).
++        if let (Err(why), None) = (&opens, &again) {
++            crate::pass_times::note_not_inline(core.command_buffer(), *why);
++        }
+         if let Some(pass) = &rate_map {
+             let (map, state) = pass.taken();
+             core.take_rate_map(map, state);
+@@ -6368,6 +6373,8 @@ impl RenderLowering {
+                     (false, false) => cause,
+                 };
+                 self.core.device().shared().counts.instance_split(cause);
++                // LOCAL (Atlas) diagnostic: the split's cause, to the pass timer (`pass_times.rs`).
++                crate::pass_times::note_split(self.core.command_buffer(), cause);
+                 let previous = std::mem::replace(&mut self.current, *instance);
+                 self.earlier.push(previous);
+                 self.barrier_splits += usize::from(self.barrier);
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+index 0b490627..e67b4acd 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+@@ -331,6 +331,11 @@ impl RenderLowering {
+                 if matches!(self.inline, Inline::Open { .. }) && records && !capture {
+                     self.inline = Inline::Never;
+                     (self.core.device().shared().counts).pass_not_inline(NotInline::Draws);
++                    // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++                    crate::pass_times::note_not_inline(
++                        self.core.command_buffer(),
++                        NotInline::Draws,
++                    );
+                 }
+                 None
+             }
+@@ -369,19 +374,30 @@ impl RenderLowering {
+             } => instance,
+             Next::New { split: true, .. } => {
+                 counts.pass_not_inline(NotInline::Draws);
++                // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++                crate::pass_times::note_not_inline(self.core.command_buffer(), NotInline::Draws);
+                 return Ok(None);
+             }
+         };
+         if stood.is_some() {
+             counts.pass_not_inline(NotInline::StandIn);
++            // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++            crate::pass_times::note_not_inline(self.core.command_buffer(), NotInline::StandIn);
+             return Ok(None);
+         }
+         if !instance.shape.storage.is_empty() {
+             counts.pass_not_inline(NotInline::Storage);
++            // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++            crate::pass_times::note_not_inline(self.core.command_buffer(), NotInline::Storage);
+             return Ok(None);
+         }
+         if writes {
+             counts.pass_not_inline(NotInline::MemorylessWrites);
++            // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++            crate::pass_times::note_not_inline(
++                self.core.command_buffer(),
++                NotInline::MemorylessWrites,
++            );
+             return Ok(None);
+         }
+         let plain = made
+@@ -405,6 +421,8 @@ impl RenderLowering {
+             && !instance.shader_tests;
+         if !plain {
+             counts.pass_not_inline(NotInline::Draws);
++            // LOCAL (Atlas) diagnostic: to the pass timer (`pass_times.rs`).
++            crate::pass_times::note_not_inline(self.core.command_buffer(), NotInline::Draws);
+             return Ok(None);
+         }
+         let device = self.core.device().clone();
+@@ -498,7 +516,12 @@ impl RenderLowering {
+         // and framebuffer are live until the command buffer completes (the encoder holds them
+         // to its end, which retains them), the render area is the framebuffer's extent, and
+         // every image rests in `GENERAL`.
++        // LOCAL (Atlas) diagnostic: the pass's first instance, to the pass timer (`pass_times.rs`).
++        let scope = crate::pass_times::scope(crate::pass_times::Tag::Pass(
++            crate::pass_times::PassAt::Inline,
++        ));
+         unsafe { raw.cmd_begin_render_pass(held, &info, vk::SubpassContents::INLINE) };
++        drop(scope);
+         device.shared().counts.render_pass_begun(PassBegun::Inline);
+         self.current.draws = held;
+         self.current.inline = true;
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_splits.rs b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+index c7c9e642..7cd2407c 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_splits.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_splits.rs
+@@ -577,7 +577,12 @@ fn record_kept(
+         for step in &instance.before {
+             step.record_in(raw, held);
+         }
++        // LOCAL (Atlas) diagnostic: an instance after a split, to the pass timer (`pass_times.rs`).
++        let scope = crate::pass_times::scope(crate::pass_times::Tag::Pass(
++            crate::pass_times::PassAt::InlineSplit,
++        ));
+         raw.cmd_begin_render_pass(held, &info, vk::SubpassContents::INLINE);
++        drop(scope);
+         let begun = crate::work_counts::PassBegun::InlineSplit;
+         shared.counts.render_pass_begun(begun);
+         let mut draws = kept.room.recordings[..kept.draws].iter();
+diff --git a/crates/metal2vulkan-runtime/src/render/pass_steps.rs b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+index 61e2f403..9290f127 100644
+--- a/crates/metal2vulkan-runtime/src/render/pass_steps.rs
++++ b/crates/metal2vulkan-runtime/src/render/pass_steps.rs
+@@ -216,11 +216,16 @@ impl PassSteps {
+                 .framebuffer(framebuffer)
+                 .render_area(self.render_area)
+                 .clear_values(self.clear_values.as_slice());
++            // LOCAL (Atlas) diagnostic: the pass's instance, to the pass timer (`pass_times.rs`).
++            let scope = crate::pass_times::scope(crate::pass_times::Tag::Pass(
++                crate::pass_times::PassAt::Instance,
++            ));
+             raw.cmd_begin_render_pass(
+                 command_buffer,
+                 &begin,
+                 vk::SubpassContents::SECONDARY_COMMAND_BUFFERS,
+             );
++            drop(scope);
+         }
+     }
+ 
+@@ -373,7 +378,13 @@ impl PassSteps {
+                     .framebuffer(framebuffer.raw)
+                     .render_area(self.render_area)
+                     .clear_values(self.clear_values.as_slice());
++                // LOCAL (Atlas) diagnostic: the resolving instance, to the pass timer
++                // (`pass_times.rs`).
++                let scope = crate::pass_times::scope(crate::pass_times::Tag::Pass(
++                    crate::pass_times::PassAt::Resolve,
++                ));
+                 raw.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
++                drop(scope);
+                 raw.cmd_end_render_pass(command_buffer);
+             }
+         }
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 927b65f1..6a13c30a 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1591,6 +1591,8 @@ impl Device {
+     /// runtime extension, for a caller's helper texture).
+     pub fn new_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, Error> {
+         const CALL: &str = "new_texture";
++        // LOCAL (Atlas) diagnostic: the image census's purpose (`image_log.rs`).
++        let _purpose = crate::image_log::api("texture");
+         self.keep_room();
+         let descriptor = &self.texture_options(CALL, descriptor)?;
+         // An `Outside` texture takes no ID, so no ID's limit applies.
+@@ -2836,6 +2838,8 @@ impl Device {
+     /// The image of `plan` for a texture of `layout` made with `descriptor` (and its hazard
+     /// tracking mode `hazard`), checked against the device's limits for it, placed, and in the
+     /// `GENERAL` layout.
++    // LOCAL (Atlas) diagnostic: its caller's place, for the image census (`image_log.rs`).
++    #[track_caller]
+     fn new_image(
+         &self,
+         plan: ImagePlan,
+@@ -2855,6 +2859,8 @@ impl Device {
+     /// shape was written and released; those it compresses read a fixed pattern, which the
+     /// runtime does not give yet). The runtime's own images keep [`new_image`](Self::new_image)'s
+     /// start: an image its first command writes in full need not be zeroed first.
++    // LOCAL (Atlas) diagnostic: its caller's place, for the image census (`image_log.rs`).
++    #[track_caller]
+     fn new_texture_image(
+         &self,
+         plan: ImagePlan,
+@@ -3030,6 +3036,8 @@ impl Device {
+     /// [`new_image`](Self::new_image)'s image, of `identity`, its owner made by `owner` of its
+     /// placement and `VkImage` (a heap's unaliased texture and a shadow whose copies leave an
+     /// aspect out, `texture/heap.rs`; a view's shadow, `texture/view_shadow.rs`).
++    // LOCAL (Atlas) diagnostic: its caller's place, for the image census (`image_log.rs`).
++    #[track_caller]
+     fn new_image_owned(
+         &self,
+         plan: ImagePlan,
+@@ -3053,6 +3061,8 @@ impl Device {
+     /// any command reads it: a texture's over a buffer (`storage_over_buffer`), and a heap
+     /// texture's over the heap's bytes (`texture/heap.rs`, `new_heap_shadow` and
+     /// `heap_planes_image`).
++    // LOCAL (Atlas) diagnostic: its caller's place, for the image census (`image_log.rs`).
++    #[track_caller]
+     fn new_image_as_it_lies(
+         &self,
+         plan: ImagePlan,
+@@ -3068,6 +3078,8 @@ impl Device {
+     /// `start` says so, else zeroed: on the host where it takes host copies, else by a clear
+     /// where one writes its format ([`clears_to_zero`](Self::clears_to_zero)), else by copies of
+     /// the device's zeros. (or moved alone, [`Start::Moved`].)
++    // LOCAL (Atlas) diagnostic: its caller's place, for the image census (`image_log.rs`).
++    #[track_caller]
+     fn new_image_starting(
+         &self,
+         plan: ImagePlan,
+@@ -3080,6 +3092,17 @@ impl Device {
+         let held = start == Start::Held;
+         let moved = start == Start::Moved;
+         let storage = descriptor.resource_options.storage_mode()?;
++        // LOCAL (Atlas) diagnostic: where the image was asked for, for the image census
++        // (`image_log.rs`).
++        let _origin = crate::image_log::origin(
++            std::panic::Location::caller(),
++            match storage {
++                StorageMode::Shared => "Shared",
++                StorageMode::Managed => "Managed",
++                StorageMode::Private => "Private",
++                StorageMode::Memoryless => "Memoryless",
++            },
++        );
+         let class = plan.memory_class(storage, &self.properties().driver_defects);
+         // A `Shared` or `Managed` texture's image with host-transfer usage where the device
+         // copies on the host and makes and places it so (`texture/host_copy.rs`), else as
+@@ -3630,6 +3653,8 @@ impl Heap {
+     /// Refused for a placement heap, whose textures take an offset (`Invalid`, as for its
+     /// buffers).
+     pub fn new_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, Error> {
++        // LOCAL (Atlas) diagnostic: the image census's purpose (`image_log.rs`).
++        let _purpose = crate::image_log::api("heap-texture");
+         let descriptor = &self.device().texture_options("new_texture", descriptor)?;
+         match self.heap_type() {
+             HeapType::Sparse => self.device().new_sparse_texture(self, descriptor),
+@@ -3664,6 +3689,8 @@ impl Heap {
+         descriptor: &TextureDescriptor,
+         offset: u64,
+     ) -> Result<Texture, Error> {
++        // LOCAL (Atlas) diagnostic: the image census's purpose (`image_log.rs`).
++        let _purpose = crate::image_log::api("heap-texture");
+         let device = self.device();
+         let descriptor = &device.texture_options("new_texture_at_offset", descriptor)?;
+         device.new_heap_texture(self, descriptor, Some(offset))

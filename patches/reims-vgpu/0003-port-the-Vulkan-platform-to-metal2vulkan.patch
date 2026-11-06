@@ -1,10 +1,10 @@
-From 87d42a94bde8923a373c86ab661176fbd54bb904 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: macbox <macbox@localhost>
 Date: Wed, 28 Oct 2026 16:14:23 +0000
-Subject: [PATCH 3/3] port the Vulkan platform to metal2vulkan
+Subject: [PATCH 03/25] port the Vulkan platform to metal2vulkan
  development 0db5825a
 
-Builds on metal2vulkan 0db5825a with patches/metal2vulkan applied:
+Builds on /srv/work/tmp/agent/reims-research/m2v-dev (branch atlas/dev-arl):
 upstream development 0db5825a, the env-gated Arrow Lake-S facts
 (M2V_ARL_FACTS, c7c4784c) and PixelFormatInfo::of / TextureLevelInfo::of
 (0d31d29c, the release's format table without a device). Cargo.toml's
@@ -104,7 +104,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  21 files changed, 239 insertions(+), 942 deletions(-)
 
 diff --git a/crates/reims-vgpu-vulkan/src/answer.rs b/crates/reims-vgpu-vulkan/src/answer.rs
-index 31d3e13..a42adca 100644
+index 31d3e138..a42adca5 100644
 --- a/crates/reims-vgpu-vulkan/src/answer.rs
 +++ b/crates/reims-vgpu-vulkan/src/answer.rs
 @@ -401,28 +401,20 @@ pub fn create<T>(
@@ -511,7 +511,7 @@ index 31d3e13..a42adca 100644
                  | Inexact::RateMap
                  | Inexact::FillFormat
 diff --git a/crates/reims-vgpu-vulkan/src/answer/native.rs b/crates/reims-vgpu-vulkan/src/answer/native.rs
-index d62ad80..573b84a 100644
+index d62ad80e..573b84ab 100644
 --- a/crates/reims-vgpu-vulkan/src/answer/native.rs
 +++ b/crates/reims-vgpu-vulkan/src/answer/native.rs
 @@ -36,11 +36,11 @@ pub struct NativeRelay {
@@ -585,7 +585,7 @@ index d62ad80..573b84a 100644
          kind: rt::Degradation::HeapTextureLargerThanMetal,
          ground: "a heap texture's size and alignment are the device's image's, coarser than \
 diff --git a/crates/reims-vgpu-vulkan/src/gpu.rs b/crates/reims-vgpu-vulkan/src/gpu.rs
-index b31c5a4..7daf3f1 100644
+index b31c5a4b..7daf3f13 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu.rs
 @@ -135,22 +135,16 @@ pub(crate) fn runtime_pixel_format(raw: u64) -> Option<PixelFormat> {
@@ -618,7 +618,7 @@ index b31c5a4..7daf3f1 100644
      held_by(raw, |raw| crate::gpu::format_info::described(sel, raw))
  }
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/caps.rs b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
-index 2def509..d522f41 100644
+index 2def509c..d522f41c 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/caps.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
 @@ -38,11 +38,11 @@
@@ -637,7 +637,7 @@ index 2def509..d522f41 100644
  //! | the address an indirect command's arguments answer for a nil patch or control-point index buffer (`icb::NIL_BUFFER_ADDRESS`) | `0x1eeee1111` | Metal's private getters' answer, which no record holds |
  //!
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/caps/tests/metal_tests.rs b/crates/reims-vgpu-vulkan/src/gpu/caps/tests/metal_tests.rs
-index 2290c3b..54071ad 100644
+index 2290c3b0..54071ad1 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/caps/tests/metal_tests.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/caps/tests/metal_tests.rs
 @@ -171,11 +171,8 @@ fn stand_ins_are_the_metal_platforms_here() {
@@ -655,7 +655,7 @@ index 2290c3b..54071ad 100644
          (
              f.supports_memory_order_atomics,
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/desc.rs b/crates/reims-vgpu-vulkan/src/gpu/desc.rs
-index 106de01..7f89814 100644
+index 106de019..7f898143 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/desc.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/desc.rs
 @@ -387,10 +387,7 @@ impl TextureFields {
@@ -705,7 +705,7 @@ index 106de01..7f89814 100644
              lacked(sel, raw);
          }
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/device.rs b/crates/reims-vgpu-vulkan/src/gpu/device.rs
-index a376dae..0b48b45 100644
+index a376daeb..0b48b459 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/device.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/device.rs
 @@ -233,12 +233,11 @@ static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::n
@@ -757,7 +757,7 @@ index a376dae..0b48b45 100644
              return Ok(None);
          }
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/device/tests/metal_tests.rs b/crates/reims-vgpu-vulkan/src/gpu/device/tests/metal_tests.rs
-index 8e9974b..461eb19 100644
+index 8e9974bf..461eb198 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/device/tests/metal_tests.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/device/tests/metal_tests.rs
 @@ -2448,11 +2448,8 @@ fn the_setter_takes_what_metals_takes() {
@@ -775,7 +775,7 @@ index 8e9974b..461eb19 100644
  }
  
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_blit/tests/metal_tests.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_blit/tests/metal_tests.rs
-index cd0f412..c912afd 100644
+index cd0f412e..c912afd5 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/encode_blit/tests/metal_tests.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/encode_blit/tests/metal_tests.rs
 @@ -2854,13 +2854,6 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
@@ -819,7 +819,7 @@ index cd0f412..c912afd 100644
  }
  
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
-index f5b6cac..82e1a20 100644
+index f5b6caca..82e1a207 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
 @@ -4560,28 +4560,20 @@ pub(crate) mod tests {
@@ -870,7 +870,7 @@ index f5b6cac..82e1a20 100644
          for format in [RGBA16F, 92] {
              end(&averaging, format);
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/fill.rs b/crates/reims-vgpu-vulkan/src/gpu/fill.rs
-index 1c30cac..e3fdf35 100644
+index 1c30cac8..e3fdf352 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/fill.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/fill.rs
 @@ -365,17 +365,15 @@ mod tests {
@@ -896,7 +896,7 @@ index 1c30cac..e3fdf35 100644
      }
  
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/format_info.rs b/crates/reims-vgpu-vulkan/src/gpu/format_info.rs
-index c5e1eea..5ec0ade 100644
+index c5e1eea4..5ec0ade8 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/format_info.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/format_info.rs
 @@ -1,25 +1,27 @@
@@ -1420,7 +1420,7 @@ index c5e1eea..5ec0ade 100644
  
      #[cfg(target_os = "macos")]
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/format_info/tests/metal_tests.rs b/crates/reims-vgpu-vulkan/src/gpu/format_info/tests/metal_tests.rs
-index f57137c..73d4455 100644
+index f57137c8..73d44551 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/format_info/tests/metal_tests.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/format_info/tests/metal_tests.rs
 @@ -105,12 +105,8 @@ fn descriptions_are_the_metal_platforms_here() {
@@ -1439,7 +1439,7 @@ index f57137c..73d4455 100644
          (ycbcr8.name.as_deref(), ycbcr8.flags, ycbcr8.cast_class),
          (Some("MTLPixelFormatYCBCR8_420_2P"), 0x783_001d, cast_class)
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/metal_space.rs b/crates/reims-vgpu-vulkan/src/gpu/metal_space.rs
-index 7c97844..91107b3 100644
+index 7c97844c..91107b32 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/metal_space.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/metal_space.rs
 @@ -246,7 +246,7 @@ pub fn own_memory(
@@ -1465,7 +1465,7 @@ index 7c97844..91107b3 100644
  /// line names the texture.
  pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescriptor) {
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource.rs b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
-index dfb3aaf..549138b 100644
+index dfb3aaf7..549138bc 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/resource.rs
 @@ -1246,12 +1246,8 @@ fn indices(sel: &'static str, r: NsRange) -> std::ops::Range<u64> {
@@ -1508,7 +1508,7 @@ index dfb3aaf..549138b 100644
  
  /// The runtime's format of a view in `raw`, which `sel` makes, a value [`no_view`] is not nil in:
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/resource/tests/metal_tests.rs b/crates/reims-vgpu-vulkan/src/gpu/resource/tests/metal_tests.rs
-index 8b4d883..d1d242d 100644
+index 8b4d8835..d1d242d8 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/resource/tests/metal_tests.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/resource/tests/metal_tests.rs
 @@ -6218,7 +6218,6 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
@@ -1520,7 +1520,7 @@ index 8b4d883..d1d242d 100644
              let block = crate::gpu::format_info::block(sel, raw, "a heap texture of");
              let [bw, bh] = block.extent();
 diff --git a/crates/reims-vgpu-vulkan/src/gpu/states.rs b/crates/reims-vgpu-vulkan/src/gpu/states.rs
-index 3aefccc..535ed80 100644
+index 3aefccc3..535ed80f 100644
 --- a/crates/reims-vgpu-vulkan/src/gpu/states.rs
 +++ b/crates/reims-vgpu-vulkan/src/gpu/states.rs
 @@ -1147,8 +1147,8 @@ mod tests {
@@ -1548,7 +1548,7 @@ index 3aefccc..535ed80 100644
          assert_eq!(raised.site().file, "resourceIndex");
          let site = catch_death(|| {
 diff --git a/crates/reims-vgpu-vulkan/src/os.rs b/crates/reims-vgpu-vulkan/src/os.rs
-index 4aba15f..dc71a67 100644
+index 4aba15ff..dc71a67c 100644
 --- a/crates/reims-vgpu-vulkan/src/os.rs
 +++ b/crates/reims-vgpu-vulkan/src/os.rs
 @@ -36,7 +36,7 @@ pub(crate) use host_os::open_loader;
@@ -1561,7 +1561,7 @@ index 4aba15f..dc71a67 100644
  };
  pub use host_os::{
 diff --git a/crates/reims-vgpu-vulkan/src/os/linux.rs b/crates/reims-vgpu-vulkan/src/os/linux.rs
-index 3a4a7fa..910e1ee 100644
+index 3a4a7fa8..910e1ee2 100644
 --- a/crates/reims-vgpu-vulkan/src/os/linux.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/linux.rs
 @@ -120,18 +120,6 @@ pub fn install_process_services() {
@@ -1584,7 +1584,7 @@ index 3a4a7fa..910e1ee 100644
  /// none, as there is no Metal here to ask, so the runtime's own stands.
  pub fn default_registry_id() -> Option<u64> {
 diff --git a/crates/reims-vgpu-vulkan/src/os/macos.rs b/crates/reims-vgpu-vulkan/src/os/macos.rs
-index 24331d6..6975a25 100644
+index 24331d6f..6975a25b 100644
 --- a/crates/reims-vgpu-vulkan/src/os/macos.rs
 +++ b/crates/reims-vgpu-vulkan/src/os/macos.rs
 @@ -86,11 +86,6 @@ pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {
@@ -1600,7 +1600,7 @@ index 24331d6..6975a25 100644
  /// of Metal once, on the first call that finds a device: `None` where Metal has none. It is
  /// the registry ID of the device MoltenVK runs the runtime's default device on where the Mac
 diff --git a/crates/reims-vgpu-vulkan/src/platform.rs b/crates/reims-vgpu-vulkan/src/platform.rs
-index 1438607..8c7771d 100644
+index 1438607d..8c7771db 100644
 --- a/crates/reims-vgpu-vulkan/src/platform.rs
 +++ b/crates/reims-vgpu-vulkan/src/platform.rs
 @@ -14,7 +14,6 @@

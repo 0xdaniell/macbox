@@ -1,0 +1,907 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 3 Nov 2026 06:03:53 +0000
+Subject: [PATCH 22/25] Coherent: tell trapping surfaces of host reads and
+ writes, test B1, add guest probes
+
+- P1: the video devices read and write guest surfaces outside the runtime
+  (lends, and the dma-buf a decoder or the scaler binds in place), which
+  bypassed the traps: a host read missed GPU writes still in the image, a
+  host write never reached it. lend_surface_bytes{,_for_reading} and the new
+  GuestSurface::device_reads/device_writes (decoder frame writes, scaler
+  source and destination in place) now call shadow_coherent::host_reads /
+  host_writes over the surface's view and each run of its pages.
+- B1: vendor/qemu census tracks the rows as ranges (93f37d5d3a);
+  coherent_test.c tracks only the rows, and t_outside_write, t_outside_dma
+  and the new t_planes run in the full harness (CENSUS_OUTSIDE=1/2/3 alone).
+- Guest probes for the Mac (untested, no swiftc here): probe_encode (P1),
+  probe_untracked (P2), probe_signal, probe_tail (B1), probe_long.
+- Cargo [patch] points at the coherent-b1 m2v worktree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../reims-vgpu-video-core/src/host/decoder.rs |   2 +
+ crates/reims-vgpu-video-core/src/surfaces.rs  |  15 ++
+ crates/reims-vgpu-vulkan/src/os.rs            |   5 +-
+ crates/reims-vgpu-vulkan/src/os/surface.rs    |  48 ++++++
+ crates/reims-vgpu/src/platform.rs             |   8 +
+ crates/reims-vgpu/src/platform/vulkan.rs      |   4 +
+ crates/reims-vgpu/src/scaler/gpu.rs           |   3 +
+ crates/reims-vgpu/src/video.rs                |   8 +
+ scripts/internal/census/coherent_test.c       |  59 +++++--
+ scripts/internal/census/probe_common.swift    | 110 ++++++++++++
+ scripts/internal/census/probe_encode.swift    | 161 ++++++++++++++++++
+ scripts/internal/census/probe_long.swift      |  60 +++++++
+ scripts/internal/census/probe_signal.swift    |  43 +++++
+ scripts/internal/census/probe_tail.swift      |  52 ++++++
+ scripts/internal/census/probe_untracked.swift |  55 ++++++
+ 15 files changed, 622 insertions(+), 11 deletions(-)
+ create mode 100644 scripts/internal/census/probe_common.swift
+ create mode 100644 scripts/internal/census/probe_encode.swift
+ create mode 100644 scripts/internal/census/probe_long.swift
+ create mode 100644 scripts/internal/census/probe_signal.swift
+ create mode 100644 scripts/internal/census/probe_tail.swift
+ create mode 100644 scripts/internal/census/probe_untracked.swift
+
+diff --git a/crates/reims-vgpu-video-core/src/host/decoder.rs b/crates/reims-vgpu-video-core/src/host/decoder.rs
+index 31ba3f5e..a122c714 100644
+--- a/crates/reims-vgpu-video-core/src/host/decoder.rs
++++ b/crates/reims-vgpu-video-core/src/host/decoder.rs
+@@ -1963,10 +1963,12 @@ impl ZeroCopy {
+             }
+         };
+         let writing = clock.now();
++        held.surface.device_writes();
+         let written = frame.write_to_guest(&target);
+         parts.device += clock.elapsed_since(writing);
+         match written {
+             Ok(DeviceWrite::Written) => {
++                held.surface.device_writes();
+                 parts.written += 1;
+                 Some(Ok(()))
+             }
+diff --git a/crates/reims-vgpu-video-core/src/surfaces.rs b/crates/reims-vgpu-video-core/src/surfaces.rs
+index be3fd87d..32e75099 100644
+--- a/crates/reims-vgpu-video-core/src/surfaces.rs
++++ b/crates/reims-vgpu-video-core/src/surfaces.rs
+@@ -61,6 +61,21 @@ pub trait GuestSurface: Send + Sync {
+     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
+         None
+     }
++
++    /// LOCAL (Atlas): a device is about to read the surface's
++    /// [`GuestSurface::device_memory`] with no lend (the scaler's source in
++    /// place), so the host makes what its GPU wrote over the same pages
++    /// reach them first. Nothing, the default, for a host without such
++    /// writes.
++    fn device_reads(&self) {}
++
++    /// LOCAL (Atlas): a device writes, or has just written, the surface's
++    /// [`GuestSurface::device_memory`] with no lend (a decoder's frame, the
++    /// scaler's destination in place), so the host's GPU takes the bytes
++    /// there as new at its next use of them. Called before the write and
++    /// again after it. Nothing, the default, for a host without such
++    /// copies.
++    fn device_writes(&self) {}
+ }
+ 
+ /// A surface's layout.
+diff --git a/crates/reims-vgpu-vulkan/src/os.rs b/crates/reims-vgpu-vulkan/src/os.rs
+index dc71a67c..e73137b4 100644
+--- a/crates/reims-vgpu-vulkan/src/os.rs
++++ b/crates/reims-vgpu-vulkan/src/os.rs
+@@ -47,7 +47,10 @@ pub use host_os::{
+ pub(crate) use host_os::{PAGE, mapped, writable};
+ #[cfg(all(test, target_os = "macos"))]
+ pub(crate) use macos::MATRIX_KEY;
+-pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
++pub use surface::{
++    PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout,
++    surface_device_access,
++};
+ pub use wsi::{add_window_extensions, present_fences};
+ 
+ #[cfg(test)]
+diff --git a/crates/reims-vgpu-vulkan/src/os/surface.rs b/crates/reims-vgpu-vulkan/src/os/surface.rs
+index 0e8aafe2..af2d644b 100644
+--- a/crates/reims-vgpu-vulkan/src/os/surface.rs
++++ b/crates/reims-vgpu-vulkan/src/os/surface.rs
+@@ -361,6 +361,7 @@ pub fn lend_surface_bytes(
+     let made = recorded(surface, |made| (made.pages.clone(), made.offset));
+     let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
+     let length = surface.alloc_size().saturating_sub(offset);
++    host_meets(&made, base, offset, length, rt::shadow_coherent::host_writes);
+     let _lend = LENDING.lock();
+     let pages = match made {
+         Some((pages, _)) if !pages.is_empty() => pages,
+@@ -444,6 +445,7 @@ pub fn lend_surface_bytes_for_reading(
+     let made = recorded(surface, |made| (made.pages.clone(), made.offset));
+     let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
+     let length = surface.alloc_size().saturating_sub(offset);
++    host_meets(&made, base, offset, length, rt::shadow_coherent::host_reads);
+     let _lend = LENDING.lock();
+     let pages = match made {
+         Some((pages, _)) if !pages.is_empty() => pages,
+@@ -519,6 +521,43 @@ impl Lent {
+     }
+ }
+ 
++/// LOCAL (Atlas): tells the runtime's trapping surfaces (`shadow_coherent`) that a host outside
++/// it is about to read or write `surface`'s `length` bytes (`notice` is `host_reads` or
++/// `host_writes`), so a read sees the GPU's writes copied back first and a write reaches the
++/// image the next command uses. A trapping surface lies over the buffer a texture on it is over,
++/// which is either the run of the guest's pages the bytes lie in or the surface's own view of
++/// them at `base`, so both are named; a surface that meets neither costs a scan of the tracked
++/// surfaces, none when nothing traps.
++/// LOCAL (Atlas): a device is about to read (`write` false) or write `surface`'s bytes as a lend
++/// would lend them, through memory lent to it outside a lend (a dma-buf of its pages): the
++/// trapping surfaces over them are told, as [`lend_surface_bytes`] tells them.
++pub fn surface_device_access(surface: &OsSurface, write: bool) {
++    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
++    if surface.protection_options() != 0 || base == 0 {
++        return;
++    }
++    let made = recorded(surface, |made| (made.pages.clone(), made.offset));
++    let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
++    let length = surface.alloc_size().saturating_sub(offset);
++    let notice = if write { rt::shadow_coherent::host_writes } else { rt::shadow_coherent::host_reads };
++    host_meets(&made, base, offset, length, notice);
++}
++
++fn host_meets(
++    made: &Option<(Vec<std::ops::Range<u64>>, u64)>,
++    base: u64,
++    offset: u64,
++    length: u64,
++    mut notice: impl FnMut(std::ops::Range<u64>),
++) {
++    notice(base..base.saturating_add(length));
++    if let Some((pages, _)) = made {
++        for run in in_runs(pages, &(offset..offset.saturating_add(length))) {
++            notice(run);
++        }
++    }
++}
++
+ /// Where a lend of `surface`'s `length` bytes, which lie in the runs of the guest's pages
+ /// `held`, reaches them ([`lend_surface_bytes`]).
+ fn lent_where(surface: &OsSurface, held: &[std::ops::Range<u64>], length: u64) -> Lent {
+@@ -781,6 +820,15 @@ pub(crate) mod tests {
+             ..SurfaceSpec::default()
+         };
+         let s = OsSurfaces::new().create(&spec).unwrap();
++        let mut noticed = Vec::new();
++        let made = recorded(&s, |made| (made.pages.clone(), made.offset));
++        let base = s.base_address().as_ptr::<u8>().addr().to_u64();
++        host_meets(&made, base, 0x40, 2 * page - 0x40, |r| noticed.push(r));
++        assert_eq!(
++            noticed,
++            [base..base + 2 * page - 0x40, high + 0x40..high + page, low..low + page],
++            "a trapping surface is told of the view and of each run of pages the bytes lie in"
++        );
+         let split = (page - 0x40).to_usize();
+         let (mut before, mut at, mut landed) = (0, 0, 0);
+         lend_surface_bytes(&s, &mut |b| {
+diff --git a/crates/reims-vgpu/src/platform.rs b/crates/reims-vgpu/src/platform.rs
+index 7089be97..133264a7 100644
+--- a/crates/reims-vgpu/src/platform.rs
++++ b/crates/reims-vgpu/src/platform.rs
+@@ -108,6 +108,14 @@ pub trait ApiPlatform: Platform {
+         let _ = surface;
+         Err("this platform lends no surface's memory to devices")
+     }
++
++    /// LOCAL (Atlas): a device reads (`write` false) or writes `surface`'s memory as
++    /// [`ApiPlatform::surface_device_memory`] lent it, outside any lend: the platform's GPU,
++    /// whose textures over the same pages may trap (`shadow_coherent`), is told. Nothing by
++    /// default.
++    fn surface_device_access(&self, surface: &Self::Surface, write: bool) {
++        let _ = (surface, write);
++    }
+ }
+ 
+ /// The API's state for one platform instance.
+diff --git a/crates/reims-vgpu/src/platform/vulkan.rs b/crates/reims-vgpu/src/platform/vulkan.rs
+index b710f9ed..c02aee32 100644
+--- a/crates/reims-vgpu/src/platform/vulkan.rs
++++ b/crates/reims-vgpu/src/platform/vulkan.rs
+@@ -94,6 +94,10 @@ impl ApiPlatform for VulkanPlatform {
+         reims_vgpu_vulkan::os::lend_surface_bytes_for_reading(surface, read)
+     }
+ 
++    fn surface_device_access(&self, surface: &<Self as Platform>::Surface, write: bool) {
++        reims_vgpu_vulkan::os::surface_device_access(surface, write);
++    }
++
+     /// On Linux, the bytes `lend_surface_bytes` lends, as a dma-buf of their pages made by
+     /// udmabuf and as the surface's view of them, with an identity attached to the surface
+     /// (`platform/vulkan/lent_memory.rs`). On macOS none: there the Metal platform lends a
+diff --git a/crates/reims-vgpu/src/scaler/gpu.rs b/crates/reims-vgpu/src/scaler/gpu.rs
+index 1cca3353..fdd032cb 100644
+--- a/crates/reims-vgpu/src/scaler/gpu.rs
++++ b/crates/reims-vgpu/src/scaler/gpu.rs
+@@ -445,6 +445,7 @@ impl<G: Gpu> GpuAccelerator<G> {
+                         return Err(io_return::BAD_ARGUMENT);
+                     }
+                     let planes = at_base(&src.planes, base).ok_or(io_return::UNSUPPORTED)?;
++                    job.source.device_reads();
+                     return Ok(Bound {
+                         buffer,
+                         planes,
+@@ -507,6 +508,7 @@ impl<G: Gpu> GpuAccelerator<G> {
+                     }
+                     let planes = at_base(&dst.planes, base).ok_or(io_return::UNSUPPORTED)?;
+                     if planes.iter().all(BoundPlane::word_aligned) {
++                        job.destination.device_writes();
+                         return Ok(Bound {
+                             buffer,
+                             planes,
+@@ -750,6 +752,7 @@ impl<G: Gpu> Accelerator for GpuAccelerator<G> {
+         let staged = destination.staged;
+         let ran = self.run(job, source, destination);
+         if !staged {
++            job.destination.device_writes();
+             return ran.err().unwrap_or(io_return::SUCCESS);
+         }
+         // Staged: the destination's lend says whether it can be written, then what the kernel
+diff --git a/crates/reims-vgpu/src/video.rs b/crates/reims-vgpu/src/video.rs
+index 910fd69a..dbb06ae6 100644
+--- a/crates/reims-vgpu/src/video.rs
++++ b/crates/reims-vgpu/src/video.rs
+@@ -240,6 +240,14 @@ impl<P: ApiPlatform> GuestSurface for MappedSurface<P> {
+     /// asked for once for this hold: the bytes [`Self::write`] lends, for the decoders' device to
+     /// write a frame into while the session holds the surface. `None` where the platform lends
+     /// none, said once a hold at debug.
++    fn device_reads(&self) {
++        self.platform.surface_device_access(&self.surface, false);
++    }
++
++    fn device_writes(&self) {
++        self.platform.surface_device_access(&self.surface, true);
++    }
++
+     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
+         let lent = self.device.get_or_init(|| {
+             entry::run(|_| self.platform.surface_device_memory(&self.surface))
+diff --git a/scripts/internal/census/coherent_test.c b/scripts/internal/census/coherent_test.c
+index e9744270..9147c35d 100644
+--- a/scripts/internal/census/coherent_test.c
++++ b/scripts/internal/census/coherent_test.c
+@@ -27,9 +27,9 @@ static struct {
+ 
+ static uint64_t page_at(int i) { return s.base + i * PG; }
+ 
+-// AUDIT: the pages the library names. Coherent::all_pages() and find() cover Layout.range(), the
+-// texture's rows, while census_coh_track holds every page of the census surface: past the rows of
+-// a 3200x1800 surface whose allocation has 25 more pages, a plane's neighbour in a biplanar one.
++// The pages the library names: Coherent::range(), the texture's rows, which it tracks
++// (census_coh_track(start, len)); a 3200x1800 surface's allocation has 25 pages past them, and a
++// biplanar one a plane beside them. The census surface is every page; past `named` none is ours.
+ static int named = PAGES;
+ 
+ static void note(const uint64_t *pages, size_t n) {
+@@ -65,7 +65,7 @@ static void sync_all_locked(void) {
+ static void on_fault(void *ctx, uint64_t addr, bool write) {
+     uint64_t page = addr & ~(PG - 1);
+ 
+-    // AUDIT: as shadow_coherent.rs's free fault(): no surface's range() holds it, so it untracks.
++    // As shadow_coherent.rs's free fault(): no surface's range() holds it, so it untracks.
+     if ((page - s.base) / PG >= (uint64_t)named) {
+         census_coh_untrack(addr);
+         return;
+@@ -137,7 +137,7 @@ static void surface(uint32_t id, uint64_t off) {
+     s.id = id; s.off = off; s.base = (uint64_t)main_map + off;
+     memset(s.ahead, 0, sizeof s.ahead);
+     s.probing = 0;
+-    if (!census_coh_track(s.base, PAGES * PG)) DIE("track");
++    if (!census_coh_track(s.base, named * PG)) DIE("track");
+ }
+ 
+ // The GPU wrote `word` over the pages `mask` holds, and the command buffer completed.
+@@ -709,12 +709,12 @@ static void t_fuse_coherent(struct vcpu *c) {
+     CHECK(plain && s.faults == faults, "and the guest writes every page with no marker left");
+ }
+ 
+-// AUDIT: a guest CPU write to a page of the surface that the library never named.
++// A guest CPU write to a page of the surface that the library never named (audit B1).
+ static void t_outside_write(struct vcpu *c) {
+-    printf("[outside] a guest write to a held page past the texture's rows\n");
++    printf("[outside] a guest write to a page past the texture's rows\n");
+     named = PAGES - 1;
+     surface(12, 0xe00000);
+-    CHECK(state(PAGES - 1) == 2, "census_coh_track held it too");
++    CHECK(state(PAGES - 1) == 3 && state(PAGES - 2) == 2, "the census holds the rows' pages alone");
+     int abandons = s.abandons, probes = s.probes;
+     uint64_t start = now_ns();
+     setr(c, STUB(g_write), 0x7777, gpa(PAGES - 1), 0, 0, 0, 0);
+@@ -723,10 +723,11 @@ static void t_outside_write(struct vcpu *c) {
+     CHECK(run == RUN_IO, "the write ran");
+     CHECK(*(uint64_t *)(main_map + s.off + (PAGES - 1) * PG) == 0x7777, "into the page");
+     CHECK(s.abandons == abandons, "and the census stayed on: every surface is still coherent");
++    census_surface_unmapped(12);
+     named = PAGES;
+ }
+ 
+-// AUDIT: a device's DMA into that page, then a guest read of a page the image is ahead of.
++// A device's DMA into that page, then a guest read of a page the image is ahead of (audit B1).
+ static void t_outside_dma(struct vcpu *c) {
+     printf("[outside] DMA into a held page past the texture's rows, with page 0 armed\n");
+     named = PAGES - 1;
+@@ -739,6 +740,40 @@ static void t_outside_dma(struct vcpu *c) {
+     setr(c, STUB(g_read), 0, gpa(0), 0, 0, 0, 0);
+     CHECK(run_guest(c, 0) == RUN_IO && getr(c).rax == 0x8888, "so the guest reads the image's word");
+     printf("    the guest read %#llx\n", (unsigned long long)getr(c).rax);
++    census_surface_unmapped(13);
++    named = PAGES;
++}
++
++// Two planes of one census surface, each a range of its own, as a biplanar surface's two
++// textures are: each tracks, arms and goes alone, and a range over another is refused.
++static void t_planes(struct vcpu *c) {
++    printf("[planes] two ranges of one surface: one's untrack leaves the other armed\n");
++    named = PAGES / 2;
++    surface(15, 0x1100000);
++    uint64_t second = s.base + (PAGES / 2) * PG, pages0 = census_coherent_pages;
++    CHECK(!census_coh_track(s.base + PG, PG), "a range inside the first is refused");
++    CHECK(!census_coh_track(second - PG, 2 * PG), "and one that meets it");
++    CHECK(census_coh_track(s.base, (PAGES / 2) * PG), "the same range again is tracked already");
++    CHECK(census_coherent_pages == pages0, "and counts once");
++    CHECK(census_coh_track(second, (PAGES / 2) * PG), "the second plane tracks");
++    CHECK(census_coherent_pages == pages0 + PAGES / 2, "its pages count");
++    CHECK(state(PAGES / 2) == 2 && state(PAGES - 1) == 2, "held");
++    completed(1, 0x9999);
++    uint64_t at = second;
++    CHECK(census_coh_arm(&at, 1, NULL, 0) == 0 && state(PAGES / 2) == 1, "a page of each armed");
++    CHECK(state(0) == 1, "the first's too");
++    census_coh_untrack(s.base);
++    CHECK(state(0) == 3 && state(PAGES / 2 - 1) == 3, "the first plane's pages open");
++    CHECK(state(PAGES / 2) == 1 && state(PAGES - 1) == 2, "the second's stay as they were");
++    CHECK(census_coherent_pages == pages0, "the first's pages no longer count");
++    int faults = s.faults;
++    census_coherent_touch(main_map + s.off, 8, true);
++    CHECK(s.faults == faults, "a device's write to the first plane is no one's now");
++    CHECK(census_coh_track(s.base, (PAGES / 2) * PG), "and it tracks again");
++    census_coh_untrack(second);
++    CHECK(state(PAGES / 2) == 3 && state(0) == 2, "the second goes alone");
++    census_surface_unmapped(15);
++    CHECK(state(0) == 6 && census_coherent_pages == pages0 - PAGES / 2, "the unmap takes the rest");
+     named = PAGES;
+ }
+ 
+@@ -753,7 +788,8 @@ int main(int argc, char **argv) {
+     struct vcpu c;
+     vcpu_init(&c, 0);
+     if (getenv("CENSUS_OUTSIDE")) {
+-        if (atoi(getenv("CENSUS_OUTSIDE")) == 1) t_outside_write(&c); else t_outside_dma(&c);
++        int which = atoi(getenv("CENSUS_OUTSIDE"));
++        if (which == 1) t_outside_write(&c); else if (which == 2) t_outside_dma(&c); else t_planes(&c);
+         printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
+         return failures != 0;
+     }
+@@ -773,6 +809,9 @@ int main(int argc, char **argv) {
+     t_coherent_cost(&c);
+     t_scattered();
+     if (getenv("CENSUS_SPEED")) t_guest_speed();
++    t_outside_write(&c);
++    t_outside_dma(&c);
++    t_planes(&c);
+     t_fuse_coherent(&c);
+     census_flush();
+     printf("%s: %d failed\n", failures ? "FAILED" : "PASSED", failures);
+diff --git a/scripts/internal/census/probe_common.swift b/scripts/internal/census/probe_common.swift
+new file mode 100644
+index 00000000..8c9a0b3a
+--- /dev/null
++++ b/scripts/internal/census/probe_common.swift
+@@ -0,0 +1,110 @@
++// probe_common.swift: shared by probe_untracked, probe_signal, probe_tail and probe_long. Build each as
++//   swiftc -O probe_common.swift probe_<name>.swift -o probe_<name>
++// A GPU gradient renderer, a GPU copy (sample one texture into another surface), and pixel checks
++// at a grid of points, as readback.swift has them, for surfaces of any size.
++import Foundation
++import Metal
++import IOSurface
++
++let probeSource = """
++#include <metal_stdlib>
++using namespace metal;
++struct V { float4 p [[position]]; float2 uv; };
++vertex V vs(uint i [[vertex_id]]) { float2 a[3] = {{-1,-1},{3,-1},{-1,3}}; V o; o.p = float4(a[i],0,1); o.uv = (a[i]+1)/2; o.uv.y = 1-o.uv.y; return o; }
++fragment float4 grad(V i [[stage_in]], constant float4 &c [[buffer(0)]]) { return float4(i.uv.x*c.x, i.uv.y*c.y, c.z, c.w); }
++fragment float4 copy(V i [[stage_in]], texture2d<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return t.sample(s, i.uv); }
++"""
++let dev = MTLCopyAllDevices().first!
++let lib = try! dev.makeLibrary(source: probeSource, options: nil)
++func pipe(_ f: String) -> MTLRenderPipelineState {
++    let d = MTLRenderPipelineDescriptor()
++    d.vertexFunction = lib.makeFunction(name: "vs"); d.fragmentFunction = lib.makeFunction(name: f)
++    d.colorAttachments[0].pixelFormat = .bgra8Unorm
++    return try! dev.makeRenderPipelineState(descriptor: d)
++}
++let gradP = pipe("grad"), copyP = pipe("copy")
++let queue = dev.makeCommandQueue()!
++
++func makeSurface(_ w: Int, _ h: Int, allocSize: Int? = nil) -> IOSurface {
++    var p: [IOSurfacePropertyKey: Any] = [.width: w, .height: h, .bytesPerElement: 4, .pixelFormat: 0x42475241,
++                                          IOSurfacePropertyKey(rawValue: "IOSurfaceIsGlobal"): true]
++    if let a = allocSize { p[.allocSize] = a }
++    return IOSurface(properties: p)!
++}
++func texture(_ s: IOSurface, untracked: Bool = false) -> MTLTexture {
++    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: s.width, height: s.height, mipmapped: false)
++    d.usage = [.renderTarget, .shaderRead]; d.storageMode = .managed
++    if untracked { d.hazardTrackingMode = .untracked }
++    return dev.makeTexture(descriptor: d, iosurface: s, plane: 0)!
++}
++/// Encodes `draws` draws of the gradient `c` into `t` in `b`.
++func encodeGradient(_ b: MTLCommandBuffer, _ t: MTLTexture, _ c: [Float], draws: Int = 1) {
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = t
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(gradP); var c = c; e.setFragmentBytes(&c, length: 16, index: 0)
++    for _ in 0..<draws { e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3) }
++    e.endEncoding()
++}
++func gradient(_ t: MTLTexture, _ c: [Float], wait: Bool = true) {
++    let b = queue.makeCommandBuffer()!
++    encodeGradient(b, t, c); b.commit()
++    if wait { b.waitUntilCompleted() }
++}
++func encodeCopy(_ b: MTLCommandBuffer, _ from: MTLTexture, _ to: MTLTexture) {
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = to
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(copyP); e.setFragmentTexture(from, index: 0)
++    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
++}
++/// Samples `t` into a new surface and answers with that surface: the GPU's view of `t`.
++func viaGPU(_ t: MTLTexture) -> IOSurface {
++    let out = makeSurface(t.width, t.height), o = texture(out)
++    let b = queue.makeCommandBuffer()!
++    encodeCopy(b, t, o); b.commit(); b.waitUntilCompleted()
++    return out
++}
++func px(_ s: IOSurface, _ x: Int, _ y: Int) -> [UInt8] {
++    let p = (s.baseAddress + y * s.bytesPerRow + x * 4).assumingMemoryBound(to: UInt8.self)
++    return [p[0], p[1], p[2], p[3]]
++}
++/// BGRA of the gradient `c` at x, y of a w x h surface.
++func want(_ c: [Float], _ w: Int, _ h: Int, _ x: Int, _ y: Int) -> [UInt8] {
++    let u = (Float(x) + 0.5) / Float(w), v = (Float(y) + 0.5) / Float(h)
++    let f = [c[2], v * c[1], u * c[0], c[3]]
++    return f.map { UInt8(max(0, min(255, ($0 * 255).rounded()))) }
++}
++/// Compares `s` with `expect` at a grid of points, the last row and column among them:
++/// (matched, total, the first mismatch).
++func compare(_ s: IOSurface, lock: Bool = true, step: Int = 37, _ expect: (Int, Int) -> [UInt8]) -> (Int, Int, String) {
++    if lock { s.lock(options: .readOnly, seed: nil) }
++    defer { if lock { s.unlock(options: .readOnly, seed: nil) } }
++    var bad = 0, total = 0, first = ""
++    let xs = Array(stride(from: 1, to: s.width, by: step)) + [s.width - 1]
++    let ys = Array(stride(from: 2, to: s.height, by: step)) + [s.height - 1]
++    for y in ys {
++        for x in xs {
++            let g = px(s, x, y), e = expect(x, y)
++            total += 1
++            if zip(g, e).contains(where: { abs(Int($0) - Int($1)) > 2 }) {
++                bad += 1
++                if first.isEmpty { first = "(\(x),\(y)) got \(g) want \(e)" }
++            }
++        }
++    }
++    return (total - bad, total, first)
++}
++var failed = 0
++func check(_ name: String, _ s: IOSurface, lock: Bool = true, _ expect: (Int, Int) -> [UInt8]) {
++    let (good, total, first) = compare(s, lock: lock, expect)
++    print(good == total ? "  ok  " : "  BAD ", name, "\(good)/\(total)", first)
++    if good != total { failed += 1 }
++}
++func finish(_ extra: String = "") -> Never {
++    print(failed == 0 ? "PASS" : "FAIL", "\(failed) checks failed", extra)
++    exit(failed == 0 ? 0 : 1)
++}
++func env(_ name: String, _ fallback: Double) -> Double {
++    Double(ProcessInfo.processInfo.environment[name] ?? "") ?? fallback
++}
+diff --git a/scripts/internal/census/probe_encode.swift b/scripts/internal/census/probe_encode.swift
+new file mode 100644
+index 00000000..95a3e8c3
+--- /dev/null
++++ b/scripts/internal/census/probe_encode.swift
+@@ -0,0 +1,161 @@
++// probe_encode.swift (P1): on a guest, swiftc -O probe_encode.swift -o probe_encode && ./probe_encode
++// PROBE_SECONDS (default 180) is how long it runs.
++// The GPU renders a moving frame into an IOSurface of 1920x1088 BGRA (2,088,960 texels), and the
++// frame is encoded right away with VTCompressionSession, decoded, and compared. Nothing on the CPU
++// touches the surface between the render and the encode, so the host's video encoder (outside the
++// runtime) is the first to read it. If the host misses the GPU's writes still held in the texture,
++// the decoded frame is a stale one: its frame number, drawn as 32 big blocks, is wrong.
++// Three surfaces are used in turn, so each is reused every third frame.
++// It prints one line per 100 frames and ends with PASS or FAIL plus numbers.
++import Foundation
++import Metal
++import IOSurface
++import CoreVideo
++import CoreMedia
++import VideoToolbox
++
++let W = 1920, H = 1088
++let seconds = Double(ProcessInfo.processInfo.environment["PROBE_SECONDS"] ?? "180")!
++let source = """
++#include <metal_stdlib>
++using namespace metal;
++struct V { float4 p [[position]]; float2 uv; };
++vertex V vs(uint i [[vertex_id]]) { float2 a[3] = {{-1,-1},{3,-1},{-1,3}}; V o; o.p = float4(a[i],0,1); o.uv = (a[i]+1)/2; o.uv.y = 1-o.uv.y; return o; }
++// The top 80%: 8x4 blocks, block b white where bit b of the frame number is set.
++// The bottom band: a bar that moves with the frame number, over a gradient.
++fragment float4 frame(V i [[stage_in]], constant uint &n [[buffer(0)]]) {
++    if (i.uv.y < 0.8) {
++        uint bx = min(uint(i.uv.x * 8), 7u), by = min(uint(i.uv.y / 0.8 * 4), 3u);
++        float fx = fract(i.uv.x * 8), fy = fract(i.uv.y / 0.8 * 4);
++        if (fx < 0.1 || fx > 0.9 || fy < 0.1 || fy > 0.9) return float4(0.5, 0.5, 0.5, 1);
++        float on = float((n >> (by * 8 + bx)) & 1u);
++        return float4(on, on, on, 1);
++    }
++    float bar = fract(float(n) / 120.0);
++    float d = abs(i.uv.x - bar);
++    return d < 0.02 ? float4(1, 0, 0, 1) : float4(i.uv.x, 0.3, 1 - i.uv.x, 1);
++}
++"""
++let dev = MTLCopyAllDevices().first!
++let lib = try! dev.makeLibrary(source: source, options: nil)
++let pd = MTLRenderPipelineDescriptor()
++pd.vertexFunction = lib.makeFunction(name: "vs"); pd.fragmentFunction = lib.makeFunction(name: "frame")
++pd.colorAttachments[0].pixelFormat = .bgra8Unorm
++let pipe = try! dev.makeRenderPipelineState(descriptor: pd)
++let queue = dev.makeCommandQueue()!
++
++struct Slot { let surface: IOSurface; let texture: MTLTexture; let buffer: CVPixelBuffer }
++func makeSlot() -> Slot {
++    let s = IOSurface(properties: [.width: W, .height: H, .bytesPerElement: 4, .pixelFormat: 0x42475241,
++                                   IOSurfacePropertyKey(rawValue: "IOSurfaceIsGlobal"): true])!
++    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: W, height: H, mipmapped: false)
++    d.usage = [.renderTarget, .shaderRead]; d.storageMode = .managed
++    let t = dev.makeTexture(descriptor: d, iosurface: s, plane: 0)!
++    var pb: Unmanaged<CVPixelBuffer>?
++    let r = CVPixelBufferCreateWithIOSurface(nil, unsafeBitCast(s, to: IOSurfaceRef.self), nil, &pb)
++    precondition(r == kCVReturnSuccess, "CVPixelBufferCreateWithIOSurface: \(r)")
++    return Slot(surface: s, texture: t, buffer: pb!.takeRetainedValue())
++}
++let slots = [makeSlot(), makeSlot(), makeSlot()]
++
++func render(_ t: MTLTexture, _ n: UInt32) {
++    let p = MTLRenderPassDescriptor(); p.colorAttachments[0].texture = t
++    p.colorAttachments[0].loadAction = .dontCare; p.colorAttachments[0].storeAction = .store
++    let b = queue.makeCommandBuffer()!, e = b.makeRenderCommandEncoder(descriptor: p)!
++    e.setRenderPipelineState(pipe); var n = n; e.setFragmentBytes(&n, length: 4, index: 0)
++    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
++    b.commit(); b.waitUntilCompleted()
++}
++
++// Encoder: H.264, real time, no reordering, so each frame's sample comes out in order.
++var encoded: [(UInt32, CMSampleBuffer)] = []
++let encodedLock = NSLock()
++var session: VTCompressionSession?
++let made = VTCompressionSessionCreate(allocator: nil, width: Int32(W), height: Int32(H),
++    codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
++    compressedDataAllocator: nil, outputCallback: { _, tag, status, _, sample in
++        guard status == noErr, let sample = sample else { print("  encode status \(status)"); return }
++        encodedLock.lock(); encoded.append((UInt32(UInt(bitPattern: tag)), sample)); encodedLock.unlock()
++    }, refcon: nil, compressionSessionOut: &session)
++precondition(made == noErr, "VTCompressionSessionCreate: \(made)")
++let enc = session!
++VTSessionSetProperty(enc, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
++VTSessionSetProperty(enc, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
++VTSessionSetProperty(enc, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
++VTSessionSetProperty(enc, key: kVTCompressionPropertyKey_AverageBitRate, value: 20_000_000 as CFNumber)
++
++var decoder: VTDecompressionSession?
++func makeDecoder(_ format: CMFormatDescription) {
++    let attrs = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA] as CFDictionary
++    var d: VTDecompressionSession?
++    let r = VTDecompressionSessionCreate(allocator: nil, formatDescription: format, decoderSpecification: nil,
++                                         imageBufferAttributes: attrs, outputCallback: nil, decompressionSessionOut: &d)
++    precondition(r == noErr, "VTDecompressionSessionCreate: \(r)")
++    decoder = d
++}
++/// The frame number read back from a decoded BGRA frame: each block's centre, thresholded.
++func readNumber(_ pb: CVPixelBuffer) -> (Int64, Bool) {
++    CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
++    let base = CVPixelBufferGetBaseAddress(pb)!, bpr = CVPixelBufferGetBytesPerRow(pb)
++    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
++    var n: Int64 = 0, clean = true
++    for b in 0..<32 {
++        let bx = b % 8, by = b / 8
++        let x = Int((Double(bx) + 0.5) / 8 * Double(w)), y = Int((Double(by) + 0.5) / 4 * 0.8 * Double(h))
++        let p = (base + y * bpr + x * 4).assumingMemoryBound(to: UInt8.self)
++        let g = Int(p[1])
++        if g > 160 { n |= 1 << b } else if g >= 96 { clean = false }
++    }
++    return (n, clean)
++}
++func decode(_ sample: CMSampleBuffer) -> (Int64, Bool)? {
++    if decoder == nil { makeDecoder(CMSampleBufferGetFormatDescription(sample)!) }
++    var got: (Int64, Bool)?
++    let r = VTDecompressionSessionDecodeFrame(decoder!, sampleBuffer: sample, flags: [], infoFlagsOut: nil) {
++        status, _, image, _, _ in
++        if status == noErr, let image = image { got = readNumber(image) }
++    }
++    VTDecompressionSessionWaitForAsynchronousFrames(decoder!)
++    return r == noErr ? got : nil
++}
++
++print("device:", dev.name, "frames of \(W)x\(H) BGRA for \(Int(seconds)) s")
++let start = Date()
++var n: UInt32 = 1, frames = 0, wrong = 0, undecoded = 0, unclean = 0, firstWrong = ""
++var renderNs: UInt64 = 0, encodeNs: UInt64 = 0
++while Date().timeIntervalSince(start) < seconds {
++    let slot = slots[Int(n) % slots.count]
++    let t0 = DispatchTime.now().uptimeNanoseconds
++    render(slot.texture, n)
++    let t1 = DispatchTime.now().uptimeNanoseconds
++    let pts = CMTime(value: CMTimeValue(n), timescale: 60)
++    let r = VTCompressionSessionEncodeFrame(enc, imageBuffer: slot.buffer, presentationTimeStamp: pts,
++        duration: .invalid, frameProperties: nil, sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(n)),
++        infoFlagsOut: nil)
++    precondition(r == noErr, "VTCompressionSessionEncodeFrame: \(r)")
++    // The encoder reads the surface before this returns; the frame must be out of its
++    // queue before the slot is reused three frames on.
++    VTCompressionSessionCompleteFrames(enc, untilPresentationTimeStamp: pts)
++    let t2 = DispatchTime.now().uptimeNanoseconds
++    renderNs += t1 - t0; encodeNs += t2 - t1
++    encodedLock.lock(); let out = encoded; encoded.removeAll(); encodedLock.unlock()
++    for (tag, sample) in out {
++        frames += 1
++        guard let (got, clean) = decode(sample) else { undecoded += 1; continue }
++        if !clean { unclean += 1 }
++        if got != Int64(tag & 0xffff_ffff) {
++            wrong += 1
++            if firstWrong.isEmpty { firstWrong = "frame \(tag) decoded as \(got)" }
++        }
++    }
++    if n % 100 == 0 {
++        print("  \(n) frames, \(wrong) wrong, render \(renderNs / UInt64(n) / 1000) us, encode \(encodeNs / UInt64(n) / 1000) us")
++        fflush(stdout)
++    }
++    n += 1
++}
++VTCompressionSessionCompleteFrames(enc, untilPresentationTimeStamp: .invalid)
++let ok = wrong == 0 && undecoded == 0 && frames > 0
++print(ok ? "PASS" : "FAIL", "frames \(frames) wrong \(wrong) undecoded \(undecoded) unclean-blocks-frames \(unclean)",
++      "render-us \(renderNs / UInt64(max(n, 1)) / 1000) encode-us \(encodeNs / UInt64(max(n, 1)) / 1000)", firstWrong)
++exit(ok ? 0 : 1)
+diff --git a/scripts/internal/census/probe_long.swift b/scripts/internal/census/probe_long.swift
+new file mode 100644
+index 00000000..760a2c4f
+--- /dev/null
++++ b/scripts/internal/census/probe_long.swift
+@@ -0,0 +1,60 @@
++// probe_long.swift (long run): swiftc -O probe_common.swift probe_long.swift -o probe_long
++// PROBE_SECONDS (default 300). Thousands of frames over minutes, each one checked:
++// - Four surfaces are used in turn, so each is reused every fourth frame.
++// - Every 37th frame, a surface's texture is dropped and a new one made on it.
++// - Every 101st frame, a surface is dropped and a new one made, which may land on its pages.
++// - Each frame the GPU renders a gradient whose colour changes every frame. Then the CPU reads it,
++//   and the GPU reads it through a second texture.
++// - Every 5th frame the CPU writes a band of rows first, and the GPU's read must see it.
++// It prints one line per 500 frames and ends with PASS or FAIL plus numbers.
++import Foundation
++import Metal
++import IOSurface
++
++let W = 1600, H = 1000
++let seconds = env("PROBE_SECONDS", 300)
++struct Slot { var surface: IOSurface; var writer: MTLTexture; var reader: MTLTexture }
++func makeSlot() -> Slot { let s = makeSurface(W, H); return Slot(surface: s, writer: texture(s), reader: texture(s)) }
++var slots = (0..<4).map { _ in makeSlot() }
++func colour(_ n: Int) -> [Float] {
++    [Float(n % 7 + 1) / 8, Float(n % 5 + 1) / 6, Float(n % 11) / 11, 1]
++}
++let band = 40, bandValue: UInt32 = 0xff20_4060
++print("device:", dev.name, "\(W)x\(H) BGRA for \(Int(seconds)) s")
++let start = Date()
++var n = 0, recreatedTextures = 0, recreatedSurfaces = 0, frameFails = 0, firstFail = ""
++while Date().timeIntervalSince(start) < seconds {
++    let i = n % slots.count
++    if n % 101 == 100 { slots[i] = makeSlot(); recreatedSurfaces += 1 }
++    else if n % 37 == 36 {
++        slots[i].writer = texture(slots[i].surface); slots[i].reader = texture(slots[i].surface); recreatedTextures += 1
++    }
++    let slot = slots[i], c = colour(n), y0 = (n * 13) % (H - band)
++    gradient(slot.writer, c)
++    let cpuBand = n % 5 == 0
++    if cpuBand {
++        slot.surface.lock(options: [], seed: nil)
++        for y in y0..<(y0 + band) {
++            let row = (slot.surface.baseAddress + y * slot.surface.bytesPerRow).assumingMemoryBound(to: UInt32.self)
++            for x in 0..<W { row[x] = bandValue }
++        }
++        slot.surface.unlock(options: [], seed: nil)
++    }
++    let expect: (Int, Int) -> [UInt8] = { x, y in
++        cpuBand && y >= y0 && y < y0 + band ? [0x60, 0x40, 0x20, 0xff] : want(c, W, H, x, y)
++    }
++    let (g1, t1, f1) = compare(slot.surface, step: 53, expect)
++    let (g2, t2, f2) = compare(viaGPU(slot.reader), step: 53, expect)
++    if g1 != t1 || g2 != t2 {
++        frameFails += 1
++        if firstFail.isEmpty { firstFail = "frame \(n) slot \(i): cpu \(g1)/\(t1) \(f1) gpu \(g2)/\(t2) \(f2)" }
++    }
++    n += 1
++    if n % 500 == 0 {
++        print("  \(n) frames, \(frameFails) failed, \(recreatedTextures) textures and \(recreatedSurfaces) surfaces made again",
++              String(format: "%.1f fps", Double(n) / Date().timeIntervalSince(start)))
++        fflush(stdout)
++    }
++}
++if frameFails != 0 { failed += 1; print("  first:", firstFail) }
++finish("frames \(n) failed-frames \(frameFails) textures-made-again \(recreatedTextures) surfaces-made-again \(recreatedSurfaces)")
+diff --git a/scripts/internal/census/probe_signal.swift b/scripts/internal/census/probe_signal.swift
+new file mode 100644
+index 00000000..b3d408d9
+--- /dev/null
++++ b/scripts/internal/census/probe_signal.swift
+@@ -0,0 +1,43 @@
++// probe_signal.swift (CPU read after a shared-event signal): swiftc -O probe_common.swift probe_signal.swift -o probe_signal
++// One command buffer renders a gradient into a surface, signals a shared event, then keeps the GPU
++// busy with unrelated work. The CPU waits for the event, not for the command buffer, and reads the
++// surface at once. Metal promises the render's writes are visible at the signal, so the read must
++// see them though the command buffer has not completed. It prints whether the command buffer was
++// still running at the read; a round where it had completed proves nothing and is counted apart.
++import Foundation
++import Metal
++import IOSurface
++
++let W = 1920, H = 1200
++let A: [Float] = [1, 1, 0.25, 1], B: [Float] = [0.5, 1, 0.75, 1]
++let rounds = Int(env("PROBE_ROUNDS", 20))
++let busyDraws = Int(env("PROBE_BUSY_DRAWS", 600))
++print("device:", dev.name, "rounds \(rounds), busy draws \(busyDraws)")
++let busySurface = makeSurface(W, H), busy = texture(busySurface)
++var running = 0, completed = 0
++for round in 0..<rounds {
++    let s = makeSurface(W, H), t = texture(s)
++    let c = round % 2 == 0 ? A : B, before = round % 2 == 0 ? B : A
++    gradient(t, before); _ = viaGPU(t)
++    let ev = dev.makeSharedEvent()!
++    let b = queue.makeCommandBuffer()!
++    encodeGradient(b, t, c)
++    b.encodeSignalEvent(ev, value: 1)
++    encodeGradient(b, busy, A, draws: busyDraws)
++    b.commit()
++    let until = Date().addingTimeInterval(5)
++    while ev.signaledValue < 1 && Date() < until { usleep(50) }
++    let signalled = ev.signaledValue >= 1
++    let stillRunning = b.status != .completed
++    // Read with no lock first, as an app that trusts the event may, then with a read lock.
++    let (good, total, first) = compare(s, lock: false) { want(c, W, H, $0, $1) }
++    let (good2, total2, first2) = compare(s) { want(c, W, H, $0, $1) }
++    b.waitUntilCompleted()
++    if stillRunning { running += 1 } else { completed += 1 }
++    let ok = signalled && good == total && good2 == total2
++    print(ok ? "  ok  " : "  BAD ", "round \(round)", signalled ? "" : "(the event never came)",
++          stillRunning ? "the buffer was running" : "the buffer had completed",
++          "unlocked \(good)/\(total) locked \(good2)/\(total2)", first, first2)
++    if !ok { failed += 1 }
++}
++finish("rounds-read-while-running \(running) rounds-already-completed \(completed)")
+diff --git a/scripts/internal/census/probe_tail.swift b/scripts/internal/census/probe_tail.swift
+new file mode 100644
+index 00000000..c0b3641f
+--- /dev/null
++++ b/scripts/internal/census/probe_tail.swift
+@@ -0,0 +1,52 @@
++// probe_tail.swift (B1): swiftc -O probe_common.swift probe_tail.swift -o probe_tail
++// A 3200x1800 BGRA surface's rows end at 23,040,000 bytes; it is made with 64 KiB more, so its
++// allocation has whole pages past the rows. The CPU writes those trailing pages (as an app keeping
++// its own data after the pixels may) between GPU renders and CPU reads of the pixels. Every check
++// must pass, and the trailing bytes must keep what the CPU wrote.
++// That Coherent stays on is checked on the host: after a run the census must not have fused
++// ("census: fused" absent from the QEMU log) and the m2v counters closed_by_overlap and
++// closed_by_marks must not grow. The probe prints the time per round too: a surface that fell back
++// to copies costs a full copy each way, so a large jump between rounds is a hint.
++import Foundation
++import Metal
++import IOSurface
++
++let W = 3200, H = 1800
++let rowsEnd = W * 4 * H
++let s = makeSurface(W, H, allocSize: rowsEnd + 65536)
++let t = texture(s)
++let A: [Float] = [1, 1, 0.25, 1], B: [Float] = [0.5, 1, 0.75, 1]
++print("device:", dev.name, "bytesPerRow \(s.bytesPerRow) allocationSize \(s.allocationSize) rows end \(s.bytesPerRow * H)")
++let tailStart = s.bytesPerRow * H, tailLength = s.allocationSize - tailStart
++if tailLength < 4096 { print("  note: only \(tailLength) bytes past the rows; the trailing-page case is not reached") }
++func writeTail(_ v: UInt8) {
++    s.lock(options: [], seed: nil)
++    memset(s.baseAddress + tailStart, Int32(v), tailLength)
++    s.unlock(options: [], seed: nil)
++}
++func tailHolds(_ v: UInt8) -> Bool {
++    s.lock(options: .readOnly, seed: nil); defer { s.unlock(options: .readOnly, seed: nil) }
++    let p = (s.baseAddress + tailStart).assumingMemoryBound(to: UInt8.self)
++    return (0..<tailLength).allSatisfy { p[$0] == v }
++}
++let rounds = Int(env("PROBE_ROUNDS", 200))
++var times: [Double] = []
++for round in 0..<rounds {
++    let c = round % 2 == 0 ? A : B, v = UInt8(truncatingIfNeeded: round &+ 1)
++    let t0 = Date()
++    gradient(t, c)
++    writeTail(v)
++    let (good, total, first) = compare(s) { want(c, W, H, $0, $1) }
++    let (good2, total2, first2) = compare(viaGPU(t)) { want(c, W, H, $0, $1) }
++    let tail = tailHolds(v)
++    times.append(Date().timeIntervalSince(t0) * 1000)
++    let ok = good == total && good2 == total2 && tail
++    if !ok || round % 50 == 0 {
++        print(ok ? "  ok  " : "  BAD ", "round \(round): cpu \(good)/\(total) gpu \(good2)/\(total2) tail \(tail)",
++              String(format: "%.2f ms", times.last!), first, first2)
++    }
++    if !ok { failed += 1 }
++}
++let sorted = times.sorted()
++finish(String(format: "rounds %d median-ms %.2f p95-ms %.2f max-ms %.2f", rounds, sorted[sorted.count / 2],
++              sorted[sorted.count * 95 / 100], sorted.last!))
+diff --git a/scripts/internal/census/probe_untracked.swift b/scripts/internal/census/probe_untracked.swift
+new file mode 100644
+index 00000000..42622f90
+--- /dev/null
++++ b/scripts/internal/census/probe_untracked.swift
+@@ -0,0 +1,55 @@
++// probe_untracked.swift (P2): swiftc -O probe_common.swift probe_untracked.swift -o probe_untracked
++// An untracked-hazard texture is made on a surface first, then a tracked one on the same surface.
++// The GPU writes through the tracked one and reads through the untracked one, which the runtime's
++// hazard tracking does not see. The read must still see the write: the untracked reader is
++// synced like any other. Run in four orders: the reader waits for the writer, or commits right
++// after it on the same queue; the reader samples, or blits.
++import Foundation
++import Metal
++import IOSurface
++
++let W = 1920, H = 1200
++let A: [Float] = [1, 1, 0.25, 1], B: [Float] = [0.5, 1, 0.75, 1]
++print("device:", dev.name)
++for (name, waits) in [("the reader commits after the write completed", true),
++                      ("the reader commits right after the writer, same queue", false)] {
++    print("[1] untracked reader made first, tracked writer:", name)
++    for round in 0..<3 {
++        let s = makeSurface(W, H)
++        let reader = texture(s, untracked: true), writer = texture(s)
++        gradient(writer, B); _ = viaGPU(reader)
++        let c = round % 2 == 0 ? A : B
++        let other = round % 2 == 0 ? B : A
++        gradient(writer, other)
++        gradient(writer, c, wait: waits)
++        let out = makeSurface(W, H), o = texture(out)
++        let b = queue.makeCommandBuffer()!
++        encodeCopy(b, reader, o); b.commit(); b.waitUntilCompleted()
++        check("round \(round): the untracked texture's view", out) { want(c, W, H, $0, $1) }
++    }
++}
++print("[2] untracked reader made first, read by a blit into a buffer")
++do {
++    let s = makeSurface(W, H)
++    let reader = texture(s, untracked: true), writer = texture(s)
++    gradient(writer, B); _ = viaGPU(reader)
++    gradient(writer, A, wait: false)
++    let bpr = W * 4, buf = dev.makeBuffer(length: bpr * H, options: .storageModeShared)!
++    let b = queue.makeCommandBuffer()!, e = b.makeBlitCommandEncoder()!
++    e.copy(from: reader, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
++           sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0,
++           destinationBytesPerRow: bpr, destinationBytesPerImage: bpr * H)
++    e.endEncoding(); b.commit(); b.waitUntilCompleted()
++    let p = buf.contents().assumingMemoryBound(to: UInt8.self)
++    var bad = 0, total = 0, first = ""
++    for y in stride(from: 2, to: H, by: 37) {
++        for x in stride(from: 1, to: W, by: 37) {
++            let at = y * bpr + x * 4, g = [p[at], p[at + 1], p[at + 2], p[at + 3]], w = want(A, W, H, x, y)
++            total += 1
++            if zip(g, w).contains(where: { abs(Int($0) - Int($1)) > 2 }) { bad += 1; if first.isEmpty { first = "(\(x),\(y)) got \(g) want \(w)" } }
++        }
++    }
++    print(bad == 0 ? "  ok  " : "  BAD ", "the blit's bytes", "\(total - bad)/\(total)", first)
++    if bad != 0 { failed += 1 }
++}
++finish()
