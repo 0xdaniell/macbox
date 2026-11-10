@@ -4,6 +4,8 @@ You're asked to give this Linux host a macOS VM with Xcode, iOS Simulators and T
 panel. You can do almost all of it yourself, including the steps in macOS's GUI. Work through
 `./macbox next` until every line is ticked; [docs/setup.md](docs/setup.md) explains each step.
 
+If macbox is already installed and you're asked to update it, skip to [Updating](#updating).
+
 ## Sharing improvements upstream
 
 macbox welcomes contributions of any kind from users and coding agents: issues, ideas,
@@ -78,3 +80,31 @@ mac-sim up && mac-sim run && mac-sim shot /tmp/home.png && mac-sim down
 
 Look at `/tmp/home.png`. If the user runs T3 Code, open the simulator in their Device panel with
 `device_open`, using the ids `mac-sim t3` prints.
+
+## Updating
+
+You're asked to bring an existing install to the latest version. The user's VM, simulators and
+config stay; only macbox's checkout, its build and its links change.
+
+1. Find the checkout: `readlink -f "$(command -v macbox)"` points into it. `git status` there: if
+   there are local changes, show them to the user and ask before you stash or drop anything.
+2. `git log -1 --format=%h` (note it, to go back), then `git pull --ff-only`. Read what changed:
+   `git log --oneline ORIG_HEAD..`.
+3. `./macbox agents install`: tools, skills and user units are links into the checkout, and files
+   can move between versions (they moved to `src/` in November 2026).
+4. `./macbox doctor`. Anything it reports about the host: show the user the commands and ask.
+5. If `git diff --stat ORIG_HEAD -- src/versions.env src/patches` shows anything, run
+   `./macbox build` in the background (20 to 60 minutes) and report progress. The running VM keeps
+   its QEMU until it restarts.
+6. Config: compare `~/.config/macbox/macbox.env` with the defaults in docs/setup.md ("2. Config
+   and checks"). Values `macbox init` wrote earlier stay as they were: `MACBOX_COHERENT=off` there
+   is what `init` wrote before the default became `auto` (on with an Arrow Lake iGPU). Tell the user what differs and ask before you change it.
+7. Ask the user when the VM may restart: it closes the simulators and apps running in macOS. Then
+   `./macbox down && ./macbox up`.
+8. Check: `./macbox status`, `./macbox coherent status`, `./macbox next` (every line still
+   ticked), and the end-to-end check under "When you're done". Tell the user the old and new
+   commit, and what the release changed.
+
+If the new build misbehaves, go back: point `qemu/current` in
+`$MACBOX_HOME/home/.local/share/reims-ctl/qemu/` at the previous build (they stay installed), or
+`git checkout <old commit>` and `./macbox build`, then restart.
