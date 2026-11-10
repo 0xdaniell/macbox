@@ -38,7 +38,7 @@ node), makes an SSH key `~/.ssh/macbox_ed25519`, and adds a `Host macbox` block 
 | `MACBOX_CPUSET` | empty | pin QEMU to some cores, e.g. a hybrid CPU's performance cores (`0-7`) |
 | `MACBOX_BUILD_CPUSET` | empty | cores for `macbox build`, e.g. the efficiency cores |
 | `MACBOX_DISK_CACHE` | none | `writeback` panicked macOS's NVMe driver under heavy swap; `unsafe` is faster, but a crash of the host itself can corrupt the VM's disk. Applies at the next `macbox up` |
-| `MACBOX_COHERENT` | auto | `auto`: on with an Arrow Lake iGPU. Coherent, zero-copy surfaces, and the switches measured with it: a 3x simulator 50 → 117 fps there ([performance.md](performance.md#coherent-and-the-switches-measured-with-it-on-by-default-on-arrow-lake)); `on` with any GPU, `off` |
+| `MACBOX_COHERENT` | auto | `auto`: on with an Arrow Lake iGPU. Coherent, zero-copy surfaces, and the switches measured with it: a 3x simulator 50 → 120 fps there ([performance.md](performance.md#coherent-and-the-switches-measured-with-it-on-by-default-on-arrow-lake)); `on` with any GPU, `off` |
 | `MACBOX_HOME` | ~/.local/share/macbox | everything macbox keeps |
 
 Then:

@@ -6,7 +6,7 @@ have, with no Mac and no cloud service. Claude Code, Codex and T3 Code each get 
 simulator to build an app, run it, tap through it, take screenshots and record video, on their own.
 
 It's fast: an iPhone 17 Pro simulator at full 3x resolution renders a heavy Liquid Glass screen at
-**117 fps on an Intel integrated GPU**. Before macbox's patches, the same GPU managed 17.
+**120 fps on an Intel integrated GPU**, the screen's full refresh rate. Before macbox's patches, the same GPU managed 17.
 
 **Website:** [tuna-nope.github.io/macbox](https://tuna-nope.github.io/macbox/)
 
@@ -80,7 +80,7 @@ VM when you say so. By hand: [docs/setup.md, Updating](docs/setup.md#updating).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/fps-dark.svg">
-  <img alt="iOS Simulator at 3x, Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 on November 5, 70.0 with Coherent, 117 with the build macbox makes now" src="docs/images/fps-light.svg" width="760">
+  <img alt="iOS Simulator at 3x, Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 on November 5, 70 with Coherent, 120 with the build macbox makes now" src="docs/images/fps-light.svg" width="760">
 </picture>
 
 Measured on an Intel Core Ultra 7 265 (Arrow Lake iGPU) with an iPhone 17 Pro simulator at 3x
