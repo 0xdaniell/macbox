@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Tue, 10 Nov 2026 08:27:58 +0000
+Subject: [PATCH] shadow_lazy: a command buffer dropped uncommitted takes its
+ standings with it
+
+With surface_lazy_open_ids, dropped() took the id out of the open set, so a
+standing its encoders left read as committed and a later encoder could skip
+the copy in it needed. Clear those standings, count them (dropped-standings
+in the report), and test it without a GPU.
+---
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 113 +++++++++++++-----
+ 1 file changed, 84 insertions(+), 29 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 9cf44341..31d7366d 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -150,6 +150,8 @@ static TWINS: AtomicU64 = AtomicU64::new(0);
+ static READERS_FIRST: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS_UNMATCHED: AtomicU64 = AtomicU64::new(0);
++/// LOCAL (Atlas): standings cleared because their command buffer was dropped uncommitted ([`dropped`]).
++static DROPPED_STANDINGS: AtomicU64 = AtomicU64::new(0);
+ /// Milliseconds since the first report's chance at the last report.
+ static REPORTED: AtomicU64 = AtomicU64::new(0);
+ 
+@@ -236,9 +238,22 @@ fn note_open(id: u64) {
+     open.insert(id);
+ }
+ 
+-/// LOCAL (Atlas): the command buffer `id` went without a commit: it holds no standing open.
++/// LOCAL (Atlas): the command buffer `id` went without a commit. A standing its encoders left
++/// stands for writes that never ran, so it goes: with `surface_lazy_open_ids` the open set is what
++/// says a standing's command buffer has not committed, and taking `id` out of it alone would read as
++/// committed, and a later encoder would skip the copy in it needs. A committed command buffer left
++/// the set at its commit, so only one dropped uncommitted looks through the surfaces.
+ pub(crate) fn dropped(id: u64) {
+-    open_ids().lock().unwrap().remove(&id);
++    if !open_ids().lock().unwrap().remove(&id) {
++        return;
++    }
++    for lazy in surfaces() {
++        let mut stood = lazy.stood.lock().unwrap();
++        if stood.is_some_and(|stood| stood.id == id) {
++            *stood = None;
++            DROPPED_STANDINGS.fetch_add(1, Ordering::Relaxed);
++        }
++    }
+ }
+ 
+ /// LOCAL (Atlas): the command buffers committed whose last batch the scheduler has not planned
+@@ -989,7 +1004,8 @@ fn report() {
+         "surface_lazy: taken {taken} refused {refused} resyncs {resyncs} | refused: touched {} \
+          written {} epoch {} own {} uncommitted {} no-standing {} | in: first {} beyond-held {} \
+          changed {} bounded {} | ahead: deferred {} shared {} flushes {} whole {} texels {} \
+-         discarded {} presents {} unmatched {} twins {} readers-first {} own-backs-skipped {}",
++         discarded {} presents {} unmatched {} twins {} readers-first {} own-backs-skipped {} \
++         dropped-standings {}",
+         by[Refused::Touched as usize],
+         by[Refused::Written as usize],
+         by[Refused::Epoch as usize],
+@@ -1011,6 +1027,7 @@ fn report() {
+         read(&TWINS),
+         read(&READERS_FIRST),
+         read(&OWN_BACKS_SKIPPED),
++        read(&DROPPED_STANDINGS),
+     );
+     eprintln!("coherent_writer_wins: yielded {}", super::shadow_coherent::YIELDED.load(Ordering::Relaxed));
+     // LOCAL (Atlas, lab diagnostics): why the large shadows' copies back were recorded.
+@@ -1263,32 +1280,36 @@ impl Lazy {
+         size: [u32; 2],
+         texels: u64,
+     ) -> Option<Arc<Lazy>> {
+-        (surface && takes_surface(size[0], texels)).then(|| {
+-            Arc::new(Lazy {
+-                defer_no: Default::default(),
+-                yielded: Default::default(),
+-                truth: OnceLock::new(),
+-                written: AtomicU64::new(0),
+-                plain: AtomicU64::new(0),
+-                beside: Mutex::default(),
+-                stood: Mutex::new(None),
+-                resynced: Mutex::new(Instant::now()),
+-                device: Arc::new(device.clone()),
+-                pages: pages(),
+-                size,
+-                displayed: AtomicBool::new(false),
+-                keeps: OnceLock::new(),
+-                pending: Mutex::new(None),
+-                ahead: AtomicBool::new(false),
+-                flush_after: AtomicU64::new(0),
+-                queue: OnceLock::new(),
+-                taken: AtomicU64::new(0),
+-                refused: AtomicU64::new(0),
+-                copied_in: AtomicU64::new(0),
+-                presents: AtomicU64::new(0),
+-                coherent: OnceLock::new(),
+-                owners: Mutex::new(Vec::new()),
+-            })
++        (surface && takes_surface(size[0], texels))
++            .then(|| Lazy::new(Arc::new(device.clone()), pages(), size))
++    }
++
++    /// A surface of `size` over the host addresses `pages`, its queue from `device`.
++    fn new(device: Hold, pages: Option<Range<usize>>, size: [u32; 2]) -> Arc<Lazy> {
++        Arc::new(Lazy {
++            defer_no: Default::default(),
++            yielded: Default::default(),
++            truth: OnceLock::new(),
++            written: AtomicU64::new(0),
++            plain: AtomicU64::new(0),
++            beside: Mutex::default(),
++            stood: Mutex::new(None),
++            resynced: Mutex::new(Instant::now()),
++            device,
++            pages,
++            size,
++            displayed: AtomicBool::new(false),
++            keeps: OnceLock::new(),
++            pending: Mutex::new(None),
++            ahead: AtomicBool::new(false),
++            flush_after: AtomicU64::new(0),
++            queue: OnceLock::new(),
++            taken: AtomicU64::new(0),
++            refused: AtomicU64::new(0),
++            copied_in: AtomicU64::new(0),
++            presents: AtomicU64::new(0),
++            coherent: OnceLock::new(),
++            owners: Mutex::new(Vec::new()),
+         })
+     }
+ 
+@@ -1908,3 +1929,37 @@ impl Lazy {
+         Some((stood.held, stood.stale, stood.written))
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A surface the command buffer `id`'s encoder left standing, as [`Lazy::stand`] leaves it.
++    fn left_standing_by(id: u64) -> Arc<Lazy> {
++        let lazy = Lazy::new(Arc::new(()), None, [64, 64]);
++        registry().write().unwrap().push(Arc::downgrade(&lazy));
++        note_open(id);
++        *lazy.stood.lock().unwrap() =
++            Some(Stood { id, touched: 0, held: None, stale: None, written: 0, plain: 0, epoch: 0 });
++        lazy
++    }
++
++    /// With `surface_lazy_open_ids`, a command buffer dropped without a commit takes its standings
++    /// with it: they stand for writes that never ran, and must not read as committed.
++    #[test]
++    fn a_command_buffer_dropped_uncommitted_takes_its_standing_with_it() {
++        crate::live::set(OPEN_IDS, Some("1"));
++        // Identities no command buffer of the test process takes (`ShadowCarry::id` counts up).
++        let (kept, gone) = (u64::MAX - 21, u64::MAX - 22);
++        let committed_one = left_standing_by(kept);
++        let dropped_one = left_standing_by(gone);
++        assert!(!committed_one.standing_committed());
++        assert!(!dropped_one.standing_committed());
++        committed(kept);
++        dropped(kept);
++        dropped(gone);
++        assert!(committed_one.standing_committed());
++        assert!(dropped_one.stood.lock().unwrap().is_none());
++        assert!(!dropped_one.standing_committed());
++    }
++}
