@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 06:19:27 +0000
+Subject: [PATCH 33/33] staged page-ups read guest pages with one memcpy per
+ run (the volatile 8-byte loads ran at ~4 GB/s) and never read the runtime
+ buffer back (write-combined)
+
+---
+ crates/reims-vgpu-core/src/gpu_task/memory.rs | 27 +++++++++++++++----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/crates/reims-vgpu-core/src/gpu_task/memory.rs b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+index ccefff6a..93ebf586 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/memory.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+@@ -651,18 +651,35 @@ impl<P: Platform> GpuTask<P> {
+             let Some(dst) = bytes.get_mut(at..end) else {
+                 return Ok(None);
+             };
+-            if !map.read(r.physical_address, dst) {
++            if !Self::read_guest(&map, r.physical_address, dst) {
+                 return Ok(None);
+             }
+             at = end;
+         }
+-        // Counted on first prepares only: what the zero switch would have skipped.
+-        let zeros = first && bytes.iter().fold(0_u8, |any, &b| any | b) == 0;
++        // The buffer's bytes are not read back: its memory may be write-combined.
+         times.copy = ns(copying, self.mono());
+-        page_refs::note_staged(length, zeros, times);
++        page_refs::note_staged(length, false, times);
+         Ok(Some(Staged::Buffer(buffer)))
+     }
+ 
++    /// Copies guest physical `physical..+dst.len()` into `dst` with one `memcpy`; false when
++    /// no range of the map holds it all. For a staged page-up's pages only: no GPU access to
++    /// them is pending (`memory::page_refs`) and the guest's CPU may not write a committed
++    /// command buffer's resource, so nothing writes them while they are read.
++    fn read_guest(map: &MemoryMap<P>, physical: u64, dst: &mut [u8]) -> bool {
++        let source = map.virtual_address_for_physical(physical, dst.len().to_u64());
++        if source.is_null() {
++            return false;
++        }
++        #[allow(unsafe_code)] // architecture 17.3: a bulk read of mapped guest RAM
++        // SAFETY: `source..source + dst.len()` lies in one range of the map, which the map's
++        // owner keeps mapped while the map lives (`map` holds it here), and `dst` is ours.
++        unsafe {
++            std::ptr::copy_nonoverlapping(source.as_ptr::<u8>(), dst.as_mut_ptr(), dst.len());
++        }
++        true
++    }
++
+     /// Whether every byte of the guest's `ranges` reads zero, read a page at a time and stopping
+     /// at the first page that does not; `None` when a range is outside the map.
+     fn runs_read_zero(map: &MemoryMap<P>, ranges: &[PhysRange]) -> Option<bool> {
+@@ -673,7 +690,7 @@ impl<P: Platform> GpuTask<P> {
+             while at < end {
+                 let n = end.wrapping_sub(at).min(PAGE).to_usize();
+                 let dst = chunk.get_mut(..n)?;
+-                if !map.read(at, dst) {
++                if !Self::read_guest(map, at, dst) {
+                     return None;
+                 }
+                 if dst.iter().fold(0_u8, |any, &b| any | b) != 0 {

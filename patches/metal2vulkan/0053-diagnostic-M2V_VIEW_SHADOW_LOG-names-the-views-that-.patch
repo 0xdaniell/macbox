@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 01:25:48 +0000
+Subject: [PATCH 53/92] diagnostic: M2V_VIEW_SHADOW_LOG names the views that
+ take shadows
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/texture/view_shadow.rs                | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 739b98de..6d940e98 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -315,6 +315,34 @@ impl Device {
+             || Error::Unsupported(self.apart_refusal(Some(base.as_ref()), view.pixel_format));
+         let image = self.image_shadow(call, base, texture, view, apart, None)?;
+         self.shared().counts.view_shadow_made();
++        // LOCAL (Atlas) diagnostic: which views take shadows, where `M2V_VIEW_SHADOW_LOG` is set.
++        if std::env::var_os("M2V_VIEW_SHADOW_LOG").is_some() {
++            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
++                let b = base.plan();
++                eprintln!(
++                    "m2v-view-shadow: {call} view {:?} of {:?} texture (base {:?} {:?} {}x{} flags {:?} usage {:?} views {:?} purpose {}) rendered {rendered} reinterprets {} at {}",
++                    view.pixel_format,
++                    texture.pixel_format,
++                    b.pixel_format,
++                    b.format,
++                    b.extent[0],
++                    b.extent[1],
++                    b.flags,
++                    b.usage,
++                    b.view_formats,
++                    crate::image_log::image_note(base.own_raw()),
++                    self.reinterprets(base, view.pixel_format),
++                    std::backtrace::Backtrace::force_capture()
++                        .to_string()
++                        .lines()
++                        .filter(|l| l.contains("metal2vulkan_runtime::"))
++                        .take(8)
++                        .collect::<Vec<_>>()
++                        .join(" | "),
++                );
++            }
++        }
+         let reinterpreting =
+             !self.shared().view_reinterpretation && self.reinterprets(base, view.pixel_format);
+         let formats = (base.plan().format, image.plan().format);

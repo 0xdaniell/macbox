@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 13:29:49 +0000
+Subject: [PATCH 68/92] lab: surface_coherent_writer_wins live switch (default
+ off): a reading trap owner yields its pages to a writing image over the same
+ surface, forgetting its standing
+
+---
+ crates/metal2vulkan-runtime/src/shadow.rs     |  2 +-
+ .../src/shadow_coherent.rs                    | 57 +++++++++++++++++++
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 14 +++++
+ 3 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index f00d845d..496cab01 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -2801,7 +2801,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+         for shadow in shadows {
+             // Made here, or for a keep's scratch above: not copied in yet, so its copy in is the
+             // encoder's first.
+-            let i = self.entry(&shadow.copies);
++            let i = crate::shadow_coherent::as_writer(shadow.writes, || self.entry(&shadow.copies));
+             let two_ways = kept
+                 .iter()
+                 .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index d00e5e28..04a2fa5f 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -253,6 +253,24 @@ static LATE_COMPARES: AtomicU64 = AtomicU64::new(0);
+ static LATE_COMPARE_NS: AtomicU64 = AtomicU64::new(0);
+ static LATE_COMPARE_NS_MAX: AtomicU64 = AtomicU64::new(0);
+ 
++thread_local! {
++    /// LOCAL (Atlas): whether the shadow use being planned on this thread writes its texture
++    /// ([`as_writer`]), read by [`Coherent::tracks`] under `surface_coherent_writer_wins`.
++    static WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// LOCAL (Atlas): run `f` (a shadow entry's planning, which may track a surface) as a use that
++/// writes the texture or not.
++pub(crate) fn as_writer<R>(writes: bool, f: impl FnOnce() -> R) -> R {
++    let before = WRITER.with(|w| w.replace(writes));
++    let out = f();
++    WRITER.with(|w| w.set(before));
++    out
++}
++
++/// LOCAL (Atlas): owners that yielded their pages to a writer (`surface_coherent_writer_wins`).
++pub(crate) static YIELDED: AtomicU64 = AtomicU64::new(0);
++
+ pub(crate) fn count(what: Fallback) {
+     FALLBACK[what as usize].fetch_add(1, Ordering::Relaxed);
+ }
+@@ -752,6 +770,22 @@ impl Coherent {
+         for one in dead {
+             one.retire();
+         }
++        // LOCAL (Atlas): live `surface_coherent_writer_wins` (default off). Two textures over one
++        // surface race to trap its pages at their first use; where the one that won never left a
++        // write ahead and has nothing running, and this use writes, it yields the pages to this
++        // one, as a dead surface's image retires above: the writer's copies back per encoder are
++        // what the trap saves. The yielding image goes on lazy alone, copying in when it is used.
++        if WRITER.with(std::cell::Cell::get) && crate::live::on("surface_coherent_writer_wins", false) {
++            let owners: Vec<Arc<Coherent>> = (all().read().unwrap().iter())
++                .filter(|one| meets(one) && one.lazy.strong_count() > 0)
++                .cloned()
++                .collect();
++            for one in owners {
++                if one.try_yield() {
++                    YIELDED.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++        }
+         // One image traps per surface: a trap reaches one, and that one would untrack the pages
+         // from under another. Any other stays lazy, its copies back keeping the pages.
+         {
+@@ -1379,6 +1413,29 @@ impl Coherent {
+         self.close(&mut state, true);
+     }
+ 
++    /// LOCAL (Atlas): give its pages up to another image over them that writes
++    /// (`surface_coherent_writer_wins`): only where it never left a write ahead and has nothing
++    /// running, so its image holds nothing the pages lack; what it settled lands as `retire`'s.
++    fn try_yield(&self) -> bool {
++        let mut state = self.lock();
++        if !state.tracked || state.closed {
++            return false;
++        }
++        // Anything it holds that the pages lack, or the pages hold that its image lacks, keeps it.
++        let busy = !state.running.is_empty() || !state.open.is_empty() || state.flushing != 0
++            || !state.owed.is_empty() || !state.owed_in.is_empty();
++        if self.counts.defers.load(Ordering::Relaxed) > 0 || busy || state.guest.is_some() {
++            return false;
++        }
++        self.sync_done(&mut state, SyncBy::Unmap);
++        self.close(&mut state, true);
++        drop(state);
++        if let Some(lazy) = self.lazy.upgrade() {
++            lazy.forget_standing();
++        }
++        true
++    }
++
+     /// Another image over the surface is about to read it: open pages held, so it reads all the
+     /// guest wrote and the next write traps. Whether any was open.
+     pub(crate) fn seal(&self) -> bool {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 1f9dc7da..9cf44341 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1012,6 +1012,7 @@ fn report() {
+         read(&READERS_FIRST),
+         read(&OWN_BACKS_SKIPPED),
+     );
++    eprintln!("coherent_writer_wins: yielded {}", super::shadow_coherent::YIELDED.load(Ordering::Relaxed));
+     // LOCAL (Atlas, lab diagnostics): why the large shadows' copies back were recorded.
+     for (lazy, name) in [(1usize, "lazy"), (0, "plain")] {
+         let parts: Vec<String> = (0..12)
+@@ -1206,6 +1207,10 @@ pub(crate) struct Lazy {
+     /// LOCAL (Atlas, lab diagnostics): `defer`'s refusals by exit (not presented, beside
+     /// another, keeps gone, no queue, the traps refused).
+     defer_no: [AtomicU64; 5],
++    /// LOCAL (Atlas): its surface stopped trapping for another image over it
++    /// (`surface_coherent_writer_wins`): the standing it kept while the pages trapped is not
++    /// trusted, and its next take copies the whole image in.
++    yielded: std::sync::atomic::AtomicBool,
+     truth: OnceLock<(ResourceKey, Option<ResourceKey>, UseRange)>,
+     written: AtomicU64,
+     /// LOCAL (Atlas): the writes counted in [`Lazy::written`] that left no [`Beside`] entry
+@@ -1261,6 +1266,7 @@ impl Lazy {
+         (surface && takes_surface(size[0], texels)).then(|| {
+             Arc::new(Lazy {
+                 defer_no: Default::default(),
++                yielded: Default::default(),
+                 truth: OnceLock::new(),
+                 written: AtomicU64::new(0),
+                 plain: AtomicU64::new(0),
+@@ -1303,6 +1309,11 @@ impl Lazy {
+         self.coherent.get().filter(|coherent| coherent.is_live())
+     }
+ 
++    /// LOCAL (Atlas): its surface gave its pages up to another image ([`Lazy::yielded`]).
++    pub(crate) fn forget_standing(&self) {
++        self.yielded.store(true, Ordering::Relaxed);
++    }
++
+     /// LOCAL (Atlas, lab diagnostics): the takes of its standing so far.
+     pub(crate) fn size_and_taken(&self) -> ([u32; 2], u64) {
+         (self.size, self.taken.load(Ordering::Relaxed))
+@@ -1845,6 +1856,9 @@ impl Lazy {
+         ordered: bool,
+     ) -> Option<(Option<[u32; 4]>, Option<[u32; 4]>, u64)> {
+         report();
++        if self.yielded.swap(false, Ordering::Relaxed) {
++            *self.stood.lock().unwrap() = None;
++        }
+         let Some(stood) = *self.stood.lock().unwrap() else {
+             REFUSED_BY[Refused::NoStanding as usize].fetch_add(1, Ordering::Relaxed);
+             return None;

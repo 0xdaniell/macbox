@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 18:03:51 +0000
+Subject: [PATCH 77/92] lab: live shared_ccs=1: a GPU-written Shared/Managed
+ texture that does not trap takes no host-transfer usage (keeps CCS on ANV);
+ its CPU copies take the staging path
+
+---
+ crates/metal2vulkan-runtime/src/texture.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 8486ee10..21aca83e 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3223,7 +3223,16 @@ impl Device {
+         let one_sample = layout.samples == 1;
+         let staged =
+             !traps && !held && !private && one_sample && self.stages(&plan, layout.pixel_format);
+-        let refused = (held || private) && !traps;
++        // LOCAL (Atlas, lab): live `shared_ccs=1`: a `Shared` or `Managed` texture the GPU writes
++        // (storage or color attachment), whose pages do not trap, takes no host-transfer usage,
++        // which on ANV turns its compression off: its CPU copies go through the staging queue (or
++        // the device's other copies) instead, and the GPU's passes and kernels over it keep CCS.
++        let gpu_written = (plan.usage)
++            .intersects(ImageUsageFlags::STORAGE | ImageUsageFlags::COLOR_ATTACHMENT);
++        let compressed = !traps
++            && gpu_written
++            && crate::live::get("shared_ccs").as_deref() == Some("1");
++        let refused = ((held || private) && !traps) || compressed;
+         let hosted = match refused || !one_sample || is_pvrtc(descriptor.pixel_format) {
+             true => None,
+             false => self.host_placed_image(&plan, layout.texture_type, class, staged, traps),

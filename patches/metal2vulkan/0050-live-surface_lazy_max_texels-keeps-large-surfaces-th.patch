@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 7 Nov 2026 17:53:51 +0000
+Subject: [PATCH 50/92] live surface_lazy_max_texels keeps large surfaces (the
+ desktop) out of surface_lazy
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/shadow_lazy.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index bc393926..dfe3a73c 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -282,8 +282,15 @@ pub(crate) fn takes_surface(width: u32, texels: u64) -> bool {
+     let wide = crate::live::get("surface_lazy_min_width")
+         .and_then(|v| v.parse().ok())
+         .is_none_or(|min: u32| width >= min);
++    // LOCAL (Atlas): `surface_lazy_max_texels` (default none) keeps a larger surface out, the
++    // desktop's among them: its encoders' scissors span the screen, so each copies back the whole
++    // surface, where a Simulator's display copies back what it drew (2026-11-07 loadlab).
++    let small = crate::live::get("surface_lazy_max_texels")
++        .and_then(|v| v.parse().ok())
++        .is_none_or(|max: u64| texels <= max);
+     crate::live::on(SWITCH, false)
+         && wide
++        && small
+         && texels
+             >= crate::live::get("surface_lazy_min_texels")
+                 .and_then(|v| v.parse().ok())

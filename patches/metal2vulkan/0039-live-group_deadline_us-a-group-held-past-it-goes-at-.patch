@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:23:21 +0000
+Subject: [PATCH 39/92] live group_deadline_us: a group held past it goes at
+ the next pass
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/command_buffer/group.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 781237a2..626669dd 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -498,6 +498,13 @@ impl Group {
+             }
+             return None;
+         }
++        // LOCAL (Atlas, DEEP-GPU): live `group_deadline_us` (0 or unset: none): a group whose
++        // first batch was held longer than that goes at the scheduler's next pass, so no batch
++        // waits past the deadline for a group to fill (the guest sees its completion later).
++        let deadline_us = crate::live::get("group_deadline_us").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
++        if deadline_us != 0 && gpu_time::host_nanos().saturating_sub(first.held_at) >= deadline_us * 1000 {
++            return None;
++        }
+         let value = device.shared().queues[self.queue].pending_beyond_one()?;
+         if !self.kept {
+             self.kept = true;

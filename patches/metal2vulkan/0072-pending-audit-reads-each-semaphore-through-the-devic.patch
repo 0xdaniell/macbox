@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 16:56:45 +0000
+Subject: [PATCH 72/92] pending audit reads each semaphore through the device
+ that submitted it
+
+---
+ .../metal2vulkan-runtime/src/pending_audit.rs | 24 +++++++++++++++----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/pending_audit.rs b/crates/metal2vulkan-runtime/src/pending_audit.rs
+index 6bc05d27..cb98b9ef 100644
+--- a/crates/metal2vulkan-runtime/src/pending_audit.rs
++++ b/crates/metal2vulkan-runtime/src/pending_audit.rs
+@@ -15,7 +15,7 @@
+ use ash::vk;
+ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicU64, Ordering};
+-use std::sync::{LazyLock, Mutex, OnceLock};
++use std::sync::{LazyLock, Mutex};
+ use std::time::Instant;
+ 
+ /// The most lines written.
+@@ -32,11 +32,14 @@ pub(crate) fn on() -> bool {
+     *ON
+ }
+ 
+-/// The device whose semaphores and fences are read (the first that submits).
+-static DEVICE: OnceLock<ash::Device> = OnceLock::new();
++/// The devices that submitted, each read through its own (a semaphore read through another
++/// device reads 0).
++static DEVICES: LazyLock<Mutex<Vec<ash::Device>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+ 
+ /// A primary's last submission.
+ struct Sub {
++    /// The index of its device in [`DEVICES`].
++    device: usize,
+     site: &'static str,
+     at: Instant,
+     /// The timeline signals of its info or the first later info of the same call with any.
+@@ -70,7 +73,8 @@ fn line(text: String) {
+ 
+ /// Why `sub` is still pending, or `None` where it completed (or nothing tells).
+ fn pending(sub: &Sub) -> Option<String> {
+-    let device = DEVICE.get()?;
++    let devices = DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = devices.get(sub.device)?;
+     for &(semaphore, value) in &sub.signals {
+         // SAFETY: a semaphore of the device a submission signalled; read only.
+         if let Ok(now) = unsafe { device.get_semaphore_counter_value(semaphore) } {
+@@ -214,7 +218,16 @@ pub(crate) fn submits(
+     if !*ON {
+         return;
+     }
+-    let _ = DEVICE.set(device.clone());
++    let index = {
++        let mut devices = DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++        match devices.iter().position(|d| d.handle() == device.handle()) {
++            Some(at) => at,
++            None => {
++                devices.push(device.clone());
++                devices.len() - 1
++            }
++        }
++    };
+     // Each info's timeline signals, nonzero.
+     let signals: Vec<Vec<(vk::Semaphore, u64)>> = infos
+         .iter()
+@@ -283,6 +296,7 @@ pub(crate) fn submits(
+             state.subs.insert(
+                 p,
+                 Sub {
++                    device: index,
+                     site,
+                     at,
+                     signals: mine.clone(),

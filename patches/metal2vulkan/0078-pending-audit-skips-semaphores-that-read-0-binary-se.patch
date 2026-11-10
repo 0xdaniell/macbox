@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 20:02:49 +0000
+Subject: [PATCH 78/92] pending audit skips semaphores that read 0 (binary
+ semaphores in a signal list)
+
+---
+ crates/metal2vulkan-runtime/src/pending_audit.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/pending_audit.rs b/crates/metal2vulkan-runtime/src/pending_audit.rs
+index 76361024..a3899011 100644
+--- a/crates/metal2vulkan-runtime/src/pending_audit.rs
++++ b/crates/metal2vulkan-runtime/src/pending_audit.rs
+@@ -95,6 +95,11 @@ fn pending(seen: &HashMap<u64, u64>, sub: &Sub) -> Option<String> {
+         }
+         // SAFETY: a semaphore of the device a submission signalled; read only.
+         if let Ok(now) = unsafe { device.get_semaphore_counter_value(semaphore) } {
++            // A read of 0 under a signal value seen 64 times or more is a binary semaphore in the
++            // signal list (its values are ignored, and its counter reads 0): not a timeline.
++            if now == 0 {
++                continue;
++            }
+             if now < value {
+                 // Each device's read of it, to tell a wrong device (another fd's syncobj) apart.
+                 let others: Vec<String> = devices

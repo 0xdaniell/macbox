@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:22:17 +0000
+Subject: [PATCH 38/92] a shared event's host wait sends held groups (HostWait)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/event.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/event.rs b/crates/metal2vulkan-runtime/src/event.rs
+index 0e8575be..10174929 100644
+--- a/crates/metal2vulkan-runtime/src/event.rs
++++ b/crates/metal2vulkan-runtime/src/event.rs
+@@ -302,6 +302,7 @@ impl EventShared {
+     /// counter raises it any more (`exit_guard`).
+     pub(super) fn wait_until(self: &Arc<Self>, value: u64, timeout: Duration) -> bool {
+         let deadline = Instant::now().checked_add(timeout);
++        let mut host_wait = None;
+         loop {
+             if self.value() >= value {
+                 return true;
+@@ -316,6 +317,14 @@ impl EventShared {
+             if left.is_zero() || exit_guard::closed() {
+                 return false;
+             }
++            // LOCAL (Atlas, DEEP-GPU): a host thread blocks on the value: no submission group
++            // is kept while it waits, so a held batch that signals it goes now
++            // (`command_buffer::HostWait`). Taken once, without the event's lock.
++            if host_wait.is_none() {
++                drop(state);
++                host_wait = Some(super::command_buffer::HostWait::begin(Some(&self.device)));
++                continue;
++            }
+             state.parked += 1;
+             let mut state = self
+                 .changed

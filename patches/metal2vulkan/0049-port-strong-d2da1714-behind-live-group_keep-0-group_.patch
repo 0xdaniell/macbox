@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 7 Nov 2026 16:54:29 +0000
+Subject: [PATCH 49/92] port strong d2da1714 behind live group_keep=0 /
+ group_events=0 (default as A), and the M2V_WBS_AUDIT diagnostic
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/group.rs               |  13 +-
+ .../src/command_buffer/rerun.rs               |   2 +-
+ .../src/command_buffer/submit.rs              |   5 +
+ .../metal2vulkan-runtime/src/device/prime.rs  |   6 +-
+ .../metal2vulkan-runtime/src/device/relay.rs  |   2 +-
+ .../src/device/staging.rs                     |   2 +-
+ .../metal2vulkan-runtime/src/device/submit.rs |   4 +-
+ crates/metal2vulkan-runtime/src/lib.rs        |   2 +
+ .../metal2vulkan-runtime/src/scheduler/mod.rs |   2 +-
+ .../metal2vulkan-runtime/src/sparse/bind.rs   |   1 +
+ crates/metal2vulkan-runtime/src/wbs_audit.rs  | 166 ++++++++++++++++++
+ 11 files changed, 193 insertions(+), 12 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/wbs_audit.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 626669dd..6d8051a6 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -481,6 +481,13 @@ impl Group {
+     /// the completion turns to wake the scheduler at. Counted once per group, and once more where
+     /// a waiter sends a group kept before.
+     pub(crate) fn keeps(&mut self) -> Option<u64> {
++        // LOCAL (Atlas, port of strong d2da1714): with the live switch `group_keep=0` a group is
++        // not kept past its pass. On Arrow Lake (one `VkQueue`) groups kept past a pass sat behind
++        // waits submitted ahead of them by paths that do not look at the group, until i915's
++        // fence timeout (strong A/B 2026-11-07). Default: kept, as build A.
++        if crate::live::get("group_keep").as_deref() == Some("0") {
++            return None;
++        }
+         let first = self.members.first()?;
+         let device = first.submission.buffer().device();
+         if self.full()
+@@ -612,7 +619,7 @@ impl Group {
+         let submitted =
+             shared.submit_logged((queue, Some(value)), fence, &relayed, |vk_queue| unsafe {
+                 shared.counts.queue_submitted(submits.len(), buffers);
+-                raw.queue_submit(vk_queue, submits, fence.unwrap_or(vk::Fence::null()))
++                { crate::wbs_audit::submits("group", submits); raw.queue_submit(vk_queue, submits, fence.unwrap_or(vk::Fence::null())) }
+             });
+         exit_guard::called(Call::QueueSubmit);
+         self.events.clear();
+@@ -687,7 +694,7 @@ fn submit_alone(device: &Device, after: After<'_>) -> Result<(), vk::Result> {
+     // SAFETY: the batch's submission's own (`submit.rs`).
+     let submitted = shared.submit_logged((queue, Some(value)), fence, relayed, |vk_queue| unsafe {
+         shared.counts.queue_submitted(infos.len(), buffers);
+-        raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null()))
++        { crate::wbs_audit::submits("group_one", infos); raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null())) }
+     });
+     exit_guard::called(Call::QueueSubmit);
+     submitted
+@@ -713,7 +720,7 @@ fn signal_alone(
+     // value (no batch signalled them); the `VkQueue` is used under its lock.
+     let submitted = shared.submit_logged((queue, value), None, relayed, |vk_queue| unsafe {
+         shared.counts.queue_submitted(1, 0);
+-        raw.queue_submit(vk_queue, &[info], vk::Fence::null())
++        { crate::wbs_audit::submits("group_end_signals", &[info]); raw.queue_submit(vk_queue, &[info], vk::Fence::null()) }
+     });
+     exit_guard::called(Call::QueueSubmit);
+     submitted
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs b/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
+index f11126a1..577341cc 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
+@@ -420,7 +420,7 @@ impl LoopCheck {
+             (queue, None),
+             Some(fence),
+             &buffer.relayed,
+-            |vk_queue| unsafe { raw.queue_submit(vk_queue, &submits, fence) },
++            |vk_queue| unsafe { crate::wbs_audit::submits("rerun", &submits); raw.queue_submit(vk_queue, &submits, fence) },
+         );
+         exit_guard::called(Call::QueueSubmit);
+         if let Err(error) = submitted {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index bfed8d1c..30fed418 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -365,6 +365,11 @@ impl CommandBufferShared {
+                 && !met
+                 && sync.binary_waits.is_empty()
+                 && sync.binary_signals.is_empty()
++                // LOCAL (Atlas, port of strong d2da1714): with the live switch `group_events=0` a
++                // batch that signals an event joins no group, so no group holds a signal another
++                // submission may already wait for on the one `VkQueue`. Default: joins, as build A.
++                && (crate::live::get("group_events").as_deref() != Some("0")
++                    || sync.signals.is_empty())
+                 && (state.recorded[state.batch_range(index)].iter())
+                     .all(|recorded| recorded.sparse.is_empty())
+         };
+diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
+index 942dc897..8e6cb175 100644
+--- a/crates/metal2vulkan-runtime/src/device/prime.rs
++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
+@@ -691,7 +691,7 @@ impl Primer<'_> {
+         // SAFETY: the caller's; the bind binds nothing, waits for nothing and signals nothing,
+         // and the queue is used under its lock.
+         queues[0]
+-            .with(|queue| unsafe { device.queue_bind_sparse(queue, &info, vk::Fence::null()) })
++            .with(|queue| unsafe { crate::wbs_audit::binds("prime_bind", &info); device.queue_bind_sparse(queue, &info, vk::Fence::null()) })
+             .map_err(vulkan)?;
+         self.made(Call::QueueBindSparse);
+         Ok(())
+@@ -806,7 +806,7 @@ impl Primer<'_> {
+         // already; the signal raises the semaphore; the fence is new; the queue is used under its
+         // lock.
+         queues[0]
+-            .with(|queue| unsafe { device.queue_submit(queue, &[submit], fence) })
++            .with(|queue| unsafe { crate::wbs_audit::submits("prime", &[submit]); device.queue_submit(queue, &[submit], fence) })
+             .map_err(vulkan)?;
+         self.made(Call::QueueSubmit);
+         let start = Instant::now();
+@@ -830,7 +830,7 @@ impl Primer<'_> {
+             .semaphore(signal)
+             .value(2);
+         // SAFETY: the semaphore is live, its one submitted signal landed, and 2 is above it.
+-        unsafe { device.signal_semaphore(&raised) }.map_err(vulkan)?;
++        unsafe { crate::wbs_audit::host_signal("prime_host", &raised); device.signal_semaphore(&raised) }.map_err(vulkan)?;
+         self.made(Call::SignalSemaphore);
+         for queue in queues {
+             // SAFETY: the timeline is live.
+diff --git a/crates/metal2vulkan-runtime/src/device/relay.rs b/crates/metal2vulkan-runtime/src/device/relay.rs
+index 171a5108..a5b605b6 100644
+--- a/crates/metal2vulkan-runtime/src/device/relay.rs
++++ b/crates/metal2vulkan-runtime/src/device/relay.rs
+@@ -486,7 +486,7 @@ impl super::DeviceShared {
+                 // value signalled there before where it has one; the queue is used under its
+                 // lock.
+                 let submitted =
+-                    unsafe { raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
++                    unsafe { crate::wbs_audit::submits("relay", submits); raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
+                 exit_guard::called(Call::QueueSubmit);
+                 if submitted.is_err() {
+                     if let Some((fence, flights)) = logged {
+diff --git a/crates/metal2vulkan-runtime/src/device/staging.rs b/crates/metal2vulkan-runtime/src/device/staging.rs
+index 71396260..1223922d 100644
+--- a/crates/metal2vulkan-runtime/src/device/staging.rs
++++ b/crates/metal2vulkan-runtime/src/device/staging.rs
+@@ -246,7 +246,7 @@ impl Device {
+         shared.counts.queue_submitted(1, buffers.len());
+         let submitted = unsafe {
+             staging.word.restore();
+-            raw.queue_submit(queue, &[submit], made.fence)
++            { crate::wbs_audit::submits("staging", &[submit]); raw.queue_submit(queue, &[submit], made.fence) }
+         };
+         exit_guard::called(Call::QueueSubmit);
+         submitted.map_err(|error| self.failed(error))?;
+diff --git a/crates/metal2vulkan-runtime/src/device/submit.rs b/crates/metal2vulkan-runtime/src/device/submit.rs
+index c72b4d5e..e9ace296 100644
+--- a/crates/metal2vulkan-runtime/src/device/submit.rs
++++ b/crates/metal2vulkan-runtime/src/device/submit.rs
+@@ -249,7 +249,7 @@ impl Device {
+                 .iter()
+                 .map(|info| info.command_buffer_count as usize);
+             shared.counts.queue_submitted(submits.len(), buffers.sum());
+-            raw.queue_submit(queue, &submits, objects.fence)
++            { crate::wbs_audit::submits("internal", &submits); raw.queue_submit(queue, &submits, objects.fence) }
+         });
+         // A `vkQueueSubmit` that fails leaves what its submissions reference as it was, or loses
+         // the device: the work goes back as `taken` drops.
+@@ -316,7 +316,7 @@ impl Device {
+         // the timeline's value (the internal lock is held).
+         shared.counts.queue_submitted(0, 0);
+         let bound = shared.use_queue(0, By::Runtime, |queue| unsafe {
+-            raw.queue_bind_sparse(queue, &[info], vk::Fence::null())
++            { crate::wbs_audit::binds("internal_bind", &[info]); raw.queue_bind_sparse(queue, &[info], vk::Fence::null()) }
+         });
+         exit_guard::called(Call::QueueBindSparse);
+         bound.map_err(|error| self.failed(error))?;
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 546bf564..bfd49eed 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -128,6 +128,8 @@ mod image_barrier;
+ // LOCAL (Atlas) diagnostic: the image census and object registry (M2V_IMAGE_LOG).
+ mod image_log;
+ mod image_plan;
++// LOCAL (Atlas, diagnostic): M2V_WBS_AUDIT=1 reports timeline waits submitted before their signals.
++mod wbs_audit;
+ mod in_place;
+ mod in_place_check;
+ mod index_bounds;
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index ff6f6367..64de47fe 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -208,7 +208,7 @@ impl Nudge {
+             .value(value);
+         // SAFETY: the device's semaphore, live while its scheduler runs; `value` is above the
+         // semaphore's (the values rise under the scheduler's lock).
+-        let signalled = unsafe { self.functions.get().signal_semaphore(&info) };
++        let signalled = unsafe { crate::wbs_audit::host_signal("scheduler_host", &info); self.functions.get().signal_semaphore(&info) };
+         exit_guard::called(exit_guard::Call::SignalSemaphore);
+         signalled.is_ok()
+     }
+diff --git a/crates/metal2vulkan-runtime/src/sparse/bind.rs b/crates/metal2vulkan-runtime/src/sparse/bind.rs
+index 8bb81c7d..177c0d75 100644
+--- a/crates/metal2vulkan-runtime/src/sparse/bind.rs
++++ b/crates/metal2vulkan-runtime/src/sparse/bind.rs
+@@ -336,6 +336,7 @@ pub(crate) fn bind_batch(
+     // lock. Where the queue's failures are relayed, one of the bind's loses the device
+     // (`device/relay.rs`).
+     shared.counts.queue_submitted(0, 0);
++    crate::wbs_audit::binds("sparse_bind", &[info]);
+     let bound = shared.use_queue(queue, By::Runtime, |vk_queue| unsafe {
+         shared
+             .vk()
+diff --git a/crates/metal2vulkan-runtime/src/wbs_audit.rs b/crates/metal2vulkan-runtime/src/wbs_audit.rs
+new file mode 100644
+index 00000000..8e42469a
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/wbs_audit.rs
+@@ -0,0 +1,166 @@
++//! LOCAL (Atlas, diagnostic): an audit of waits submitted before their signals.
++//!
++//! With `M2V_WBS_AUDIT=1` (read once per process), every `vkQueueSubmit` and `vkQueueBindSparse`
++//! the runtime makes, and every host `vkSignalSemaphore`, passes its timeline semaphores' waits
++//! and signals here first. A wait for a value above the highest one any submission or host
++//! signal so far asked of that semaphore is a wait before its signal: on a device of one
++//! `VkQueue` (Arrow Lake's ANV) a later submission on that queue can never run before it, so it
++//! holds until i915's fence timeout. Each such wait is written to stderr (at most
++//! [`MOST_LINES`]) with the submitting site; once the signal comes, how long after the wait.
++//! Off, each call is one relaxed load. Semaphores never signalled by a submission seen here (a
++//! caller's own, or one made with a value) are not judged.
++use ash::vk;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{LazyLock, Mutex};
++use std::time::Instant;
++
++/// The most lines written.
++const MOST_LINES: u64 = 400;
++
++static ON: LazyLock<bool> =
++    LazyLock::new(|| std::env::var_os("M2V_WBS_AUDIT").is_some_and(|v| v == "1"));
++static LINES: AtomicU64 = AtomicU64::new(0);
++
++#[derive(Default)]
++struct Seen {
++    /// The highest value asked of each semaphore so far.
++    signalled: HashMap<u64, u64>,
++    /// Waits found early: (semaphore, value) -> (site, when).
++    early: Vec<(u64, u64, &'static str, Instant)>,
++}
++
++static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(|| Mutex::new(Seen::default()));
++
++fn line(text: String) {
++    if LINES.fetch_add(1, Ordering::Relaxed) < MOST_LINES {
++        eprintln!("m2v-wbs-audit: {text}");
++    }
++}
++
++fn judge(seen: &mut Seen, site: &'static str, waits: &[(vk::Semaphore, u64)]) {
++    for &(semaphore, value) in waits {
++        let key = vk::Handle::as_raw(semaphore);
++        let Some(&highest) = seen.signalled.get(&key) else {
++            continue;
++        };
++        if value > highest {
++            line(format!(
++                "{site}: waits for {key:#x} to reach {value}, asked only {highest} so far"
++            ));
++            seen.early.push((key, value, site, Instant::now()));
++        }
++    }
++}
++
++fn signal(seen: &mut Seen, site: &'static str, signals: &[(vk::Semaphore, u64)]) {
++    for &(semaphore, value) in signals {
++        let key = vk::Handle::as_raw(semaphore);
++        let highest = seen.signalled.entry(key).or_insert(0);
++        *highest = (*highest).max(value);
++        let mut i = 0;
++        while i < seen.early.len() {
++            let (s, v, at, when) = seen.early[i];
++            if s == key && v <= value {
++                line(format!(
++                    "{at}: its early wait for {key:#x} to reach {v} met by {site} {:.1} ms later",
++                    when.elapsed().as_secs_f64() * 1000.0
++                ));
++                seen.early.swap_remove(i);
++            } else {
++                i += 1;
++            }
++        }
++    }
++}
++
++/// # Safety
++/// `count` items at `semaphores`, and `values` either null or `count` items.
++unsafe fn pairs(
++    semaphores: *const vk::Semaphore,
++    values: *const u64,
++    count: u32,
++    values_count: u32,
++) -> Vec<(vk::Semaphore, u64)> {
++    if semaphores.is_null() || values.is_null() || count == 0 || values_count < count {
++        return Vec::new();
++    }
++    let n = count as usize;
++    // SAFETY: the caller's.
++    let (s, v) = unsafe {
++        (std::slice::from_raw_parts(semaphores, n), std::slice::from_raw_parts(values, n))
++    };
++    s.iter().copied().zip(v.iter().copied()).filter(|&(_, v)| v != 0).collect()
++}
++
++/// The timeline info in a `pNext` chain, if any.
++///
++/// # Safety
++/// `next` is a valid Vulkan `pNext` chain.
++unsafe fn timeline(mut next: *const std::ffi::c_void) -> Option<&'static vk::TimelineSemaphoreSubmitInfo<'static>> {
++    while !next.is_null() {
++        // SAFETY: every Vulkan structure starts with sType and pNext.
++        let base = unsafe { &*next.cast::<vk::BaseInStructure<'static>>() };
++        if base.s_type == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO {
++            // SAFETY: its type says so.
++            return Some(unsafe { &*next.cast::<vk::TimelineSemaphoreSubmitInfo<'static>>() });
++        }
++        next = base.p_next.cast();
++    }
++    None
++}
++
++/// A `vkQueueSubmit`'s infos, before the call.
++pub(crate) fn submits(site: &'static str, infos: &[vk::SubmitInfo<'_>]) {
++    if !*ON {
++        return;
++    }
++    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    for info in infos {
++        // SAFETY: a submission the caller is about to make, so its pointers are valid.
++        let Some(t) = (unsafe { timeline(info.p_next) }) else {
++            continue;
++        };
++        // SAFETY: as above.
++        let (waits, signals) = unsafe {
++            (
++                pairs(info.p_wait_semaphores, t.p_wait_semaphore_values, info.wait_semaphore_count, t.wait_semaphore_value_count),
++                pairs(info.p_signal_semaphores, t.p_signal_semaphore_values, info.signal_semaphore_count, t.signal_semaphore_value_count),
++            )
++        };
++        judge(&mut seen, site, &waits);
++        signal(&mut seen, site, &signals);
++    }
++}
++
++/// A `vkQueueBindSparse`'s infos, before the call.
++pub(crate) fn binds(site: &'static str, infos: &[vk::BindSparseInfo<'_>]) {
++    if !*ON {
++        return;
++    }
++    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    for info in infos {
++        // SAFETY: as in `submits`.
++        let Some(t) = (unsafe { timeline(info.p_next) }) else {
++            continue;
++        };
++        // SAFETY: as above.
++        let (waits, signals) = unsafe {
++            (
++                pairs(info.p_wait_semaphores, t.p_wait_semaphore_values, info.wait_semaphore_count, t.wait_semaphore_value_count),
++                pairs(info.p_signal_semaphores, t.p_signal_semaphore_values, info.signal_semaphore_count, t.signal_semaphore_value_count),
++            )
++        };
++        judge(&mut seen, site, &waits);
++        signal(&mut seen, site, &signals);
++    }
++}
++
++/// A host `vkSignalSemaphore`, before the call.
++pub(crate) fn host_signal(site: &'static str, info: &vk::SemaphoreSignalInfo<'_>) {
++    if !*ON {
++        return;
++    }
++    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    signal(&mut seen, site, &[(info.semaphore, info.value)]);
++}

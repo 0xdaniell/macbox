@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 21:47:42 +0000
+Subject: [PATCH 30/33] REIMS_VGPU_PAGED_BUFFER_BY_PAGES=1 finds kept paged
+ buffers by the guest pages they show
+
+---
+ .../src/gpu_task/paged_buffers.rs             | 35 ++++++++++++++-----
+ 1 file changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+index 79384ec9..38d10c01 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/paged_buffers.rs
+@@ -65,6 +65,12 @@ pub(crate) fn entries_by_env() -> usize {
+     })
+ }
+ 
++/// LOCAL (Atlas): whether entries are found by the guest pages they show (read once).
++fn by_pages() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("REIMS_VGPU_PAGED_BUFFER_BY_PAGES").as_deref() == Ok("1"))
++}
++
+ /// The mode [`SKIP_ENV_VAR`] asks for (read once): 0 without it, or for any other value.
+ pub(crate) fn skip_mode_by_env() -> u8 {
+     static MODE: OnceLock<u8> = OnceLock::new();
+@@ -335,10 +341,18 @@ impl<B: Handle, L: PartialEq> PagedBuffers<B, L> {
+         now: MonoTime,
+     ) -> (Option<B>, Gone<B, L>) {
+         let mut entries = self.entries.lock();
+-        let Some(at) = entries
+-            .iter()
+-            .position(|e| e.page == page && e.length == length)
+-        else {
++        // LOCAL (Atlas): `REIMS_VGPU_PAGED_BUFFER_BY_PAGES=1` finds an entry by the guest pages it
++        // shows, at any task page: a view shows those physical pages whichever task range maps
++        // them, and the compositor's recycled ranges come back over pages of a few surfaces.
++        let at = match by_pages() {
++            true => entries
++                .iter()
++                .position(|e| e.length == length && e.lease == *lease && e.runs.same_as(runs)),
++            false => entries
++                .iter()
++                .position(|e| e.page == page && e.length == length),
++        };
++        let Some(at) = at else {
+             return (None, Gone(Vec::new()));
+         };
+         let Some(mut entry) = entries.remove(at) else {
+@@ -370,10 +384,15 @@ impl<B: Handle, L: PartialEq> PagedBuffers<B, L> {
+     ) -> Gone<B, L> {
+         let mut gone = Vec::new();
+         let mut entries = self.entries.lock();
+-        if let Some(at) = entries
+-            .iter()
+-            .position(|e| e.page == page && e.length == length)
+-        {
++        let at = match by_pages() {
++            true => entries
++                .iter()
++                .position(|e| e.length == length && e.lease == lease && e.runs.same_as(&runs)),
++            false => entries
++                .iter()
++                .position(|e| e.page == page && e.length == length),
++        };
++        if let Some(at) = at {
+             gone.extend(entries.remove(at));
+         }
+         while entries.len() >= self.capacity() {

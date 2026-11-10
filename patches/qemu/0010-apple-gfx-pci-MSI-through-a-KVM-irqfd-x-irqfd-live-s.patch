@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 15:15:21 +0000
+Subject: [PATCH 10/13] apple-gfx-pci: MSI through a KVM irqfd (x-irqfd, live
+ switch)
+
+LOCAL (Atlas), DEEP-VIRT experiment. A raise scheduled a main-loop BH that took
+the BQL and called msi_notify: per interrupt a main-loop wakeup, its run-queue
+wait, the BQL and a KVM_SIGNAL_MSI ioctl. With x-irqfd the library thread writes
+an eventfd that KVM routes to the vector (posted interrupt), as vfio-pci and
+ivshmem do. Default off (APPLE_GFX_IRQFD=1 turns it on at start; qom-set
+toggles it live). While disarmed the eventfd is watched by the main loop so a
+raise racing a disarm still reaches msi_notify. x-irq-stats counts both paths.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/apple-gfx-pci.c | 208 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 208 insertions(+)
+
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index 34228552f3..66eedde9b8 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -29,15 +29,155 @@
+ #include "hw/core/boards.h"
+ #include "hw/pci/pci_device.h"
+ #include "hw/pci/msi.h"
++#include "qemu/atomic.h"
++#include "qemu/event_notifier.h"
++#include "qemu/error-report.h"
++#include "system/accel-irq.h"
++#include "system/kvm.h"
+ #include "apple-gfx.h"
+ #include "trace.h"
+ 
++/*
++ * LOCAL (Atlas): the MSI through a KVM irqfd.
++ *
++ * A raise used to schedule a BH in the main loop, which took the BQL and
++ * called msi_notify: per interrupt an aio_notify wakeup of the main loop
++ * thread, its run-queue wait, the BQL and a KVM_SIGNAL_MSI ioctl, before the
++ * vCPU saw it. With the irqfd armed, the library's thread writes an eventfd
++ * that KVM routes to the vector itself (a posted interrupt with APICv), as
++ * vfio-pci and ivshmem do: no main loop, no BQL, no allocation.
++ *
++ * - x-irqfd (bool, default APPLE_GFX_IRQFD=1 in the environment, else off) can
++ *   be set live with qom-set; off is the BH path exactly as before.
++ * - It arms while MSI is enabled (each config write re-syncs, and an armed
++ *   route follows the guest's address and data) and only vector 0 (the
++ *   devices have one).
++ * - While disarmed, the eventfd stays watched by the main loop, which turns
++ *   a stray write (a raise that read "armed" just before a disarm) into an
++ *   msi_notify: no interrupt is lost at a switch.
++ * - x-irq-stats: "irqfd=<n> bh=<n> armed=<0|1>".
++ */
++typedef struct AppleGFXPCIIrq {
++    PCIDevice *dev;
++    bool wanted;        /* x-irqfd */
++    bool have_notifier;
++    bool attached;      /* BQL: the irqfd is in KVM */
++    int armed;          /* atomic: raisers write the eventfd */
++    int virq;
++    EventNotifier notifier;
++    uint64_t via_irqfd; /* atomic */
++    uint64_t via_bh;    /* atomic */
++} AppleGFXPCIIrq;
++
++static void apple_gfx_pci_irq_stray(EventNotifier *n)
++{
++    AppleGFXPCIIrq *irq = container_of(n, AppleGFXPCIIrq, notifier);
++
++    if (event_notifier_test_and_clear(n) && msi_enabled(irq->dev)) {
++        msi_notify(irq->dev, 0);
++    }
++}
++
++/* Under the BQL: arm, follow the route, or disarm, as wanted and MSI say. */
++static void apple_gfx_pci_irq_sync(AppleGFXPCIIrq *irq)
++{
++    bool want = irq->wanted && irq->have_notifier && kvm_enabled() &&
++                accel_msi_via_irqfd_enabled() && msi_enabled(irq->dev);
++    AccelRouteChange c;
++    int virq;
++
++    if (want && !irq->attached) {
++        c = accel_irqchip_begin_route_changes();
++        virq = accel_irqchip_add_msi_route(&c, 0, irq->dev);
++        if (virq < 0) {
++            warn_report_once("apple-gfx: no MSI route for the irqfd (%d); "
++                             "interrupts stay on the main loop", virq);
++            return;
++        }
++        accel_irqchip_commit_route_changes(&c);
++        event_notifier_set_handler(&irq->notifier, NULL);
++        if (accel_irqchip_add_irqfd_notifier_gsi(&irq->notifier, NULL,
++                                                 virq) < 0) {
++            warn_report_once("apple-gfx: irqfd refused; interrupts stay on "
++                             "the main loop");
++            accel_irqchip_release_virq(virq);
++            event_notifier_set_handler(&irq->notifier,
++                                       apple_gfx_pci_irq_stray);
++            return;
++        }
++        irq->virq = virq;
++        irq->attached = true;
++        qatomic_store_release(&irq->armed, 1);
++        info_report("apple-gfx: %s: MSI through irqfd (virq %d)",
++                    object_get_typename(OBJECT(irq->dev)), virq);
++    } else if (want) {
++        accel_irqchip_update_msi_route(irq->virq,
++                                       msi_get_message(irq->dev, 0), irq->dev);
++        accel_irqchip_commit_routes();
++    } else if (irq->attached) {
++        qatomic_set(&irq->armed, 0);
++        smp_mb();
++        accel_irqchip_remove_irqfd_notifier_gsi(&irq->notifier, irq->virq);
++        accel_irqchip_release_virq(irq->virq);
++        irq->virq = -1;
++        irq->attached = false;
++        event_notifier_set_handler(&irq->notifier, apple_gfx_pci_irq_stray);
++        apple_gfx_pci_irq_stray(&irq->notifier);
++        info_report("apple-gfx: %s: MSI back on the main loop",
++                    object_get_typename(OBJECT(irq->dev)));
++    }
++}
++
++/* On any thread: true when the raise went to the irqfd. */
++static bool apple_gfx_pci_irq_fast(AppleGFXPCIIrq *irq, uint32_t vector)
++{
++    if (vector == 0 && qatomic_load_acquire(&irq->armed) &&
++        msi_enabled(irq->dev)) {
++        event_notifier_set(&irq->notifier);
++        qatomic_inc(&irq->via_irqfd);
++        return true;
++    }
++    qatomic_inc(&irq->via_bh);
++    return false;
++}
++
++static bool apple_gfx_pci_irq_get_wanted(Object *obj, Error **errp);
++static void apple_gfx_pci_irq_set_wanted(Object *obj, bool value,
++                                         Error **errp);
++static char *apple_gfx_pci_irq_get_stats(Object *obj, Error **errp);
++
++static void apple_gfx_pci_irq_init(Object *obj, AppleGFXPCIIrq *irq)
++{
++    const char *env = getenv("APPLE_GFX_IRQFD");
++
++    irq->dev = PCI_DEVICE(obj);
++    irq->virq = -1;
++    irq->wanted = env && strcmp(env, "1") == 0;
++    object_property_add_bool(obj, "x-irqfd", apple_gfx_pci_irq_get_wanted,
++                             apple_gfx_pci_irq_set_wanted);
++    object_property_add_str(obj, "x-irq-stats", apple_gfx_pci_irq_get_stats,
++                            NULL);
++}
++
++/* In realize, after msi_init. */
++static void apple_gfx_pci_irq_realize(AppleGFXPCIIrq *irq)
++{
++    if (event_notifier_init(&irq->notifier, 0) < 0) {
++        warn_report("apple-gfx: no eventfd for the irqfd");
++        return;
++    }
++    irq->have_notifier = true;
++    event_notifier_set_handler(&irq->notifier, apple_gfx_pci_irq_stray);
++    apple_gfx_pci_irq_sync(irq);
++}
++
+ OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXPCIState, APPLE_GFX_PCI)
+ 
+ struct AppleGFXPCIState {
+     PCIDevice parent_obj;
+ 
+     AppleGFXState common;
++    AppleGFXPCIIrq irq;
+     bool efi_fb_bar;
+     MemoryRegion efi_fb_bar_mr; /* BAR 2 */
+     MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
+@@ -56,6 +196,7 @@ static void apple_gfx_pci_init(Object *obj)
+     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+ 
+     apple_gfx_common_init(obj, &s->common, TYPE_APPLE_GFX_PCI);
++    apple_gfx_pci_irq_init(obj, &s->irq);
+ }
+ 
+ static void apple_gfx_pci_finalize(Object *obj)
+@@ -91,6 +232,10 @@ static void apple_gfx_pci_raise_interrupt_cb(void *ctx, uint32_t vector)
+     AppleGFXPCIInterruptJob *job;
+ 
+     trace_apple_gfx_raise_irq(vector);
++    if (apple_gfx_pci_irq_fast(&container_of(dev, AppleGFXPCIState,
++                                              parent_obj)->irq, vector)) {
++        return;
++    }
+     job = g_new0(AppleGFXPCIInterruptJob, 1);
+     job->device = dev;
+     job->vector = vector;
+@@ -190,6 +335,7 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+     if (ret != 0) {
+         return;
+     }
++    apple_gfx_pci_irq_realize(&s->irq);
+ 
+     apple_gfx_common_realize(&s->common, DEVICE(dev), &config, errp);
+ }
+@@ -202,6 +348,15 @@ static void apple_gfx_pci_reset(Object *obj, ResetType type)
+     if (s->common.mmio_written) {
+         memory_region_set_enabled(&s->efi_fb, false);
+     }
++    apple_gfx_pci_irq_sync(&s->irq);
++}
++
++/* LOCAL (Atlas): MSI's enable, address and data reach the irqfd. */
++static void apple_gfx_pci_write_config(PCIDevice *dev, uint32_t addr,
++                                       uint32_t val, int len)
++{
++    pci_default_write_config(dev, addr, val, len);
++    apple_gfx_pci_irq_sync(&APPLE_GFX_PCI(dev)->irq);
+ }
+ 
+ static const Property apple_gfx_pci_properties[] = {
+@@ -237,6 +392,7 @@ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
+     pci->class_id = PCI_CLASS_DISPLAY_OTHER;
+     pci->romfile = "ReimsVgpu.rom";
+     pci->realize = apple_gfx_pci_realize;
++    pci->config_write = apple_gfx_pci_write_config;
+ 
+     device_class_set_props(dc, apple_gfx_pci_properties);
+ }
+@@ -262,8 +418,44 @@ struct AppleGFXIOSurfacePCIState {
+     AppleGFXPCIState *gpu;
+     MemoryRegion iomem; /* BAR 0 */
+     RvgIOSurfaceDevice *pgiosfc;
++    AppleGFXPCIIrq irq;
+ };
+ 
++static AppleGFXPCIIrq *apple_gfx_pci_irq_of(Object *obj)
++{
++    if (object_dynamic_cast(obj, TYPE_APPLE_GFX_PCI)) {
++        return &APPLE_GFX_PCI(obj)->irq;
++    }
++    return &APPLE_GFX_IOSURFACE_PCI(obj)->irq;
++}
++
++static bool apple_gfx_pci_irq_get_wanted(Object *obj, Error **errp)
++{
++    return apple_gfx_pci_irq_of(obj)->wanted;
++}
++
++/* qom-set runs under the BQL. */
++static void apple_gfx_pci_irq_set_wanted(Object *obj, bool value,
++                                         Error **errp)
++{
++    AppleGFXPCIIrq *irq = apple_gfx_pci_irq_of(obj);
++
++    irq->wanted = value;
++    if (DEVICE(obj)->realized) {
++        apple_gfx_pci_irq_sync(irq);
++    }
++}
++
++static char *apple_gfx_pci_irq_get_stats(Object *obj, Error **errp)
++{
++    AppleGFXPCIIrq *irq = apple_gfx_pci_irq_of(obj);
++
++    return g_strdup_printf("irqfd=%" PRIu64 " bh=%" PRIu64 " armed=%d",
++                           qatomic_read(&irq->via_irqfd),
++                           qatomic_read(&irq->via_bh),
++                           qatomic_read(&irq->armed));
++}
++
+ /*
+  * The registers are 64 bits wide, and an 8-byte access passes whole: the
+  * ring's and the descriptor table's bases are guest physical addresses, which
+@@ -312,6 +504,10 @@ static void apple_gfx_iosurface_pci_raise_interrupt_cb(void *ctx,
+     AppleGFXPCIInterruptJob *job;
+ 
+     trace_apple_gfx_iosfc_raise_irq(vector);
++    if (apple_gfx_pci_irq_fast(&container_of(ctx, AppleGFXIOSurfacePCIState,
++                                             parent_obj)->irq, vector)) {
++        return;
++    }
+     job = g_new0(AppleGFXPCIInterruptJob, 1);
+     job->device = ctx;
+     job->vector = vector;
+@@ -380,6 +576,7 @@ static void apple_gfx_iosurface_pci_realize(PCIDevice *dev, Error **errp)
+     if (ret != 0) {
+         return;
+     }
++    apple_gfx_pci_irq_realize(&s->irq);
+ 
+     /*
+      * The guest's RAM, as the gpu's device has it. On Linux the library maps
+@@ -419,6 +616,7 @@ static void apple_gfx_iosurface_pci_reset(Object *obj, ResetType type)
+         0x1018, /* the write counter */
+     };
+ 
++    apple_gfx_pci_irq_sync(&s->irq);
+     if (!s->pgiosfc) {
+         return;
+     }
+@@ -427,6 +625,14 @@ static void apple_gfx_iosurface_pci_reset(Object *obj, ResetType type)
+     }
+ }
+ 
++static void apple_gfx_iosurface_pci_write_config(PCIDevice *dev,
++                                                 uint32_t addr, uint32_t val,
++                                                 int len)
++{
++    pci_default_write_config(dev, addr, val, len);
++    apple_gfx_pci_irq_sync(&APPLE_GFX_IOSURFACE_PCI(dev)->irq);
++}
++
+ static void apple_gfx_iosurface_pci_init(Object *obj)
+ {
+     AppleGFXIOSurfacePCIState *s = APPLE_GFX_IOSURFACE_PCI(obj);
+@@ -434,6 +640,7 @@ static void apple_gfx_iosurface_pci_init(Object *obj)
+     memory_region_init_io(&s->iomem, obj, &apple_gfx_iosurface_pci_ops, s,
+                           TYPE_APPLE_GFX_IOSURFACE_PCI,
+                           APPLE_GFX_IOSURFACE_PCI_MMIO_SIZE);
++    apple_gfx_pci_irq_init(obj, &s->irq);
+ }
+ 
+ static const Property apple_gfx_iosurface_pci_properties[] = {
+@@ -463,6 +670,7 @@ static void apple_gfx_iosurface_pci_class_init(ObjectClass *klass,
+     pci->device_id = APPLE_GFX_IOSURFACE_PCI_DEVICE_ID;
+     pci->class_id = PCI_CLASS_SYSTEM_OTHER;
+     pci->realize = apple_gfx_iosurface_pci_realize;
++    pci->config_write = apple_gfx_iosurface_pci_write_config;
+ 
+     device_class_set_props(dc, apple_gfx_iosurface_pci_properties);
+ }

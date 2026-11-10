@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 15:26:13 +0000
+Subject: [PATCH 35/92] group_batches live switch, groups up to 16 batches
+
+The batches a group holds before it goes are the live switch group_batches (default 4, as before;
+at most 16, the bound of the submission arrays). Lab on the Arrow Lake iGPU (Mesa 26.2.4, i915):
+each kernel submission a merge saves is ~50 us of render-engine time in the Simulator's frame shape.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/group.rs               | 25 +++++++++++++++----
+ .../src/command_buffer/mod.rs                 |  2 +-
+ .../metal2vulkan-runtime/src/scheduler/mod.rs |  6 ++---
+ 3 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index dc2c7a37..a87bd837 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -94,9 +94,21 @@ use std::collections::BTreeSet;
+ use std::sync::atomic::Ordering;
+ use std::sync::Arc;
+ 
+-/// The most batches one kernel submission holds: the first is seen complete late by the GPU time
+-/// of at most this many less one.
+-pub(crate) const GROUP_BATCHES: usize = 4;
++/// The most batches one kernel submission may hold, the bound of the arrays below: the first is
++/// seen complete late by the GPU time of at most this many less one. LOCAL (Atlas): a group holds
++/// [`group_batches`] of them, the live switch `group_batches` (default 4, the upstream bound).
++pub(crate) const GROUP_BATCHES: usize = 16;
++
++/// LOCAL (Atlas): the batches a group holds before it goes at once, the live switch
++/// `group_batches` (`live.rs`), 4 where unset, at least 1 and at most [`GROUP_BATCHES`]. Measured
++/// on the Arrow Lake iGPU (Mesa 26.2.4, i915): each kernel submission a merge saves is about 50 us
++/// of render-engine time in a Simulator frame's shape (DEEP-GPU lane, 2026-11-05).
++pub(crate) fn group_batches() -> usize {
++    crate::live::get("group_batches")
++        .and_then(|value| value.parse::<usize>().ok())
++        .unwrap_or(4)
++        .clamp(1, GROUP_BATCHES)
++}
+ 
+ /// The most `VkSubmitInfo`s a batch names: its work's and its finale's (`submit.rs`).
+ const BATCH_INFOS: usize = 2;
+@@ -255,6 +267,8 @@ struct Member {
+ #[derive(Default)]
+ pub(crate) struct Group {
+     queue: usize,
++    /// LOCAL (Atlas): the batches it holds before it goes, [`group_batches`] as it opened.
++    cap: usize,
+     members: Vec<Member>,
+     /// It stayed held past a pass for the work its queue ran ([`keeps`](Group::keeps)).
+     kept: bool,
+@@ -305,7 +319,7 @@ impl Group {
+     /// first: the group is empty, or the batch may wait in it (`joins`) on its queue with room.
+     pub(crate) fn admits(&self, queue: usize, joins: bool) -> bool {
+         self.members.is_empty()
+-            || (joins && self.queue == queue && self.members.len() < GROUP_BATCHES)
++            || (joins && self.queue == queue && self.members.len() < self.cap)
+     }
+ 
+     /// Whether a batch held signals the event of `semaphore` to `index` or above: only the group's
+@@ -319,7 +333,7 @@ impl Group {
+     /// may join, found with room, goes with at most a batch less held, so no submission holds
+     /// more.
+     pub(crate) fn full(&self) -> bool {
+-        self.members.len() >= GROUP_BATCHES
++        self.members.len() >= self.cap.max(1)
+     }
+ 
+     /// A batch on `VkQueue` `queue` is held, before its submission changes the scheduler's
+@@ -328,6 +342,7 @@ impl Group {
+     pub(crate) fn open(&mut self, queue: usize, waited: &[u64]) {
+         if self.members.is_empty() {
+             self.queue = queue;
++            self.cap = group_batches();
+             self.waited.clear();
+             self.waited.extend_from_slice(waited);
+         }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index e553cecf..c660f223 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -55,7 +55,7 @@ pub(super) use first_submission::{NotedTable, ReplayTable};
+ /// (`tests::batches::only_drivers_measured_to_merge_their_submissions_group_their_batches`).
+ #[cfg(test)]
+ pub(crate) use group::merges_submissions;
+-pub(super) use group::{Group, GroupEnd, GROUP_BATCHES};
++pub(super) use group::{group_batches, Group, GroupEnd};
+ use rebound_use::{ReboundUse, Unlogged};
+ pub(super) use submit::{BatchLists, Submitting};
+ 
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index c750a0ff..ff6f6367 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -144,7 +144,7 @@ use super::command_buffer::gate::Hold;
+ use super::command_buffer::kept_barriers::KeptBarriers;
+ use super::command_buffer::BatchLists;
+ use super::command_buffer::CommandBufferShared;
+-use super::command_buffer::{Group, GroupEnd, Submitting, GROUP_BATCHES};
++use super::command_buffer::{group_batches, Group, GroupEnd, Submitting};
+ use super::device::functions::Functions;
+ use super::device::lock;
+ use super::error::{CommandBufferError, Error, MemoryKind};
+@@ -1689,7 +1689,7 @@ type Work = (Hold<CommandBufferShared>, usize);
+ /// Where the line's batches may go in one kernel submission (`command_buffer/group.rs`), the
+ /// batches right behind a head that goes (its checks in `left` or none due, otherwise ready, its
+ /// events' values reached on the device or by the host) are looked at too, at most
+-/// [`GROUP_BATCHES`] less one and none committed after another line's batch
++/// [`group_batches`] less one and none committed after another line's batch
+ /// ([`Order::leading_mut`]), each that goes taking its checks to `left` likewise: so the next pass
+ /// finds them ready together. Each check still runs in commit order before its own batch's
+ /// submission, within the pass before it, where a head's alone runs after the batch before it
+@@ -1697,7 +1697,7 @@ type Work = (Hold<CommandBufferShared>, usize);
+ fn check_heads(state: &mut State, behind: &[u64], left: &mut Left<Work>, awaits: &Awaits) -> bool {
+     let State { order, binary, .. } = state;
+     let mut landing = false;
+-    order.leading_mut(behind, GROUP_BATCHES - 1, |held, head| {
++    order.leading_mut(behind, group_batches() - 1, |held, head| {
+         let otherwise_ready = binary.ready(&held.binary_needs)
+             && !(held.segments && held.buffer.needs_host_step(held.index));
+         let due = held.checked

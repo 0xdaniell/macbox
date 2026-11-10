@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 12:11:16 +0000
+Subject: [PATCH 65/92] per-surface defer refusal counters and coherent state
+ in the lazy report (lab diagnostics)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/shadow_lazy.rs | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 8ef612fc..33013ce9 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1039,7 +1039,8 @@ fn report() {
+     }
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+-            "surface_lazy:   {:#x} {}x{} displayed {} taken {} refused {} in {} presents {}",
++            "surface_lazy:   {:#x} {}x{} displayed {} taken {} refused {} in {} presents {} \
++             coherent {}/{} defer-no {:?}",
+             lazy.pages.as_ref().map_or(0, |pages| pages.start),
+             lazy.size[0],
+             lazy.size[1],
+@@ -1048,6 +1049,9 @@ fn report() {
+             read(&lazy.refused),
+             read(&lazy.copied_in),
+             read(&lazy.presents),
++            lazy.coherent.get().is_some(),
++            lazy.coherent().is_some(),
++            lazy.defer_no.each_ref().map(read),
+         );
+     }
+ }
+@@ -1198,6 +1202,9 @@ const BESIDE_KEPT: usize = 256;
+ 
+ /// One surface's standing.
+ pub(crate) struct Lazy {
++    /// LOCAL (Atlas, lab diagnostics): `defer`'s refusals by exit (not presented, beside
++    /// another, keeps gone, no queue, the traps refused).
++    defer_no: [AtomicU64; 5],
+     truth: OnceLock<(ResourceKey, Option<ResourceKey>, UseRange)>,
+     written: AtomicU64,
+     /// LOCAL (Atlas): the writes counted in [`Lazy::written`] that left no [`Beside`] entry
+@@ -1252,6 +1259,7 @@ impl Lazy {
+     ) -> Option<Arc<Lazy>> {
+         (surface && takes_surface(size[0], texels)).then(|| {
+             Arc::new(Lazy {
++                defer_no: Default::default(),
+                 truth: OnceLock::new(),
+                 written: AtomicU64::new(0),
+                 plain: AtomicU64::new(0),
+@@ -1399,6 +1407,7 @@ impl Lazy {
+                 || !(self.displayed.load(Ordering::Relaxed) || crate::live::on(PRESENT_ALL, false)))
+         {
+             count(Fallback::LazyDeferNotPresent);
++            self.defer_no[0].fetch_add(1, Ordering::Relaxed); // LOCAL (Atlas): diagnostics
+             return false;
+         }
+         // What it leaves ahead only hooks that find it can bring back, standing or not.
+@@ -1407,27 +1416,32 @@ impl Lazy {
+         if self.beside_another() {
+             SHARED.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LazyDeferBeside);
++            self.defer_no[1].fetch_add(1, Ordering::Relaxed);
+             return false;
+         }
+         let Some(holds) = self.keeps.get() else {
+             count(Fallback::LazyDeferKeepsGone);
++            self.defer_no[2].fetch_add(1, Ordering::Relaxed);
+             return false;
+         };
+         let holds: Option<Vec<Hold>> = holds.iter().map(Weak::upgrade).collect();
+         let Some(holds) = holds else {
+             count(Fallback::LazyDeferKeepsGone);
++            self.defer_no[2].fetch_add(1, Ordering::Relaxed);
+             return false;
+         };
+         if self.queue.get().is_none() {
+             let device = self.device.downcast_ref::<Device>();
+             let Some(queue) = device.and_then(|d| d.new_command_queue().ok()) else {
+                 count(Fallback::LazyDeferNoQueue);
++                self.defer_no[3].fetch_add(1, Ordering::Relaxed);
+                 return false;
+             };
+             let _ = self.queue.set(Arc::new(queue));
+         }
+         // Its record is what a trap copies: no page, no deferring.
+         if coherent.is_some_and(|coherent| !coherent.defers(id, area)) {
++            self.defer_no[4].fetch_add(1, Ordering::Relaxed);
+             return false;
+         }
+         let mut pending = self.pending.lock().unwrap();

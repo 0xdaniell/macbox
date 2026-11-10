@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 11:52:29 +0000
+Subject: [PATCH 92/92] live inline_checks=1: run a batch's submission checks
+ in the pass, under the scheduler's lock (Reims's checks), so a chained
+ command buffer goes in the pass that finds it ready
+
+---
+ .../metal2vulkan-runtime/src/scheduler/mod.rs | 21 +++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index b5e50b3d..8fb340aa 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -1731,7 +1731,7 @@ fn check_heads(state: &mut State, behind: &[u64], left: &mut Left<Work>, awaits:
+                 return false;
+             }
+             if due {
+-                left.push(Kind::Check, (held.buffer.hold(), held.index));
++                check_now_or_leave(held, left);
+             }
+             return true;
+         }
+@@ -1756,12 +1756,29 @@ fn check_heads(state: &mut State, behind: &[u64], left: &mut Left<Work>, awaits:
+             }
+             Some(_) => {}
+         }
+-        left.push(Kind::Check, (held.buffer.hold(), held.index));
++        check_now_or_leave(held, left);
+         goes(held)
+     });
+     landing
+ }
+ 
++/// LOCAL (Atlas), live `inline_checks=1`: run a batch's submission checks here, under the
++/// scheduler's lock, inside the pass's section, so the batch goes in this pass, not in the next
++/// round after the check ran off the lock. Each command buffer's events chain on the one before
++/// (Reims's FIFO order, `encodeSignalEventScheduled`), so each checked link of the chain cost a
++/// round, 1-4 ms under a Simulator's commits (`sched_log.rs`, 2026-11-09). Only for a program
++/// whose check takes no lock of the runtime's but a command buffer's, which the lock order
++/// allows after the scheduler's (Reims's: its own registry and command-buffer locks, then
++/// `Submission::uses`), and holds no command buffer's last handle (the scheduler holds the
++/// batch's). Off: left to the thread, as upstream.
++fn check_now_or_leave(held: &Held, left: &mut Left<Work>) {
++    if crate::live::on("inline_checks", false) {
++        held.buffer.run_checks(held.index);
++    } else {
++        left.push(Kind::Check, (held.buffer.hold(), held.index));
++    }
++}
++
+ /// The waits of `held`, a line's head, for a shared event's value that a submitted GPU signal
+ /// reaches: each chained on the `VkQueue` before and is held on the host now, so each cost moved
+ /// (`WorkCounts::shared_event_waits_held`, `event_timeline.rs`). Counted once per batch, at the

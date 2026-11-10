@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 11:10:19 +0000
+Subject: [PATCH 63/92] count why large shadows copy back (lab diagnostics,
+ printed with surface_lazy's report)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/shadow.rs     | 58 +++++++++++++++++--
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 13 +++++
+ 2 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index ca2a7c3e..1211c06a 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -182,6 +182,20 @@ use crate::device::functions::Vk;
+ use ash::vk;
+ use metal2vulkan::error::{Feature, Unsupported};
+ use metal2vulkan::metal::PixelFormat;
++
++/// LOCAL (Atlas, lab diagnostics): why each copy back of a shadow of at least
++/// [`BACK_WHY_MIN_TEXELS`] texels was recorded, `[lazy surface or not][reason]` (reasons in
++/// [`BACK_WHY_NAMES`]); printed with `shadow_lazy`'s report. Counting only, no behaviour.
++pub(crate) static BACK_WHY: [[std::sync::atomic::AtomicU64; 12]; 2] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 12] }; 2];
++/// LOCAL (Atlas): the texels those copies back moved, alike.
++pub(crate) static BACK_WHY_TEXELS: [[std::sync::atomic::AtomicU64; 12]; 2] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 12] }; 2];
++pub(crate) const BACK_WHY_NAMES: [&str; 12] = [
++    "use-meets", "other-shadow", "regrows", "unkept", "two-ways", "beyond-held", "finish",
++    "ahead-not-alone", "ahead-merge", "ahead-no-lazy", "ahead-refused", "other",
++];
++const BACK_WHY_MIN_TEXELS: u64 = 2_000_000;
+ use std::ops::Range;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::Arc;
+@@ -2592,6 +2606,25 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+     /// copy in left, which the buffer still holds (a write of its bytes another way leaves the
+     /// image stale, and copies in again before the next use).
+     fn copy_back(&mut self, i: usize, copies: &mut Vec<ShadowCopy<M>>) {
++        self.copy_back_why(i, copies, 11);
++    }
++
++    /// LOCAL (Atlas): [`copy_back`](Self::copy_back), counted by `why` ([`BACK_WHY`]).
++    fn copy_back_why(&mut self, i: usize, copies: &mut Vec<ShadowCopy<M>>, why: usize) {
++        {
++            let entry = &self.entries[i];
++            let texels = entry.copies.texels();
++            if texels >= BACK_WHY_MIN_TEXELS {
++                use std::sync::atomic::Ordering::Relaxed;
++                let lazy = usize::from(entry.copies.lazy.is_some());
++                let moved = match entry.area {
++                    Some([x0, y0, x1, y1]) => u64::from(x1 - x0) * u64::from(y1 - y0),
++                    None => texels,
++                };
++                BACK_WHY[lazy][why].fetch_add(1, Relaxed);
++                BACK_WHY_TEXELS[lazy][why].fetch_add(moved, Relaxed);
++            }
++        }
+         let entry = &mut self.entries[i];
+         let two_ways = entry.two_ways;
+         let step = match &entry.merge {
+@@ -2740,7 +2773,15 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             let unkept = entry.merge.is_none()
+                 && (merged_kept.iter()).any(|kept| kept.shadow_key == entry.copies.shadow_key);
+             if touched || regrows || unkept || (entry.merge.is_some() && entry.two_ways) {
+-                self.copy_back(i, &mut copies);
++                let met = uses.iter().any(|used| entry.copies.meets(used));
++                let why = match () {
++                    _ if met => 0,
++                    _ if touched => 1,
++                    _ if regrows => 2,
++                    _ if unkept => 3,
++                    _ => 4,
++                };
++                self.copy_back_why(i, &mut copies, why);
+             }
+         }
+         for shadow in shadows {
+@@ -2772,7 +2813,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+             // the encoder wrote through it goes back first, then the copy in below moves what
+             // this command needs.
+             if beyond_held && entry.dirty {
+-                self.copy_back(i, &mut copies);
++                self.copy_back_why(i, &mut copies, 5);
+             }
+             let entry = &mut self.entries[i];
+             let cause = match entry.standing {
+@@ -2997,7 +3038,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+         let mut copies = Vec::new();
+         for i in 0..self.entries.len() {
+             if self.entries[i].dirty {
+-                self.copy_back(i, &mut copies);
++                self.copy_back_why(i, &mut copies, 6);
+             }
+         }
+         copies
+@@ -3030,7 +3071,16 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
+                     entry.dirty = false;
+                     entry.area = None;
+                 }
+-                false => self.copy_back(i, &mut copies),
++                false => {
++                    let entry = &self.entries[i];
++                    let why = match () {
++                        _ if !alone => 7,
++                        _ if entry.merge.is_some() || entry.two_ways => 8,
++                        _ if entry.copies.lazy.is_none() => 9,
++                        _ => 10,
++                    };
++                    self.copy_back_why(i, &mut copies, why);
++                }
+             }
+         }
+         copies
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index f99e10da..9061bd11 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1012,6 +1012,19 @@ fn report() {
+         read(&READERS_FIRST),
+         read(&OWN_BACKS_SKIPPED),
+     );
++    // LOCAL (Atlas, lab diagnostics): why the large shadows' copies back were recorded.
++    for (lazy, name) in [(1usize, "lazy"), (0, "plain")] {
++        let parts: Vec<String> = (0..12)
++            .filter_map(|w| {
++                let n = super::shadow::BACK_WHY[lazy][w].load(Ordering::Relaxed);
++                let t = super::shadow::BACK_WHY_TEXELS[lazy][w].load(Ordering::Relaxed);
++                (n > 0).then(|| format!("{} {n}/{}M", super::shadow::BACK_WHY_NAMES[w], t / 1_000_000))
++            })
++            .collect();
++        if !parts.is_empty() {
++            eprintln!("copy_back_why {name}: {}", parts.join(" "));
++        }
++    }
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+             "surface_lazy:   {:#x} {}x{} displayed {} taken {} refused {} in {} presents {}",

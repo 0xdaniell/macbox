@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 10:20:47 +0000
+Subject: [PATCH 89/92] diagnostic: scheduler log: held reasons per logical
+ queue (host-held event waits apart)
+
+---
+ .../src/command_buffer/mod.rs                 |  5 +++
+ crates/metal2vulkan-runtime/src/sched_log.rs  | 39 +++++++++++++++++++
+ .../metal2vulkan-runtime/src/scheduler/mod.rs | 13 +++++++
+ 3 files changed, 57 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 4181fbb0..69b0cc92 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -3433,6 +3433,11 @@ impl CommandBufferShared {
+     pub(crate) fn kernel_times(&self) -> &KernelTimes {
+         &self.kernel
+     }
++
++    /// LOCAL (Atlas) diagnostic (`sched_log.rs`): its logical queue's identity.
++    pub(crate) fn queue_id(&self) -> u64 {
++        self.queue.id()
++    }
+ }
+ 
+ impl CommandBufferShared {
+diff --git a/crates/metal2vulkan-runtime/src/sched_log.rs b/crates/metal2vulkan-runtime/src/sched_log.rs
+index 6be9bec1..8cc8fc35 100644
+--- a/crates/metal2vulkan-runtime/src/sched_log.rs
++++ b/crates/metal2vulkan-runtime/src/sched_log.rs
+@@ -29,6 +29,31 @@ pub(crate) fn mark(at: &AtomicU64) {
+ type Table = HashMap<u64, (usize, [Vec<u32>; 3])>;
+ 
+ static TABLE: Mutex<Option<Table>> = Mutex::new(None);
++
++/// Per logical queue, per reason bit (`scheduler::HeldFor` as bits, bit 7 a host-held event
++/// wait): batches held, their held nanoseconds, the most.
++type Holds = HashMap<u64, [(u64, u64, u64); 8]>;
++
++static HOLDS: Mutex<Option<Holds>> = Mutex::new(None);
++
++/// A batch of logical queue `queue` held for `reasons` (bits) went after `nanos`.
++pub(crate) fn held(queue: u64, reasons: u8, nanos: u64) {
++    if !on() {
++        return;
++    }
++    let Ok(mut holds) = HOLDS.lock() else { return };
++    let row = holds.get_or_insert_with(HashMap::new).entry(queue).or_insert([(0, 0, 0); 8]);
++    for (bit, cell) in row.iter_mut().enumerate() {
++        if reasons & (1 << bit) != 0 {
++            cell.0 += 1;
++            cell.1 += nanos;
++            cell.2 = cell.2.max(nanos);
++        }
++    }
++}
++
++const REASONS: [&str; 8] =
++    ["binary", "reencode", "decode", "hoststep", "check", "event", "earlier", "event-host"];
+ static LAST: AtomicU64 = AtomicU64::new(0);
+ 
+ /// The scheduler began submitting the first batch of a command buffer of logical queue `queue`
+@@ -73,6 +98,7 @@ pub(crate) fn note(queue: u64, vk_queue: usize, kernel: &KernelTimes) {
+     drop(table);
+     let mut rows: Vec<(u64, (usize, [Vec<u32>; 3]))> = rows.into_iter().collect();
+     rows.sort_by_key(|(_, (_, lists))| std::cmp::Reverse(lists[2].len()));
++    let holds = HOLDS.lock().ok().and_then(|mut h| h.take());
+     let mut text = format!("m2v sched log: {secs:.1} s window\n");
+     for (queue, (vk_queue, mut lists)) in rows {
+         let n = lists[2].len();
+@@ -92,6 +118,19 @@ pub(crate) fn note(queue: u64, vk_queue: usize, kernel: &KernelTimes) {
+             );
+         }
+         text += " ms\n";
++        if let Some(row) = holds.as_ref().and_then(|h| h.get(&queue)) {
++            text += &format!("m2v sched log:     held for (n, total ms/s, max ms) on queue {queue}:");
++            for (name, (n, total, most)) in REASONS.iter().zip(row) {
++                if *n > 0 {
++                    text += &format!(
++                        " {name} {n} {:.1} {:.2};",
++                        *total as f64 / 1e6 / secs,
++                        *most as f64 / 1e6
++                    );
++                }
++            }
++            text += "\n";
++        }
+     }
+     eprint!("{text}");
+ }
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index f3975540..93cd9190 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -529,6 +529,9 @@ struct Held {
+     /// The host nanoseconds at the first look of the scheduler's that found it held
+     /// ([`held_for`](Self::held_for)), until it goes ([`hold_ended`](Self::hold_ended)).
+     held_since: Option<u64>,
++    /// LOCAL (Atlas) diagnostic (`sched_log.rs`): each `HeldFor` a look found it held for, as a
++    /// bit; bit 7, an event wait held on the host for a submitted GPU signal to land.
++    reasons: u8,
+ }
+ 
+ impl Held {
+@@ -536,6 +539,7 @@ impl Held {
+     /// noted at the first look that found it held at all, whatever the reason then. Nothing is
+     /// read from the host's clock while nothing waits.
+     fn held_for(&mut self, reason: HeldFor) {
++        self.reasons |= 1 << (reason as u8); // LOCAL (Atlas) diagnostic
+         (self.buffer.device().shared().counts).head_held_for(reason);
+         if self.held_since.is_none() {
+             self.held_since = Some(gpu_time::host_nanos());
+@@ -548,6 +552,8 @@ impl Held {
+         if let Some(since) = self.held_since.take() {
+             let nanos = gpu_time::host_nanos().saturating_sub(since);
+             (self.buffer.device().shared().counts).batch_hold_ended(nanos);
++            // LOCAL (Atlas) diagnostic: per queue, by reason (`sched_log.rs`).
++            crate::sched_log::held(self.buffer.queue_id(), self.reasons, nanos);
+         }
+     }
+ }
+@@ -1098,6 +1104,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+             hastened: false,
+             counted_held: false,
+             held_since: None,
++            reasons: 0,
+         });
+         order.push(queue, held);
+         spent.push(buffer);
+@@ -1232,6 +1239,12 @@ fn submit_ready(
+             let waits = event_waits(held);
+             if waits.is_none() {
+                 held.held_for(HeldFor::EventValue);
++                // LOCAL (Atlas) diagnostic: a wait held on the host for a GPU signal to land.
++                if crate::sched_log::on()
++                    && (held.waits.iter()).any(|(event, value)| event.held_for_the_host(*value))
++                {
++                    held.reasons |= 1 << 7;
++                }
+             }
+             waits
+         });

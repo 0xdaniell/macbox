@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 15:17:12 +0000
+Subject: [PATCH 11/13] apple-gfx-pci: x-halt-poll-ns, a live per-VM
+ KVM_CAP_HALT_POLL knob
+
+LOCAL (Atlas), DEEP-VIRT experiment (on top of the irqfd branch). qom-set on
+the gfx device sets this VM's halt-poll ceiling, so a halt-poll A/B needs no
+change of the host's kvm.halt_poll_ns. Unset, nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/kvm/kvm-all.c        |  8 ++++++++
+ accel/stubs/kvm-stub.c     |  5 +++++
+ hw/display/apple-gfx-pci.c | 42 ++++++++++++++++++++++++++++++++++++++
+ include/system/kvm.h       |  7 +++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 7a84a3e33b..1777860eaf 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -1510,6 +1510,14 @@ int kvm_check_extension(KVMState *s, unsigned int extension)
+     return ret;
+ }
+ 
++int kvm_set_halt_poll_ns(uint64_t ns)
++{
++    if (!kvm_state || !kvm_vm_check_extension(kvm_state, KVM_CAP_HALT_POLL)) {
++        return -ENOSYS;
++    }
++    return kvm_vm_enable_cap(kvm_state, KVM_CAP_HALT_POLL, 0, ns);
++}
++
+ int kvm_vm_check_extension(KVMState *s, unsigned int extension)
+ {
+     int ret;
+diff --git a/accel/stubs/kvm-stub.c b/accel/stubs/kvm-stub.c
+index 32b4b07403..15dfff140e 100644
+--- a/accel/stubs/kvm-stub.c
++++ b/accel/stubs/kvm-stub.c
+@@ -143,3 +143,8 @@ int kvm_create_guest_memfd(uint64_t size, uint64_t flags, Error **errp)
+ {
+     return -ENOSYS;
+ }
++
++int kvm_set_halt_poll_ns(uint64_t ns)
++{
++    return -ENOSYS;
++}
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index 66eedde9b8..e2f1da1faa 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -32,6 +32,7 @@
+ #include "qemu/atomic.h"
+ #include "qemu/event_notifier.h"
+ #include "qemu/error-report.h"
++#include "qapi/visitor.h"
+ #include "system/accel-irq.h"
+ #include "system/kvm.h"
+ #include "apple-gfx.h"
+@@ -191,12 +192,53 @@ struct AppleGFXPCIState {
+ #define APPLE_GFX_PCI_PAGE_SHIFT 14
+ #endif
+ 
++/*
++ * LOCAL (Atlas), DEEP-VIRT experiment: x-halt-poll-ns sets KVM_CAP_HALT_POLL
++ * for this VM (qom-set, live; -1 reads until set: the kvm module's
++ * halt_poll_ns applies), so a halt-poll A/B needs no host-wide change. The
++ * device carries it because the accelerator is not in the QOM tree.
++ */
++static int64_t apple_gfx_halt_poll_ns = -1;
++
++static void apple_gfx_pci_get_halt_poll(Object *obj, Visitor *v,
++                                        const char *name, void *opaque,
++                                        Error **errp)
++{
++    visit_type_int64(v, name, &apple_gfx_halt_poll_ns, errp);
++}
++
++static void apple_gfx_pci_set_halt_poll(Object *obj, Visitor *v,
++                                        const char *name, void *opaque,
++                                        Error **errp)
++{
++    int64_t ns;
++    int ret;
++
++    if (!visit_type_int64(v, name, &ns, errp)) {
++        return;
++    }
++    if (ns < 0 || ns > 10 * 1000 * 1000) {
++        error_setg(errp, "x-halt-poll-ns: 0 to 10000000");
++        return;
++    }
++    ret = kvm_set_halt_poll_ns(ns);
++    if (ret < 0) {
++        error_setg_errno(errp, -ret, "KVM_CAP_HALT_POLL");
++        return;
++    }
++    apple_gfx_halt_poll_ns = ns;
++    info_report("apple-gfx: KVM halt polling at most %" PRId64 " ns", ns);
++}
++
+ static void apple_gfx_pci_init(Object *obj)
+ {
+     AppleGFXPCIState *s = APPLE_GFX_PCI(obj);
+ 
+     apple_gfx_common_init(obj, &s->common, TYPE_APPLE_GFX_PCI);
+     apple_gfx_pci_irq_init(obj, &s->irq);
++    object_property_add(obj, "x-halt-poll-ns", "int",
++                        apple_gfx_pci_get_halt_poll,
++                        apple_gfx_pci_set_halt_poll, NULL, NULL);
+ }
+ 
+ static void apple_gfx_pci_finalize(Object *obj)
+diff --git a/include/system/kvm.h b/include/system/kvm.h
+index 714b8c7b01..d38ec31d61 100644
+--- a/include/system/kvm.h
++++ b/include/system/kvm.h
+@@ -214,6 +214,13 @@ int kvm_check_extension(KVMState *s, unsigned int extension);
+ 
+ int kvm_vm_ioctl(KVMState *s, unsigned long type, ...);
+ 
++/*
++ * LOCAL (Atlas): KVM_CAP_HALT_POLL for this VM, the most a halted vCPU
++ * polls before it sleeps, in ns (the kvm module's halt_poll_ns otherwise).
++ * 0 on success, -errno (-ENOSYS without KVM or the capability).
++ */
++int kvm_set_halt_poll_ns(uint64_t ns);
++
+ void kvm_flush_coalesced_mmio_buffer(void);
+ 
+ void kvm_irqchip_add_change_notifier(Notifier *n);

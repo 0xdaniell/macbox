@@ -1,0 +1,515 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 16:27:36 +0000
+Subject: [PATCH 71/92] M2V_PENDING_AUDIT diagnostic: begins/resets of command
+ buffers whose submission (or an executing primary's) is pending
+
+---
+ .../src/command_buffer/group.rs               |   6 +-
+ .../src/command_buffer/rerun.rs               |   2 +-
+ .../metal2vulkan-runtime/src/device/prime.rs  |   2 +-
+ .../metal2vulkan-runtime/src/device/relay.rs  |   2 +-
+ .../src/device/staging.rs                     |   2 +-
+ .../metal2vulkan-runtime/src/device/submit.rs |   2 +-
+ crates/metal2vulkan-runtime/src/lib.rs        |   1 +
+ .../metal2vulkan-runtime/src/pending_audit.rs | 318 ++++++++++++++++++
+ .../metal2vulkan-runtime/src/recorder/log.rs  |  14 +
+ .../src/recorder/thunks.rs                    |   2 +
+ crates/metal2vulkan-runtime/src/spares.rs     |   6 +
+ 11 files changed, 349 insertions(+), 8 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/pending_audit.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 6d8051a6..f592cb4f 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -619,7 +619,7 @@ impl Group {
+         let submitted =
+             shared.submit_logged((queue, Some(value)), fence, &relayed, |vk_queue| unsafe {
+                 shared.counts.queue_submitted(submits.len(), buffers);
+-                { crate::wbs_audit::submits("group", submits); raw.queue_submit(vk_queue, submits, fence.unwrap_or(vk::Fence::null())) }
++                { crate::wbs_audit::submits("group", submits); crate::pending_audit::submits(raw, "group", submits, fence.unwrap_or(vk::Fence::null())); raw.queue_submit(vk_queue, submits, fence.unwrap_or(vk::Fence::null())) }
+             });
+         exit_guard::called(Call::QueueSubmit);
+         self.events.clear();
+@@ -694,7 +694,7 @@ fn submit_alone(device: &Device, after: After<'_>) -> Result<(), vk::Result> {
+     // SAFETY: the batch's submission's own (`submit.rs`).
+     let submitted = shared.submit_logged((queue, Some(value)), fence, relayed, |vk_queue| unsafe {
+         shared.counts.queue_submitted(infos.len(), buffers);
+-        { crate::wbs_audit::submits("group_one", infos); raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null())) }
++        { crate::wbs_audit::submits("group_one", infos); crate::pending_audit::submits(raw, "group_one", infos, fence.unwrap_or(vk::Fence::null())); raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null())) }
+     });
+     exit_guard::called(Call::QueueSubmit);
+     submitted
+@@ -720,7 +720,7 @@ fn signal_alone(
+     // value (no batch signalled them); the `VkQueue` is used under its lock.
+     let submitted = shared.submit_logged((queue, value), None, relayed, |vk_queue| unsafe {
+         shared.counts.queue_submitted(1, 0);
+-        { crate::wbs_audit::submits("group_end_signals", &[info]); raw.queue_submit(vk_queue, &[info], vk::Fence::null()) }
++        { crate::wbs_audit::submits("group_end_signals", &[info]); crate::pending_audit::submits(raw, "group_end_signals", &[info], vk::Fence::null()); raw.queue_submit(vk_queue, &[info], vk::Fence::null()) }
+     });
+     exit_guard::called(Call::QueueSubmit);
+     submitted
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs b/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
+index 577341cc..085af460 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/rerun.rs
+@@ -420,7 +420,7 @@ impl LoopCheck {
+             (queue, None),
+             Some(fence),
+             &buffer.relayed,
+-            |vk_queue| unsafe { crate::wbs_audit::submits("rerun", &submits); raw.queue_submit(vk_queue, &submits, fence) },
++            |vk_queue| unsafe { crate::wbs_audit::submits("rerun", &submits); crate::pending_audit::submits(raw, "rerun", &submits, fence); raw.queue_submit(vk_queue, &submits, fence) },
+         );
+         exit_guard::called(Call::QueueSubmit);
+         if let Err(error) = submitted {
+diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
+index 8e6cb175..b0b2de77 100644
+--- a/crates/metal2vulkan-runtime/src/device/prime.rs
++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
+@@ -806,7 +806,7 @@ impl Primer<'_> {
+         // already; the signal raises the semaphore; the fence is new; the queue is used under its
+         // lock.
+         queues[0]
+-            .with(|queue| unsafe { crate::wbs_audit::submits("prime", &[submit]); device.queue_submit(queue, &[submit], fence) })
++            .with(|queue| unsafe { crate::wbs_audit::submits("prime", &[submit]); crate::pending_audit::submits(device, "prime", &[submit], fence); device.queue_submit(queue, &[submit], fence) })
+             .map_err(vulkan)?;
+         self.made(Call::QueueSubmit);
+         let start = Instant::now();
+diff --git a/crates/metal2vulkan-runtime/src/device/relay.rs b/crates/metal2vulkan-runtime/src/device/relay.rs
+index a5b605b6..3cb88527 100644
+--- a/crates/metal2vulkan-runtime/src/device/relay.rs
++++ b/crates/metal2vulkan-runtime/src/device/relay.rs
+@@ -486,7 +486,7 @@ impl super::DeviceShared {
+                 // value signalled there before where it has one; the queue is used under its
+                 // lock.
+                 let submitted =
+-                    unsafe { crate::wbs_audit::submits("relay", submits); raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
++                    unsafe { crate::wbs_audit::submits("relay", submits); crate::pending_audit::submits(raw, "relay", submits, fence.unwrap_or_default()); raw.queue_submit(vk_queue, submits, fence.unwrap_or_default()) };
+                 exit_guard::called(Call::QueueSubmit);
+                 if submitted.is_err() {
+                     if let Some((fence, flights)) = logged {
+diff --git a/crates/metal2vulkan-runtime/src/device/staging.rs b/crates/metal2vulkan-runtime/src/device/staging.rs
+index 1223922d..b89a86ca 100644
+--- a/crates/metal2vulkan-runtime/src/device/staging.rs
++++ b/crates/metal2vulkan-runtime/src/device/staging.rs
+@@ -246,7 +246,7 @@ impl Device {
+         shared.counts.queue_submitted(1, buffers.len());
+         let submitted = unsafe {
+             staging.word.restore();
+-            { crate::wbs_audit::submits("staging", &[submit]); raw.queue_submit(queue, &[submit], made.fence) }
++            { crate::wbs_audit::submits("staging", &[submit]); crate::pending_audit::submits(raw, "staging", &[submit], made.fence); raw.queue_submit(queue, &[submit], made.fence) }
+         };
+         exit_guard::called(Call::QueueSubmit);
+         submitted.map_err(|error| self.failed(error))?;
+diff --git a/crates/metal2vulkan-runtime/src/device/submit.rs b/crates/metal2vulkan-runtime/src/device/submit.rs
+index e9ace296..77ca99d8 100644
+--- a/crates/metal2vulkan-runtime/src/device/submit.rs
++++ b/crates/metal2vulkan-runtime/src/device/submit.rs
+@@ -249,7 +249,7 @@ impl Device {
+                 .iter()
+                 .map(|info| info.command_buffer_count as usize);
+             shared.counts.queue_submitted(submits.len(), buffers.sum());
+-            { crate::wbs_audit::submits("internal", &submits); raw.queue_submit(queue, &submits, objects.fence) }
++            { crate::wbs_audit::submits("internal", &submits); crate::pending_audit::submits(raw, "internal", &submits, objects.fence); raw.queue_submit(queue, &submits, objects.fence) }
+         });
+         // A `vkQueueSubmit` that fails leaves what its submissions reference as it was, or loses
+         // the device: the work goes back as `taken` drops.
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index bfd49eed..145f310a 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -130,6 +130,7 @@ mod image_log;
+ mod image_plan;
+ // LOCAL (Atlas, diagnostic): M2V_WBS_AUDIT=1 reports timeline waits submitted before their signals.
+ mod wbs_audit;
++mod pending_audit;
+ mod in_place;
+ mod in_place_check;
+ mod index_bounds;
+diff --git a/crates/metal2vulkan-runtime/src/pending_audit.rs b/crates/metal2vulkan-runtime/src/pending_audit.rs
+new file mode 100644
+index 00000000..6bc05d27
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/pending_audit.rs
+@@ -0,0 +1,318 @@
++//! LOCAL (Atlas, diagnostic): command buffers begun or reset while a submission that runs them
++//! is pending, and primaries submitted with a secondary begun again since they executed it.
++//!
++//! With `M2V_PENDING_AUDIT=1` (read once per process), every `vkBeginCommandBuffer` and
++//! `vkCmdExecuteCommands` that reaches the driver (through the recorder's thunks or a replay),
++//! every `vkResetCommandPool` of a spare (with the pool's command buffers) and every
++//! `vkQueueSubmit` the runtime makes pass here first. A begin or reset of a command buffer whose
++//! last submission (its own, or that of a primary that executed it since its last begin) has not
++//! reached its timeline signal is written to stderr (at most [`MOST_LINES`]) with the sites, the
++//! time since the submission, and the semaphore's value against the signal. On ANV (Mesa 26.2.4)
++//! such a begin rewrites batch buffers the GPU has yet to run: a secondary run by
++//! `CALL_AND_RETURN` ends at its new recording's return jump, whose address the primary never
++//! patched (0), and the command streamer runs into the general state pool (the MULTI2 hang of
++//! 2026-11-08, IPEHR 0x3f800000 at 0x200024). Off, each call is one relaxed load.
++use ash::vk;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{LazyLock, Mutex, OnceLock};
++use std::time::Instant;
++
++/// The most lines written.
++const MOST_LINES: u64 = 300;
++
++static ON: LazyLock<bool> =
++    LazyLock::new(|| std::env::var_os("M2V_PENDING_AUDIT").is_some_and(|v| v == "1"));
++static LINES: AtomicU64 = AtomicU64::new(0);
++static FOUND: AtomicU64 = AtomicU64::new(0);
++static CHECKED: AtomicU64 = AtomicU64::new(0);
++
++/// Whether the audit is on.
++pub(crate) fn on() -> bool {
++    *ON
++}
++
++/// The device whose semaphores and fences are read (the first that submits).
++static DEVICE: OnceLock<ash::Device> = OnceLock::new();
++
++/// A primary's last submission.
++struct Sub {
++    site: &'static str,
++    at: Instant,
++    /// The timeline signals of its info or the first later info of the same call with any.
++    signals: Vec<(vk::Semaphore, u64)>,
++    fence: vk::Fence,
++}
++
++#[derive(Default)]
++struct State {
++    /// Each command buffer's begins so far.
++    generation: HashMap<u64, u64>,
++    /// A primary's executed secondaries since its last begin, with each one's generation then.
++    executes: HashMap<u64, Vec<(u64, u64)>>,
++    /// A secondary's executing primaries since its last begin.
++    executed_by: HashMap<u64, Vec<u64>>,
++    /// A primary's last submission since its last begin.
++    subs: HashMap<u64, Sub>,
++}
++
++static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
++
++fn key(buffer: vk::CommandBuffer) -> u64 {
++    vk::Handle::as_raw(buffer)
++}
++
++fn line(text: String) {
++    if LINES.fetch_add(1, Ordering::Relaxed) < MOST_LINES {
++        eprintln!("m2v-pending-audit: {text}");
++    }
++}
++
++/// Why `sub` is still pending, or `None` where it completed (or nothing tells).
++fn pending(sub: &Sub) -> Option<String> {
++    let device = DEVICE.get()?;
++    for &(semaphore, value) in &sub.signals {
++        // SAFETY: a semaphore of the device a submission signalled; read only.
++        if let Ok(now) = unsafe { device.get_semaphore_counter_value(semaphore) } {
++            if now < value {
++                return Some(format!(
++                    "timeline {:#x} at {now} < {value}",
++                    vk::Handle::as_raw(semaphore)
++                ));
++            }
++        }
++    }
++    if sub.signals.is_empty() && sub.fence != vk::Fence::null() {
++        // SAFETY: as above (a fence the runtime may have reset or reused since: a hint).
++        if let Ok(false) = unsafe { device.get_fence_status(sub.fence) } {
++            return Some(format!("fence {:#x} unsignalled", vk::Handle::as_raw(sub.fence)));
++        }
++    }
++    None
++}
++
++/// Check `buffer` about to be begun or reset at `site`, then forget what it recorded.
++fn check_and_forget(state: &mut State, buffer: u64, site: &'static str) {
++    CHECKED.fetch_add(1, Ordering::Relaxed);
++    if let Some(sub) = state.subs.get(&buffer) {
++        if let Some(why) = pending(sub) {
++            let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
++            line(format!(
++                "#{n} {site}: command buffer {buffer:#x} itself, submitted at {} {:.2} ms ago, is pending ({why})",
++                sub.site,
++                sub.at.elapsed().as_secs_f64() * 1000.0
++            ));
++        }
++    }
++    if let Some(primaries) = state.executed_by.get(&buffer) {
++        for primary in primaries {
++            match state.subs.get(primary) {
++                Some(sub) => {
++                    if let Some(why) = pending(sub) {
++                        let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
++                        line(format!(
++                            "#{n} {site}: secondary {buffer:#x} executed by primary {primary:#x}, submitted at {} {:.2} ms ago, is pending ({why})",
++                            sub.site,
++                            sub.at.elapsed().as_secs_f64() * 1000.0
++                        ));
++                    }
++                }
++                // Not submitted yet: its submission finds the secondary begun again.
++                None => {}
++            }
++        }
++    }
++    *state.generation.entry(buffer).or_insert(0) += 1;
++    state.subs.remove(&buffer);
++    if let Some(secondaries) = state.executes.remove(&buffer) {
++        for (secondary, _) in secondaries {
++            if let Some(by) = state.executed_by.get_mut(&secondary) {
++                by.retain(|p| *p != buffer);
++            }
++        }
++    }
++    // A secondary begun again: the primaries that executed it keep their record, and a
++    // submission of one of them finds the generation changed.
++    if let Some(by) = state.executed_by.get_mut(&buffer) {
++        by.clear();
++    }
++}
++
++/// A `vkBeginCommandBuffer` of `buffer` at `site`, before the call.
++pub(crate) fn begin(buffer: vk::CommandBuffer, site: &'static str) {
++    if !*ON {
++        return;
++    }
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    check_and_forget(&mut state, key(buffer), site);
++}
++
++/// A `vkResetCommandPool` of a pool holding `buffers`, at `site`, before the call.
++pub(crate) fn reset_pool(buffers: &[vk::CommandBuffer], site: &'static str) {
++    if !*ON {
++        return;
++    }
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    for &buffer in buffers {
++        check_and_forget(&mut state, key(buffer), site);
++    }
++}
++
++/// A `vkCmdExecuteCommands` of `secondaries` in `primary`.
++///
++/// # Safety
++/// `count` handles at `secondaries`.
++pub(crate) unsafe fn executes(
++    primary: vk::CommandBuffer,
++    count: u32,
++    secondaries: *const vk::CommandBuffer,
++) {
++    if !*ON || secondaries.is_null() || count == 0 {
++        return;
++    }
++    // SAFETY: the caller's.
++    let list = unsafe { std::slice::from_raw_parts(secondaries, count as usize) };
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let p = key(primary);
++    for &secondary in list {
++        let s = key(secondary);
++        let generation = state.generation.get(&s).copied().unwrap_or(0);
++        state.executes.entry(p).or_default().push((s, generation));
++        let by = state.executed_by.entry(s).or_default();
++        if !by.contains(&p) {
++            by.push(p);
++        }
++    }
++}
++
++/// The timeline info in a `pNext` chain, if any.
++///
++/// # Safety
++/// `next` is a valid Vulkan `pNext` chain.
++unsafe fn timeline(
++    mut next: *const std::ffi::c_void,
++) -> Option<&'static vk::TimelineSemaphoreSubmitInfo<'static>> {
++    while !next.is_null() {
++        // SAFETY: every Vulkan structure starts with sType and pNext.
++        let base = unsafe { &*next.cast::<vk::BaseInStructure<'static>>() };
++        if base.s_type == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO {
++            // SAFETY: its type says so.
++            return Some(unsafe { &*next.cast::<vk::TimelineSemaphoreSubmitInfo<'static>>() });
++        }
++        next = base.p_next.cast();
++    }
++    None
++}
++
++/// A `vkQueueSubmit` of `infos` with `fence` on `device` at `site`, before the call.
++pub(crate) fn submits(
++    device: &ash::Device,
++    site: &'static str,
++    infos: &[vk::SubmitInfo<'_>],
++    fence: vk::Fence,
++) {
++    if !*ON {
++        return;
++    }
++    let _ = DEVICE.set(device.clone());
++    // Each info's timeline signals, nonzero.
++    let signals: Vec<Vec<(vk::Semaphore, u64)>> = infos
++        .iter()
++        .map(|info| {
++            // SAFETY: a submission the caller is about to make, so its pointers are valid.
++            let Some(t) = (unsafe { timeline(info.p_next) }) else {
++                return Vec::new();
++            };
++            let n = info.signal_semaphore_count as usize;
++            if info.p_signal_semaphores.is_null()
++                || t.p_signal_semaphore_values.is_null()
++                || (t.signal_semaphore_value_count as usize) < n
++            {
++                return Vec::new();
++            }
++            // SAFETY: as above.
++            let (s, v) = unsafe {
++                (
++                    std::slice::from_raw_parts(info.p_signal_semaphores, n),
++                    std::slice::from_raw_parts(t.p_signal_semaphore_values, n),
++                )
++            };
++            s.iter().copied().zip(v.iter().copied()).filter(|&(_, v)| v != 0).collect()
++        })
++        .collect();
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let at = Instant::now();
++    for (index, info) in infos.iter().enumerate() {
++        if info.p_command_buffers.is_null() || info.command_buffer_count == 0 {
++            continue;
++        }
++        // SAFETY: as above.
++        let buffers = unsafe {
++            std::slice::from_raw_parts(info.p_command_buffers, info.command_buffer_count as usize)
++        };
++        let mine = signals[index..]
++            .iter()
++            .find(|s| !s.is_empty())
++            .cloned()
++            .unwrap_or_default();
++        for &buffer in buffers {
++            let p = key(buffer);
++            // A secondary begun again since this primary executed it.
++            if let Some(executed) = state.executes.get(&p) {
++                for &(s, generation) in executed {
++                    let now = state.generation.get(&s).copied().unwrap_or(0);
++                    if now != generation {
++                        let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
++                        line(format!(
++                            "#{n} {site}: primary {p:#x} submitted with secondary {s:#x} begun {} time(s) since it executed it",
++                            now - generation
++                        ));
++                    }
++                }
++            }
++            if let Some(previous) = state.subs.get(&p) {
++                if let Some(why) = pending(previous) {
++                    let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
++                    line(format!(
++                        "#{n} {site}: primary {p:#x} submitted again while its submission at {} {:.2} ms ago is pending ({why})",
++                        previous.site,
++                        previous.at.elapsed().as_secs_f64() * 1000.0
++                    ));
++                }
++            }
++            state.subs.insert(
++                p,
++                Sub {
++                    site,
++                    at,
++                    signals: mine.clone(),
++                    fence,
++                },
++            );
++        }
++    }
++    let checked = CHECKED.load(Ordering::Relaxed);
++    if checked > 0 && checked.is_power_of_two() && checked >= 1024 {
++        line(format!(
++            "summary: {checked} begins/resets checked, {} found",
++            FOUND.load(Ordering::Relaxed)
++        ));
++    }
++}
++
++/// The routed commands' hook (`recorder/thunks.rs`), for a command that reaches the driver.
++macro_rules! hook {
++    (begin_command_buffer, $cb:ident, $info:ident) => {
++        if $crate::pending_audit::on() {
++            $crate::pending_audit::begin($cb, "begin")
++        }
++    };
++    (cmd_execute_commands, $cb:ident, $count:ident, $buffers:ident) => {
++        if $crate::pending_audit::on() {
++            // SAFETY: the driver call's own arguments.
++            unsafe { $crate::pending_audit::executes($cb, $count, $buffers) }
++        }
++    };
++    ($f:ident, $cb:ident $(, $a:ident)*) => {};
++}
++pub(crate) use hook;
+diff --git a/crates/metal2vulkan-runtime/src/recorder/log.rs b/crates/metal2vulkan-runtime/src/recorder/log.rs
+index 895770d7..68fc6f1c 100644
+--- a/crates/metal2vulkan-runtime/src/recorder/log.rs
++++ b/crates/metal2vulkan-runtime/src/recorder/log.rs
+@@ -1277,6 +1277,11 @@ impl Log {
+                 unsafe { f(cb, $($arg),*) }
+             }};
+         }
++        // LOCAL (Atlas) diagnostic (`pending_audit.rs`): a primary begun ahead was checked as
++        // it was begun.
++        if !begun {
++            crate::pending_audit::begin(cb, "replay begin");
++        }
+         if !begun {
+             let began = call!(BeginCommandBuffer, vk::PFN_vkBeginCommandBuffer, &begin);
+             if began != vk::Result::SUCCESS {
+@@ -1606,6 +1611,15 @@ impl Log {
+                         for &secondary in self.command_buffers.get(buffers) {
+                             resolved.push(resolve(secondary).ok_or(vk::Result::ERROR_UNKNOWN)?);
+                         }
++                        // LOCAL (Atlas) diagnostic (`pending_audit.rs`).
++                        // SAFETY: `resolved` holds that many handles.
++                        unsafe {
++                            crate::pending_audit::executes(
++                                cb,
++                                resolved.len() as u32,
++                                resolved.as_ptr(),
++                            )
++                        };
+                         call!(
+                             CmdExecuteCommands,
+                             vk::PFN_vkCmdExecuteCommands,
+diff --git a/crates/metal2vulkan-runtime/src/recorder/thunks.rs b/crates/metal2vulkan-runtime/src/recorder/thunks.rs
+index 1c9970ba..027a3dd4 100644
+--- a/crates/metal2vulkan-runtime/src/recorder/thunks.rs
++++ b/crates/metal2vulkan-runtime/src/recorder/thunks.rs
+@@ -182,6 +182,8 @@ macro_rules! commands {
+                     crate::pass_times::hook!(after $f, stamps::<S>(), command_buffer $(, $a)*);
+                     return logged;
+                 }
++                // LOCAL (Atlas) diagnostic: the pending audit's hook (`pending_audit.rs`).
++                crate::pending_audit::hook!($f, command_buffer $(, $a)*);
+                 let real = REAL.$f[S].load(Ordering::Acquire);
+                 if real.is_null() {
+                     missing($n);
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+index 5a4ad4e2..cd4a108d 100644
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -313,6 +313,12 @@ impl Spares {
+             return Ok(None);
+         };
+         if pool.recording {
++            // LOCAL (Atlas) diagnostic (`pending_audit.rs`).
++            if crate::pending_audit::on() {
++                let all: Vec<vk::CommandBuffer> =
++                    pool.made.iter().flatten().copied().chain(pool.begun).collect();
++                crate::pending_audit::reset_pool(&all, "spare pool reset");
++            }
+             // SAFETY: the pool is the caller's alone now, and nothing of it is pending: the
+             // command buffer that gave it back ended its work or was never submitted.
+             let reset = unsafe {

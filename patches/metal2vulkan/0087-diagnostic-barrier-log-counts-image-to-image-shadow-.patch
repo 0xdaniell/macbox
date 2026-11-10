@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 09:26:03 +0000
+Subject: [PATCH 87/92] diagnostic: barrier log counts image-to-image shadow
+ copies by size and cause, and shadow counters
+
+---
+ crates/metal2vulkan-runtime/src/shadow.rs     | 24 +++++++++++++++++++
+ .../metal2vulkan-runtime/src/work_counts.rs   | 20 +++++++++++++++-
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 496cab01..fb6f4f1c 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -529,6 +529,11 @@ impl ShadowStaging {
+ }
+ 
+ impl ShadowCopies {
++    /// LOCAL (Atlas) diagnostic: whether the source is an image shadow over a lazy surface's.
++    pub(crate) fn source_is_over(&self) -> bool {
++        matches!(&self.source, ShadowSource::Image { over: Some(_), .. })
++    }
++
+     /// Whether the shadow is a large IOSurface plane's, from which its copies in count apart
+     /// (`WorkCounts::shadow_texels_first_copied_in_large_surfaces` and kin): a texture over an
+     /// IOSurface's plane of at least [`LARGE_SURFACE_TEXELS`] texels.
+@@ -1412,6 +1417,7 @@ impl ShadowCopy {
+     /// after what precedes it; the buffer and the shadow are live until it completes, and an
+     /// image is in the `GENERAL` layout; `back` is this copy's `staged_back`, over the buffer's
+     /// `VkBuffer` as it is now.
++    #[track_caller]
+     pub(super) unsafe fn record(
+         &self,
+         device: &Vk,
+@@ -1537,6 +1543,24 @@ impl ShadowCopy {
+                         })
+                         .collect()
+                 };
++                // LOCAL (Atlas) diagnostic: the shadow copies image to image, by size and cause.
++                if crate::barrier_log::on() {
++                    let e = regions.first().map(|r| r.extent).unwrap_or_default();
++                    let texels: u64 = regions
++                        .iter()
++                        .map(|r| r.extent.width as u64 * r.extent.height as u64)
++                        .sum();
++                    crate::barrier_log::note(
++                        std::panic::Location::caller(),
++                        match (into_shadow, c.source_is_over()) {
++                            (true, true) => "img-in-over",
++                            (true, false) => "img-in",
++                            (false, true) => "img-back-over",
++                            (false, false) => "img-back",
++                        },
++                        [e.width as u64, e.height as u64, regions.len() as u64, texels],
++                    );
++                }
+                 // SAFETY: the caller's contract; the regions lie in both images, which have
+                 // the same shape and formats of one copy unit (planned when the view was made).
+                 unsafe {
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index f305652c..3812d519 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -1244,7 +1244,9 @@ impl Counters {
+         format!(
+             "totals: begun {} by [enc seg cont sec work bar kept int] {:?} submitted {} queue_submits {} infos {} \
+              grouped {} batches_grouped {} group_ends {:?} kept_bar {} finales folded {} apart {} \
+-             bare_starts {} prefixed_starts {} command_barriers {}",
++             bare_starts {} prefixed_starts {} command_barriers {} | shadow copies {} att_reads {} att_splits {} \
++             snapshotted {} snap_splits {} own_pixel {} bounded {} via_swizzle {} view_shadows {} att_passes {} \
++             texels_in {} texels_in_images {} bounded_texels {} texels_back {} back_dispatched {} kept {}",
+             l(&self.command_buffers_begun),
+             by,
+             l(&self.command_buffers_submitted),
+@@ -1259,6 +1261,22 @@ impl Counters {
+             l(&self.bare_starts),
+             l(&self.prefixed_starts),
+             l(&self.command_barriers),
++            l(&self.shadow_copies),
++            l(&self.attachment_reads_through_copies),
++            l(&self.attachment_read_splits),
++            l(&self.reading_draws_snapshotted),
++            l(&self.snapshot_inline_splits),
++            l(&self.own_pixel_reads),
++            l(&self.bounded_shadow_copies),
++            l(&self.views_through_swizzle),
++            l(&self.view_shadows),
++            l(&self.shadow_attachment_passes),
++            l(&self.shadow_texels_copied_in),
++            l(&self.shadow_texels_copied_in_images),
++            l(&self.shadow_texels_bounded_copied_in),
++            l(&self.shadow_texels_copied_back),
++            l(&self.shadow_copies_back_dispatched),
++            l(&self.shadow_texels_kept),
+         )
+     }
+ 

@@ -1,0 +1,382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Fri, 6 Nov 2026 11:44:38 +0000
+Subject: [PATCH 29/33] Integrate guarded render lowering and multi-queue
+ regression coverage
+
+Integrate CPU lane 0f1cb0f and 3a75482 while retaining the integration tree m2v patch paths. Worker remains opt-in and is refused under strict, census and EXACT=all. Isolated lavapipe evidence is recorded in DEEP-CPU-PARALLEL-20261106.md; the combined tree still needs its gate.
+---
+ .../src/gpu/encode_render.rs                  | 220 ++++++++++++++++++
+ crates/reims-vgpu-vulkan/src/platform.rs      | 114 +++++++++
+ 2 files changed, 334 insertions(+)
+
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
+index 82e1a207..67a2e34b 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/encode_render.rs
+@@ -4022,6 +4022,226 @@ pub(crate) mod tests {
+         assert_eq!(event.signaled_value(), 5);
+     }
+ 
++    /// LOCAL (Atlas, DEEP-CPU): a guest task's stream of command buffers on one queue, each a
++    /// fill, then a cleared pass of 1 to 40 draws, a completed handler and a scheduled signal
++    /// after the pass's end (in the order `gpu_task/exec.rs` encodes an exec's tail), runs on a device that lowers render calls on the runtime's
++    /// lowering thread (`REIMS_VGPU_RENDER_LOWERING=worker`, [`crate::platform::render_lowering`])
++    /// as on one that lowers them at the call: the same texels and bytes, the event at the last
++    /// value, every command buffer completed, in commit order. The worker device's counts show its
++    /// ends left to the lowering thread, the at-call device's none
++    #[test]
++    fn render_calls_lowered_on_the_worker_run_as_at_the_call() {
++        use metal2vulkan::device::RenderLoweringPolicy;
++        const N: usize = 24;
++        let run = |d: &crate::gpu::device::VulkanDevice| exec_shaped_stream(d, N);
++        let at_call = dev();
++        let mut policy = crate::platform::device_options().policy;
++        assert_eq!(policy.render_lowering, RenderLoweringPolicy::AtCall);
++        policy.render_lowering = RenderLoweringPolicy::Worker;
++        let worker = crate::gpu::device::tests::device_with_policy(policy);
++        let before = (at_call.raw.work_counts(), worker.raw.work_counts());
++        let (a, w) = (run(&at_call), run(&worker));
++        let after = (at_call.raw.work_counts(), worker.raw.work_counts());
++        let expected: Vec<_> = (0..N).map(|i| (i, 4)).collect();
++        assert_eq!(a.0, expected, "at the call: completed in order");
++        assert_eq!(w.0, expected, "worker: completed in order");
++        assert_eq!(w.1, a.1, "texels");
++        assert!(
++            a.1.iter().any(|t| t.iter().any(|&b| b != 0)),
++            "the draws drew"
++        );
++        let filled: Vec<u8> = (0..N)
++            .flat_map(|i| [u8::try_from(i + 1).unwrap(); 4])
++            .collect();
++        assert_eq!((a.2.clone(), w.2), (filled.clone(), filled));
++        assert_eq!((a.3, w.3), (N as u64, N as u64));
++        eprintln!(
++            "lowering counts: at_call {:?} worker {:?}",
++            lowering_counts(&before.0, &after.0),
++            lowering_counts(&before.1, &after.1)
++        );
++        let ends = |c: &metal2vulkan_runtime::WorkCounts| c.render_log_ends_by_thread;
++        assert_eq!(
++            ends(&after.0),
++            ends(&before.0),
++            "at the call: nothing left to the thread"
++        );
++        assert!(
++            ends(&after.1) > ends(&before.1),
++            "worker: ends left to the lowering thread"
++        );
++        assert!(
++            after.1.render_log_batches_by_thread + after.1.render_log_batches_by_program
++                > before.1.render_log_batches_by_thread + before.1.render_log_batches_by_program,
++            "worker: the 40-draw passes logged batches"
++        );
++    }
++
++    /// LOCAL (Atlas, DEEP-CPU): two Sims' exec streams at once, each on its own thread and queue,
++    /// lower on the device's lanes (m2v `render/lowering_worker.rs`, one lane per queue in turn)
++    /// and give what they give lowered at the call: per queue, every command buffer completed in
++    /// its commit order with status 4, the same texels and bytes, the event at the last value.
++    /// The worker's ends ran off the program's threads. The lanes' CPU time against the wall
++    /// time is printed (diagnostic only: lavapipe, debug, not a frame-rate figure).
++    #[test]
++    fn two_sims_lowered_on_the_lanes_run_as_at_the_call() {
++        use metal2vulkan::device::RenderLoweringPolicy;
++        const N: usize = 24;
++        let run = |d: &crate::gpu::device::VulkanDevice| {
++            std::thread::scope(|scope| {
++                let sims: Vec<_> = (0..2)
++                    .map(|_| scope.spawn(|| exec_shaped_stream(d, N)))
++                    .collect();
++                sims.into_iter()
++                    .map(|sim| sim.join().unwrap())
++                    .collect::<Vec<_>>()
++            })
++        };
++        let at_call = dev();
++        let mut policy = crate::platform::device_options().policy;
++        policy.render_lowering = RenderLoweringPolicy::Worker;
++        let worker = crate::gpu::device::tests::device_with_policy(policy);
++        let a = run(&at_call);
++        let (before, lanes_before) = (worker.raw.work_counts(), lane_cpu_nanos());
++        let wall = std::time::Instant::now();
++        let w = run(&worker);
++        let wall = wall.elapsed().as_nanos() as u64;
++        let lanes_after = lane_cpu_nanos();
++        let after = worker.raw.work_counts();
++        let expected: Vec<_> = (0..N).map(|i| (i, 4)).collect();
++        let filled: Vec<u8> = (0..N)
++            .flat_map(|i| [u8::try_from(i + 1).unwrap(); 4])
++            .collect();
++        for (sim, (a, w)) in a.iter().zip(&w).enumerate() {
++            assert_eq!(a.0, expected, "at the call, sim {sim}: completed in order");
++            assert_eq!(w.0, expected, "worker, sim {sim}: completed in order");
++            assert_eq!(w.1, a.1, "sim {sim}: texels");
++            assert!(
++                a.1.iter().any(|t| t.iter().any(|&b| b != 0)),
++                "sim {sim}: drew"
++            );
++            assert_eq!((&a.2, &w.2), (&filled, &filled), "sim {sim}: filled");
++            assert_eq!((a.3, w.3), (N as u64, N as u64), "sim {sim}: event");
++        }
++        let counts = lowering_counts(&before, &after);
++        let lane_nanos: Vec<u64> = (lanes_after.iter())
++            .map(|(tid, n)| {
++                n - lanes_before
++                    .iter()
++                    .find(|(t, _)| t == tid)
++                    .map_or(0, |b| b.1)
++            })
++            .filter(|&n| n > 0)
++            .collect();
++        eprintln!(
++            "two sims, worker, {} lanes: counts {counts:?}; lowering threads busy {lane_nanos:?} ns \
++             of {wall} ns wall (sum/wall {:.2})",
++            lane_nanos.len(),
++            lane_nanos.iter().sum::<u64>() as f64 / wall as f64
++        );
++        assert!(counts[2] > 0, "worker: ends left to the lowering threads");
++    }
++
++    /// The device's lowering threads' (`metal2vulkan-lowering`) CPU time in ns, by thread id
++    /// (`/proc/self/task/*/schedstat`).
++    fn lane_cpu_nanos() -> Vec<(u64, u64)> {
++        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
++            return Vec::new();
++        };
++        (tasks.flatten())
++            .filter_map(|task| {
++                let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
++                if !comm.starts_with("metal2vulkan-lo") {
++                    return None;
++                }
++                let stat = std::fs::read_to_string(task.path().join("schedstat")).ok()?;
++                let tid = task.file_name().to_str()?.parse().ok()?;
++                Some((tid, stat.split_whitespace().next()?.parse().ok()?))
++            })
++            .collect()
++    }
++
++    /// What [`exec_shaped_stream`] reads: the completions in order (index, status), the three
++    /// targets' texels, the filled bytes and the event's value.
++    type ExecStream = (Vec<(usize, u64)>, Vec<Vec<u8>>, Vec<u8>, u64);
++
++    /// `n` command buffers on a new queue of `d`, in the order Reims's exec makes them: a fill,
++    /// a cleared pass of 1-40 draws over 3 rotating targets, end, completed handler, scheduled
++    /// signal on one shared event, commit. What it read once all completed.
++    fn exec_shaped_stream(d: &crate::gpu::device::VulkanDevice, n: usize) -> ExecStream {
++        use reims_vgpu_core::platform::types::NsRange;
++        let p = platform();
++        let state = fixture_state::<VulkanPlatform>(d, "vert:tri_vert", "frag:tri_frag");
++        let targets: Vec<_> = (0..3).map(|_| pass_of(&p, d, (4, 4))).collect();
++        let bytes = buffer::<VulkanPlatform>(d, (n * 4) as u64, 0, &vec![0; n * 4]);
++        let event = d.new_shared_event().unwrap();
++        let q = d.new_command_queue().unwrap();
++        let (done, completed) = std::sync::mpsc::channel();
++        for i in 0..n {
++            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
++            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
++            let fill = BlitCmd::FillBuffer {
++                buffer: &bytes,
++                range: NsRange::new((i * 4) as u64, 4),
++                value: u8::try_from(i + 1).unwrap(),
++            };
++            blit.encode(OnFault::Die, fill).unwrap();
++            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
++            let e = cb
++                .render_encoder(OnFault::Die, &targets[i % 3].1)
++                .unwrap()
++                .unwrap();
++            let mut cmds = vec![RenderCmd::SetRenderPipelineState {
++                pipeline_state: Some(&state),
++            }];
++            let draws = if i % 4 == 0 { 40 } else { i % 4 };
++            cmds.extend((0..draws).map(|_| three(3, None)));
++            cmds.push(RenderCmd::EndEncoding);
++            send_all(&e, cmds);
++            let done = done.clone();
++            cb.add_completed_handler(
++                OnFault::Die,
++                Box::new(move |info| done.send((i, info.status.0)).unwrap()),
++            )
++            .unwrap();
++            cb.encode_signal_when_scheduled(Some(&event), (i + 1) as u64)
++                .unwrap();
++            cb.commit(OnFault::Die).unwrap();
++        }
++        let order: Vec<_> = (0..n)
++            .map(|_| {
++                completed
++                    .recv_timeout(std::time::Duration::from_secs(30))
++                    .unwrap()
++            })
++            .collect();
++        let texels: Vec<_> = targets
++            .iter()
++            .map(|(t, _)| crate::gpu::resource::tests::read_back(t))
++            .collect();
++        // SAFETY: a Shared buffer's bytes, read after every command buffer completed.
++        let filled =
++            unsafe { std::slice::from_raw_parts(bytes.contents().as_ptr::<u8>(), n * 4) }.to_vec();
++        (order, texels, filled, event.signaled_value())
++    }
++
++    /// The lowering counts from `b` to `a`: batches by thread and program, ends by thread and
++    /// program, commits run by thread and program, waits.
++    fn lowering_counts(
++        b: &metal2vulkan_runtime::WorkCounts,
++        a: &metal2vulkan_runtime::WorkCounts,
++    ) -> [u64; 7] {
++        [
++            a.render_log_batches_by_thread - b.render_log_batches_by_thread,
++            a.render_log_batches_by_program - b.render_log_batches_by_program,
++            a.render_log_ends_by_thread - b.render_log_ends_by_thread,
++            a.render_log_ends_by_program - b.render_log_ends_by_program,
++            a.render_log_commits_by_thread - b.render_log_commits_by_thread,
++            a.render_log_commits_by_program - b.render_log_commits_by_program,
++            a.render_log_waits - b.render_log_waits,
++        ]
++    }
++
+     /// What a command buffer of a new queue shows on `p`'s device `d` whose render pass, over a
+     /// 4 by 4 target filled with 0x11, binds a memoryless 4 by 4 `RGBA8Unorm` texture and a
+     /// sampler at fragment slot 0 and draws a triangle over the target with the fixtures'
+diff --git a/crates/reims-vgpu-vulkan/src/platform.rs b/crates/reims-vgpu-vulkan/src/platform.rs
+index f8b22b88..b957171b 100644
+--- a/crates/reims-vgpu-vulkan/src/platform.rs
++++ b/crates/reims-vgpu-vulkan/src/platform.rs
+@@ -285,6 +285,18 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
+                 b"reims-vgpu: REIMS_VGPU_GROUPED=1: grouped completion\n",
+             );
+         }
++        // LOCAL (Atlas, DEEP-CPU): `REIMS_VGPU_RENDER_LOWERING=worker`, read once per process,
++        // takes the runtime's lowering thread for render encoders
++        // (`RenderLoweringPolicy::Worker`): see [`render_lowering`].
++        let (lowering, line) = render_lowering(
++            std::env::var_os(RENDER_LOWERING_VAR).as_deref(),
++            crate::answer::strict_process() || crate::answer::census::on(),
++            std::env::var("REIMS_VGPU_EXACT").ok().as_deref(),
++        );
++        options.policy.render_lowering = lowering;
++        if let Some(line) = line {
++            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
++        }
+         let sink = rt::MessageSink::new(crate::answer::notice);
+         options.messages = Some(sink.with_least_severity(crate::answer::least_severity()));
+         options.announce_each =
+@@ -378,6 +390,76 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
+     policy
+ }
+ 
++/// LOCAL (Atlas, DEEP-CPU): the variable that picks where render encoders' calls are lowered.
++pub const RENDER_LOWERING_VAR: &str = "REIMS_VGPU_RENDER_LOWERING";
++
++/// Where the device lowers its render encoders' calls (`DevicePolicy::render_lowering`), from
++/// `REIMS_VGPU_RENDER_LOWERING` (`value`), and the stderr line to write, if any.
++///
++/// Unset, empty or `at_call`: inside each call, the runtime's default
++/// (`RenderLoweringPolicy::AtCall`), production's form. `worker`: the runtime logs each render
++/// call after its checks at the call and lowers it, the encoder's end and the commit's own work
++/// on the device's lowering thread, in order (metal2vulkan docs/API.md section 1,
++/// `render/deferral.rs`). The guest task's service thread then decodes the next commands while
++/// that thread lowers the earlier ones: two stages of one task's serial stream, its order
++/// unchanged. Commit order across the device's queues stays the program's
++/// (`render/queued_commits.rs`), so every FIFO's event chain, scheduled signal and completion
++/// keeps its order.
++///
++/// What changes under `worker`, and why it is kept out of audits:
++/// - A refusal only the lowering finds (a runtime gap of the draw's variant, out of memory, a
++///   Vulkan error) fails the command buffer (`CallRefused`, completion status 3) instead of
++///   raising at the call (the exec's reply 2). Refusals the call's checks find still return
++///   from the call.
++/// - A degradation announced while the lowering thread lowers a call is announced outside every
++///   call of this platform: `answer::hearing` does not hear it (the `HalfOutputPrecision` relay
++///   of `binds`), census attributes it to no selector, and strict mode dies on that thread rather
++///   than at the call. So `worker` is refused, with a line, in a strict or census process
++///   (`audited`) and under `REIMS_VGPU_EXACT=all`, whose exact answers take `AtCall`.
++///
++/// Another value changes nothing, and a line says so.
++pub(crate) fn render_lowering(
++    value: Option<&std::ffi::OsStr>,
++    audited: bool,
++    exact: Option<&str>,
++) -> (metal2vulkan::device::RenderLoweringPolicy, Option<String>) {
++    use metal2vulkan::device::RenderLoweringPolicy::{AtCall, Worker};
++    let Some(value) = value else {
++        return (AtCall, None);
++    };
++    let value = value.to_string_lossy();
++    match value.trim() {
++        "" | "at_call" => (AtCall, None),
++        "worker" => {
++            let exact_all = exact
++                .unwrap_or_default()
++                .split(',')
++                .any(|n| n.trim() == EXACT_ALL);
++            if audited || exact_all {
++                let why = if audited { "strict or census mode" } else { "REIMS_VGPU_EXACT=all" };
++                let line = format!(
++                    "reims-vgpu: {RENDER_LOWERING_VAR}=worker refused under {why}: render calls \
++                     lowered at the call\n"
++                );
++                (AtCall, Some(line))
++            } else {
++                let line = format!(
++                    "reims-vgpu: {RENDER_LOWERING_VAR}=worker: render calls lowered on the \
++                     runtime's lowering thread\n"
++                );
++                (Worker, Some(line))
++            }
++        }
++        other => (
++            AtCall,
++            Some(format!(
++                "reims-vgpu: {RENDER_LOWERING_VAR} names {other:?}, none of at_call, worker: \
++                 ignored\n"
++            )),
++        ),
++    }
++}
++
+ /// The shader cache's directory under `HOME`, which every process of the library shares. It
+ /// holds the runtime's translations of the guest's functions and each pipeline's driver record
+ /// (MoltenVK's included: about 1.7 MB for a macOS 26 guest's `Xgc` pipeline
+@@ -594,6 +676,38 @@ pub(crate) mod tests {
+     use super::*;
+     use crate::gpu::device::tests::dev;
+ 
++    /// LOCAL (Atlas, DEEP-CPU): `REIMS_VGPU_RENDER_LOWERING` is off by default and off for
++    /// anything but `worker`; `worker` takes the lowering thread unless the process audits
++    /// (strict or census mode) or `REIMS_VGPU_EXACT` names `all`
++    #[test]
++    fn render_lowering_takes_the_worker_only_when_asked_and_unaudited() {
++        use metal2vulkan::device::RenderLoweringPolicy::{AtCall, Worker};
++        use std::ffi::OsStr;
++        assert_eq!(render_lowering(None, false, None), (AtCall, None));
++        for quiet in ["", " ", "at_call", " at_call "] {
++            assert_eq!(render_lowering(Some(OsStr::new(quiet)), false, None), (AtCall, None));
++        }
++        for other in ["Worker", "1", "on", "worker,", "atcall"] {
++            let (p, line) = render_lowering(Some(OsStr::new(other)), false, None);
++            assert_eq!(p, AtCall, "{other}");
++            assert!(line.unwrap().contains("ignored"), "{other}");
++        }
++        let worker = Some(OsStr::new("worker"));
++        let (p, line) = render_lowering(worker, false, None);
++        assert_eq!(p, Worker);
++        assert!(line.unwrap().contains("lowering thread"));
++        assert_eq!(
++            render_lowering(worker, false, Some("batch_order, host_page_textures")).0,
++            Worker
++        );
++        for (audited, exact) in [(true, None), (false, Some("all")), (false, Some("batch_order, all"))]
++        {
++            let (p, line) = render_lowering(worker, audited, exact);
++            assert_eq!(p, AtCall, "{audited} {exact:?}");
++            assert!(line.unwrap().contains("refused"));
++        }
++    }
++
+     /// The kinds a call hears and those that die by default are announced at every occurrence in
+     /// every mode, and every other kind of `DIES` only in strict and census mode
+     #[test]

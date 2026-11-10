@@ -61,7 +61,8 @@ and the QEMU command line; `reims-ctl command mac` (inside the container) prints
 - Before each start: `WAYLAND_DISPLAY` (sway's, or the host's), and the GPU tuning:
   `M2V_LIVE=$MACBOX_HOME/run/live.conf` with `host_rt_in_place=1`,
   `REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1`, `M2V_ARL_FACTS` on an Arrow Lake GPU, and with
-  `MACBOX_COHERENT=on` the census and Coherent switches ([performance.md](performance.md)).
+  Coherent (`MACBOX_COHERENT`, on by default with an Arrow Lake GPU) the census, Coherent and the
+  switches measured with it, in `live.conf` and Reims's environment ([performance.md](performance.md)).
   The disk's options in `extra_args` are written again, so a changed `MACBOX_DISK_CACHE` applies.
 
 The system disk starts on SATA, because macOS's installer may not find a disk on NVMe, and moves to

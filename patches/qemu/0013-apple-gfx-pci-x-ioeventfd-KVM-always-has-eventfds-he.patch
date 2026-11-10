@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:38:39 +0000
+Subject: [PATCH 13/13] apple-gfx-pci: x-ioeventfd: KVM always has eventfds
+ here (kvm_eventfds_enabled is gone)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/apple-gfx-pci.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index ed0c00e2d0..cdc53eb7b3 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -255,7 +255,7 @@ static void *apple_gfx_pci_db_thread(void *opaque)
+ static void apple_gfx_pci_db_sync(AppleGFXPCIDoorbell *db)
+ {
+     bool want = db->wanted && db->have_notifiers && db->mr &&
+-                kvm_enabled() && kvm_eventfds_enabled();
++                kvm_enabled();
+     int i;
+ 
+     if (want == db->attached) {

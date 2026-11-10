@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 7 Nov 2026 16:47:29 +0000
+Subject: [PATCH 47/92] diagnostic: per-draw units (live pass_draws) and a
+ pipeline census in the pass timer
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/pass_times.rs | 252 +++++++++++++++++-
+ .../src/pipeline/graphics.rs                  |  19 ++
+ 2 files changed, 259 insertions(+), 12 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/pass_times.rs b/crates/metal2vulkan-runtime/src/pass_times.rs
+index 9cd4574c..fe63c8e5 100644
+--- a/crates/metal2vulkan-runtime/src/pass_times.rs
++++ b/crates/metal2vulkan-runtime/src/pass_times.rs
+@@ -188,6 +188,8 @@ pub(crate) enum Class {
+     Pass,
+     Compute,
+     Transfer,
++    /// One draw, where the capture times draws (`pass_draws`).
++    Draw,
+ }
+ 
+ /// A slot's own timestamp commands (`recorder/thunks.rs`), which the units record through: into a
+@@ -413,6 +415,11 @@ struct RawState {
+     pending_draws: u32,
+     /// The render pass instance that executed it, a secondary.
+     parent: Option<usize>,
++    /// Its draw unit open, where the capture times draws.
++    draw_open: Option<usize>,
++    /// The graphics pipeline last bound, and the first scissor last set (x, y, w, h).
++    pipeline: u64,
++    scissor: Option<[i64; 4]>,
+ }
+ 
+ /// A unit of work.
+@@ -427,6 +434,11 @@ struct Unit {
+     /// Its block's index in the capture's and its start query's offset in it.
+     block: usize,
+     offset: u32,
++    /// A draw unit's description, the `VkCommandBuffer` it was recorded on, and the unit open
++    /// there as it was recorded.
++    note: Option<String>,
++    raw: u64,
++    parent: Option<usize>,
+ }
+ 
+ #[derive(Default)]
+@@ -447,6 +459,8 @@ pub(crate) struct Capture {
+     seq: u64,
+     key: usize,
+     queue_label: String,
++    /// Whether each draw is its own unit too (the live switch `pass_draws`, read as it began).
++    draws: bool,
+     state: Mutex<CaptureState>,
+ }
+ 
+@@ -535,6 +549,7 @@ fn start(device: &Device, queue: &CommandQueue, key: usize) -> Option<Arc<Captur
+         seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+         key,
+         queue_label: label.replace(',', ";"),
++        draws: times.host_reset && crate::live::on("pass_draws", false),
+         state: Mutex::default(),
+     });
+     LIVE.fetch_add(1, Ordering::Relaxed);
+@@ -743,6 +758,9 @@ pub(crate) unsafe fn begin_pass(
+         count: 0,
+         block: 0,
+         offset: 0,
++        note: None,
++        raw: 0,
++        parent: None,
+     };
+     // SAFETY: the caller's.
+     let opened = unsafe { open(st, cb, &capture, state, unit) };
+@@ -786,6 +804,8 @@ pub(crate) unsafe fn end(st: Stamps, cb: vk::CommandBuffer) {
+     };
+     let mut guard = lock(&capture.state);
+     let state = &mut *guard;
++    // SAFETY: the caller's.
++    unsafe { close_draw(st, cb, state) };
+     let Some(open) = state.raws.get_mut(&cb.as_raw()).and_then(|r| r.open.take()) else {
+         return;
+     };
+@@ -845,6 +865,9 @@ pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, comma
+         count: 1,
+         block: 0,
+         offset: 0,
++        note: None,
++        raw: 0,
++        parent: None,
+     };
+     // SAFETY: the caller's.
+     let opened = unsafe { open(st, cb, &capture, state, unit) };
+@@ -853,6 +876,112 @@ pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, comma
+     }
+ }
+ 
++/// Close the draw unit open on `cb`, where one is.
++///
++/// # Safety
++///
++/// `cb` is recording, by the caller alone; `st` are its slot's.
++unsafe fn close_draw(st: Stamps, cb: vk::CommandBuffer, state: &mut CaptureState) {
++    if let Some(open) = state.raws.get_mut(&cb.as_raw()).and_then(|r| r.draw_open.take()) {
++        // SAFETY: the caller's.
++        unsafe { close(st, cb, state, open) };
++    }
++}
++
++/// Before `vkCmdEndRenderPass` or `vkCmdExecuteCommands` on `cb`: its draw unit closed.
++///
++/// # Safety
++///
++/// As the command's; `st` are its slot's.
++pub(crate) unsafe fn draws_end(st: Stamps, cb: vk::CommandBuffer) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    // SAFETY: the caller's.
++    unsafe { close_draw(st, cb, &mut guard) };
++}
++
++/// Before `vkCmdBindPipeline` of a graphics `pipeline`, or `vkCmdSetScissor` of `scissor`, on
++/// `cb`: kept for its next draws' descriptions.
++pub(crate) fn draw_state(cb: vk::CommandBuffer, pipeline: Option<u64>, scissor: Option<[i64; 4]>) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    if !capture.draws {
++        return;
++    }
++    let mut state = lock(&capture.state);
++    if let Some(raw) = state.raws.get_mut(&cb.as_raw()) {
++        if let Some(pipeline) = pipeline {
++            raw.pipeline = pipeline;
++        }
++        if scissor.is_some() {
++            raw.scissor = scissor;
++        }
++    }
++}
++
++/// Before a draw `what` of `count` vertices, indices or indirect draws and `instances` on `cb`:
++/// counted as [`draw`], and where the capture times draws, its own unit opened (the last one on
++/// `cb` closed).
++///
++/// # Safety
++///
++/// As the command's: `cb` recording inside a render pass instance (or a secondary of one), by the
++/// caller alone; `st` are its slot's.
++pub(crate) unsafe fn draw_at(st: Stamps, cb: vk::CommandBuffer, what: &'static str, count: u32, instances: u32) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let Some(capture) = capture_of(cb) else {
++        return;
++    };
++    let mut guard = lock(&capture.state);
++    let state = &mut *guard;
++    let Some(raw) = state.raws.get_mut(&cb.as_raw()) else {
++        return;
++    };
++    match raw.open.or(raw.parent) {
++        Some(at) => state.units[at].count += 1,
++        None => raw.pending_draws += 1,
++    }
++    if !capture.draws {
++        return;
++    }
++    let scissor = raw.scissor.map_or_else(|| "-".to_owned(), |[x, y, w, h]| format!("{x}+{y}+{w}x{h}"));
++    let note = format!("{what}:{count}x{instances};pipe={:#x};sc={scissor}", raw.pipeline);
++    let (encoder, parent) = (raw.encoder, raw.open);
++    // SAFETY: the caller's.
++    unsafe { close_draw(st, cb, state) };
++    let unit = Unit {
++        class: Class::Draw,
++        tag: None,
++        site: None,
++        command: what,
++        encoder,
++        label: None,
++        count: 1,
++        block: 0,
++        offset: 0,
++        note: Some(note),
++        raw: cb.as_raw(),
++        parent,
++    };
++    // SAFETY: the caller's; the capture times draws only where the device resets its queries on
++    // the host, so `open` records no reset inside the render pass instance.
++    let opened = unsafe { open(st, cb, &capture, state, unit) };
++    if let Some(raw) = state.raws.get_mut(&cb.as_raw()) {
++        raw.draw_open = opened;
++    }
++}
++
+ /// Before a draw on `cb`: counted in its render pass instance, or the one that executes it.
+ pub(crate) fn draw(cb: vk::CommandBuffer) {
+     if LIVE.load(Ordering::Relaxed) == 0 {
+@@ -946,6 +1075,7 @@ macro_rules! hook {
+     };
+     (before cmd_execute_commands, $st:expr, $cb:ident, $count:ident, $buffers:ident) => {
+         if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::draws_end($st, $cb) };
+             unsafe { $crate::pass_times::execute($cb, $count, $buffers) }
+         }
+     };
+@@ -956,17 +1086,38 @@ macro_rules! hook {
+             }
+         }
+     };
+-    (before cmd_draw, $st:expr, $cb:ident $(, $a:ident)*) => {
+-        $crate::pass_times::hook!(@draw $cb)
++    (before cmd_draw, $st:expr, $cb:ident, $v:ident, $i:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw_at $st, $cb, "draw", $v, $i)
+     };
+-    (before cmd_draw_indexed, $st:expr, $cb:ident $(, $a:ident)*) => {
+-        $crate::pass_times::hook!(@draw $cb)
++    (before cmd_draw_indexed, $st:expr, $cb:ident, $v:ident, $i:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw_at $st, $cb, "indexed", $v, $i)
+     };
+-    (before cmd_draw_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
+-        $crate::pass_times::hook!(@draw $cb)
++    (before cmd_draw_indirect, $st:expr, $cb:ident, $b:ident, $o:ident, $n:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw_at $st, $cb, "indirect", $n, 0)
+     };
+-    (before cmd_draw_indexed_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
+-        $crate::pass_times::hook!(@draw $cb)
++    (before cmd_draw_indexed_indirect, $st:expr, $cb:ident, $b:ident, $o:ident, $n:ident $(, $a:ident)*) => {
++        $crate::pass_times::hook!(@draw_at $st, $cb, "indexed-indirect", $n, 0)
++    };
++    (before cmd_bind_pipeline, $st:expr, $cb:ident, $point:ident, $pipeline:ident) => {
++        if $crate::pass_times::on() && $point == ash::vk::PipelineBindPoint::GRAPHICS {
++            $crate::pass_times::draw_state($cb, Some(ash::vk::Handle::as_raw($pipeline)), None)
++        }
++    };
++    (before cmd_set_scissor, $st:expr, $cb:ident, $first:ident, $count:ident, $scissors:ident) => {
++        if $crate::pass_times::on() && $first == 0 && $count > 0 && !$scissors.is_null() {
++            // SAFETY: the command's: `count` rectangles at `scissors`.
++            let r = unsafe { *$scissors };
++            $crate::pass_times::draw_state(
++                $cb,
++                None,
++                Some([r.offset.x.into(), r.offset.y.into(), r.extent.width.into(), r.extent.height.into()]),
++            )
++        }
++    };
++    (before cmd_end_render_pass, $st:expr, $cb:ident) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::draws_end($st, $cb) }
++        }
+     };
+     (before cmd_draw_mesh_tasks, $st:expr, $cb:ident $(, $a:ident)*) => {
+         $crate::pass_times::hook!(@draw $cb)
+@@ -1021,6 +1172,11 @@ macro_rules! hook {
+             $crate::pass_times::draw($cb)
+         }
+     };
++    (@draw_at $st:expr, $cb:ident, $what:literal, $n:expr, $i:expr) => {
++        if $crate::pass_times::on() {
++            unsafe { $crate::pass_times::draw_at($st, $cb, $what, $n, $i) }
++        }
++    };
+     (@work $st:expr, $cb:ident, $class:ident, $name:literal) => {
+         if $crate::pass_times::on() {
+             unsafe { $crate::pass_times::work($st, $cb, $crate::pass_times::Class::$class, $name) }
+@@ -1122,6 +1278,7 @@ pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
+             _ => "-".to_owned(),
+         };
+         let kind = match (unit.class, unit.tag) {
++            (Class::Draw, _) => "draw".to_owned(),
+             (Class::Pass, Some(Tag::Pass(PassAt::Resolve))) => "render-pass-resolve".to_owned(),
+             (Class::Pass, Some(Tag::Pass(_))) => "render-pass".to_owned(),
+             (Class::Pass, _) => {
+@@ -1150,10 +1307,13 @@ pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
+                 None => format!("internal:{}", unit.command),
+             },
+         };
+-        let attachments = unit
+-            .label
+-            .as_ref()
+-            .map_or_else(|| "-".to_owned(), PassLabel::format);
++        let attachments = match &unit.note {
++            Some(note) => note.replace(',', ";"),
++            None => unit
++                .label
++                .as_ref()
++                .map_or_else(|| "-".to_owned(), PassLabel::format),
++        };
+         let split = match unit.tag {
+             _ if instance(unit) => {
+                 let n = totals.get(&unit.encoder).copied().unwrap_or(1);
+@@ -1180,6 +1340,12 @@ pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
+                 format!("{i}/{n}:{cause};{records}{not_inline}")
+             }
+             Some(Tag::Pass(PassAt::Resolve)) => "resolve".to_owned(),
++            _ if unit.class == Class::Draw => {
++                let parent = unit
++                    .parent
++                    .or_else(|| state.raws.get(&unit.raw).and_then(|r| r.parent));
++                parent.map_or_else(|| "in=?".to_owned(), |p| format!("in={p}"))
++            }
+             _ => "-".to_owned(),
+         };
+         let _ = writeln!(
+@@ -1195,3 +1361,65 @@ pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
+     drop(state);
+     capture.times.append(&out, lines);
+ }
++
++/// LOCAL (Atlas) diagnostic: the pipeline census, while the pass timer is on: one line per
++/// graphics pipeline made, appended to `<dir>/pipes-<pid>.csv` (its handle, which the draw units
++/// name, its color blend states, its pass's shape and its stages' SPIR-V digests), and each stage's
++/// SPIR-V written once to `<dir>/spv/<digest>.spv`.
++pub(crate) fn pipeline_made(
++    raw: vk::Pipeline,
++    blends: &[vk::PipelineColorBlendAttachmentState],
++    pass: &dyn std::fmt::Debug,
++    topology: &dyn std::fmt::Debug,
++    stages: &[(&str, &str, &[u32])],
++) {
++    let Some(dir) = dir() else {
++        return;
++    };
++    static OUT: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(Mutex::default);
++    static WRITTEN: LazyLock<Mutex<std::collections::HashSet<u64>>> = LazyLock::new(Mutex::default);
++    let fnv = |words: &[u32]| {
++        words.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, w| {
++            w.to_le_bytes()
++                .iter()
++                .fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
++        })
++    };
++    let mut line = format!("{:#x},{:?}", raw.as_raw(), topology);
++    line.push(',');
++    for (i, b) in blends.iter().enumerate() {
++        let _ = write!(
++            line,
++            "{}{i}:{}/m{:x}/{}-{}-{}/{}-{}-{}",
++            if i > 0 { "|" } else { "" },
++            b.blend_enable,
++            b.color_write_mask.as_raw(),
++            b.src_color_blend_factor.as_raw(),
++            b.dst_color_blend_factor.as_raw(),
++            b.color_blend_op.as_raw(),
++            b.src_alpha_blend_factor.as_raw(),
++            b.dst_alpha_blend_factor.as_raw(),
++            b.alpha_blend_op.as_raw(),
++        );
++    }
++    let _ = write!(line, ",{}", format!("{pass:?}").replace(',', ";").replace('\n', " "));
++    let spv = dir.join("spv");
++    for (stage, entry, words) in stages {
++        let digest = fnv(words);
++        let _ = write!(line, ",{stage}:{entry}:{digest:016x}");
++        if lock(&WRITTEN).insert(digest) {
++            let _ = std::fs::create_dir_all(&spv);
++            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++            let _ = std::fs::write(spv.join(format!("{digest:016x}.spv")), bytes);
++        }
++    }
++    line.push('\n');
++    let mut out = lock(&OUT);
++    if out.is_none() {
++        let path = dir.join(format!("pipes-{}.csv", std::process::id()));
++        *out = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
++    }
++    if let Some(file) = out.as_mut() {
++        let _ = file.write_all(line.as_bytes());
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+index 9e061710..ec4d5eee 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -1233,6 +1233,25 @@ impl VariantObjects {
+         shared.counts.driver_diagnostics_withheld(withheld);
+         let (raw, linked) = created?;
+         let created_in = started.elapsed();
++        // LOCAL (Atlas) diagnostic: the pipeline census (`pass_times.rs`).
++        if crate::pass_times::on() {
++            let stages: Vec<(&str, &str, &[u32])> = content
++                .stages
++                .iter()
++                .filter_map(|s| pipeline.stages.get(s.at))
++                .map(|m| {
++                    let stage = if m.stage == metal2vulkan::vk::ShaderStage::VERTEX {
++                        "vs"
++                    } else if m.stage == metal2vulkan::vk::ShaderStage::FRAGMENT {
++                        "fs"
++                    } else {
++                        "other"
++                    };
++                    (stage, m.entry_point.as_str(), &m.spirv[..])
++                })
++                .collect();
++            crate::pass_times::pipeline_made(raw, &content.blends, &key.pass, &key.topology, &stages);
++        }
+         let kept_at = split.then(std::time::Instant::now);
+         if content.blend_flags.contains(
+             vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT,

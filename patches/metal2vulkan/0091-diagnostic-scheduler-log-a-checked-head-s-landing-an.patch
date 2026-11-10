@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 11:26:16 +0000
+Subject: [PATCH 91/92] diagnostic: scheduler log: a checked head's landing and
+ unknown event waits apart
+
+---
+ crates/metal2vulkan-runtime/src/sched_log.rs     | 12 +++++++-----
+ crates/metal2vulkan-runtime/src/scheduler/mod.rs | 10 +++++++---
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/sched_log.rs b/crates/metal2vulkan-runtime/src/sched_log.rs
+index 8cc8fc35..0cd4bf92 100644
+--- a/crates/metal2vulkan-runtime/src/sched_log.rs
++++ b/crates/metal2vulkan-runtime/src/sched_log.rs
+@@ -32,17 +32,17 @@ static TABLE: Mutex<Option<Table>> = Mutex::new(None);
+ 
+ /// Per logical queue, per reason bit (`scheduler::HeldFor` as bits, bit 7 a host-held event
+ /// wait): batches held, their held nanoseconds, the most.
+-type Holds = HashMap<u64, [(u64, u64, u64); 8]>;
++type Holds = HashMap<u64, [(u64, u64, u64); 10]>;
+ 
+ static HOLDS: Mutex<Option<Holds>> = Mutex::new(None);
+ 
+ /// A batch of logical queue `queue` held for `reasons` (bits) went after `nanos`.
+-pub(crate) fn held(queue: u64, reasons: u8, nanos: u64) {
++pub(crate) fn held(queue: u64, reasons: u16, nanos: u64) {
+     if !on() {
+         return;
+     }
+     let Ok(mut holds) = HOLDS.lock() else { return };
+-    let row = holds.get_or_insert_with(HashMap::new).entry(queue).or_insert([(0, 0, 0); 8]);
++    let row = holds.get_or_insert_with(HashMap::new).entry(queue).or_insert([(0, 0, 0); 10]);
+     for (bit, cell) in row.iter_mut().enumerate() {
+         if reasons & (1 << bit) != 0 {
+             cell.0 += 1;
+@@ -52,8 +52,10 @@ pub(crate) fn held(queue: u64, reasons: u8, nanos: u64) {
+     }
+ }
+ 
+-const REASONS: [&str; 8] =
+-    ["binary", "reencode", "decode", "hoststep", "check", "event", "earlier", "event-host"];
++const REASONS: [&str; 10] = [
++    "binary", "reencode", "decode", "hoststep", "check", "event", "earlier", "event-host",
++    "check-landing", "check-unknown",
++];
+ static LAST: AtomicU64 = AtomicU64::new(0);
+ 
+ /// The scheduler began submitting the first batch of a command buffer of logical queue `queue`
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 93cd9190..b5e50b3d 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -531,7 +531,7 @@ struct Held {
+     held_since: Option<u64>,
+     /// LOCAL (Atlas) diagnostic (`sched_log.rs`): each `HeldFor` a look found it held for, as a
+     /// bit; bit 7, an event wait held on the host for a submitted GPU signal to land.
+-    reasons: u8,
++    reasons: u16,
+ }
+ 
+ impl Held {
+@@ -539,7 +539,7 @@ impl Held {
+     /// noted at the first look that found it held at all, whatever the reason then. Nothing is
+     /// read from the host's clock while nothing waits.
+     fn held_for(&mut self, reason: HeldFor) {
+-        self.reasons |= 1 << (reason as u8); // LOCAL (Atlas) diagnostic
++        self.reasons |= 1 << (reason as u16); // LOCAL (Atlas) diagnostic
+         (self.buffer.device().shared().counts).head_held_for(reason);
+         if self.held_since.is_none() {
+             self.held_since = Some(gpu_time::host_nanos());
+@@ -1740,12 +1740,16 @@ fn check_heads(state: &mut State, behind: &[u64], left: &mut Left<Work>, awaits:
+             return !due && goes(held);
+         }
+         match landing_waits(held) {
+-            None => return false,
++            None => {
++                held.reasons |= 1 << 9; // LOCAL (Atlas) diagnostic: a value no signal reaches yet
++                return false;
++            }
+             Some(waits) if !waits.is_empty() && !held.buffer.device().is_lost() => {
+                 awaits.events(&held.waits);
+                 fence(Ordering::SeqCst);
+                 if landing_waits(held).is_some_and(|waits| !waits.is_empty()) {
+                     (held.buffer.device().shared().counts).head_awaiting_check_signals();
++                    held.reasons |= 1 << 8; // LOCAL (Atlas) diagnostic: a GPU signal to land
+                     landing = true;
+                     return false;
+                 }

@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 21:46:20 +0000
+Subject: [PATCH 84/92] view_render_direct also for reinterpreted views: a view
+ whose every use is held in the image's own format is the image (A8 over R8)
+
+---
+ .../src/texture/view_shadow.rs                | 39 +++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 2dee1c90..a9aeb65e 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -130,6 +130,11 @@ impl Texture {
+                 if self.device().image_takes_view(base, record.pixel_format) {
+                     return Ok(Storage::Image(Arc::clone(base)));
+                 }
++                // LOCAL (Atlas), live `view_render_direct=1`: a view whose every use the device
++                // holds in the image's own format is the image itself (`same_bits`).
++                if crate::live::on("view_render_direct", false) && self.device().same_bits(base, record) {
++                    return Ok(Storage::Image(Arc::clone(base)));
++                }
+                 let shadow = self.device().new_view_shadow(
+                     call,
+                     base,
+@@ -305,6 +310,40 @@ impl Texture {
+ }
+ 
+ impl Device {
++    /// LOCAL (Atlas): whether every use of a view presenting `record` is held in `image`'s own
++    /// Vulkan format, so the view's texture may be the image itself, as a texture of the view's
++    /// pixel format made over it would be: an `A8Unorm` view of an `R8Unorm` image on a device
++    /// without `A8_UNORM`, whose sampled, storage and attachment forms are all `R8_UNORM` with
++    /// Metal's alpha in red (`FormatEmulation::AlphaInRed`). The image has each use's usage.
++    /// Liquid Glass's masks over the Sim screen took a shadow of the same bits, copied in and back
++    /// about 2400 times a second.
++    pub(super) fn same_bits(&self, image: &Image, record: &ViewRecord) -> bool {
++        use metal2vulkan::device::FormatUsage as U;
++        let plan = image.plan();
++        let profile = self.compile_device().profile();
++        let mut uses = Vec::new();
++        if record.usage.contains(TextureUsage::SHADER_READ) {
++            uses.push((U::SampledImage, ImageUsageFlags::SAMPLED));
++        }
++        if record.usage.contains(TextureUsage::SHADER_WRITE) {
++            uses.push((U::StorageImage, ImageUsageFlags::STORAGE));
++        }
++        if record.usage.contains(TextureUsage::RENDER_TARGET) {
++            uses.push((U::ColorAttachment, ImageUsageFlags::COLOR_ATTACHMENT));
++        }
++        if uses.is_empty() || record.alpha_reads_one || record.presented.rotation != 0 {
++            return false;
++        }
++        if !matches!(image.owner, Owner::Runtime { .. } | Owner::Caller(_) | Owner::HeapUnaliased(_)) {
++            return false;
++        }
++        uses.iter().all(|&(usage, flag)| {
++            plan.usage.contains(flag)
++                && metal2vulkan::metal::format::vk_format(record.pixel_format, &[usage].into(), profile)
++                    .is_ok_and(|m| m.format == plan.format)
++        })
++    }
++
+     /// Where a view presenting `record` of `image` (its texture's image, or the image a shadowed
+     /// view's texels are copied from) reads and writes the image in the image's own format (the
+     /// module docs): that format and the swizzle over its channels its bindings present the view

@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 14:00:39 +0000
+Subject: [PATCH 69/92] lab: surface_twin_make_once live switch (default off):
+ textures of a lazy surface made one at a time so a later one binds the first
+ shadow; diagnostic for a second first shadow
+
+---
+ crates/metal2vulkan-runtime/src/texture.rs    |  5 +++
+ .../src/texture/surface_twin.rs               | 41 +++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 834ee016..8486ee10 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2149,6 +2149,11 @@ impl Device {
+     ) -> Result<Texture, Error> {
+         let record = ViewRecord::of_descriptor(layout, descriptor);
+         let texels = Arc::new(texels);
++        // LOCAL (Atlas): live `surface_twin_make_once` (default off). Two textures of one lazy
++        // surface made at once both found no first shadow and made an image each, as the first is
++        // noted only once its image is made: two standings over one surface, whose traps race
++        // (`shadow_coherent::Coherent::tracks`). Made one at a time, the later binds the first.
++        let _making = surface_twin::making_one(&texels);
+         // LOCAL (Atlas): one image for a surface's bytes (`surface_twin.rs`).
+         if let Some(storage) = self.surface_twin(&texels, descriptor, layout) {
+             return Ok(Texture::made(self, storage, record, None, id_use));
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+index 14978604..d5471d16 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+@@ -30,6 +30,38 @@ use super::*;
+ /// The live switch.
+ const SWITCH: &str = "surface_twin";
+ 
++/// LOCAL (Atlas): held while a texture of a lazy surface is made, from the look for its first
++/// shadow to its own noting as one (`surface_twin_make_once`); `None` where it is not held.
++pub(super) struct Making(Option<std::sync::MutexGuard<'static, ()>>);
++
++impl Drop for Making {
++    fn drop(&mut self) {
++        if self.0.take().is_some() {
++            MAKING.with(|making| making.set(false));
++        }
++    }
++}
++
++thread_local! {
++    static MAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// LOCAL (Atlas): make textures of lazy surfaces one at a time (`surface_twin_make_once`); a
++/// texture made while this thread makes one (an attachment's twin) goes on as before.
++pub(super) fn making_one(texels: &Texels) -> Making {
++    static ONE: Mutex<()> = Mutex::new(());
++    if !crate::live::on("surface_twin_make_once", false)
++        || !texels.lies_lazily()
++        || texels.surface_key().is_none()
++        || MAKING.with(std::cell::Cell::get)
++    {
++        return Making(None);
++    }
++    let guard = ONE.lock().unwrap_or_else(|e| e.into_inner());
++    MAKING.with(|making| making.set(true));
++    Making(Some(guard))
++}
++
+ /// A surface's first shadow, weakly: it goes with its last texture.
+ struct First {
+     image: Weak<Image>,
+@@ -178,6 +210,15 @@ impl Device {
+         };
+         let mut twins = lock(&self.shared().textures.twins.0);
+         twins.retain(|_, first| first.texels.strong_count() > 0);
++        // LOCAL (Atlas, lab diagnostics): a second first shadow of one surface, made while the
++        // first was made (`surface_twin_make_once`).
++        if twins.contains_key(&key) {
++            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            if n < 16 {
++                eprintln!("m2v-twin-second-first: {key:?} extent {:?} ({} so far)", image.plan().extent, n + 1);
++            }
++        }
+         twins.entry(key).or_insert_with(|| First {
+             image: Arc::downgrade(image),
+             texels: Arc::downgrade(texels),

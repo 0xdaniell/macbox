@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:07:54 +0000
+Subject: [PATCH 12/13] apple-gfx-pci: WakeFifo doorbells through KVM
+ ioeventfds (x-ioeventfd, live switch)
+
+LOCAL (Atlas), ARCH experiment. A write of 0x1020 with FIFO id 1..8 is completed by KVM
+and signals that id's eventfd; a doorbell thread makes the same library call off the vCPU.
+Default off (APPLE_GFX_IOEVENTFD=1 turns it on at start); x-db-stats counts kicks/folds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/apple-gfx-pci.c | 164 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 164 insertions(+)
+
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index e2f1da1faa..ed0c00e2d0 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -35,6 +35,8 @@
+ #include "qapi/visitor.h"
+ #include "system/accel-irq.h"
+ #include "system/kvm.h"
++#include "qemu/thread.h"
++#include <poll.h>
+ #include "apple-gfx.h"
+ #include "trace.h"
+ 
+@@ -174,17 +176,167 @@ static void apple_gfx_pci_irq_realize(AppleGFXPCIIrq *irq)
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(AppleGFXPCIState, APPLE_GFX_PCI)
+ 
++/*
++ * LOCAL (Atlas), ARCH experiment: the WakeFifo doorbell (0x1020) through KVM
++ * ioeventfds.
++ *
++ * The guest's kext writes 0x1020 with the child FIFO's id after every command
++ * it queues (~100 per Sim frame). Each write was a full exit to QEMU's vCPU
++ * thread and a call into the library, which only queues a poke of that FIFO.
++ * With x-ioeventfd, KVM completes a write of id 1..APPLE_GFX_DB_IDS itself and
++ * signals that id's eventfd; this device's doorbell thread reads the eventfds
++ * and makes the same library call (rvg_device_mmio_write(0x1020, id)), off
++ * the vCPU. Doorbells that come while a poke is pending fold into one (the
++ * eventfd's counter): a poke makes the FIFO read its ring up to "written",
++ * so a folded doorbell loses nothing. Any other value still exits to QEMU.
++ *
++ * - x-ioeventfd (bool, default APPLE_GFX_IOEVENTFD=1 in the environment, else
++ *   off) can be set live with qom-set; off is the exit path exactly as before.
++ *   A doorbell signalled just before a switch off is still delivered: the
++ *   thread keeps polling the eventfds.
++ * - x-db-stats: "kicks=<n> folded=<n> attached=<0|1>" (kicks: library calls
++ *   from the thread; folded: doorbells that landed on a pending one).
++ */
++#define APPLE_GFX_DB_IDS 8
++#define APPLE_GFX_DB_OFFSET 0x1020
++
++typedef struct AppleGFXPCIDoorbell {
++    AppleGFXState *common;
++    MemoryRegion *mr;
++    bool wanted;        /* x-ioeventfd */
++    bool have_notifiers;
++    bool attached;      /* BQL: the eventfds are in KVM */
++    bool thread_started;
++    EventNotifier n[APPLE_GFX_DB_IDS];
++    QemuThread thread;
++    uint64_t kicks;     /* atomic */
++    uint64_t folded;    /* atomic */
++} AppleGFXPCIDoorbell;
++
++static void *apple_gfx_pci_db_thread(void *opaque)
++{
++    AppleGFXPCIDoorbell *db = opaque;
++    struct pollfd pfd[APPLE_GFX_DB_IDS];
++    int i;
++
++    for (i = 0; i < APPLE_GFX_DB_IDS; i++) {
++        pfd[i].fd = event_notifier_get_fd(&db->n[i]);
++        pfd[i].events = POLLIN;
++    }
++    for (;;) {
++        if (poll(pfd, APPLE_GFX_DB_IDS, -1) < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            error_report("apple-gfx: doorbell poll: %s", strerror(errno));
++            return NULL;
++        }
++        for (i = 0; i < APPLE_GFX_DB_IDS; i++) {
++            uint64_t count;
++            ssize_t r;
++
++            if (!(pfd[i].revents & POLLIN)) {
++                continue;
++            }
++            r = read(pfd[i].fd, &count, sizeof(count));
++            if (r != sizeof(count) || count == 0) {
++                continue;
++            }
++            qatomic_add(&db->folded, count - 1);
++            qatomic_inc(&db->kicks);
++            rvg_device_mmio_write(db->common->pgdev, APPLE_GFX_DB_OFFSET,
++                                  (uint64_t)(i + 1));
++        }
++    }
++    return NULL;
++}
++
++/* Under the BQL: attach or detach the eventfds as wanted. */
++static void apple_gfx_pci_db_sync(AppleGFXPCIDoorbell *db)
++{
++    bool want = db->wanted && db->have_notifiers && db->mr &&
++                kvm_enabled() && kvm_eventfds_enabled();
++    int i;
++
++    if (want == db->attached) {
++        return;
++    }
++    if (want && !db->thread_started) {
++        qemu_thread_create(&db->thread, "apple-gfx-db",
++                           apple_gfx_pci_db_thread, db, QEMU_THREAD_DETACHED);
++        db->thread_started = true;
++    }
++    memory_region_transaction_begin();
++    for (i = 0; i < APPLE_GFX_DB_IDS; i++) {
++        if (want) {
++            memory_region_add_eventfd(db->mr, APPLE_GFX_DB_OFFSET, 4, true,
++                                      i + 1, &db->n[i]);
++        } else {
++            memory_region_del_eventfd(db->mr, APPLE_GFX_DB_OFFSET, 4, true,
++                                      i + 1, &db->n[i]);
++        }
++    }
++    memory_region_transaction_commit();
++    db->attached = want;
++    info_report("apple-gfx: WakeFifo doorbells %s", want ?
++                "through KVM ioeventfds" : "back on vCPU exits");
++}
++
++static void apple_gfx_pci_db_realize(AppleGFXPCIDoorbell *db,
++                                     AppleGFXState *common)
++{
++    int i;
++
++    db->common = common;
++    db->mr = &common->iomem_gfx;
++    for (i = 0; i < APPLE_GFX_DB_IDS; i++) {
++        if (event_notifier_init(&db->n[i], 0) < 0) {
++            warn_report("apple-gfx: no eventfd for the doorbells");
++            while (--i >= 0) {
++                event_notifier_cleanup(&db->n[i]);
++            }
++            return;
++        }
++    }
++    db->have_notifiers = true;
++    apple_gfx_pci_db_sync(db);
++}
++
+ struct AppleGFXPCIState {
+     PCIDevice parent_obj;
+ 
+     AppleGFXState common;
+     AppleGFXPCIIrq irq;
++    AppleGFXPCIDoorbell db;
+     bool efi_fb_bar;
+     MemoryRegion efi_fb_bar_mr; /* BAR 2 */
+     MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
+ };
+ 
+ #define APPLE_GFX_PCI_EFI_FB_BAR_SIZE (64 << 20)
++
++static bool apple_gfx_pci_db_get(Object *obj, Error **errp)
++{
++    return APPLE_GFX_PCI(obj)->db.wanted;
++}
++
++static void apple_gfx_pci_db_set(Object *obj, bool value, Error **errp)
++{
++    AppleGFXPCIDoorbell *db = &APPLE_GFX_PCI(obj)->db;
++
++    db->wanted = value;
++    apple_gfx_pci_db_sync(db);
++}
++
++static char *apple_gfx_pci_db_stats(Object *obj, Error **errp)
++{
++    AppleGFXPCIDoorbell *db = &APPLE_GFX_PCI(obj)->db;
++
++    return g_strdup_printf("kicks=%" PRIu64 " folded=%" PRIu64
++                           " attached=%d", qatomic_read(&db->kicks),
++                           qatomic_read(&db->folded), db->attached);
++}
++
+ /* The library's page for the EFI registers: APV_PAGE_SHIFT in reims-vgpu */
+ #ifdef HOST_X86_64
+ #define APPLE_GFX_PCI_PAGE_SHIFT 12
+@@ -236,6 +388,14 @@ static void apple_gfx_pci_init(Object *obj)
+ 
+     apple_gfx_common_init(obj, &s->common, TYPE_APPLE_GFX_PCI);
+     apple_gfx_pci_irq_init(obj, &s->irq);
++    {
++        const char *env = getenv("APPLE_GFX_IOEVENTFD");
++
++        s->db.wanted = env && strcmp(env, "1") == 0;
++    }
++    object_property_add_bool(obj, "x-ioeventfd", apple_gfx_pci_db_get,
++                             apple_gfx_pci_db_set);
++    object_property_add_str(obj, "x-db-stats", apple_gfx_pci_db_stats, NULL);
+     object_property_add(obj, "x-halt-poll-ns", "int",
+                         apple_gfx_pci_get_halt_poll,
+                         apple_gfx_pci_set_halt_poll, NULL, NULL);
+@@ -323,6 +483,7 @@ static void apple_gfx_pci_mmio_written(AppleGFXState *common, hwaddr offset,
+ 
+ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+ {
++    ERRP_GUARD();
+     AppleGFXPCIState *s = APPLE_GFX_PCI(dev);
+     RvgHostCallbacks callbacks = {
+         .struct_size = sizeof(callbacks),
+@@ -380,6 +541,9 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+     apple_gfx_pci_irq_realize(&s->irq);
+ 
+     apple_gfx_common_realize(&s->common, DEVICE(dev), &config, errp);
++    if (!*errp && s->common.pgdev) {
++        apple_gfx_pci_db_realize(&s->db, &s->common);
++    }
+ }
+ 
+ static void apple_gfx_pci_reset(Object *obj, ResetType type)

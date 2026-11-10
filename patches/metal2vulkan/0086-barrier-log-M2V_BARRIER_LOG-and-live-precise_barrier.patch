@@ -1,0 +1,351 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 08:32:47 +0000
+Subject: [PATCH 86/92] barrier log (M2V_BARRIER_LOG) and live
+ precise_barriers: shadow runs between images and reach clears without the L3
+ flush
+
+---
+ .../metal2vulkan-runtime/src/barrier_log.rs   | 72 +++++++++++++++++++
+ .../metal2vulkan-runtime/src/clear_reach.rs   |  5 +-
+ .../src/command_buffer/mod.rs                 |  4 ++
+ .../src/command_buffer/submit.rs              | 10 +++
+ crates/metal2vulkan-runtime/src/encoder.rs    | 22 +++++-
+ crates/metal2vulkan-runtime/src/lib.rs        |  1 +
+ crates/metal2vulkan-runtime/src/tracker.rs    | 52 ++++++++++++++
+ .../metal2vulkan-runtime/src/work_counts.rs   | 26 +++++++
+ 8 files changed, 188 insertions(+), 4 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/barrier_log.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/barrier_log.rs b/crates/metal2vulkan-runtime/src/barrier_log.rs
+new file mode 100644
+index 00000000..0bfc7a7a
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/barrier_log.rs
+@@ -0,0 +1,72 @@
++//! LOCAL (Atlas) diagnostic: the barrier log, `M2V_BARRIER_LOG=1`. Counts each global memory
++//! barrier the runtime records through [`Barrier::record`](crate::tracker::Barrier) by the place
++//! that recorded it and its masks, and each barrier a batch's barrier command buffer carries as the
++//! batch is submitted (kept or recorded: `command_buffer/submit.rs`), and logs every 10 s the rates
++//! of the 30 most frequent, with the device's counts of command buffers begun by kind, submissions
++//! and finales. Unset (or `0`), each hook is one check of a `OnceLock`.
++
++use std::collections::HashMap;
++use std::panic::Location;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::Instant;
++
++/// Whether the log is on: read once.
++pub(crate) fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_BARRIER_LOG").is_ok_and(|v| !v.is_empty() && v != "0"))
++}
++
++/// The place, a label, and the masks: src stages, dst stages, src access, dst access.
++type Key = (&'static str, u32, &'static str, u64, u64, u64, u64);
++
++static TABLE: Mutex<Option<HashMap<Key, u64>>> = Mutex::new(None);
++
++fn start() -> Instant {
++    static START: OnceLock<Instant> = OnceLock::new();
++    *START.get_or_init(Instant::now)
++}
++
++/// Counts one barrier recorded or submitted at `site` (`label` says which).
++pub(crate) fn note(site: &'static Location<'static>, label: &'static str, masks: [u64; 4]) {
++    let _ = start();
++    let key = (site.file(), site.line(), label, masks[0], masks[1], masks[2], masks[3]);
++    if let Ok(mut table) = TABLE.lock() {
++        *table.get_or_insert_with(HashMap::new).entry(key).or_insert(0) += 1;
++    }
++}
++
++/// Logs the table and `counts` once 10 s passed since the last log; called on the scheduler's
++/// thread as batches are submitted.
++pub(crate) fn tick(counts: &crate::work_counts::Counters) {
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    let now = start().elapsed().as_millis() as u64;
++    let last = LAST.load(Ordering::Relaxed);
++    if now.saturating_sub(last) < 10_000
++        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
++    {
++        return;
++    }
++    let secs = (now - last).max(1) as f64 / 1000.0;
++    let rows: Vec<(Key, u64)> = match TABLE.lock() {
++        Ok(mut table) => table.take().map(|t| t.into_iter().collect()).unwrap_or_default(),
++        Err(_) => return,
++    };
++    let mut rows = rows;
++    rows.sort_by(|a, b| b.1.cmp(&a.1));
++    let total: u64 = rows.iter().map(|r| r.1).sum();
++    let mut text = format!(
++        "m2v barrier log: {:.0}/s barriers over {:.1} s; {}\n",
++        total as f64 / secs,
++        secs,
++        counts.barrier_log_line()
++    );
++    for ((file, line, label, ss, ds, sa, da), n) in rows.iter().take(30) {
++        let file = file.rsplit("src/").next().unwrap_or(file);
++        text += &format!(
++            "m2v barrier log:   {:8.0}/s {label} {file}:{line} src {ss:#x}/{sa:#x} dst {ds:#x}/{da:#x}\n",
++            *n as f64 / secs
++        );
++    }
++    eprint!("{text}");
++}
+diff --git a/crates/metal2vulkan-runtime/src/clear_reach.rs b/crates/metal2vulkan-runtime/src/clear_reach.rs
+index c6118d1f..76cb956a 100644
+--- a/crates/metal2vulkan-runtime/src/clear_reach.rs
++++ b/crates/metal2vulkan-runtime/src/clear_reach.rs
+@@ -752,7 +752,8 @@ impl ReachClears {
+             crate::work_counts::PoolCompiled::AttachmentClear,
+             clears.len() as u64,
+         );
+-        core.barrier(Barrier::everything());
++        // LOCAL (Atlas), live `precise_barriers`: the clears write attachments' images alone.
++        core.barrier(Barrier::everything_on_images());
+         core.command(
+             render_target::ATTACHMENT_STAGES,
+             &uses,
+@@ -796,7 +797,7 @@ impl ReachClears {
+                 }
+             },
+         );
+-        core.barrier(Barrier::everything());
++        core.barrier(Barrier::everything_on_images());
+         core.retain(clears);
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 3a0b2881..13e06af0 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -3781,6 +3781,10 @@ impl CommandBufferShared {
+             // and ended in its own recordings), and only this call records it, under the state
+             // lock; the slot's queries were reset by the batch's start, before it in submission
+             // order (`submit.rs`).
++            // LOCAL (Atlas) diagnostic: the barrier log's tick (`barrier_log.rs`).
++            if crate::barrier_log::on() {
++                crate::barrier_log::tick(&self.device.shared().counts);
++            }
+             unsafe {
+                 crate::batch_order::end(self.device.shared().by_ends).record(device, raw);
+                 if let Some((queries, first)) = stamp {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index c6fc03ce..4d59cc9b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1523,6 +1523,16 @@ impl CommandBufferShared {
+         stamps: Stamps,
+     ) -> Result<vk::CommandBuffer, CommandBufferError> {
+         let device = &self.device;
++        // LOCAL (Atlas) diagnostic: the barrier log (`barrier_log.rs`).
++        if crate::barrier_log::on() {
++            for barrier in barriers {
++                crate::barrier_log::note(std::panic::Location::caller(), "batch-cb", barrier.log_masks());
++            }
++            if barriers.is_empty() {
++                crate::barrier_log::note(std::panic::Location::caller(), "batch-cb-none", [0; 4]);
++            }
++            crate::barrier_log::tick(&device.shared().counts);
++        }
+         if transitions.is_empty() && !super::fences::ends_at_fence(device, at.queue) {
+             let taken = kept
+                 .take(device, at.queue, barriers, stamps.kept(), at.value)
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 25504a87..08ba2e43 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -731,6 +731,7 @@ impl EncoderCore {
+     }
+ 
+     /// Record a barrier the program asked for (a compute encoder's memory barriers).
++    #[track_caller] // LOCAL (Atlas) diagnostic: the barrier log names the caller (`barrier_log.rs`).
+     pub(super) fn barrier(&mut self, barrier: Barrier) {
+         let Some(raw) = self.recording() else {
+             return;
+@@ -1617,6 +1618,11 @@ impl EncoderCore {
+     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
+         let device = self.device().clone();
+         let mut run = ShadowRun::default();
++        // LOCAL (Atlas), live `precise_barriers`: a run whose copies are all between images takes
++        // `Barrier::everything_on_images` (no buffer's bytes, so no indirect arguments, are written).
++        run.images = copies
++            .iter()
++            .all(|copy| !matches!(copy.copies.source, crate::shadow::ShadowSource::Bytes { .. }));
+         // The keeps a dispatch at their copy in took, which record nothing.
+         let mut taken = Vec::new();
+         for (i, copy) in copies.iter().enumerate() {
+@@ -1675,7 +1681,7 @@ impl EncoderCore {
+             }
+         }
+         if run.recorded() {
+-            self.barrier(Barrier::everything());
++            self.barrier(run.barrier());
+         }
+     }
+ 
+@@ -1700,7 +1706,7 @@ impl EncoderCore {
+         let aliased = self.aliased(uses);
+         let tracked = aliased.as_deref().unwrap_or(uses);
+         if run.before(tracked, writes_truth) {
+-            self.barrier(Barrier::everything());
++            self.barrier(run.barrier());
+         }
+         let Some(raw) = self.recording() else {
+             return;
+@@ -2453,6 +2459,8 @@ struct ShadowRun {
+     fenced: bool,
+     /// Whether a copy was recorded in the run.
+     recorded: bool,
++    /// LOCAL (Atlas): whether every copy of the run is between images (`ShadowSource::Image`).
++    images: bool,
+ }
+ 
+ impl ShadowRun {
+@@ -2462,6 +2470,16 @@ impl ShadowRun {
+             since: Some(Vec::new()),
+             fenced: false,
+             recorded: false,
++            images: false,
++        }
++    }
++
++    /// LOCAL (Atlas): the run's barrier from everything before or to everything after:
++    /// `Barrier::everything_on_images` where every copy is between images, else `everything`.
++    fn barrier(&self) -> Barrier {
++        match self.images {
++            true => Barrier::everything_on_images(),
++            false => Barrier::everything(),
+         }
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 145f310a..4036c1c7 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -165,6 +165,7 @@ mod noted_apart;
+ mod owned_kernel;
+ // LOCAL (Atlas) diagnostic: the pass timer (M2V_PASS_TIMES).
+ mod pass_times;
++mod barrier_log; // LOCAL (Atlas) diagnostic: M2V_BARRIER_LOG
+ mod pending_dispatch;
+ mod pipeline;
+ mod pixel_format_info;
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index d32cb2ca..49da39c2 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -411,6 +411,43 @@ impl Barrier {
+         }
+     }
+ 
++    /// LOCAL (Atlas), live `precise_barriers=1` (default off): [`everything`](Barrier::everything)
++    /// in the access types device commands perform, for a run of commands that write images alone
++    /// (a shadow's copies between images, `encoder.rs`; a pass's reach clears, `clear_reach.rs`):
++    /// every write a device command makes (shader, attachment, transfer) before every access of
++    /// every later command but a read of indirect arguments, which lie in a buffer; no `MEMORY_*`
++    /// mask, and so none of the host's, whose accesses a queue submission and the timeline's
++    /// signal order. Where the switch is off, `everything` itself. On ANV before Gfx20 a
++    /// `MEMORY_WRITE` on either side or an `INDIRECT_COMMAND_READ` is a flush of the whole L3
++    /// (`anv_pipe_flush_bits_for_access_flags`, Mesa 26.2.4); cbbench, ARL, ANV 26.0.8, a
++    /// 1206x2622 pass a unit: no barrier 26.8 us, this one 28.2, `everything` 57.7.
++    pub(super) fn everything_on_images() -> Barrier {
++        if !crate::live::on("precise_barriers", false) {
++            return Barrier::everything();
++        }
++        const WRITES: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
++            vk::AccessFlags2::SHADER_WRITE.as_raw()
++                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw()
++                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
++                | vk::AccessFlags2::TRANSFER_WRITE.as_raw(),
++        );
++        const ACCESSES: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
++            WRITES.as_raw()
++                | vk::AccessFlags2::INDEX_READ.as_raw()
++                | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ.as_raw()
++                | vk::AccessFlags2::UNIFORM_READ.as_raw()
++                | vk::AccessFlags2::INPUT_ATTACHMENT_READ.as_raw()
++                | vk::AccessFlags2::SHADER_READ.as_raw()
++                | vk::AccessFlags2::COLOR_ATTACHMENT_READ.as_raw()
++                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ.as_raw()
++                | vk::AccessFlags2::TRANSFER_READ.as_raw(),
++        );
++        Barrier {
++            src: Access::new(vk::PipelineStageFlags2::ALL_COMMANDS, WRITES),
++            dst: Access::new(vk::PipelineStageFlags2::ALL_COMMANDS, ACCESSES),
++        }
++    }
++
+     /// LOCAL (Atlas): from a tile dispatch's copies into its scratch to the dispatch, which reads
+     /// and writes the scratch (`render/tile_writes.rs`).
+     pub(super) fn copied_to_dispatch() -> Barrier {
+@@ -489,7 +526,12 @@ impl Barrier {
+     ///
+     /// `command_buffer` is a command buffer of `device` in the recording state, and no other
+     /// thread records it.
++    #[track_caller]
+     pub(super) unsafe fn record(self, device: &Vk, command_buffer: vk::CommandBuffer) {
++        // LOCAL (Atlas) diagnostic: the barrier log (`barrier_log.rs`).
++        if crate::barrier_log::on() {
++            crate::barrier_log::note(std::panic::Location::caller(), "rec", self.log_masks());
++        }
+         let masks = self.legacy();
+         let barrier = vk::MemoryBarrier::default()
+             .src_access_mask(masks.src_access)
+@@ -508,6 +550,16 @@ impl Barrier {
+         }
+     }
+ 
++    /// LOCAL (Atlas) diagnostic: the masks the barrier log keys on (`barrier_log.rs`).
++    pub(crate) fn log_masks(self) -> [u64; 4] {
++        [
++            self.src.stages.as_raw(),
++            self.dst.stages.as_raw(),
++            self.src.access.as_raw(),
++            self.dst.access.as_raw(),
++        ]
++    }
++
+     fn add(&mut self, src: Access, dst: Access) {
+         self.src = self.src.union(src);
+         self.dst = self.dst.union(dst);
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 873d951e..f305652c 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -1236,6 +1236,32 @@ impl Counters {
+         self.instance_splits_by[cause as usize].fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    /// LOCAL (Atlas) diagnostic: the barrier log's line of counts (`barrier_log.rs`), totals so far.
++    pub(crate) fn barrier_log_line(&self) -> String {
++        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
++        let by: Vec<u64> = self.command_buffers_begun_by.iter().map(l).collect();
++        let ends: Vec<u64> = self.group_ends.iter().map(l).collect();
++        format!(
++            "totals: begun {} by [enc seg cont sec work bar kept int] {:?} submitted {} queue_submits {} infos {} \
++             grouped {} batches_grouped {} group_ends {:?} kept_bar {} finales folded {} apart {} \
++             bare_starts {} prefixed_starts {} command_barriers {}",
++            l(&self.command_buffers_begun),
++            by,
++            l(&self.command_buffers_submitted),
++            l(&self.queue_submissions),
++            l(&self.submit_infos),
++            l(&self.grouped_submissions),
++            l(&self.batches_grouped),
++            ends,
++            l(&self.barrier_buffers_kept),
++            l(&self.finales_folded),
++            l(&self.finales_apart),
++            l(&self.bare_starts),
++            l(&self.prefixed_starts),
++            l(&self.command_barriers),
++        )
++    }
++
+     /// A `VkCommandBuffer` was begun (`vkBeginCommandBuffer`) for `what`.
+     pub(crate) fn command_buffer_begun(&self, what: Begun) {
+         self.command_buffers_begun.fetch_add(1, Ordering::Relaxed);

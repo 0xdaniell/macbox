@@ -1,0 +1,953 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Fri, 6 Nov 2026 11:37:15 +0000
+Subject: [PATCH 43/92] lower independent queues' render calls on a bounded set
+ of lanes
+
+RenderLoweringPolicy::Worker lowered every queue's logged render calls on one
+thread per device, so busy Sims (one queue each, one VkDevice) serialized there.
+The device now lowers on up to lanes() threads (one per 4 host threads, 1..4).
+Each command queue takes a lane in turn at creation and keeps it; its slots are
+handed only to that lane, so one queue's slots are lowered one at a time in hand
+order as before. Only different lanes run at once, as AtCall's program threads
+of different queues already do. A lane's thread starts with its first slot.
+
+Unchanged: one device-wide QueuedCommits order and its single runner (binary
+semaphores and events of a later commit never pass an earlier one), slot
+ownership (queued/busy/draining), drains and settle. Per lane: the queue, its
+park/wake and the ENDS_IN_FLIGHT bound (no cross-Sim back-pressure). A panic on
+any lane, or a lane thread that fails to start, ends every lane: queued slots
+are left to their programs' drains, the lost slot refuses later drains. Teardown
+stops and joins every started lane (not one on its own thread). A kept slot
+still queued on another lane is not reused for an encoder of a different lane.
+
+Test (lavapipe, m2v_cpu_icd): two queues on different lanes, queue A's slot
+held so its lane waits inside it: queue B's batches and end are lowered while
+B's commit stays behind A's; a cross-queue event gates B's copy; pixels, word,
+per-queue handler order and status equal AtCall; a refused commit on A still
+lets A's signal and B complete; a work-counts drain with both lanes busy
+returns; teardown joins both. Negative control (all queues on lane 0) fails at
+the overlap check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/queue.rs      |  10 +
+ crates/metal2vulkan-runtime/src/render.rs     |   2 +
+ .../src/render/deferral.rs                    |  75 ++++-
+ .../src/render/lowering_worker.rs             | 260 +++++++++++++-----
+ .../src/tests/deferred_calls.rs               | 257 +++++++++++++++++
+ 5 files changed, 518 insertions(+), 86 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/queue.rs b/crates/metal2vulkan-runtime/src/queue.rs
+index c88c4f3f..d2e1869d 100644
+--- a/crates/metal2vulkan-runtime/src/queue.rs
++++ b/crates/metal2vulkan-runtime/src/queue.rs
+@@ -85,6 +85,9 @@ struct QueueShared {
+     id: u64,
+     /// The index of the device's `VkQueue` the queue submits to.
+     vk_queue: usize,
++    /// LOCAL (Atlas, DEEP-CPU): the lanes' turn its encoders' calls are lowered on under
++    /// `RenderLoweringPolicy::Worker` (`render/lowering_worker.rs`).
++    lowering_lane: usize,
+     label: Mutex<Option<String>>,
+     /// The slots its uncompleted command buffers hold.
+     slots: Arc<Slots>,
+@@ -275,6 +278,7 @@ impl Device {
+             device: self.clone(),
+             id,
+             vk_queue,
++            lowering_lane: self.shared().deferred.next_queue_lane(),
+             label: Mutex::new(None),
+             slots: Slots::new(count, Arc::clone(&self.shared().uncommitted)),
+             latest_gpu_end: Mutex::new(0),
+@@ -378,6 +382,12 @@ impl CommandQueue {
+         self.0.id
+     }
+ 
++    /// LOCAL (Atlas, DEEP-CPU): the lanes' turn its encoders' calls are lowered on
++    /// (`render/lowering_worker.rs`).
++    pub(crate) fn lowering_lane(&self) -> usize {
++        self.0.lowering_lane
++    }
++
+     /// The index of the device's `VkQueue` the queue submits to.
+     pub(super) fn vk_queue(&self) -> usize {
+         self.0.vk_queue
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 89c399b5..b933b575 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -426,6 +426,8 @@ use deferral::Logged;
+ pub(crate) use deferral::{lowering, DeferredEncoders, EndInFlight};
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ pub(crate) use deferral::{BATCH_CALLS, HANDED_BATCHES};
++#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
++pub(crate) use lowering_worker::lanes as lowering_lanes;
+ pub(crate) use inline_splits::SpareKept;
+ use replay::{
+     DrawIndexed, DrawIndexedIndirect, DrawIndexedPatches, DrawIndexedPatchesIndirect, DrawPatches,
+diff --git a/crates/metal2vulkan-runtime/src/render/deferral.rs b/crates/metal2vulkan-runtime/src/render/deferral.rs
+index 90023fbc..27ac4980 100644
+--- a/crates/metal2vulkan-runtime/src/render/deferral.rs
++++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
+@@ -78,6 +78,7 @@ use crate::replay::CallLog;
+ use metal2vulkan::device::RenderLoweringPolicy;
+ use std::collections::VecDeque;
+ use std::marker::PhantomData;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+ 
+ /// The calls of a batch (the module docs): few enough that the lowering thread starts on a pass's
+@@ -230,6 +231,9 @@ struct SlotState {
+     /// Batches lowered, their calls still held until the program's thread empties them as it
+     /// takes them to fill (the module docs).
+     lowered: Vec<Batch>,
++    /// LOCAL (Atlas, DEEP-CPU): the lane of its encoder's queue, which alone it is
++    /// handed to, and whose ends in flight its end counts among (`render/lowering_worker.rs`).
++    lane: usize,
+ }
+ 
+ /// What the lowering thread takes of a slot: a batch handed, or, once none is, the encoder's end
+@@ -295,13 +299,18 @@ impl SlotState {
+ /// command buffer, which the lowering held: for the caller to let go of once it holds none of the
+ /// slot's locks, since its drop may give the slot back (an end in flight the command buffer
+ /// held, `CommandBuffer::hold_end`).
+-fn end_lowering(lowerer: &mut Lowerer, at: u32, by_thread: bool) -> Option<CommandBuffer> {
++fn end_lowering(
++    lowerer: &mut Lowerer,
++    at: u32,
++    lane: usize,
++    by_thread: bool,
++) -> Option<CommandBuffer> {
+     let mut lowering = lowerer.lowering.take()?;
+     let command_buffer = lowering.core.command_buffer().clone();
+     let shared = lowering.core.device().shared();
+     shared.counts.render_log_end_lowered(by_thread);
+     if let Some(worker) = shared.deferred.started() {
+-        worker.end_done();
++        worker.end_done(lane);
+     }
+     // Judged as of its call, when no buffer of the device was detached.
+     lowering.core.judges_unattached(true);
+@@ -330,14 +339,14 @@ impl LoweringSlot {
+                     self.left_by_thread();
+                     return;
+                 };
+-                let turn = {
++                let (turn, lane) = {
+                     let mut state = lock(&self.state);
+                     let Some(turn) = state.next_turn() else {
+                         state.queued = false;
+                         return;
+                     };
+                     state.busy = true;
+-                    turn
++                    (turn, state.lane)
+                 };
+                 // A program that waits for room has it (`wait_for_room`).
+                 self.handed_back.notify_all();
+@@ -346,7 +355,7 @@ impl LoweringSlot {
+                     if let Some(batch) = &turn.batch {
+                         batch.lower(&mut lowerer, true);
+                     }
+-                    (turn.end).and_then(|at| end_lowering(&mut lowerer, at, true))
++                    (turn.end).and_then(|at| end_lowering(&mut lowerer, at, lane, true))
+                 });
+                 (turn, ended)
+             };
+@@ -417,7 +426,9 @@ impl LoweringSlot {
+         for batch in state.handed.iter().chain([&state.filling]) {
+             batch.lower(&mut lowerer, false);
+         }
+-        let ended = (state.ending.take()).and_then(|at| end_lowering(&mut lowerer, at, false));
++        let lane = state.lane;
++        let ended =
++            (state.ending.take()).and_then(|at| end_lowering(&mut lowerer, at, lane, false));
+         let then = then(&mut lowerer, &state.filling);
+         drop(lowerer);
+         let next = state.filling.next() + past;
+@@ -461,7 +472,7 @@ impl LoweringSlot {
+                 .as_ref()
+                 .map(|lowering| lowering.core.device().shared());
+             if let Some(worker) = shared.and_then(|shared| shared.deferred.started()) {
+-                worker.end_done();
++                worker.end_done(guard.lane);
+             }
+         }
+         let state = &mut *guard;
+@@ -491,14 +502,35 @@ impl LoweringSlot {
+ pub(crate) struct DeferredEncoders {
+     slots: Mutex<Vec<Arc<LoweringSlot>>>,
+     worker: OnceLock<Option<LoweringWorker>>,
++    /// LOCAL (Atlas, DEEP-CPU): the device's command queues made, which take the lowering lanes
++    /// in turn (`render/lowering_worker.rs`).
++    queues: AtomicUsize,
+ }
+ 
+ impl DeferredEncoders {
++    /// LOCAL (Atlas, DEEP-CPU): the lanes' turn of a command queue made now, which its
++    /// encoders' slots are handed to for the queue's life (`render/lowering_worker.rs`).
++    pub(crate) fn next_queue_lane(&self) -> usize {
++        self.queues.fetch_add(1, Ordering::Relaxed)
++    }
++
+     /// A slot for `lowering`'s encoder, which logs its calls, with its checks at the call: one
+     /// kept, its checks' room reused, else a new one.
+     fn take(&self, lowering: Box<RenderLowering>) -> Arc<LoweringSlot> {
++        let turn = lowering
++            .core
++            .command_buffer()
++            .command_queue()
++            .lowering_lane();
++        let lane = turn % super::lowering_worker::lanes();
+         let mut slots = lock(&self.slots);
+-        let kept = slots.iter().find(|slot| !lock(&slot.state).taken).cloned();
++        // LOCAL (Atlas, DEEP-CPU): not one still in another lane's queue, whose thread would
++        // lower this encoder's batches out of its queue's lane (`render/lowering_worker.rs`).
++        let free = |slot: &&Arc<LoweringSlot>| {
++            let state = lock(&slot.state);
++            !state.taken && (!state.queued || state.lane == lane)
++        };
++        let kept = slots.iter().find(free).cloned();
+         let slot = match kept {
+             Some(slot) => slot,
+             None => {
+@@ -515,6 +547,7 @@ impl DeferredEncoders {
+                         panicked: false,
+                         ending: None,
+                         lowered: Vec::new(),
++                        lane: 0,
+                     }),
+                     lowerer: Mutex::new(Lowerer {
+                         lowering: None,
+@@ -529,6 +562,7 @@ impl DeferredEncoders {
+         let mut state = lock(&slot.state);
+         state.taken = true;
+         drop(slots);
++        state.lane = lane;
+         state.checking = true;
+         match &mut state.checks {
+             Some(checks) => checks.reset(&lowering),
+@@ -588,6 +622,11 @@ impl DeferredEncoders {
+ /// validation crate's GPU safety cfgs alone).
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ impl DeferredEncoders {
++    /// LOCAL (Atlas, DEEP-CPU): the device's lowering threads, where they started.
++    pub(crate) fn started_for_test(&self) -> Option<&LoweringWorker> {
++        self.started()
++    }
++
+     /// The slots open encoders hold now.
+     pub(crate) fn taken(&self) -> Vec<Arc<LoweringSlot>> {
+         let slots = lock(&self.slots);
+@@ -610,6 +649,13 @@ impl LoweringSlot {
+     pub(crate) fn handed(&self) -> usize {
+         lock(&self.state).handed.len()
+     }
++
++    /// LOCAL (Atlas, DEEP-CPU): everything handed of the slot was lowered, its end included: no
++    /// batch handed or being lowered, and no end left to lower.
++    pub(crate) fn lowered_all(&self) -> bool {
++        let state = lock(&self.state);
++        !state.busy && state.handed.is_empty() && state.ending.is_none()
++    }
+ }
+ 
+ /// A program's encoder's slot, with the calls it logged and their checks (the module docs),
+@@ -789,9 +835,10 @@ impl RenderCommandEncoder {
+                 }
+                 let unqueued = state.hand_off();
+                 let full = state.handed.len() >= HANDED_BATCHES;
++                let lane = state.lane;
+                 drop(state);
+                 let worker = logged.device.shared().deferred.worker();
+-                if unqueued && !worker.is_some_and(|worker| worker.hand(slot)) {
++                if unqueued && !worker.is_some_and(|worker| worker.hand(slot, lane)) {
+                     lock(&slot.state).queued = false;
+                 }
+                 if full {
+@@ -855,9 +902,11 @@ impl RenderCommandEncoder {
+             let shared = command_buffer.device().shared();
+             shared.deferred.worker().filter(|worker| worker.runs())
+         });
+-        let checked = {
++        let (checked, lane) = {
+             let state = lock(&slot.state);
+-            state.checking && state.checks.as_ref().is_some_and(|c| !c.ends_at_call())
++            let checked =
++                state.checking && state.checks.as_ref().is_some_and(|c| !c.ends_at_call());
++            (checked, state.lane)
+         };
+         let shared = logged.device.shared();
+         let hands = checked && !shared.rebinds.any_detached_now() && !exit_guard::closed();
+@@ -865,7 +914,7 @@ impl RenderCommandEncoder {
+         if let Some((command_buffer, worker)) = handing {
+             // Room for the end among those in flight, without the slot's lock, which the thread
+             // takes to lower them (`render/lowering_worker.rs`).
+-            if worker.reserve_end() {
++            if worker.reserve_end(lane) {
+                 shared.counts.render_log_waited();
+             }
+             let mut state = lock(&slot.state);
+@@ -876,7 +925,7 @@ impl RenderCommandEncoder {
+             // finds it held (`CommandBuffer::end_lowered`).
+             command_buffer.hold_end(EndInFlight(logged));
+             drop(state);
+-            if unqueued && !worker.hand(&slot) {
++            if unqueued && !worker.hand(&slot, lane) {
+                 lock(&slot.state).queued = false;
+             }
+             return Ok(());
+diff --git a/crates/metal2vulkan-runtime/src/render/lowering_worker.rs b/crates/metal2vulkan-runtime/src/render/lowering_worker.rs
+index e39891d7..b3a91261 100644
+--- a/crates/metal2vulkan-runtime/src/render/lowering_worker.rs
++++ b/crates/metal2vulkan-runtime/src/render/lowering_worker.rs
+@@ -1,5 +1,15 @@
+-//! A device's lowering thread (`render/deferral.rs`): it lowers the batches of logged calls the
+-//! device's render encoders hand it, while the program goes on.
++//! A device's lowering threads (`render/deferral.rs`): they lower the batches of logged calls the
++//! device's render encoders hand them, while the program goes on.
++//!
++//! - **Lanes.** LOCAL (Atlas, DEEP-CPU): the device lowers on up to [`lanes`] threads, one per
++//!   lane. Each command queue keeps one lane for its life, the queues taking the lanes in turn as
++//!   they are made (`DeferredEncoders::next_queue_lane`), and its encoders' slots are handed to that
++//!   lane alone. So one queue's slots are lowered one at a time, in the order they were handed, as
++//!   on the single thread before; only slots of queues on different lanes are lowered at once, as
++//!   the program's threads of different queues lower theirs at once under
++//!   `RenderLoweringPolicy::AtCall`. A lane's thread starts with the first slot handed to it.
++//!   The commits that wait stay in the device's one commit order (`render/queued_commits.rs`),
++//!   whichever lane lowers their ends.
+ //!
+ //! - **Order.** It takes the slots it is handed in the order they were handed, and each slot's
+ //!   batches in the order the program logged them, one at a time: a slot's calls are lowered in
+@@ -15,16 +25,18 @@
+ //! - **A panic** while lowering ends the thread: the slot it was lowering refuses every later
+ //!   drain with that panic, on the program's thread, as the call would have panicked under
+ //!   `RenderLoweringPolicy::AtCall`, and from then on the program's threads lower every slot's
+-//!   calls themselves.
+-//! - **Ends bounded.** At most [`ENDS_IN_FLIGHT`] encoders' ends are handed to the thread and not
+-//!   yet lowered: the next waits in `end_encoding` until the thread lowers one
++//!   calls themselves: every lane leaves the slots waiting in it, takes no more, and its thread
++//!   ends once the slot it lowers, if any, is done. So does a lane whose thread fails to start.
++//! - **Ends bounded.** At most [`ENDS_IN_FLIGHT`] encoders' ends are handed to a lane and not
++//!   yet lowered: the next of that lane waits in `end_encoding` until its thread lowers one
+ //!   (`WorkCounts::render_log_waits`). So a program that outruns the thread holds that many
+ //!   encoders' logs, command buffers and the runtime's pools for them, not a queue's every command
+ //!   buffer, which the thread lowers without the program, so the wait ends.
+ //! - **Commits.** The device's commits that wait for its render encoders' ends lie here too
+ //!   (`render/queued_commits.rs`): the thread that lowers such an end runs them.
+-//! - **Started** with the device's first encoder that logs its calls, at the user-interactive
+-//!   class (`exit_guard::spawn_user_interactive`), as the threads command buffers' work waits for;
++//! - **Started**, the first lane's thread with the device's first encoder that logs its calls and
++//!   each other's with the first slot handed to it, at the user-interactive class
++//!   (`exit_guard::spawn_user_interactive`), as the threads command buffers' work waits for; all
+ //!   stopped and joined with the device (`DeviceShared`'s drop). No slot handed to it holds the
+ //!   device by then: an encoder holds its device until it ends or goes, and its slot lets go of
+ //!   its lowering then.
+@@ -36,78 +48,135 @@ use crate::exit_guard;
+ use crate::recorder::take_leaving_room;
+ use std::collections::VecDeque;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, Condvar, Mutex};
++use std::sync::{Arc, Condvar, Mutex, OnceLock};
+ 
+-/// The encoders' ends handed to the thread and not yet lowered at which the next end waits (the
+-/// module docs): a few passes' lead over the thread, enough to keep it busy while the program
+-/// encodes the next pass, each end holding at most its encoder's batches
++/// The encoders' ends handed to a lane and not yet lowered at which the lane's next end waits
++/// (the module docs): a few passes' lead over its thread, enough to keep it busy while the
++/// program encodes the next pass, each end holding at most its encoder's batches
+ /// (`render/deferral.rs`).
+ pub(crate) const ENDS_IN_FLIGHT: usize = 4;
+ 
+-/// The device's lowering thread (the module docs).
++/// The most lanes a device lowers on (the module docs).
++pub(crate) const MAX_LANES: usize = 4;
++
++/// LOCAL (Atlas, DEEP-CPU): the lanes a device lowers on, on a host of `threads` hardware
++/// threads: one for every four, one to [`MAX_LANES`]. Each lane's thread is busy only while its
++/// queues' programs outrun it, and the rest of the host's threads are left to those programs
++/// (Reims's task threads, a VM's virtual CPUs) and to the device's scheduler and handlers.
++pub(crate) fn lanes_for(threads: usize) -> usize {
++    (threads / 4).clamp(1, MAX_LANES)
++}
++
++/// The lanes of this process's devices: [`lanes_for`] of the host's hardware threads, read once.
++pub(crate) fn lanes() -> usize {
++    static LANES: OnceLock<usize> = OnceLock::new();
++    *LANES.get_or_init(|| {
++        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
++        lanes_for(threads)
++    })
++}
++
++/// The device's lowering threads (the module docs).
+ pub(crate) struct LoweringWorker {
+     shared: Arc<WorkerShared>,
+-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
++    /// The lanes' threads started, to join.
++    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+ }
+ 
+-/// What the thread and the encoders that hand it their slots share.
++/// What the threads and the encoders that hand them their slots share.
+ struct WorkerShared {
+-    queue: Mutex<Queue>,
+-    wake: Condvar,
+-    /// The thread ended by a panic (the module docs).
++    lanes: Box<[Lane]>,
++    /// A thread ended by a panic, or one failed to start: no lane lowers (the module docs).
+     ended: AtomicBool,
+     /// The device's commits that wait for its render encoders' ends (the module docs).
+     commits: QueuedCommits,
+-    /// The ends handed to the thread, or about to be, and not yet lowered (the module docs).
++}
++
++/// A lane: its queue of slots, its thread's wake and its ends in flight (the module docs).
++struct Lane {
++    queue: Mutex<Queue>,
++    wake: Condvar,
++    /// The ends handed to the lane, or about to be, and not yet lowered.
+     ends: Mutex<usize>,
+     /// Signalled as one of them is lowered.
+     end_lowered: Condvar,
+ }
+ 
+ struct Queue {
+-    /// The slots handed to the thread, in order.
++    /// The slots handed to the lane, in order.
+     slots: VecDeque<Arc<LoweringSlot>>,
+-    /// The thread waits for a slot.
++    /// Its thread waits for a slot.
+     parked: bool,
++    /// Its thread was started.
++    started: bool,
+     /// The device is torn down: the thread ends.
+     stop: bool,
+ }
+ 
+ impl LoweringWorker {
+-    /// The device's lowering thread, started now; `None` where the host starts no thread, where
+-    /// the program's threads lower every logged call at their drains.
++    /// The device's lowering threads, the first lane's started now; `None` where the host starts
++    /// no thread, where the program's threads lower every logged call at their drains.
+     pub(super) fn start() -> Option<LoweringWorker> {
+-        let shared = Arc::new(WorkerShared {
++        let lanes = (0..lanes()).map(|_| Lane {
+             queue: Mutex::new(Queue {
+                 slots: VecDeque::new(),
+                 parked: false,
++                started: false,
+                 stop: false,
+             }),
+             wake: Condvar::new(),
+-            ended: AtomicBool::new(false),
+-            commits: QueuedCommits::new(),
+             ends: Mutex::new(0),
+             end_lowered: Condvar::new(),
+         });
+-        let running = Arc::clone(&shared);
++        let worker = LoweringWorker {
++            shared: Arc::new(WorkerShared {
++                lanes: lanes.collect(),
++                ended: AtomicBool::new(false),
++                commits: QueuedCommits::new(),
++            }),
++            threads: Mutex::new(Vec::new()),
++        };
++        lock(&worker.shared.lanes[0].queue).started = true;
++        worker.spawn(0).then_some(worker)
++    }
++
++    /// Start lane `lane`'s thread: whether it started.
++    fn spawn(&self, lane: usize) -> bool {
++        let running = Arc::clone(&self.shared);
+         let builder = std::thread::Builder::new().name("metal2vulkan-lowering".to_owned());
+-        let thread = exit_guard::spawn_user_interactive(builder, move || running.run()).ok()?;
+-        Some(LoweringWorker {
+-            shared,
+-            thread: Mutex::new(Some(thread)),
+-        })
++        match exit_guard::spawn_user_interactive(builder, move || running.run(lane)) {
++            Ok(thread) => {
++                lock(&self.threads).push(thread);
++                true
++            }
++            Err(_) => false,
++        }
++    }
++
++    /// The lane of the queue that took the lanes' turn `turn` (the module docs).
++    fn lane(&self, turn: usize) -> &Lane {
++        &self.shared.lanes[turn % self.shared.lanes.len()]
+     }
+ 
+-    /// Hand `slot`, which has batches handed and is in no queue, to the thread: whether it takes
+-    /// it (it has not ended).
+-    pub(super) fn hand(&self, slot: &Arc<LoweringSlot>) -> bool {
+-        let mut queue = lock(&self.shared.queue);
++    /// Hand `slot`, which has batches handed and is in no queue, to lane `turn`'s thread (the
++    /// module docs), started now where it was not: whether the lane takes it (no thread ended).
++    pub(super) fn hand(&self, slot: &Arc<LoweringSlot>, turn: usize) -> bool {
++        let lane = self.lane(turn);
++        let mut queue = lock(&lane.queue);
+         if self.shared.ended.load(Ordering::Acquire) {
+             return false;
+         }
+         queue.slots.push_back(Arc::clone(slot));
+         if queue.parked {
+-            self.shared.wake.notify_one();
++            lane.wake.notify_one();
++        }
++        let starts = !queue.started;
++        queue.started = true;
++        drop(queue);
++        if starts && !self.spawn(turn % self.shared.lanes.len()) {
++            // No lane lowers from now on: the slot, and every other waiting, is the program's.
++            self.shared.abandon(None);
++            return false;
+         }
+         true
+     }
+@@ -117,15 +186,16 @@ impl LoweringWorker {
+         &self.shared.commits
+     }
+ 
+-    /// Room for an end to hand to the thread (the module docs): wait while [`ENDS_IN_FLIGHT`]
+-    /// ends are handed and not lowered, unless the thread ended or the process exits. Whether
+-    /// the caller waited.
+-    pub(super) fn reserve_end(&self) -> bool {
+-        let mut ends = lock(&self.shared.ends);
++    /// Room for an end to hand to lane `turn` (the module docs): wait while [`ENDS_IN_FLIGHT`]
++    /// ends are handed to it and not lowered, unless a thread ended or the process exits.
++    /// Whether the caller waited.
++    pub(super) fn reserve_end(&self, turn: usize) -> bool {
++        let lane = self.lane(turn);
++        let mut ends = lock(&lane.ends);
+         let mut waited = false;
+         while *ends >= ENDS_IN_FLIGHT && self.runs() && !exit_guard::closed() {
+             waited = true;
+-            ends = (self.shared.end_lowered.wait_timeout(ends, exit_guard::WAKE))
++            ends = (lane.end_lowered.wait_timeout(ends, exit_guard::WAKE))
+                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                 .0;
+         }
+@@ -133,51 +203,70 @@ impl LoweringWorker {
+         waited
+     }
+ 
+-    /// An end [`reserve_end`](Self::reserve_end) made room for was lowered, or will never be:
+-    /// room for the next.
+-    pub(super) fn end_done(&self) {
+-        let mut ends = lock(&self.shared.ends);
++    /// An end [`reserve_end`](Self::reserve_end) of lane `turn` made room for was lowered, or
++    /// will never be: room for the next.
++    pub(super) fn end_done(&self, turn: usize) {
++        let lane = self.lane(turn);
++        let mut ends = lock(&lane.ends);
+         debug_assert!(*ends > 0, "an end lowered that was not handed");
+-        *ends -= 1;
++        *ends = ends.saturating_sub(1);
+         drop(ends);
+-        self.shared.end_lowered.notify_one();
++        lane.end_lowered.notify_one();
+     }
+ 
+-    /// Whether the thread lowers what it is handed: it has not ended.
++    /// Whether the threads lower what they are handed: none ended.
+     pub(super) fn runs(&self) -> bool {
+         !self.shared.ended.load(Ordering::Acquire)
+     }
+ 
+-    /// End the thread and wait for it, as the device is torn down.
++    /// End the threads and wait for them, as the device is torn down. Not one on its own thread
++    /// (a device whose last handle went there), which ends as it returns.
+     pub(super) fn stop(&self) {
+-        lock(&self.shared.queue).stop = true;
+-        self.shared.wake.notify_one();
+-        if let Some(thread) = lock(&self.thread).take() {
+-            let _ = thread.join();
++        for lane in &self.shared.lanes {
++            lock(&lane.queue).stop = true;
++            lane.wake.notify_all();
+         }
++        let threads = std::mem::take(&mut *lock(&self.threads));
++        let me = std::thread::current().id();
++        for thread in threads {
++            if thread.thread().id() != me {
++                let _ = thread.join();
++            }
++        }
++    }
++}
++
++/// A device test's view of the lanes (`tests::deferred_calls`).
++#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
++impl LoweringWorker {
++    /// The lanes' threads started so far.
++    pub(crate) fn threads_started(&self) -> usize {
++        lock(&self.threads).len()
+     }
+ }
+ 
+ impl WorkerShared {
+-    /// The thread's loop: each slot handed lowered, until [`LoweringWorker::stop`].
+-    fn run(&self) {
++    /// Lane `lane`'s thread's loop: each slot handed lowered, until [`LoweringWorker::stop`], or
++    /// until a thread ended (the module docs).
++    fn run(&self, lane: usize) {
+         let mut running = Running {
+             shared: self,
+             slot: None,
+         };
++        let lane = &self.lanes[lane];
+         loop {
+             let slot = {
+-                let mut queue = lock(&self.queue);
++                let mut queue = lock(&lane.queue);
+                 loop {
++                    if queue.stop || self.ended.load(Ordering::Acquire) {
++                        return;
++                    }
+                     if let Some(slot) = take_leaving_room(&mut queue.slots) {
+                         break slot;
+                     }
+-                    if queue.stop {
+-                        return;
+-                    }
+                     queue.parked = true;
+                     queue =
+-                        (self.wake.wait(queue)).unwrap_or_else(std::sync::PoisonError::into_inner);
++                        (lane.wake.wait(queue)).unwrap_or_else(std::sync::PoisonError::into_inner);
+                     queue.parked = false;
+                 }
+             };
+@@ -188,9 +277,32 @@ impl WorkerShared {
+             running.slot = None;
+         }
+     }
++
++    /// No lane lowers from now on (the module docs): each leaves the slots waiting in it, which
++    /// their programs' threads lower at their drains, `lost` (the slot a panic unwound) refusing
++    /// every later drain. A lane's thread that lowers a slot now goes on with it, then ends.
++    fn abandon(&self, lost: Option<&LoweringSlot>) {
++        // Before the lanes are swept: a hand after the sweep of its lane finds it set.
++        self.ended.store(true, Ordering::Release);
++        let mut waiting: Vec<Arc<LoweringSlot>> = Vec::new();
++        for lane in &self.lanes {
++            let mut queue = lock(&lane.queue);
++            waiting.extend(queue.slots.drain(..));
++            lane.wake.notify_all();
++            drop(queue);
++            // A program that waits for room for an end has it now (`reserve_end`).
++            lane.end_lowered.notify_all();
++        }
++        if let Some(slot) = lost {
++            slot.lost_to_panic();
++        }
++        for slot in waiting {
++            slot.left_by_thread();
++        }
++    }
+ }
+ 
+-/// The thread's loop as it runs: a panic that unwinds it ends the thread (the module docs).
++/// A lane's loop as it runs: a panic that unwinds it ends every lane (the module docs).
+ struct Running<'a> {
+     shared: &'a WorkerShared,
+     /// The slot it lowers now.
+@@ -202,16 +314,18 @@ impl Drop for Running<'_> {
+         if !std::thread::panicking() {
+             return;
+         }
+-        let waiting: Vec<Arc<LoweringSlot>> = {
+-            let mut queue = lock(&self.shared.queue);
+-            self.shared.ended.store(true, Ordering::Release);
+-            queue.slots.drain(..).collect()
+-        };
+-        if let Some(slot) = &self.slot {
+-            slot.lost_to_panic();
+-        }
+-        for slot in waiting {
+-            slot.left_by_thread();
+-        }
++        self.shared.abandon(self.slot.as_deref());
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{lanes_for, MAX_LANES};
++
++    /// One lane for every four hardware threads, at least one and at most [`MAX_LANES`].
++    #[test]
++    fn lanes_follow_the_hosts_threads_within_their_bound() {
++        let lanes: Vec<usize> = [0, 1, 4, 7, 8, 12, 16, 20, 64].map(lanes_for).into();
++        assert_eq!(lanes, [1, 1, 1, 1, 2, 3, 4, MAX_LANES, MAX_LANES]);
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs b/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs
+index 6c905701..d08ccc0d 100644
+--- a/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs
++++ b/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs
+@@ -1096,3 +1096,260 @@ fn a_commit_whose_own_work_fails_completes_with_the_refusal() {
+         assert_eq!(commits, 2, "{counts:?}");
+     }
+ }
++
++/// What [`two_queues`] reads: the pass of each queue's words, the word queue B's command buffer
++/// copied after it waited for queue A's event, the completed handlers in the order they ran on
++/// each queue (queue A's first), and
++/// the passes' command buffers' statuses and errors.
++type TwoQueues = (
++    Vec<u32>,
++    Vec<u32>,
++    Vec<u32>,
++    Vec<&'static str>,
++    [(CommandBufferStatus, Option<CommandBufferError>); 2],
++);
++
++/// LOCAL (Atlas, DEEP-CPU): the two queues' work of
++/// [`independent_queues_lower_at_once_and_keep_the_commit_order`] on `device`, which lowers as
++/// `policy` says; `refuse` injects an out of memory into the commit work of queue A's pass. Under
++/// Worker, with queue A's slot's lowering held so its lane's thread waits inside it: queue B's
++/// batches and end are lowered (by its own lane: nothing else lowers them), while its commit waits
++/// behind queue A's, and a read of the work counts made meanwhile on another thread returns once
++/// the hold ends.
++fn two_queues(device: &Device, policy: RenderLoweringPolicy, refuse: bool) -> TwoQueues {
++    let state = rectangle_state(device);
++    let lanes = crate::render::lowering_lanes();
++    let qa = device.new_command_queue().unwrap();
++    let mut qb = device.new_command_queue().unwrap();
++    while qb.lowering_lane() % lanes == qa.lowering_lane() % lanes {
++        qb = device.new_command_queue().unwrap();
++    }
++    let order = Arc::new(Mutex::new(Vec::new()));
++    let handler = |name: &'static str| {
++        let ran = Arc::clone(&order);
++        Box::new(move |_: &CommandBuffer| ran.lock().unwrap().push(name))
++    };
++    let (ta, tb) = (target(device), target(device));
++    let word = device.new_buffer(4, ResourceOptions::shared()).unwrap();
++    let copied = device.new_buffer(4, ResourceOptions::shared()).unwrap();
++    let event = device.new_shared_event().unwrap();
++    // Queue A: its pass, held under Worker.
++    let pass_a = qa.command_buffer().unwrap();
++    let mut ea = pass_a.render_command_encoder(&pass(&ta)).unwrap();
++    let held = match policy {
++        RenderLoweringPolicy::Worker => {
++            let slots = device.shared().deferred.taken();
++            let [slot] = &slots[..] else {
++                panic!("{} encoders' slots taken, not one", slots.len());
++            };
++            Some(Arc::clone(slot))
++        }
++        _ => None,
++    };
++    let color_b = bytes_of(&[1.0f32, 0.0, 0.0, 1.0], f32::to_le_bytes);
++    // Queue A's pass in one batch, handed at its end, which its lane takes and waits in; queue
++    // B's in several, its lane lowering each and the end.
++    let (draws_a, draws_b) = (4, BATCH_CALLS);
++    let encode = || {
++        rectangle(&state, &mut ea);
++        ea.set_fragment_bytes(&bytes_of(&COLOR, f32::to_le_bytes), 0)
++            .unwrap();
++        for _ in 0..draws_a {
++            ea.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++                .unwrap();
++        }
++        ea.end_encoding().unwrap();
++        pass_a.add_completed_handler(handler("a")).unwrap();
++        if refuse {
++            pass_a.fail_commit_work(2);
++        }
++        if let Some(slot) = &held {
++            // Its lane's thread took the pass's batches and waits for the held lowering.
++            until("queue A's lane takes the held slot", || slot.handed() == 0);
++        }
++        pass_a.commit().unwrap();
++        // Queue A, behind its pass: a fill, then the event queue B waits for.
++        let signal = qa.command_buffer().unwrap();
++        let mut fill = signal.blit_command_encoder().unwrap();
++        fill.fill_buffer(&word, 0..4, 0x5a).unwrap();
++        fill.end_encoding().unwrap();
++        signal
++            .encode_signal_event(EventRef::from(&event), 1)
++            .unwrap();
++        signal.add_completed_handler(handler("a-signal")).unwrap();
++        signal.commit().unwrap();
++        // Queue B: waits for queue A's event, copies the word, then its own pass.
++        let pass_b = qb.command_buffer().unwrap();
++        pass_b
++            .encode_wait_for_event(EventRef::from(&event), 1)
++            .unwrap();
++        let mut copy = pass_b.blit_command_encoder().unwrap();
++        copy.copy_from_buffer_to_buffer(&word, 0, &copied, 0, 4)
++            .unwrap();
++        copy.end_encoding().unwrap();
++        let mut eb = pass_b.render_command_encoder(&pass(&tb)).unwrap();
++        let slot_b = held.as_ref().map(|held| {
++            let slots = device.shared().deferred.taken();
++            let other = slots.iter().find(|slot| !Arc::ptr_eq(slot, held));
++            Arc::clone(other.expect("queue B's slot"))
++        });
++        rectangle(&state, &mut eb);
++        eb.set_fragment_bytes(&color_b, 0).unwrap();
++        for _ in 0..draws_b {
++            eb.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++                .unwrap();
++        }
++        eb.end_encoding().unwrap();
++        pass_b.add_completed_handler(handler("b")).unwrap();
++        pass_b.commit().unwrap();
++        if let Some(slot_b) = &slot_b {
++            // The overlap: queue A's lane waits inside its slot; queue B's lowers all of B's.
++            until("queue B's lane lowers its slot with queue A's held", || {
++                slot_b.lowered_all()
++            });
++            // The device's commit order: B's commit waits behind A's.
++            assert_eq!(pass_b.status(), CommandBufferStatus::Committed);
++            assert!(
++                order.lock().unwrap().is_empty(),
++                "a handler ran with A held"
++            );
++        }
++        (pass_b, signal)
++    };
++    let (pass_b, signal, drained) = match &held {
++        Some(slot) => {
++            let (done, drained) = mpsc::channel();
++            let ((pass_b, signal), reading) = slot.while_held(|| {
++                let made = encode();
++                // A device-wide drain, made while both lanes hold work: it returns after the
++                // hold, with every lane's lowering done.
++                let reading = std::thread::spawn({
++                    let device = device.clone();
++                    move || {
++                        let _ = device.work_counts();
++                        done.send(()).unwrap();
++                    }
++                });
++                (made, reading)
++            });
++            let drained = drained.recv_timeout(WAIT).is_ok();
++            reading.join().unwrap();
++            (pass_b, signal, drained)
++        }
++        None => {
++            let (pass_b, signal) = encode();
++            (pass_b, signal, true)
++        }
++    };
++    assert!(drained, "{policy:?}: the work counts' drain returned");
++    for command_buffer in [&pass_a, &signal, &pass_b] {
++        command_buffer.wait_until_completed_for(WAIT).unwrap();
++    }
++    let read = |target: &Texture| {
++        let command_buffer = qb.command_buffer().unwrap();
++        let back = copy_back(device, &command_buffer, target);
++        committed(&command_buffer, &back)
++    };
++    let statuses = [&pass_a, &pass_b].map(|cb| (cb.status(), cb.error()));
++    // Each queue's handlers in its order; Metal orders no queue's completions against another's.
++    let mut order = order.lock().unwrap().clone();
++    order.sort_by_key(|name| name.starts_with('b'));
++    (read(&ta), read(&tb), words_of(&copied), order, statuses)
++}
++
++/// LOCAL (Atlas, DEEP-CPU): two command queues on different lowering lanes
++/// (`render/lowering_worker.rs`) lower at once and keep the device's one commit order: with
++/// queue A's pass's lowering held, queue B's pass is lowered whole by its lane while its commit
++/// waits behind A's, and A's queue's event (signalled behind A's pass) still gates B's copy. Every
++/// result is the same under `AtCall`: each pass's color, the word B copied after its wait, each
++/// queue's handlers in its commit order, both completed. Then with A's commit work failing: A completes with
++/// `CallRefused` of `commit`, and A's signal and B's pass still complete after it, in order. A
++/// work-counts drain made with both lanes busy returns, and the device's teardown joins both lanes.
++/// Where the host gives one lane alone there is nothing to overlap.
++#[test]
++fn independent_queues_lower_at_once_and_keep_the_commit_order() {
++    let lanes = crate::render::lowering_lanes();
++    if lanes < 2 {
++        eprintln!("one lowering lane on this host: nothing to overlap");
++        return;
++    }
++    let scratch = Scratch::new("deferred-lanes");
++    let red = u32::from_le_bytes([255, 0, 0, 255]);
++    let filled = u32::from_le_bytes([0x5a; 4]);
++    let completed = (CommandBufferStatus::Completed, None);
++    let mut results = Vec::new();
++    for policy in POLICIES {
++        let device = device(&scratch.0, policy, &[], &Heard::default());
++        let result = two_queues(&device, policy, false);
++        assert!(
++            result.0.iter().all(|&w| w == PACKED),
++            "{policy:?} A {:x?}",
++            &result.0[..4]
++        );
++        assert!(
++            result.1.iter().all(|&w| w == red),
++            "{policy:?} B {:x?}",
++            &result.1[..4]
++        );
++        assert_eq!(result.2, [filled], "{policy:?}: B's copy after A's event");
++        assert_eq!(result.3, ["a", "a-signal", "b"], "{policy:?}");
++        assert_eq!(
++            result.4,
++            [completed.clone(), completed.clone()],
++            "{policy:?}"
++        );
++        let counts = device.work_counts();
++        eprintln!(
++            "{policy:?} lanes {lanes}: batches thread/program {}/{} ends {}/{} commits {}/{} waits {}",
++            counts.render_log_batches_by_thread,
++            counts.render_log_batches_by_program,
++            counts.render_log_ends_by_thread,
++            counts.render_log_ends_by_program,
++            counts.render_log_commits_by_thread,
++            counts.render_log_commits_by_program,
++            counts.render_log_waits
++        );
++        if policy == RenderLoweringPolicy::Worker {
++            // B's end by its lane (`lowered_all` above); A's by its lane or, once the hold ended,
++            // by the work counts' drain, which takes what the lane has not. Each once.
++            let ends = counts.render_log_ends_by_thread + counts.render_log_ends_by_program;
++            let commits =
++                counts.render_log_commits_by_thread + counts.render_log_commits_by_program;
++            assert!(counts.render_log_ends_by_thread >= 1, "B's end by a lane");
++            assert_eq!(
++                (ends, commits),
++                (2, 3),
++                "each end and each queued commit ran once"
++            );
++            let worker = device.shared().deferred.started_for_test();
++            assert_eq!(worker.map(|w| w.threads_started()), Some(2));
++        }
++        results.push(result);
++        drop(device);
++    }
++    assert_eq!(results[0], results[1], "Worker against AtCall");
++    // Queue A's commit refused, under Worker: later work on both queues still runs.
++    let device = device(
++        &scratch.0,
++        RenderLoweringPolicy::Worker,
++        &[],
++        &Heard::default(),
++    );
++    let (_, b, copied, order, [a, b_status]) =
++        two_queues(&device, RenderLoweringPolicy::Worker, true);
++    let commit = EncoderCall {
++        selector: "commit",
++        index: 0,
++    };
++    assert_eq!(
++        a,
++        (
++            CommandBufferStatus::Error,
++            Some(CommandBufferError::CallRefused(commit))
++        )
++    );
++    assert_eq!(b_status, completed);
++    assert!(b.iter().all(|&w| w == red), "B {:x?}", &b[..4]);
++    assert_eq!(copied, [filled]);
++    assert_eq!(order, ["a", "a-signal", "b"]);
++}

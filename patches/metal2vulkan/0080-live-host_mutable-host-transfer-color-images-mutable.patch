@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 20:25:55 +0000
+Subject: [PATCH 80/92] live host_mutable: host-transfer color images mutable
+ to any compatible format (no view shadows; ANV keeps no aux there)
+
+---
+ crates/metal2vulkan-runtime/src/texture.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 21aca83e..43c8b18f 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3115,6 +3115,18 @@ impl Device {
+         }
+         let mut hosted = plan.clone();
+         hosted.usage |= ImageUsageFlags::HOST_TRANSFER;
++        // LOCAL (Atlas), live `host_mutable=1`: ANV keeps no aux surface for a host-transfer
++        // image (Mesa 26.2.4 anv_image.c, `HOST_TRANSFER` disables compression), so making it
++        // mutable to any compatible format costs nothing there, and every later view of another
++        // format of its class is a Vulkan view of it, not a shadow image copied in and back
++        // (`texture/view_shadow.rs`, plan (b)). Color images only.
++        if crate::live::on("host_mutable", false)
++            && !hosted.usage.contains(ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
++            && !texture_aspects(&hosted).intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
++        {
++            hosted.flags |= metal2vulkan::vk::ImageCreateFlags::MUTABLE_FORMAT;
++            hosted.view_formats.clear();
++        }
+         // An image the host writes too is a parked one of its making where one is parked
+         // (`recycle.rs`), its host-transfer usage in its plan: on a miss, `placed_image`'s, as
+         // before. One the host only reads (a trapping surface's) may lie in memory the host maps

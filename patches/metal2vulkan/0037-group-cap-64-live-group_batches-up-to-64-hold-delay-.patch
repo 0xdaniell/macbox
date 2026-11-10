@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:20:37 +0000
+Subject: [PATCH 37/92] group cap 64 (live group_batches up to 64), hold-delay
+ stats line every 10 s
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/group.rs               | 64 ++++++++++++++++++-
+ 1 file changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 179ed0f6..781237a2 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -97,7 +97,7 @@ use std::sync::Arc;
+ /// The most batches one kernel submission may hold, the bound of the arrays below: the first is
+ /// seen complete late by the GPU time of at most this many less one. LOCAL (Atlas): a group holds
+ /// [`group_batches`] of them, the live switch `group_batches` (default 4, the upstream bound).
+-pub(crate) const GROUP_BATCHES: usize = 16;
++pub(crate) const GROUP_BATCHES: usize = 64;
+ 
+ /// LOCAL (Atlas): the batches a group holds before it goes at once, the live switch
+ /// `group_batches` (`live.rs`), 4 where unset, at least 1 and at most [`GROUP_BATCHES`]. Measured
+@@ -181,6 +181,64 @@ impl CommandBufferShared {
+     }
+ }
+ 
++/// LOCAL (Atlas, DEEP-GPU): what the groups held, for the VM A/B of grouped submissions: each
++/// group's batches and how long each batch waited in its group before the group's
++/// `vkQueueSubmit` (its added queueing delay), written to stderr at most every 10 s as one
++/// `m2v groups:` line (totals since the process began, and the window's histogram).
++struct HoldStats {
++    groups: std::sync::atomic::AtomicU64,
++    batches: std::sync::atomic::AtomicU64,
++    held_ns: std::sync::atomic::AtomicU64,
++    max_ns: std::sync::atomic::AtomicU64,
++    /// Batches by their wait: < 20 us, < 100 us, < 500 us, < 2 ms, < 8 ms, >= 8 ms.
++    buckets: [std::sync::atomic::AtomicU64; 6],
++    sizes: [std::sync::atomic::AtomicU64; 6],
++    last: std::sync::atomic::AtomicU64,
++}
++
++static HOLD_STATS: HoldStats = HoldStats {
++    groups: std::sync::atomic::AtomicU64::new(0),
++    batches: std::sync::atomic::AtomicU64::new(0),
++    held_ns: std::sync::atomic::AtomicU64::new(0),
++    max_ns: std::sync::atomic::AtomicU64::new(0),
++    buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 6],
++    sizes: [const { std::sync::atomic::AtomicU64::new(0) }; 6],
++    last: std::sync::atomic::AtomicU64::new(0),
++};
++
++impl HoldStats {
++    fn group(&self, now: u64, waits: impl Iterator<Item = u64>) {
++        let mut n = 0u64;
++        for wait in waits {
++            n += 1;
++            self.held_ns.fetch_add(wait, Ordering::Relaxed);
++            self.max_ns.fetch_max(wait, Ordering::Relaxed);
++            let at = [20_000, 100_000, 500_000, 2_000_000, 8_000_000].iter().take_while(|&&b| wait >= b).count();
++            self.buckets[at].fetch_add(1, Ordering::Relaxed);
++        }
++        self.groups.fetch_add(1, Ordering::Relaxed);
++        self.batches.fetch_add(n, Ordering::Relaxed);
++        let size = [2, 4, 8, 16, 32].iter().take_while(|&&b| n >= b).count();
++        self.sizes[size].fetch_add(1, Ordering::Relaxed);
++        let last = self.last.load(Ordering::Relaxed);
++        if now.saturating_sub(last) >= 10_000_000_000
++            && self.last.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
++        {
++            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
++            let (g, b, h, m) = (take(&self.groups), take(&self.batches), take(&self.held_ns), take(&self.max_ns));
++            let w: Vec<u64> = self.buckets.iter().map(take).collect();
++            let z: Vec<u64> = self.sizes.iter().map(take).collect();
++            let line = format!(
++                "m2v groups: {g} submits of {b} batches ({:.2} a submit), wait mean {:.1} us max {:.1} us; \
++                 waits <20us {} <100us {} <500us {} <2ms {} <8ms {} >=8ms {}; sizes 1 {} 2-3 {} 4-7 {} 8-15 {} 16-31 {} 32+ {}; cap {}\n",
++                b as f64 / g.max(1) as f64, h as f64 / b.max(1) as f64 / 1e3, m as f64 / 1e3,
++                w[0], w[1], w[2], w[3], w[4], w[5], z[0], z[1], z[2], z[3], z[4], z[5], group_batches(),
++            );
++            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
++        }
++    }
++}
++
+ /// LOCAL (Atlas, DEEP-GPU): how many host waiters outside a command buffer's own wait (Coherent's
+ /// `wait_settled`, which waits for the GPU writes of running command buffers over a surface's
+ /// pages within a bounded time) wait now. While any waits, no group is kept ([`Group::keeps`]),
+@@ -288,6 +346,8 @@ struct Member {
+     infos: Vec<Info>,
+     buffers: usize,
+     submission: Submission,
++    /// LOCAL (Atlas, DEEP-GPU): when it was held (`gpu_time::host_nanos`), for [`HoldStats`].
++    held_at: u64,
+ }
+ 
+ /// The batches held for one kernel submission on one `VkQueue` (the module docs), in the
+@@ -399,6 +459,7 @@ impl Group {
+             infos: held,
+             buffers,
+             submission,
++            held_at: gpu_time::host_nanos(),
+         });
+     }
+ 
+@@ -552,6 +613,7 @@ impl Group {
+         let outcome = match submitted {
+             Ok(()) => {
+                 let now = gpu_time::host_nanos();
++                HOLD_STATS.group(now, (self.members.iter()).map(|member| now.saturating_sub(member.held_at)));
+                 for member in self.members.drain(..) {
+                     self.spare.push(member.infos);
+                     if member.submission.schedules() && !member.submission.scheduled() {

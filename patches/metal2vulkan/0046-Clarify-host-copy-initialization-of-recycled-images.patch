@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Fri, 6 Nov 2026 14:53:07 +0000
+Subject: [PATCH 46/92] Clarify host-copy initialization of recycled images
+
+Document completed prior uses and host visibility before reinitialization; UNDEFINED discards previous contents rather than describing the current layout. Update call-site safety notes and the placement counter contract. Documentation only. cargo fmt --all --check passed in the existing lanes image; the isolated host-image fix passed its 52 focused CPU-ICD tests, and combined compilation remains pending safe memory availability.
+---
+ crates/metal2vulkan-runtime/src/texture.rs       |  7 +++++--
+ .../src/texture/host_copy.rs                     | 16 +++++++++-------
+ crates/metal2vulkan-runtime/src/work_counts.rs   |  4 ++--
+ 3 files changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 53ddc844..ed552832 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3292,7 +3292,9 @@ impl Device {
+             let zeros = vec![0; *length as usize];
+             let copies: Vec<vk::BufferImageCopy> = copies.iter().map(buffer_image_copy).collect();
+             // SAFETY: the image is live, made with host-transfer usage and bound to memory of its
+-            // own, which nothing used yet; every copy lies within it and reads within `zeros`.
++            // own. It is new or recycled after its last holder released it, with earlier device
++            // uses completed and writes made available to the host (`recycle.rs`). Every copy
++            // lies within it and reads within `zeros`.
+             unsafe {
+                 host_copy::start(
+                     functions,
+@@ -3312,7 +3314,8 @@ impl Device {
+             (moved, host_copies, self.shared().host_copies.as_ref())
+         {
+             // SAFETY: the image is live, made with host-transfer usage and bound to memory of its
+-            // own, which nothing used yet.
++            // own. It is new or recycled after its last holder released it, with earlier device
++            // uses completed and writes made available to the host (`recycle.rs`).
+             unsafe { host_copy::transition(functions, self.shared().vk().handle(), raw, aspects) }?;
+             self.shared().counts.image_started_on_the_host();
+             return Ok(image);
+diff --git a/crates/metal2vulkan-runtime/src/texture/host_copy.rs b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+index e55672d5..d985a7cc 100644
+--- a/crates/metal2vulkan-runtime/src/texture/host_copy.rs
++++ b/crates/metal2vulkan-runtime/src/texture/host_copy.rs
+@@ -119,14 +119,16 @@ pub(crate) unsafe fn reaches_general(
+         && destinations[..written.1.min(destinations.len())].contains(&general)
+ }
+ 
+-/// Move the new `image` (no command or host copy used it yet) of `aspects` from `UNDEFINED` to
+-/// `GENERAL` on the host, then copy `zeros` over every texel `copies` reach (`zero_copies`, each
+-/// within `zeros` from its start).
++/// Initialize a new or recycled `image` of `aspects` on the host: discard its previous contents
++/// with a transition from `UNDEFINED` to `GENERAL`, then copy `zeros` over every texel `copies`
++/// reach (`zero_copies`, each within `zeros` from its start).
+ ///
+ /// # Safety
+ ///
+ /// `functions` are `device`'s, `image` is a live image of it with host-transfer usage, bound to
+-/// memory, which nothing else uses.
++/// its own memory range, with no outstanding use. Any earlier device use has completed and its
++/// writes have been made available to the host (`HOST` / `HOST_READ`). A recycled image meets
++/// these conditions when its last holder releases it (`recycle.rs`, `Barrier::to_host`).
+ pub(super) unsafe fn start(
+     functions: &DeviceFn,
+     device: vk::Device,
+@@ -142,8 +144,8 @@ pub(super) unsafe fn start(
+     unsafe { write(functions, device, image, zeros, copies) }
+ }
+ 
+-/// Move the new `image` (no command or host copy used it yet) of `aspects` from `UNDEFINED` to
+-/// `GENERAL` on the host, writing no texel (a decoded twin's, `Start::Moved`).
++/// Discard a new or recycled `image`'s previous contents by moving `aspects` from `UNDEFINED`
++/// to `GENERAL` on the host, writing no texel (a decoded twin's, `Start::Moved`).
+ ///
+ /// # Safety
+ ///
+@@ -165,7 +167,7 @@ pub(super) unsafe fn transition(
+             base_array_layer: 0,
+             layer_count: vk::REMAINING_ARRAY_LAYERS,
+         });
+-    // SAFETY: the caller's contract; the image is in `UNDEFINED`, which the move leaves.
++    // SAFETY: the caller's contract; `UNDEFINED` discards contents from any previous layout.
+     if exit_guard::in_section() { exit_guard::called(Call::TransitionImageLayout); }
+     unsafe { (functions.transition_image_layout_ext)(device, 1, &transition) }
+         .result()
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index aac9e4c2..873d951e 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -3816,8 +3816,8 @@ pub struct WorkCounts {
+     /// waits for: a `Shared` or `Managed` texture's first move, `replace_region` or `get_bytes`
+     /// on a device that copies none on the host from memory the host caches.
+     pub staging_submissions: u64,
+-    /// New `Shared` and `Managed` textures' images with host-transfer usage placed in memory the
+-    /// host does not cache, where the device has none the image may take
++    /// Host-transfer image placements in memory the host does not cache, where the device has
++    /// none the image may take; taking an existing recycled placement adds nothing here
+     /// (`texture/host_copy.rs`): their host copies read at uncached memory's speed (a 1080p
+     /// `get_bytes` 108 ms on a Radeon 780M), and none elsewhere.
+     pub uncached_host_images: u64,

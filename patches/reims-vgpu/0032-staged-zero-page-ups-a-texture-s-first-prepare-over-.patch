@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 05:57:17 +0000
+Subject: [PATCH 32/33] staged zero page-ups: a texture's first prepare over
+ guest pages of zeros writes nothing
+
+A new texture's host texture reads zero before any command (the runtime's FirstMove), and
+before its first prepare no GPU work reached it. So when that first prepare's guest pages all
+read zero, the page-up (buffer, copy, blit) changes nothing and is skipped. The pages are
+scanned a page at a time and the scan stops at the first non-zero page; covered pages take
+the view as before. PagedTexture::prepared_once is set by every prepare, synchronize and
+skipped Private page-up.
+
+Switch: REIMS_VGPU_STAGED_ZERO=<path>, live while the file exists and page-ups are staged.
+The staged log line now splits walk, scan, buffer and copy time and counts all-zero copies.
+---
+ crates/reims-vgpu-core/src/gpu_task/memory.rs |  66 +++++++--
+ .../reims-vgpu-core/src/gpu_task/service.rs   |   5 +-
+ .../reims-vgpu-core/src/memory/page_refs.rs   | 131 ++++++++++++++----
+ crates/reims-vgpu-core/src/resources/host.rs  |   6 +-
+ .../reims-vgpu-core/src/resources/texture.rs  |  27 +++-
+ .../src/resources/texture/blit.rs             |  21 ++-
+ 6 files changed, 205 insertions(+), 51 deletions(-)
+
+diff --git a/crates/reims-vgpu-core/src/gpu_task/memory.rs b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+index 936ccb15..ccefff6a 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/memory.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+@@ -31,6 +31,8 @@ use crate::platform::Platform;
+ use crate::platform::device::GpuDevice;
+ use crate::platform::resource::Buffer as _;
+ use crate::platform::values::BufferDesc;
++use crate::memory::map::MemoryMap;
++use crate::resources::texture::Staged;
+ use crate::platform::os::clock::{Clock, MonoTime};
+ use crate::platform::types::ResourceAddressRange;
+ use crate::raise::{Kept, keep_forever};
+@@ -570,14 +572,18 @@ impl<P: Platform> GpuTask<P> {
+     /// LOCAL (Atlas): a new buffer holding a copy of the task's pages `page..page + length`, for
+     /// a texture's first page-up, when page-ups are staged and no live view covers any of the
+     /// pages (`memory::page_refs` says why that copy is the bytes a view's blit would read);
+-    /// `None` takes the view as ever. Raises as the view's walk would.
++    /// `None` takes the view as ever. On the texture's first prepare (`first`), pages of zeros
++    /// answer `Staged::Zero` while the zero switch is on: its host texture reads zero already.
++    /// Raises as the view's walk would.
+     pub(super) fn staged_page_buffer(
+         &self,
+         hold: Hold<'_>,
+         page: u32,
+         length: u64,
+-    ) -> RaiseResult<Option<P::Buffer>> {
+-        if !crate::memory::page_refs::staging() || length == 0 || length & PAGE_MASK != 0 {
++        first: bool,
++    ) -> RaiseResult<Option<Staged<P::Buffer>>> {
++        use crate::memory::page_refs::{self, StagedTimes};
++        if !page_refs::staging() || length == 0 || length & PAGE_MASK != 0 {
+             return Ok(None);
+         }
+         let offset = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
+@@ -588,6 +594,10 @@ impl<P: Platform> GpuTask<P> {
+         let Some(refs) = map.page_refs().cloned() else {
+             return Ok(None);
+         };
++        let ns = |from: MonoTime, to: MonoTime| {
++            u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX)
++        };
++        let mut times = StagedTimes::default();
+         let started = self.mono();
+         let runs = self.task_page_runs(hold, offset, length)?;
+         let total = runs
+@@ -598,9 +608,21 @@ impl<P: Platform> GpuTask<P> {
+             return Ok(None);
+         }
+         if refs.covered(&runs.ranges) {
+-            crate::memory::page_refs::note_covered();
++            page_refs::note_covered();
+             return Ok(None);
+         }
++        let walked = self.mono();
++        times.walk = ns(started, walked);
++        if first && page_refs::zero_skipping() {
++            let zeros = Self::runs_read_zero(&map, &runs.ranges);
++            let scanned = self.mono();
++            times.scan = ns(walked, scanned);
++            if zeros == Some(true) {
++                page_refs::note_zero_skipped(length, times);
++                return Ok(Some(Staged::Zero));
++            }
++        }
++        let making = self.mono();
+         let Some(buffer) = device.new_buffer(BufferDesc {
+             length,
+             options: Vec::new(),
+@@ -616,10 +638,13 @@ impl<P: Platform> GpuTask<P> {
+         if contents.is_null() {
+             return Ok(None);
+         }
++        let copying = self.mono();
++        times.make = ns(making, copying);
+         #[allow(unsafe_code)] // architecture 17.3: the new buffer's own bytes, written once
+         // SAFETY: `contents` is the CPU address of the `length` bytes of a `Shared` buffer made
+         // just now, which nothing else holds yet, and `buffer` keeps them for this borrow.
+-        let bytes = unsafe { std::slice::from_raw_parts_mut(contents.as_ptr::<u8>(), length.to_usize()) };
++        let bytes =
++            unsafe { std::slice::from_raw_parts_mut(contents.as_ptr::<u8>(), length.to_usize()) };
+         let mut at: usize = 0;
+         for r in &runs.ranges {
+             let end = at.wrapping_add(r.physical_length.to_usize());
+@@ -631,10 +656,33 @@ impl<P: Platform> GpuTask<P> {
+             }
+             at = end;
+         }
+-        let ns = u64::try_from(self.mono().saturating_duration_since(started).as_nanos())
+-            .unwrap_or(u64::MAX);
+-        crate::memory::page_refs::note_staged(length, ns);
+-        Ok(Some(buffer))
++        // Counted on first prepares only: what the zero switch would have skipped.
++        let zeros = first && bytes.iter().fold(0_u8, |any, &b| any | b) == 0;
++        times.copy = ns(copying, self.mono());
++        page_refs::note_staged(length, zeros, times);
++        Ok(Some(Staged::Buffer(buffer)))
++    }
++
++    /// Whether every byte of the guest's `ranges` reads zero, read a page at a time and stopping
++    /// at the first page that does not; `None` when a range is outside the map.
++    fn runs_read_zero(map: &MemoryMap<P>, ranges: &[PhysRange]) -> Option<bool> {
++        let mut chunk = [0_u8; PAGE as usize];
++        for r in ranges {
++            let mut at = r.physical_address;
++            let end = r.physical_address.checked_add(r.physical_length)?;
++            while at < end {
++                let n = end.wrapping_sub(at).min(PAGE).to_usize();
++                let dst = chunk.get_mut(..n)?;
++                if !map.read(at, dst) {
++                    return None;
++                }
++                if dst.iter().fold(0_u8, |any, &b| any | b) != 0 {
++                    return Some(false);
++                }
++                at = at.wrapping_add(PAGE);
++            }
++        }
++        Some(true)
+     }
+ 
+     /// LOCAL (Atlas): the buffer a paged texture pages through: a kept one over exactly the pages
+diff --git a/crates/reims-vgpu-core/src/gpu_task/service.rs b/crates/reims-vgpu-core/src/gpu_task/service.rs
+index dee53297..8ab1b8a4 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/service.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/service.rs
+@@ -721,8 +721,9 @@ impl<P: Platform> ResourceHost<P> for GpuTask<P> {
+         hold: Hold<'_>,
+         page: u32,
+         length: u64,
+-    ) -> RaiseResult<Option<P::Buffer>> {
+-        GpuTask::staged_page_buffer(self, hold, page, length)
++        first: bool,
++    ) -> RaiseResult<Option<crate::resources::texture::Staged<P::Buffer>>> {
++        GpuTask::staged_page_buffer(self, hold, page, length, first)
+     }
+ 
+     fn fresh_page_up_mode(&self, page: u32) -> u8 {
+diff --git a/crates/reims-vgpu-core/src/memory/page_refs.rs b/crates/reims-vgpu-core/src/memory/page_refs.rs
+index 5ebfa14e..f12cfe05 100644
+--- a/crates/reims-vgpu-core/src/memory/page_refs.rs
++++ b/crates/reims-vgpu-core/src/memory/page_refs.rs
+@@ -34,20 +34,52 @@ use crate::num::ToUsize;
+ /// The variable naming the switch file.
+ pub const ENV_VAR: &str = "REIMS_VGPU_STAGED_PAGE_UP";
+ 
+-/// The switch file and its last look.
++/// The variable naming the zero switch's file: while it exists (and page-ups are staged), a
++/// texture's first prepare over pages of zeros writes nothing (`Staged::Zero`).
++pub const ZERO_ENV_VAR: &str = "REIMS_VGPU_STAGED_ZERO";
++
++/// A switch file and its last look.
+ struct Switch {
+     path: Option<std::path::PathBuf>,
+     look: crate::sync::Mutex<(Option<Instant>, bool)>,
+ }
+ 
++impl Switch {
++    fn of(var: &str) -> Switch {
++        Switch {
++            path: std::env::var_os(var)
++                .filter(|p| !p.is_empty())
++                .map(std::path::PathBuf::from),
++            look: crate::sync::Mutex::new((None, false)),
++        }
++    }
++
++    /// Whether the file existed at the last look (once a second); false unset.
++    fn on(&self) -> bool {
++        let Some(path) = &self.path else {
++            return false;
++        };
++        if cfg!(test) {
++            return false;
++        }
++        let mut look = self.look.lock();
++        let now = Instant::now();
++        if look.0.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
++            *look = (Some(now), path.exists());
++        }
++        look.1
++    }
++}
++
+ fn switch() -> &'static Switch {
+     static S: OnceLock<Switch> = OnceLock::new();
+-    S.get_or_init(|| Switch {
+-        path: std::env::var_os(ENV_VAR)
+-            .filter(|p| !p.is_empty())
+-            .map(std::path::PathBuf::from),
+-        look: crate::sync::Mutex::new((None, false)),
+-    })
++    S.get_or_init(|| Switch::of(ENV_VAR))
++}
++
++/// Whether a first prepare over pages of zeros writes nothing now.
++pub(crate) fn zero_skipping() -> bool {
++    static S: OnceLock<Switch> = OnceLock::new();
++    S.get_or_init(|| Switch::of(ZERO_ENV_VAR)).on()
+ }
+ 
+ /// Whether views are counted: the variable is set (read once).
+@@ -57,19 +89,7 @@ pub(crate) fn counting() -> bool {
+ 
+ /// Whether page-ups are staged now: counting, and the file exists at the last look.
+ pub(crate) fn staging() -> bool {
+-    let s = switch();
+-    let Some(path) = &s.path else {
+-        return false;
+-    };
+-    if cfg!(test) {
+-        return false;
+-    }
+-    let mut look = s.look.lock();
+-    let now = Instant::now();
+-    if look.0.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+-        *look = (Some(now), path.exists());
+-    }
+-    look.1
++    switch().on()
+ }
+ 
+ /// The staged page-ups' counters, all tasks together.
+@@ -77,7 +97,13 @@ struct Stats {
+     staged: AtomicU64,
+     staged_bytes: AtomicU64,
+     covered: AtomicU64,
++    walk_ns: AtomicU64,
++    make_ns: AtomicU64,
+     copy_ns: AtomicU64,
++    zeros_copied: AtomicU64,
++    zeros_skipped: AtomicU64,
++    zeros_skipped_bytes: AtomicU64,
++    scan_ns: AtomicU64,
+     last: crate::sync::Mutex<Option<Instant>>,
+ }
+ 
+@@ -85,15 +111,51 @@ static STATS: Stats = Stats {
+     staged: AtomicU64::new(0),
+     staged_bytes: AtomicU64::new(0),
+     covered: AtomicU64::new(0),
++    walk_ns: AtomicU64::new(0),
++    make_ns: AtomicU64::new(0),
+     copy_ns: AtomicU64::new(0),
++    zeros_copied: AtomicU64::new(0),
++    zeros_skipped: AtomicU64::new(0),
++    zeros_skipped_bytes: AtomicU64::new(0),
++    scan_ns: AtomicU64::new(0),
+     last: crate::sync::Mutex::new(None),
+ };
+ 
+-/// Counts a staged page-up of `bytes`, whose buffer and copy took `ns`.
+-pub(crate) fn note_staged(bytes: u64, ns: u64) {
++/// The times of one staged page-up, in nanoseconds: the walk, the zero scan, the buffer's
++/// making and the copy.
++#[derive(Debug, Clone, Copy, Default)]
++pub(crate) struct StagedTimes {
++    pub(crate) walk: u64,
++    pub(crate) scan: u64,
++    pub(crate) make: u64,
++    pub(crate) copy: u64,
++}
++
++impl StagedTimes {
++    fn add(self) {
++        STATS.walk_ns.fetch_add(self.walk, Ordering::Relaxed);
++        STATS.scan_ns.fetch_add(self.scan, Ordering::Relaxed);
++        STATS.make_ns.fetch_add(self.make, Ordering::Relaxed);
++        STATS.copy_ns.fetch_add(self.copy, Ordering::Relaxed);
++    }
++}
++
++/// Counts a staged page-up of `bytes` copied into a buffer; `zeros` when every byte was zero.
++pub(crate) fn note_staged(bytes: u64, zeros: bool, times: StagedTimes) {
+     STATS.staged.fetch_add(1, Ordering::Relaxed);
+     STATS.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
+-    STATS.copy_ns.fetch_add(ns, Ordering::Relaxed);
++    if zeros {
++        STATS.zeros_copied.fetch_add(1, Ordering::Relaxed);
++    }
++    times.add();
++    log_stats();
++}
++
++/// Counts a first page-up of `bytes` of zeros that wrote nothing.
++pub(crate) fn note_zero_skipped(bytes: u64, times: StagedTimes) {
++    STATS.zeros_skipped.fetch_add(1, Ordering::Relaxed);
++    STATS.zeros_skipped_bytes.fetch_add(bytes, Ordering::Relaxed);
++    times.add();
+     log_stats();
+ }
+ 
+@@ -117,15 +179,24 @@ fn log_stats() {
+             Some(_) => *last = Some(now),
+         }
+     }
+-    let staged = STATS.staged.swap(0, Ordering::Relaxed);
+-    let bytes = STATS.staged_bytes.swap(0, Ordering::Relaxed);
+-    let covered = STATS.covered.swap(0, Ordering::Relaxed);
+-    let ns = STATS.copy_ns.swap(0, Ordering::Relaxed);
++    let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
++    let us = |c: &AtomicU64| take(c).wrapping_div(1000);
++    let staged = take(&STATS.staged);
++    let bytes = take(&STATS.staged_bytes);
++    let covered = take(&STATS.covered);
++    let zeros_copied = take(&STATS.zeros_copied);
++    let skipped = take(&STATS.zeros_skipped);
++    let skipped_bytes = take(&STATS.zeros_skipped_bytes);
+     log::info!(
+-        "staged page-ups: {staged} staged ({} KiB, {} us making and copying), {covered} took \
+-         the view (a live view covered a page)",
++        "staged page-ups: {staged} staged ({} KiB, {zeros_copied} all zero), {skipped} zero \
++         skipped ({} KiB), {covered} took the view (a live view covered a page); us: walk {}, \
++         scan {}, make {}, copy {}",
+         bytes >> 10,
+-        ns.wrapping_div(1000)
++        skipped_bytes >> 10,
++        us(&STATS.walk_ns),
++        us(&STATS.scan_ns),
++        us(&STATS.make_ns),
++        us(&STATS.copy_ns),
+     );
+ }
+ 
+diff --git a/crates/reims-vgpu-core/src/resources/host.rs b/crates/reims-vgpu-core/src/resources/host.rs
+index c440733f..19391023 100644
+--- a/crates/reims-vgpu-core/src/resources/host.rs
++++ b/crates/reims-vgpu-core/src/resources/host.rs
+@@ -87,13 +87,15 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
+     /// LOCAL (Atlas): a new buffer holding a copy of the guest's pages, for a texture's first
+     /// page-up, when no GPU access to them can be pending (`memory::page_refs`); `None` pages
+     /// through the transfer buffer as ever.
++    /// `first`: the texture's first prepare, which may answer `Staged::Zero` for pages of zeros.
+     fn staged_page_buffer(
+         &self,
+         hold: Hold<'_>,
+         page: u32,
+         length: u64,
+-    ) -> RaiseResult<Option<P::Buffer>> {
+-        let _ = (hold, page, length);
++        first: bool,
++    ) -> RaiseResult<Option<crate::resources::texture::Staged<P::Buffer>>> {
++        let _ = (hold, page, length, first);
+         Ok(None)
+     }
+ 
+diff --git a/crates/reims-vgpu-core/src/resources/texture.rs b/crates/reims-vgpu-core/src/resources/texture.rs
+index 878bc401..7577d432 100644
+--- a/crates/reims-vgpu-core/src/resources/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/texture.rs
+@@ -222,6 +222,17 @@ pub struct PagedTexture<P: Platform> {
+     pub(crate) texture: P::Texture,
+     /// The guest pages, bound at the first paging of a life and dropped by a discard.
+     pub(crate) transfer_buffer: Mutex<Option<P::Buffer>>,
++    /// LOCAL (Atlas): set at the first prepare, synchronize or skipped page-up: before it, no
++    /// GPU work reached the host texture, which reads zero (the runtime's `FirstMove`).
++    pub(crate) prepared_once: std::sync::atomic::AtomicBool,
++}
++
++/// LOCAL (Atlas): what a staged page-up found (`ResourceHost::staged_page_buffer`).
++pub enum Staged<B> {
++    /// A buffer holding a copy of the pages, to blit from.
++    Buffer(B),
++    /// Every byte of the pages is zero: a first page-up has nothing to write.
++    Zero,
+ }
+ 
+ /// The five layouts of a paged texture.
+@@ -366,6 +377,7 @@ impl<P: Platform> PagedTexture<P> {
+             is_pvrtc: false,
+             texture: texture.clone_ref(),
+             transfer_buffer: Mutex::new(None),
++            prepared_once: std::sync::atomic::AtomicBool::new(false),
+         }
+     }
+ 
+@@ -423,14 +435,21 @@ impl<P: Platform> PagedTexture<P> {
+     /// LOCAL (Atlas): for a page-up of a texture with no transfer buffer, a staged copy of its
+     /// pages to blit from instead (`memory::page_refs`), or `None`. The texture keeps no buffer:
+     /// a later page-down makes its view then.
+-    pub(crate) fn staged(&self, hold: Hold<'_>) -> RaiseResult<Option<P::Buffer>> {
++    ///
++    /// `Staged::Zero` only for the texture's first prepare (`first`), whose host texture no GPU
++    /// work reached and so reads zero, as the pages do.
++    pub(crate) fn staged(
++        &self,
++        hold: Hold<'_>,
++        first: bool,
++    ) -> RaiseResult<Option<Staged<P::Buffer>>> {
+         if self.transfer_buffer.lock().is_some() {
+             return Ok(None);
+         }
+         let Some(task) = self.task.upgrade() else {
+             return Ok(None);
+         };
+-        task.staged_page_buffer(hold, self.page, self.length)
++        task.staged_page_buffer(hold, self.page, self.length, first)
+     }
+ 
+     /// Drops the guest pages and makes the texture volatile; host-valid is kept.
+@@ -474,6 +493,7 @@ impl<P: Platform> PagedTexture<P> {
+             return false;
+         }
+         state.set_host_valid(true);
++        self.prepared_once.store(true, Ordering::Release);
+         STATS.page_ups_skipped.fetch_add(1, Ordering::Relaxed);
+         true
+     }
+@@ -488,6 +508,7 @@ impl<P: Platform> PagedTexture<P> {
+     ) -> RaiseResult<()> {
+         self.devolatilize(state)?;
+         if state.host_valid() {
++            self.prepared_once.store(true, std::sync::atomic::Ordering::Release);
+             return Ok(());
+         }
+         if !state.guest_valid() {
+@@ -498,6 +519,7 @@ impl<P: Platform> PagedTexture<P> {
+             page()?;
+         }
+         state.set_host_valid(true);
++        self.prepared_once.store(true, std::sync::atomic::Ordering::Release);
+         Ok(())
+     }
+ 
+@@ -509,6 +531,7 @@ impl<P: Platform> PagedTexture<P> {
+         ensure: impl FnOnce() -> RaiseResult<()>,
+         page: impl FnOnce() -> RaiseResult<()>,
+     ) -> RaiseResult<()> {
++        self.prepared_once.store(true, std::sync::atomic::Ordering::Release);
+         if state.guest_valid() {
+             return Ok(());
+         }
+diff --git a/crates/reims-vgpu-core/src/resources/texture/blit.rs b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+index 55e4875c..017d4f37 100644
+--- a/crates/reims-vgpu-core/src/resources/texture/blit.rs
++++ b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+@@ -17,7 +17,7 @@ use crate::resources::texture::dimension::{
+     TextureDimensionRecord, TexturePagingInfo, validate_texture_dimension,
+ };
+ use crate::resources::texture::{
+-    DIMENSION_SIZE, DeathKind, MIP_DIMENSION_SIZE, PagedTexture, RaiseKind, TextureLayout,
++    DIMENSION_SIZE, DeathKind, MIP_DIMENSION_SIZE, PagedTexture, RaiseKind, Staged, TextureLayout,
+     into_resource, mip_at, raise, record_at,
+ };
+ use crate::rt::Hold;
+@@ -255,24 +255,33 @@ impl SinglePlane {
+         state: &ResourceState,
+         encoder: Option<&P::BlitEncoder>,
+     ) -> RaiseResult<()> {
+-        // LOCAL (Atlas): a first page-up may blit from a staged copy (`PagedTexture::staged`).
++        // LOCAL (Atlas): a first page-up may blit from a staged copy, or write nothing over
++        // pages of zeros on the texture's first prepare (`PagedTexture::staged`).
++        let first = !paged
++            .prepared_once
++            .load(std::sync::atomic::Ordering::Acquire);
+         let staged = std::cell::OnceCell::new();
+         paged.prepare(
+             state,
+-            || match paged.staged(hold)? {
+-                Some(buffer) => {
+-                    let _ = staged.set(buffer);
++            || match paged.staged(hold, first)? {
++                Some(found) => {
++                    let _ = staged.set(found);
+                     Ok(())
+                 }
+                 None => paged.ensure_physical(hold),
+             },
+             || {
++                let source = match staged.get() {
++                    Some(Staged::Zero) => return Ok(()),
++                    Some(Staged::Buffer(buffer)) => Some(buffer),
++                    None => None,
++                };
+                 page_through(
+                     paged,
+                     encoder,
+                     false,
+                     &[(&self.dimension, self.blit_option)],
+-                    staged.get(),
++                    source,
+                 )?;
+                 if self.generate_mipmaps {
+                     nil_send!(

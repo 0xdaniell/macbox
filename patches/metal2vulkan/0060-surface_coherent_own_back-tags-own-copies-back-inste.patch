@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 05:29:06 +0000
+Subject: [PATCH 60/92] surface_coherent_own_back tags own copies back instead
+ of hiding them
+
+Lazy::own hid the encoder-end copy back from the plans (plan_left_planned, a stalled Sim). Now it
+counts as before; its beside record is tagged own, and a held batch's copy in skips it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/encoder.rs    | 14 ++++----
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 35 +++++++++++++++++--
+ 2 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index d7cb1ae1..6cacdf3b 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -1590,12 +1590,12 @@ impl EncoderCore {
+     /// retains each until it completes.
+     /// LOCAL (Atlas): the encoder's end's copies back, as [`shadow_copies`](Self::shadow_copies)
+     /// records them. With the live switch `surface_coherent_own_back` (default off), a trapping
+-    /// lazy surface's plain copy back of its own image records as its own (`Lazy::own`): its
+-    /// bytes then hold what the image holds, which no other import wrote, where before it counted
+-    /// as a write beside the image (`shadow_lazy::note_writes`), and each held batch after it
+-    /// copied those texels in again, over a record still running there (the coherent census's
+-    /// `taking_beside` risk, 3 Sims, 2026-11-08). A merge's copy back keeps the CPU's texels and
+-    /// still counts.
++    /// lazy surface's plain copy back of its own image is marked its own (`Lazy::own_back`): it
++    /// still counts as a write of the bytes for every plan (`shadow_lazy::note_writes`), but no
++    /// held batch after it copies those texels in again, over a record still running there (the
++    /// coherent census's `taking_beside` risk, 3 Sims, 2026-11-08). A merge's copy back keeps the
++    /// CPU's texels and is not marked. (`Lazy::own` there instead hid the write from the plans:
++    /// `plan_left_planned` and a stalled Sim.)
+     fn end_copies(&mut self, copies: &[ShadowCopy]) {
+         let own = |copy: &ShadowCopy| {
+             (matches!(copy.step, Step::Back))
+@@ -1609,7 +1609,7 @@ impl EncoderCore {
+         }
+         for copy in copies {
+             let lazy = own(copy);
+-            let _own = lazy.as_ref().map(|lazy| lazy.own());
++            let _own = lazy.as_ref().map(|lazy| lazy.own_back());
+             self.shadow_copies(std::slice::from_ref(copy));
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 1ac92c0e..5062ab66 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -136,6 +136,8 @@ static IN_BY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+ /// How many surfaces hold writes ahead in their images: every hook returns at once while none does.
+ static AHEAD: AtomicUsize = AtomicUsize::new(0);
+ static DEFERRED: AtomicU64 = AtomicU64::new(0);
++/// LOCAL (Atlas): own copies back a copy in skipped ([`BesideWrite::own`]).
++static OWN_BACKS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+ /// The copies back not left ahead, a second texture's image lying over the same pages.
+ static SHARED: AtomicU64 = AtomicU64::new(0);
+ static FLUSHES: AtomicU64 = AtomicU64::new(0);
+@@ -155,6 +157,9 @@ thread_local! {
+     /// The surface whose own copy back this thread records: neither a write that drops its standing
+     /// nor a use that asks for a copy back.
+     static OWN: Cell<*const Lazy> = const { Cell::new(std::ptr::null()) };
++    /// LOCAL (Atlas): the surface whose plain copy back of its own image this thread records
++    /// ([`Lazy::own_back`]).
++    static OWN_BACK: Cell<*const Lazy> = const { Cell::new(std::ptr::null()) };
+ }
+ 
+ /// Why a take found no standing it could use.
+@@ -936,7 +941,7 @@ fn report() {
+         "surface_lazy: taken {taken} refused {refused} resyncs {resyncs} | refused: touched {} \
+          written {} epoch {} own {} uncommitted {} no-standing {} | in: first {} beyond-held {} \
+          changed {} bounded {} | ahead: deferred {} shared {} flushes {} whole {} texels {} \
+-         discarded {} presents {} unmatched {} twins {} readers-first {}",
++         discarded {} presents {} unmatched {} twins {} readers-first {} own-backs-skipped {}",
+         by[Refused::Touched as usize],
+         by[Refused::Written as usize],
+         by[Refused::Epoch as usize],
+@@ -957,6 +962,7 @@ fn report() {
+         read(&PRESENTS_UNMATCHED),
+         read(&TWINS),
+         read(&READERS_FIRST),
++        read(&OWN_BACKS_SKIPPED),
+     );
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+@@ -1110,6 +1116,9 @@ struct BesideWrite {
+     part: usize,
+     area: Option<[u32; 4]>,
+     copied: bool,
++    /// LOCAL (Atlas): every write joined in it was the surface's own plain copy back of its image
++    /// ([`Lazy::own_back`]): its bytes hold what the image holds, so no copy in needs them.
++    own: bool,
+ }
+ 
+ const BESIDE_KEPT: usize = 256;
+@@ -1263,6 +1272,19 @@ impl Lazy {
+         OWN.with(Cell::get) == std::ptr::from_ref(self)
+     }
+ 
++    /// LOCAL (Atlas): mark this thread as recording a plain copy back of this surface's own image
++    /// until the mark drops: still a write of its bytes for every count and plan, but one a later
++    /// copy in skips ([`BesideWrite::own`]).
++    pub(crate) fn own_back(&self) -> impl Drop {
++        struct OwnBack(*const Lazy);
++        impl Drop for OwnBack {
++            fn drop(&mut self) {
++                OWN_BACK.with(|own| own.set(self.0));
++            }
++        }
++        OwnBack(OWN_BACK.with(|own| own.replace(std::ptr::from_ref(self))))
++    }
++
+     /// Mark this thread as recording its own copy back until the mark drops.
+     pub(crate) fn own(&self) -> impl Drop {
+         struct Own(*const Lazy);
+@@ -1595,10 +1617,12 @@ impl Lazy {
+             }
+             _ => None,
+         };
++        let own = OWN_BACK.with(Cell::get) == std::ptr::from_ref(self);
+         let mut beside = self.beside.lock().unwrap();
+         if let Some(last) = beside.writes.back_mut() {
+             if last.id == id && last.part == usize::MAX {
+                 last.count = count;
++                last.own &= own;
+                 last.area = match (last.area, area) {
+                     (Some(_), Some(_)) => bounding(last.area, area),
+                     _ => None,
+@@ -1611,7 +1635,7 @@ impl Lazy {
+                 beside.lost = beside.lost.max(gone.count);
+             }
+         }
+-        beside.writes.push_back(BesideWrite { count, id, part: usize::MAX, area, copied: false });
++        beside.writes.push_back(BesideWrite { count, id, part: usize::MAX, area, copied: false, own });
+         true
+     }
+ 
+@@ -1665,6 +1689,13 @@ impl Lazy {
+             if write.count <= written || write.id == id || write.copied {
+                 continue;
+             }
++            // LOCAL (Atlas): the image's own copy back: copying it in would put those texels, or
++            // older pages, over what the image holds (live `surface_coherent_own_back`).
++            if write.own {
++                write.copied = true;
++                OWN_BACKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
++                continue;
++            }
+             match ordered(write.id, write.part) {
+                 Order::Before => {}
+                 Order::Held => {

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 03:32:44 +0000
+Subject: [PATCH 57/92] diagnostic: M2V_TWIN_LOG also names views apart from a
+ texture over bytes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/texture/view_shadow.rs                | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index 6d940e98..d2b5ef59 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -144,6 +144,32 @@ impl Texture {
+                 self.rotated_view(call, record)
+             }
+             Storage::Alias { texels, .. } | Storage::Shadow { texels, .. } => {
++                // LOCAL (Atlas) diagnostic: a view of a texture over bytes that its image takes no
++                // view of, where `M2V_TWIN_LOG` is set (the first 80).
++                if std::env::var_os("M2V_TWIN_LOG").is_some() {
++                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80 {
++                        let (Storage::Alias { image, .. } | Storage::Shadow { image, .. }) = &self.0.storage else {
++                            unreachable!()
++                        };
++                        let p = image.plan();
++                        eprintln!(
++                            "m2v-view-apart: view {:?} usage {:?} {}x{} of {:?} texture, image {:?} {:?} flags {:?} usage {:?} views {:?} lazy {} shadow {}",
++                            record.pixel_format,
++                            record.usage,
++                            record.image_extent[0],
++                            record.image_extent[1],
++                            self.0.record.pixel_format,
++                            p.pixel_format,
++                            p.format,
++                            p.flags,
++                            p.usage,
++                            p.view_formats,
++                            texels.lies_lazily(),
++                            matches!(&self.0.storage, Storage::Shadow { .. }),
++                        );
++                    }
++                }
+                 let mut descriptor = TextureDescriptor::texture_2d(
+                     record.pixel_format,
+                     u64::from(record.image_extent[0]),

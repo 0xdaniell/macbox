@@ -1,10 +1,20 @@
-# macbox: macOS, Xcode and the iOS Simulator on Linux, GPU-accelerated, for AI coding agents
+# macbox
 
-**Run the real iOS Simulator on a Linux machine, without a Mac and without a cloud service.**
-macbox runs a full macOS VM in Docker with real GPU acceleration (Metal, through Reims vGPU on
-your Vulkan GPU), with Xcode, a pool of iOS Simulators, T3 Code's Device panel, and the tools AI
-coding agents (Claude Code, Codex, T3 Code) need to build, run, drive and check iOS apps on their
-own. One command, `macbox`, sets it up and runs it.
+### The real iOS Simulator and Xcode on your Linux machine. GPU-accelerated. No Mac.
+
+macbox runs a full macOS VM in Docker that draws with **Metal on your Linux GPU**, so Xcode and
+the iOS Simulator run on hardware you already have. An iPhone 17 Pro simulator at full 3x
+resolution, in a heavy Liquid Glass scene, runs at **117 fps on an Intel integrated GPU**. Before
+macbox's patches the same GPU managed 17. It's built for AI coding agents: Claude Code, Codex and
+T3 Code each get their own simulator to build, run, tap, screenshot and record iOS apps on their own.
+One command, `macbox`, builds it and runs it.
+
+| | |
+|---|---|
+| **117 fps** | iPhone 17 Pro simulator at 3x (1206×2622), Liquid Glass, on an Arrow Lake iGPU; 17.2 before |
+| **3 at once** | three 3x simulators side by side, ~32 fps each |
+| **No Mac, no cloud** | a Linux host with KVM and Docker; nothing billed per minute |
+| **Agent-ready** | `mac-sim` gives every checkout its own simulator; `sim-fps` checks 60 fps; T3 Code's Device panel streams it live |
 
 **Website and guides:** [tuna-nope.github.io/macbox](https://tuna-nope.github.io/macbox/): macOS, Xcode and
 the iOS Simulator on Linux, Expo apps, the GPU path, and AI coding agents with T3 Code.
@@ -27,8 +37,8 @@ Linux host (KVM + a Vulkan GPU + Docker)
 - **macOS draws on your GPU.** [Reims vGPU](https://github.com/steelbrain/reims-vgpu) gives QEMU
   Apple's paravirtual GPU, and macOS's own driver talks to it, so Metal works with no guest
   driver. [metal2vulkan](https://github.com/steelbrain/metal2vulkan) runs Metal's work on Vulkan.
-  macbox builds both, with patches that took a 3x iOS Simulator from 17 to 50 fps on the GPU it
-  was measured on, and to 70 with the experimental Coherent switch (see [Performance](#performance)).
+  macbox builds both, with patches that took a 3x iOS Simulator from 17 to 117 fps on the GPU it
+  was measured on (see [Performance](#performance)).
 - **The screen** opens in a window on your Linux desktop, or in a browser tab (Selkies: H.264 on
   the GPU, its bitrate following the link). Agents can see it and click and type into it
   (`macbox screenshot`, `click`, `type`), so an agent can drive the macOS installer too.
@@ -90,34 +100,37 @@ floating glass toolbar, counted at the simulator's own screen (frames per second
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/fps-dark.svg">
-  <img alt="iOS Simulator at 3x, Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 with the cohwl build, 70.0 with Coherent on" src="docs/images/fps-light.svg" width="760">
+  <img alt="iOS Simulator at 3x, Liquid Glass benchmark: 17.2 fps as upstream shipped it, 39.0 with the October 28 macbox build, 50.6 on November 5, 70.0 with Coherent, 117 with the build macbox makes now" src="docs/images/fps-light.svg" width="760">
 </picture>
 
 | iOS Simulator at 3x (1206x2622, an iPhone's pixels), glass | fps |
 |---|---|
 | Reims 2ce3209, as upstream shipped it on 2026-10-26 | 17.2 |
 | macbox, 2026-10-28: rendering guest-RAM textures in place | 38.5 / 39.5 |
-| **macbox build now** (cohwl, 2026-11-05) | **50.6** (p95 21 ms) |
-| macbox build with `MACBOX_COHERENT=on` (experimental) | **70.0** (p95 18 ms) |
+| macbox, 2026-11-05: flat32 | 50.6 |
+| macbox, 2026-11-05: + Coherent, zero-copy surfaces | 70.0 |
+| **macbox now** (2026-11-09): + grouped completion, staged page-ups, inline checks | **117** (114–121; the screen's limit is 120) |
 
-| | Reims 2ce3209 | macbox, 2026-10-28 | macbox now, Coherent on |
-|---|---|---|---|
-| iOS Simulator 1x (402x874), glass | 53.5 | 95.8 / 92.5 | not measured yet |
-| iOS Simulator 2x (804x1748), glass | 33.5 | 67.8 / 60.5 | not measured yet |
-| macOS desktop, dragging a window (presents/s) | | 105 (Coherent off) | 130 |
-| macOS desktop, Safari scrolling (presents/s) | | 75–79 (Coherent off) | 110 |
-| macOS desktop, Genie minimize at 3440x1440 (frames per animation) | ~12 | 19.5 | 29.5 / 30.5 |
+| The build macbox makes now | |
+|---|---|
+| two 3x simulators at once | 51–54 fps each |
+| three 3x simulators at once | 31–32 fps each |
+| macOS desktop (3440x1440), dragging a window | 240 display-link ticks a second alone; 126 with a simulator running |
+| copying frames back to guest RAM | 0.2% of what eager copies would cost: about 5 µs a frame |
 
-Coherent keeps the GPU's image of the simulator's and the desktop's surfaces ahead of guest RAM,
-and syncs a page only when the guest's CPU touches it: the copies that were left are gone, and the
-GPU drops from 97% to 70% busy at 3x. It is off by default for now: it hung the GPU once on its
-first day of daily use (the next boot came up without it, as designed), and the cause isn't
-settled. [docs/performance.md](docs/performance.md#coherent-experimental-off-by-default) has the details.
+Coherent keeps the GPU's image of the simulator's and the desktop's surfaces ahead of guest RAM and
+syncs a page only when the guest's CPU touches it, so the copies between them are gone. The rest
+removed per-page mappings, per-batch completions and a scheduling round per batch. It's on by
+default with an Arrow Lake iGPU, where it runs every day, and a crash guard falls back to the plain
+path after a bad run. One rare GPU hang under repeated boots of three simulators is still open.
+[docs/performance.md](docs/performance.md) has the details.
 
-The GPU is the limit: without Coherent a 3x simulator keeps this iGPU 96 to 98% busy. On a faster
-GPU every number moves up. [docs/performance.md](docs/performance.md) has what the patches do, the method, what
-didn't help, and the known limits (an idle macOS display gets no vblank from its driver, so an
-animation starts about 0.1 s late: [reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141)).
+The GPU is the limit: one 3x simulator takes about 7.7 ms of this iGPU's time per frame, and several
+simulators share about 105 frames a second. On a faster GPU every number moves up.
+[docs/performance.md](docs/performance.md) breaks a frame down (what is real rendering and what the
+translation adds), lists what didn't help, and the known limits (an idle macOS display gets no
+vblank from its driver, so an animation starts about 0.1 s late:
+[reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141)).
 
 ## Questions people ask
 

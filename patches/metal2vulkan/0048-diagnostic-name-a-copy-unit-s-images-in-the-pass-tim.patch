@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 7 Nov 2026 16:50:31 +0000
+Subject: [PATCH 48/92] diagnostic: name a copy unit's images in the pass timer
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/image_log.rs  | 15 ++++++
+ crates/metal2vulkan-runtime/src/pass_times.rs | 52 +++++++++++++++++--
+ 2 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/image_log.rs b/crates/metal2vulkan-runtime/src/image_log.rs
+index 36639493..36459411 100644
+--- a/crates/metal2vulkan-runtime/src/image_log.rs
++++ b/crates/metal2vulkan-runtime/src/image_log.rs
+@@ -923,3 +923,18 @@ pub(crate) fn pass_label(
+         extent,
+     }
+ }
++
++/// LOCAL (Atlas) diagnostic: `image` as the pass timer names a copy's (`pass_times.rs`): its
++/// extent, usage bits and purpose, where the registry knows it.
++pub(crate) fn image_note(image: vk::Image) -> String {
++    match registry().images.get(&image.as_raw()) {
++        Some(e) => format!(
++            "{}x{}:u{:x}:{}",
++            e.extent.width,
++            e.extent.height,
++            e.usage.as_raw(),
++            e.purpose
++        ),
++        None => format!("{:#x}?", image.as_raw()),
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/pass_times.rs b/crates/metal2vulkan-runtime/src/pass_times.rs
+index fe63c8e5..933b7d8a 100644
+--- a/crates/metal2vulkan-runtime/src/pass_times.rs
++++ b/crates/metal2vulkan-runtime/src/pass_times.rs
+@@ -150,6 +150,8 @@ pub(crate) enum PassAt {
+ }
+ 
+ thread_local! {
++    /// A copy's description for the unit it opens (`hook!`'s copies), taken by [`work`].
++    static COPY_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+     static SCOPE: Cell<Option<Tag>> = const { Cell::new(None) };
+     static SITE: Cell<Option<&'static Location<'static>>> = const { Cell::new(None) };
+ }
+@@ -821,6 +823,8 @@ pub(crate) unsafe fn end(st: Stamps, cb: vk::CommandBuffer) {
+ /// As the command's: `cb` recording outside a render pass instance; `st` are its slot's.
+ pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, command: &'static str) {
+     let site = SITE.with(Cell::take);
++    // A copy's description reaches only a unit this command opens.
++    let _drop_note = DropNote;
+     if LIVE.load(Ordering::Relaxed) == 0 {
+         return;
+     }
+@@ -865,7 +869,7 @@ pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, comma
+         count: 1,
+         block: 0,
+         offset: 0,
+-        note: None,
++        note: COPY_NOTE.with(|n| n.borrow_mut().take()),
+         raw: 0,
+         parent: None,
+     };
+@@ -876,6 +880,15 @@ pub(crate) unsafe fn work(st: Stamps, cb: vk::CommandBuffer, class: Class, comma
+     }
+ }
+ 
++/// Clears a copy's description that no unit took.
++struct DropNote;
++
++impl Drop for DropNote {
++    fn drop(&mut self) {
++        COPY_NOTE.with(|n| n.borrow_mut().take());
++    }
++}
++
+ /// Close the draw unit open on `cb`, where one is.
+ ///
+ /// # Safety
+@@ -982,6 +995,21 @@ pub(crate) unsafe fn draw_at(st: Stamps, cb: vk::CommandBuffer, what: &'static s
+     }
+ }
+ 
++/// Before a copy into `dst` (from `src`, an image or null) of `count` regions, the first of
++/// `extent`: its description, for the unit it opens, where any capture is live.
++pub(crate) fn copy_note(src: vk::Image, dst: vk::Image, count: u32, extent: Option<(u32, u32)>) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let (w, h) = extent.unwrap_or((0, 0));
++    let from = match src == vk::Image::null() {
++        true => "buffer".to_owned(),
++        false => image_log::image_note(src),
++    };
++    let note = format!("{count}r:{w}x{h}:{from}>{}", image_log::image_note(dst));
++    COPY_NOTE.with(|n| *n.borrow_mut() = Some(note));
++}
++
+ /// Before a draw on `cb`: counted in its render pass instance, or the one that executes it.
+ pub(crate) fn draw(cb: vk::CommandBuffer) {
+     if LIVE.load(Ordering::Relaxed) == 0 {
+@@ -1140,13 +1168,31 @@ macro_rules! hook {
+     (before cmd_copy_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
+         $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyBuffer")
+     };
+-    (before cmd_copy_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++    (before cmd_copy_image, $st:expr, $cb:ident, $src:ident, $sl:ident, $dst:ident, $dl:ident, $count:ident, $regions:ident) => {
++        if $crate::pass_times::on() {
++            $crate::pass_times::copy_note($src, $dst, $count, if $count > 0 && !$regions.is_null() {
++                // SAFETY: the command's: `count` regions.
++                let r = unsafe { *$regions };
++                Some((r.extent.width, r.extent.height))
++            } else {
++                None
++            });
++        }
+         $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyImage")
+     };
+     (before cmd_blit_image, $st:expr, $cb:ident $(, $a:ident)*) => {
+         $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdBlitImage")
+     };
+-    (before cmd_copy_buffer_to_image, $st:expr, $cb:ident $(, $a:ident)*) => {
++    (before cmd_copy_buffer_to_image, $st:expr, $cb:ident, $src:ident, $dst:ident, $dl:ident, $count:ident, $regions:ident) => {
++        if $crate::pass_times::on() {
++            $crate::pass_times::copy_note(ash::vk::Image::null(), $dst, $count, if $count > 0 && !$regions.is_null() {
++                // SAFETY: the command's: `count` regions.
++                let r = unsafe { *$regions };
++                Some((r.image_extent.width, r.image_extent.height))
++            } else {
++                None
++            });
++        }
+         $crate::pass_times::hook!(@work $st, $cb, Transfer, "vkCmdCopyBufferToImage")
+     };
+     (before cmd_copy_image_to_buffer, $st:expr, $cb:ident $(, $a:ident)*) => {
