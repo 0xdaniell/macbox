@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/images/logo.svg" width="112" alt="macbox logo: an iPhone with a terminal prompt on its screen"></p>
-
 # macbox
 
 macbox gives your AI coding agents a Mac on Linux. It runs a full macOS VM in Docker that draws
