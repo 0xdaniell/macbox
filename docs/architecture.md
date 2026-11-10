@@ -23,7 +23,7 @@ host (Linux, KVM, a Vulkan GPU)
 
 ## The container
 
-One image, `macbox:run` ([docker/Dockerfile](../docker/Dockerfile)), builds and runs everything:
+One image, `macbox:run` ([src/docker/Dockerfile](../src/docker/Dockerfile)), builds and runs everything:
 Ubuntu 26.10 (for Mesa 26.2 and Python 3.14), the build tools for Reims vGPU and QEMU, and the run
 stack (passt, sway, wayvnc, noVNC, VA-API drivers). Selkies installs into a venv under
 `MACBOX_HOME` on first use.
@@ -38,9 +38,9 @@ It runs with seccomp and AppArmor unconfined, because passt needs a user namespa
 
 ## Builds
 
-`container/build-reims.sh` (run by `macbox build` in a throwaway container) checks out Reims vGPU,
-QEMU and metal2vulkan at the commits [versions.env](../versions.env) pins, applies
-[patches/](../patches/README.md) to each of the three, points Reims's Cargo at the patched metal2vulkan, and builds
+`src/container/build-reims.sh` (run by `macbox build` in a throwaway container) checks out Reims vGPU,
+QEMU and metal2vulkan at the commits [src/versions.env](../src/versions.env) pins, applies
+[patches/](../src/patches/README.md) to each of the three, points Reims's Cargo at the patched metal2vulkan, and builds
 `reims-ctl`, the library (`cargo xtask dist --platform vulkan`) and QEMU on it. Each QEMU goes into
 `~/.local/share/reims-ctl/qemu/<date>-<commit>-macbox` and `qemu/current` moves to it. A running VM
 keeps its QEMU until it restarts, and old builds stay for going back
@@ -86,14 +86,14 @@ Selkies follow it.
 
 ## Driving the GUI
 
-`macbox screenshot | click | move | scroll | type | key | wait` run [lib/vmctl.py](../lib/vmctl.py)
+`macbox screenshot | click | move | scroll | type | key | wait` run [src/lib/vmctl.py](../src/lib/vmctl.py)
 in the container against QEMU's QMP socket: screendumps, and absolute mouse and keyboard events. That
 is enough for an agent to install macOS, go through Setup Assistant and turn on SSH by itself.
 `type -` reads the text from stdin, so a password never shows in a process list.
 
 ## The guest
 
-Everything inside macOS comes from [guest/](../guest/README.md), copied to `~/.macbox` by
+Everything inside macOS comes from [guest/](../src/guest/README.md), copied to `~/.macbox` by
 `macbox provision` and run as `~/.macbox/macbox-guest <step>` over SSH. Each step is idempotent.
 
 ## The simulators
@@ -129,17 +129,19 @@ path, name and size is a setting there, so two macboxes on one host only need di
 
 ```
 macbox                    the CLI
-versions.env              the pinned upstream commits
-docker/                   the image (Dockerfile, sway.conf)
-container/                scripts that run inside the container: build-reims.sh, display-up.sh, stream-up.sh
-lib/vmctl.py              screenshots, mouse and keyboard through QMP
-patches/                  the series on Reims vGPU, metal2vulkan and QEMU
-guest/                    everything copied into macOS (macbox-guest and its tools)
-sims/                     the agent tools on the host (mac-sim, sim-fps, android-sim) and their user units
-skills/                   the simulators, phone-builds and macbox (setup) skills
-agents/                   the instructions snippet and the Claude Code hook
-bench/                    the benchmark tools (simfps, GlassBench, GenieBench)
-docs/                     these documents; docs/images: the README's pictures and make-chart.py
-llms.txt, AGENTS.md        entry points for language models and for an agent setting macbox up
+AGENTS.md                 the entry point for an agent setting macbox up
+src/versions.env          the pinned upstream commits
+src/docker/               the image (Dockerfile, sway.conf)
+src/container/            scripts that run inside the container: build-reims.sh, display-up.sh, stream-up.sh
+src/lib/vmctl.py          screenshots, mouse and keyboard through QMP
+src/patches/              the series on Reims vGPU, metal2vulkan and QEMU
+src/guest/                everything copied into macOS (macbox-guest and its tools)
+src/sims/                 the agent tools on the host (mac-sim, sim-fps, android-sim) and their user units
+src/skills/               the simulators, phone-builds and macbox (setup) skills
+src/agents/               the instructions snippet and the Claude Code hook
+src/bench/                the benchmark tools (simfps, GlassBench, GenieBench)
+docs/                     these documents; docs/images: the pictures, the logo and make-chart.py
+docs/site/                the website and llms.txt
+.github/                  the website's workflow, issue templates, CONTRIBUTING.md
 ```
 

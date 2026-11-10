@@ -76,4 +76,4 @@ Required Notice: Copyright 2026 TUNA-NOPE (https://github.com/TUNA-NOPE)
 
 Scope: these terms cover macbox's own files. The files in patches/ modify Reims vGPU and metal2vulkan,
 which are GPL-2.0-or-later OR LGPL-3.0-or-later, and are offered under those same terms; those in
-patches/qemu modify QEMU and are GPL-2.0-or-later (patches/README.md). The projects macbox builds and downloads keep their own licenses (CREDITS.md).
+src/patches/qemu modify QEMU and are GPL-2.0-or-later (src/patches/README.md). The projects macbox builds and downloads keep their own licenses (docs/credits.md).

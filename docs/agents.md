@@ -14,11 +14,11 @@ measure.
 |---|---|
 | `mac-sim`, `mac-sim-remote`, `sim-fps`, `android-sim`, `android-gpu-desktop`, `phone-build`, `macbox` | links in `~/.local/bin` |
 | the `simulators`, `phone-builds` and `macbox` skills | links in `~/.claude/skills` and `~/.agents/skills` |
-| the "Simulators" section of the instructions ([agents/simulators-snippet.md](../agents/simulators-snippet.md)) | between `<!-- macbox:simulators -->` markers in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` (each backed up as `.bak-macbox`) |
+| the "Simulators" section of the instructions ([src/agents/simulators-snippet.md](../src/agents/simulators-snippet.md)) | between `<!-- macbox:simulators -->` markers in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` (each backed up as `.bak-macbox`) |
 | `mac-sim-idle.timer` | a user unit, enabled: idle pool simulators shut down after 20 minutes |
 
 Optional: a Claude Code hook that reminds the agent of the skill whenever a prompt mentions a
-simulator ([agents/README.md](../agents/README.md)). `./macbox agents uninstall` removes the links
+simulator ([src/agents/README.md](../src/agents/README.md)). `./macbox agents uninstall` removes the links
 and the timer (it leaves the instructions).
 
 ## What an agent does with it
@@ -35,7 +35,7 @@ mac-sim record /tmp/a.mp4 10 & ...; wait; sim-fps /tmp/a.mp4   # record a flow, 
 mac-sim down            # give it back
 ```
 
-The [simulators skill](../skills/simulators/SKILL.md) is the rulebook: which simulator for what, how
+The [simulators skill](../src/skills/simulators/SKILL.md) is the rulebook: which simulator for what, how
 to show it to the user in T3 Code's Device panel, and the loop to run after every UI change. Run
 it, screenshot it and look, record the whole flow, and check with `sim-fps` that every stretch of
 motion held 60 fps with no dropped frames. Then inspect the frames. Measure motion on a 1x
@@ -62,7 +62,7 @@ android-sim up && android-sim run && android-sim shot /tmp/a.png && android-sim 
 
 It needs the Android SDK (`ANDROID_HOME`, default `~/Android/Sdk`, with cmdline-tools), a JDK 17 for
 builds, `/dev/kvm`, and agent-device. For GPU rendering, `android-gpu-desktop` runs a hidden sway
-with Xwayland on the GPU for the emulators (`sims/systemd/android-gpu-desktop.service`); without it
+with Xwayland on the GPU for the emulators (`src/sims/systemd/android-gpu-desktop.service`); without it
 they render in software. Settings are in the same config file:
 
 | Setting | Default |
@@ -77,4 +77,4 @@ they render in software. Settings are in the same config file:
 The `phone-builds` skill and `phone-build` cover builds for a real device: an `.ipa` for an iPhone,
 TestFlight, an `.apk`. It uses Expo's EAS while the month's free cloud builds last, then builds
 locally: Android on the host, iOS in the macOS VM. iOS device builds need a paid Apple Developer
-Program membership. See [skills/phone-builds/SKILL.md](../skills/phone-builds/SKILL.md).
+Program membership. See [src/skills/phone-builds/SKILL.md](../src/skills/phone-builds/SKILL.md).

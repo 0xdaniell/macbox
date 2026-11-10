@@ -18,4 +18,4 @@ Share the use case or problem this would solve.
 
 Links, prototypes, experiments, patches, examples, or anything else relevant.
 
-No implementation required. All ideas are welcome. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+No implementation required. All ideas are welcome. See [CONTRIBUTING.md](../CONTRIBUTING.md).

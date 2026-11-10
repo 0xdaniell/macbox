@@ -114,7 +114,7 @@ drop_managed() {  # drop_managed <live file>: the lines macbox writes, so a chan
 apply_tuning() {  # before each start
   local live="$RUN/live.conf" k
   if tuning_on; then
-    [ -s "$live" ] || printf '# metal2vulkan live switches (patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$live"
+    [ -s "$live" ] || printf '# metal2vulkan live switches (src/patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$live"
     drop_managed "$live"
     local env=(--env "M2V_LIVE=$live" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1)
     if gpu_is_arl; then env+=(--env "M2V_ARL_FACTS=$ARL_FACTS"); else env+=(--env "M2V_ARL_FACTS="); fi
@@ -299,12 +299,12 @@ cmd_doctor() {
 cmd_build() {
   need_init
   say "== image $MACBOX_IMAGE"
-  $DOCKER build -t "$MACBOX_IMAGE" "$REPO/docker"
+  $DOCKER build -t "$MACBOX_IMAGE" "$REPO/src/docker"
   local e; mapfile -t e < <(cenv)
   say "== Reims vGPU, metal2vulkan and QEMU (20 to 60 minutes the first time)"
   local pin=(); [ -n "${MACBOX_BUILD_CPUSET:-}" ] && pin=(taskset -c "$MACBOX_BUILD_CPUSET")
   $DOCKER run --rm "${e[@]}" -v "$MACBOX_HOME:$MACBOX_HOME" -v "$REPO:$REPO:ro" "$MACBOX_IMAGE" \
-    "${pin[@]}" nice -n 10 bash "$REPO/container/build-reims.sh" "$@"
+    "${pin[@]}" nice -n 10 bash "$REPO/src/container/build-reims.sh" "$@"
   if vm_running; then say "the running VM keeps its QEMU; the new build starts with the next macbox down && macbox up"; fi
 }
 
@@ -341,7 +341,7 @@ cmd_up() {
     wd=/tmp/host-wayland/wayland-0
     in_c mkdir -p -m 700 /tmp/xdg   # the window's XDG_RUNTIME_DIR (vm.toml), which sway makes otherwise
   else
-    wd=$(in_c "$REPO/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
+    wd=$(in_c "$REPO/src/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
   fi
   if ! vm_running; then
     ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" --extra-args "$(qemu_extra)" >/dev/null
@@ -376,7 +376,7 @@ cmd_status() {
   local pid; pid=$(qemu_pid)
   [ -n "$pid" ] && ps -o pid,pcpu,rss,etime -p "$pid" | sed 's/^/  /'
   in_c test -S /tmp/host-wayland/wayland-0 && say "  view: local (a window on the host's desktop)" ||
-    { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/"; in_c "$REPO/container/stream-up.sh" status | sed 's/^/  /'; }
+    { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/"; in_c "$REPO/src/container/stream-up.sh" status | sed 's/^/  /'; }
   say "  build: $(build_id)$(tuning_on && echo ', GPU tuning on' || echo ', GPU tuning off')"
   say "  coherent: $(coherent_state)"
   say "  screen: $(resolution)"
@@ -418,13 +418,13 @@ cmd_gui() {  # screenshot / click / type / key / scroll / wait, through QMP in t
   case "$sub" in
     shot|wait)
       local out="${1:-$MACBOX_HOME/shots/screen.png}" tmp="$MACBOX_HOME/shots/.shot-$$.png"
-      if [ "$sub" = wait ]; then $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" wait "${2:-60}" "$tmp"
-      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" shot "$tmp"; fi
+      if [ "$sub" = wait ]; then $DOCKER exec "${e[@]}" "$C" python3 "$REPO/src/lib/vmctl.py" wait "${2:-60}" "$tmp"
+      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/src/lib/vmctl.py" shot "$tmp"; fi
       mv -f "$tmp" "$out"; say "$out" ;;
     type)
-      if [ "${1:-}" = - ]; then $DOCKER exec -i "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" type -
-      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" type "$@"; fi ;;
-    *) $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" "$sub" "$@" ;;
+      if [ "${1:-}" = - ]; then $DOCKER exec -i "${e[@]}" "$C" python3 "$REPO/src/lib/vmctl.py" type -
+      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/src/lib/vmctl.py" type "$@"; fi ;;
+    *) $DOCKER exec "${e[@]}" "$C" python3 "$REPO/src/lib/vmctl.py" "$sub" "$@" ;;
   esac
 }
 
@@ -449,10 +449,10 @@ cmd_ssh_bootstrap() {  # types into the desktop's Terminal: this host's key, the
 
 cmd_provision() {
   ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer: macbox next"
-  [ -x "$REPO/guest/macbox-guest" ] || die "guest/macbox-guest is missing from this checkout"
-  say "== copying guest/ to ~/.macbox on the Mac"
+  [ -x "$REPO/src/guest/macbox-guest" ] || die "src/guest/macbox-guest is missing from this checkout"
+  say "== copying src/guest/ to ~/.macbox on the Mac"
   guest 'mkdir -p ~/.macbox'
-  tar -C "$REPO/guest" -cf - . | guest 'tar -C ~/.macbox -xf -'
+  tar -C "$REPO/src/guest" -cf - . | guest 'tar -C ~/.macbox -xf -'
   # The guest side's settings (macbox-guest reads ~/.macbox/config.env).
   printf 'MACBOX_SIM_PREFIX=%q\nMACBOX_POOL=%q\n' "$MACBOX_SIM_PREFIX" "$MACBOX_POOL" | guest 'cat > ~/.macbox/config.env'
   local subs=("$@"); [ ${#subs[@]} -gt 0 ] || subs=(base tools "stream-settings install")
@@ -530,19 +530,19 @@ cmd_agents() {
   case "$sub" in
     install)
       mkdir -p "$bin"
-      for f in "$REPO"/sims/bin/* "$REPO"/skills/*/bin/*; do [ -f "$f" ] && ln -sfn "$f" "$bin/$(basename "$f")"; done
+      for f in "$REPO"/src/sims/bin/* "$REPO"/src/skills/*/bin/*; do [ -f "$f" ] && ln -sfn "$f" "$bin/$(basename "$f")"; done
       ln -sfn "$REPO/macbox" "$bin/macbox"
       for d in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
         mkdir -p "$d"
-        for f in "$REPO"/skills/*/; do
+        for f in "$REPO"/src/skills/*/; do
           n=$(basename "$f")
           if [ -e "$d/$n" ] && [ ! -L "$d/$n" ]; then warn "$d/$n exists and isn't macbox's link; left as it is"; continue; fi
           ln -sfn "${f%/}" "$d/$n"
         done
       done
-      if [ -d "$REPO/sims/systemd" ] && command -v systemctl >/dev/null; then
+      if [ -d "$REPO/src/sims/systemd" ] && command -v systemctl >/dev/null; then
         mkdir -p "$HOME/.config/systemd/user"
-        for f in "$REPO"/sims/systemd/*; do ln -sfn "$f" "$HOME/.config/systemd/user/$(basename "$f")"; done
+        for f in "$REPO"/src/sims/systemd/*; do ln -sfn "$f" "$HOME/.config/systemd/user/$(basename "$f")"; done
         systemctl --user daemon-reload
         systemctl --user enable --now mac-sim-idle.timer >/dev/null 2>&1 || warn "couldn't enable mac-sim-idle.timer"
       fi
@@ -550,7 +550,7 @@ cmd_agents() {
       for f in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"; do
         [ -d "$(dirname "$f")" ] || continue
         [ -f "$f" ] && cp -p "$f" "$f.bak-macbox"
-        python3 - "$f" "$REPO/agents/simulators-snippet.md" <<'PY'
+        python3 - "$f" "$REPO/src/agents/simulators-snippet.md" <<'PY'
 import re, sys
 path, snip = sys.argv[1], open(sys.argv[2]).read().strip() + "\n"
 try: old = open(path).read()
@@ -561,17 +561,17 @@ open(path, "w").write(new)
 PY
         say "instructions: the Simulators section in $f"
       done
-      say "linked: $(ls "$REPO/sims/bin" "$REPO"/skills/*/bin 2>/dev/null | grep -v -e : -e '^$' | tr '\n' ' ')macbox -> $bin"
-      say "skills: $(ls "$REPO/skills" | tr '\n' ' ')-> ~/.claude/skills, ~/.agents/skills"
-      say "Claude Code hook (optional): agents/README.md" ;;
+      say "linked: $(ls "$REPO/src/sims/bin" "$REPO"/src/skills/*/bin 2>/dev/null | grep -v -e : -e '^$' | tr '\n' ' ')macbox -> $bin"
+      say "skills: $(ls "$REPO/src/skills" | tr '\n' ' ')-> ~/.claude/skills, ~/.agents/skills"
+      say "Claude Code hook (optional): src/agents/README.md" ;;
     uninstall)
-      for f in "$REPO"/sims/bin/* "$REPO"/skills/*/bin/* "$REPO/macbox"; do n=$(basename "$f"); [ "$(readlink "$bin/$n" 2>/dev/null)" = "$f" ] && rm -f "$bin/$n"; done
+      for f in "$REPO"/src/sims/bin/* "$REPO"/src/skills/*/bin/* "$REPO/macbox"; do n=$(basename "$f"); [ "$(readlink "$bin/$n" 2>/dev/null)" = "$f" ] && rm -f "$bin/$n"; done
       for d in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
-        for f in "$REPO"/skills/*/; do n=$(basename "$f"); [ "$(readlink "$d/$n" 2>/dev/null)" = "${f%/}" ] && rm -f "$d/$n"; done
+        for f in "$REPO"/src/skills/*/; do n=$(basename "$f"); [ "$(readlink "$d/$n" 2>/dev/null)" = "${f%/}" ] && rm -f "$d/$n"; done
       done
-      if [ -d "$REPO/sims/systemd" ] && command -v systemctl >/dev/null; then
+      if [ -d "$REPO/src/sims/systemd" ] && command -v systemctl >/dev/null; then
         systemctl --user disable --now mac-sim-idle.timer >/dev/null 2>&1 || true
-        for f in "$REPO"/sims/systemd/*; do n=$(basename "$f"); [ "$(readlink "$HOME/.config/systemd/user/$n" 2>/dev/null)" = "$f" ] && rm -f "$HOME/.config/systemd/user/$n"; done
+        for f in "$REPO"/src/sims/systemd/*; do n=$(basename "$f"); [ "$(readlink "$HOME/.config/systemd/user/$n" 2>/dev/null)" = "$f" ] && rm -f "$HOME/.config/systemd/user/$n"; done
         systemctl --user daemon-reload
       fi
       say "removed macbox's links" ;;
@@ -624,7 +624,7 @@ Setup (docs/setup.md):
   macbox recovery-fix         type the Metal error-mode line into Recovery's Terminal
   macbox boot-picker on|off   OpenCore's boot picker (to reach Recovery)
   macbox ssh-bootstrap        type the SSH key + Remote Login line into the desktop's Terminal
-  macbox provision [step...]  copy guest/ to the Mac and run it (default: base tools stream-settings)
+  macbox provision [step...]  copy src/guest/ to the Mac and run it (default: base tools stream-settings)
   macbox xcode <file.xip>     install Xcode and the iOS Simulator runtime
   macbox disk nvme            the system disk on NVMe (faster), once macOS is installed
   macbox pool [create|list|delete]   the iOS Simulator pool
@@ -665,7 +665,7 @@ case "$sub" in
       local|stream) echo "$1" >"$RUN/view"; if container_up; then cmd_down; cmd_up; fi ;;
       *) die "usage: macbox view [local|stream]" ;;
     esac ;;
-  stream) container_up || die "the container isn't running"; in_c "$REPO/container/stream-up.sh" "${1:-status}" ;;
+  stream) container_up || die "the container isn't running"; in_c "$REPO/src/container/stream-up.sh" "${1:-status}" ;;
   resolution)
     [[ "${1:-}" =~ ^[0-9]+x[0-9]+$ ]] || die "usage: macbox resolution WIDTHxHEIGHT"
     echo "$1" >"$RUN/resolution"
