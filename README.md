@@ -8,7 +8,7 @@ simulator to build an app, run it, tap through it, take screenshots and record v
 It's fast: an iPhone 17 Pro simulator at full 3x resolution renders a heavy Liquid Glass screen at
 **120 fps on an Intel integrated GPU**, the screen's full refresh rate. Before macbox's patches, the same GPU managed 17.
 
-**Website:** [tuna-nope.github.io/macbox](https://tuna-nope.github.io/macbox/)
+**Website:** [0xdaniell.github.io/macbox](https://0xdaniell.github.io/macbox/)
 
 ![The macOS 26 desktop in macbox on Linux: Simulator.app shows an iPhone 17 Pro running Nimbus, a weather app, next to Nimbus's website in Safari](docs/images/hero.jpg)
 
@@ -47,13 +47,13 @@ The easy way: give your agent this repo and let it do the install, the clicks in
 screens included.
 
 ```
-Set up macbox on this machine: https://github.com/TUNA-NOPE/macbox. Follow its AGENTS.md and ask me before changing the host.
+Set up macbox on this machine: https://github.com/0xdaniell/macbox. Follow its AGENTS.md and ask me before changing the host.
 ```
 
 Or by hand:
 
 ```sh
-git clone https://github.com/TUNA-NOPE/macbox && cd macbox
+git clone https://github.com/0xdaniell/macbox && cd macbox
 ./macbox init      # config and an SSH key
 ./macbox doctor    # checks KVM, the GPU, Docker and disk space
 ./macbox build     # the GPU stack (20 to 60 minutes)
@@ -70,7 +70,7 @@ agent tools. [docs/setup.md](docs/setup.md) has every step.
 Already running macbox? Give your agent this:
 
 ```
-Update macbox on this machine to the latest version: https://github.com/TUNA-NOPE/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
+Update macbox on this machine to the latest version: https://github.com/0xdaniell/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
 ```
 
 It pulls the new version, links the tools again, rebuilds if the GPU stack changed, and restarts the

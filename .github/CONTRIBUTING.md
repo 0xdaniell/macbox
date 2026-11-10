@@ -11,7 +11,7 @@ or a partial implementation is enough to start a conversation.
 
 ## Open an issue
 
-[Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) to report a problem,
+[Open an issue](https://github.com/0xdaniell/macbox/issues/new/choose) to report a problem,
 request a feature, suggest a change, or share an experiment. Describe what you want
 or encountered, why it matters, and any relevant steps, evidence, or environment details.
 Include as much as you know; incomplete reports are still welcome.
@@ -19,7 +19,7 @@ Include as much as you know; incomplete reports are still welcome.
 ## Send a pull request
 
 If you already fixed or improved something, please
-[open a pull request](https://github.com/TUNA-NOPE/macbox/pulls).
+[open a pull request](https://github.com/0xdaniell/macbox/pulls).
 Make your change on a branch or fork, explain what it does and why it helps, and include
 the tests or checks you ran. If you haven't been able to test part of it, just say so.
 

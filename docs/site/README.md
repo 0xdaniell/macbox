@@ -1,6 +1,6 @@
 # The website
 
-The source of https://tuna-nope.github.io/macbox/, built by `build.py` (Python's standard library,
+The source of https://0xdaniell.github.io/macbox/, built by `build.py` (Python's standard library,
 nothing to install) and published to GitHub Pages by `.github/workflows/pages.yml` on every push
 to main that touches it.
 
@@ -25,4 +25,4 @@ a code sample that the CLI doesn't have.
 
 Every page also gets a Markdown copy (`index.md` beside `index.html`) for language models, as
 llmstxt.org suggests. robots.txt can't be set here: crawlers read it only at the host's root
-(`tuna-nope.github.io/robots.txt`), which this repo doesn't control. Pages carry robots meta tags.
+(`0xdaniell.github.io/robots.txt`), which this repo doesn't control. Pages carry robots meta tags.

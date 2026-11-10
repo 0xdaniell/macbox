@@ -23,5 +23,5 @@ Steps, configuration, a branch, fork, patch, logs, measurements, or screenshots.
 Hardware, OS, versions, dependencies or other setup details.
 
 Even partial experiments are welcome. If you have a working change, you can also
-[open a pull request](https://github.com/TUNA-NOPE/macbox/pulls).
+[open a pull request](https://github.com/0xdaniell/macbox/pulls).
 See [CONTRIBUTING.md](../CONTRIBUTING.md).

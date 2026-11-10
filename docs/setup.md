@@ -231,7 +231,7 @@ the Android SDK; see [docs/agents.md](agents.md#android).
 New versions come as commits on `main`. With an agent, paste this:
 
 ```
-Update macbox on this machine to the latest version: https://github.com/TUNA-NOPE/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
+Update macbox on this machine to the latest version: https://github.com/0xdaniell/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
 ```
 
 By hand, in the checkout:
