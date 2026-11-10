@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 15:02:24 +0000
+Subject: [PATCH 70/92] lab: surface_twin_make_once waits per surface, not
+ globally; counts made/waited
+
+---
+ .../src/texture/surface_twin.rs               | 47 +++++++++++++++----
+ 1 file changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+index d5471d16..8d1d8c60 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+@@ -31,12 +31,20 @@ use super::*;
+ const SWITCH: &str = "surface_twin";
+ 
+ /// LOCAL (Atlas): held while a texture of a lazy surface is made, from the look for its first
+-/// shadow to its own noting as one (`surface_twin_make_once`); `None` where it is not held.
+-pub(super) struct Making(Option<std::sync::MutexGuard<'static, ()>>);
++/// shadow to its own noting as one (`surface_twin_make_once`): textures of one surface are made one
++/// at a time, those of other surfaces meanwhile. `None` where it is not held.
++pub(super) struct Making(Option<(usize, u64)>);
++
++/// The surfaces a texture is being made of, and the wait for one to end.
++static MAKING_OF: (Mutex<Vec<(usize, u64)>>, std::sync::Condvar) =
++    (Mutex::new(Vec::new()), std::sync::Condvar::new());
+ 
+ impl Drop for Making {
+     fn drop(&mut self) {
+-        if self.0.take().is_some() {
++        if let Some(key) = self.0.take() {
++            let mut making = MAKING_OF.0.lock().unwrap_or_else(|e| e.into_inner());
++            making.retain(|one| *one != key);
++            MAKING_OF.1.notify_all();
+             MAKING.with(|making| making.set(false));
+         }
+     }
+@@ -46,20 +54,43 @@ thread_local! {
+     static MAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
+-/// LOCAL (Atlas): make textures of lazy surfaces one at a time (`surface_twin_make_once`); a
++/// LOCAL (Atlas): make textures of one lazy surface one at a time (`surface_twin_make_once`); a
+ /// texture made while this thread makes one (an attachment's twin) goes on as before.
+ pub(super) fn making_one(texels: &Texels) -> Making {
+-    static ONE: Mutex<()> = Mutex::new(());
++    let Some(key) = texels.surface_key() else {
++        return Making(None);
++    };
+     if !crate::live::on("surface_twin_make_once", false)
+         || !texels.lies_lazily()
+-        || texels.surface_key().is_none()
+         || MAKING.with(std::cell::Cell::get)
+     {
+         return Making(None);
+     }
+-    let guard = ONE.lock().unwrap_or_else(|e| e.into_inner());
++    // LOCAL (Atlas, lab diagnostics): textures made under the switch, and those that waited.
++    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    static WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    static WAITED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++    let start = std::time::Instant::now();
++    let mut making = MAKING_OF.0.lock().unwrap_or_else(|e| e.into_inner());
++    if making.contains(&key) {
++        while making.contains(&key) {
++            making = MAKING_OF.1.wait(making).unwrap_or_else(|e| e.into_inner());
++        }
++        WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        WAITED_NS.fetch_add(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
++    }
++    if made.is_power_of_two() || made % 1024 == 0 {
++        eprintln!(
++            "m2v-make-once: made {made} waited {} for {} us",
++            WAITED.load(std::sync::atomic::Ordering::Relaxed),
++            WAITED_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000
++        );
++    }
++    making.push(key);
++    drop(making);
+     MAKING.with(|making| making.set(true));
+-    Making(Some(guard))
++    Making(Some(key))
+ }
+ 
+ /// A surface's first shadow, weakly: it goes with its last texture.

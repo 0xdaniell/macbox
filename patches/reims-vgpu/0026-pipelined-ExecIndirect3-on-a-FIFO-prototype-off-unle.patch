@@ -1,0 +1,991 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 16:12:13 +0000
+Subject: [PATCH 26/33] pipelined ExecIndirect3 on a FIFO (prototype, off
+ unless REIMS_VGPU_PIPELINE_EXEC names an existing file)
+
+A pipelining FIFO sends a remote task's exec and goes on; the reply's follow-up (backing
+invalidation, failure completion) settles later on the FIFO thread in send order. The FIFO
+event value is reserved at send; a refused/faulted exec commits a fill command buffer that
+keeps the cross-task event chain moving, and the host signals after a crash.
+Not for adoption.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-core/src/fifo.rs            |   8 +
+ crates/reims-vgpu-core/src/fifo/commands.rs   |   3 +
+ .../reims-vgpu-core/src/fifo/commands/exec.rs |  24 ++
+ crates/reims-vgpu-core/src/fifo/pipeline.rs   | 238 ++++++++++++++
+ crates/reims-vgpu-core/src/fifo/ring.rs       |  14 +-
+ crates/reims-vgpu-core/src/fifo/thread.rs     |   7 +
+ crates/reims-vgpu-core/src/gpu_task/exec.rs   | 106 ++++++
+ .../reims-vgpu-core/src/gpu_task/service.rs   |   2 +
+ crates/reims-vgpu-core/src/tasks/remote.rs    | 304 ++++++++++++++++++
+ .../src/tasks/remote/completions.rs           |   5 +
+ crates/reims-vgpu-core/src/tasks/wire.rs      |   4 +
+ 11 files changed, 714 insertions(+), 1 deletion(-)
+ create mode 100644 crates/reims-vgpu-core/src/fifo/pipeline.rs
+
+diff --git a/crates/reims-vgpu-core/src/fifo.rs b/crates/reims-vgpu-core/src/fifo.rs
+index 0cd8e87a..3d58517d 100644
+--- a/crates/reims-vgpu-core/src/fifo.rs
++++ b/crates/reims-vgpu-core/src/fifo.rs
+@@ -28,6 +28,7 @@
+ //!   `tests::a_define_whose_event_raises_dies_under_its_handler`).
+ 
+ pub mod commands;
++pub mod pipeline;
+ pub mod ring;
+ pub mod stamps;
+ pub mod thread;
+@@ -241,6 +242,11 @@ pub struct Fifo<P: Platform> {
+     /// A child's ring mapping, from a start to its thread's exit.
+     mapping: Mutex<Option<Arc<Mapping<P>>>>,
+     platform: Arc<P>,
++    /// LOCAL (Atlas, VM-B): the remote execs sent and not yet settled, oldest first
++    /// ([`pipeline`]). Touched by the FIFO's thread only.
++    pending: Mutex<std::collections::VecDeque<Box<dyn pipeline::PendingExec>>>,
++    /// Whether this FIFO pipelines its execs now; it changes only while nothing is pending.
++    pipelining: AtomicBool,
+ }
+ 
+ impl<P: Platform> Drop for Fifo<P> {
+@@ -292,6 +298,8 @@ impl<P: Platform> Fifo<P> {
+             event_value: Arc::new(AtomicU64::new(0)),
+             mapping: Mutex::new(None),
+             platform: Arc::clone(platform),
++            pending: Mutex::new(std::collections::VecDeque::new()),
++            pipelining: AtomicBool::new(false),
+         })
+     }
+ 
+diff --git a/crates/reims-vgpu-core/src/fifo/commands.rs b/crates/reims-vgpu-core/src/fifo/commands.rs
+index e21b8595..ed1ec9bb 100644
+--- a/crates/reims-vgpu-core/src/fifo/commands.rs
++++ b/crates/reims-vgpu-core/src/fifo/commands.rs
+@@ -50,6 +50,9 @@ use crate::tasks::{Completion, ExecStatus, Task};
+ const DUMP_MAX: usize = 64;
+ 
+ /// The text every feature gate raises with.
++/// LOCAL (Atlas, VM-B): ExecIndirect3's command id, the one opcode a pipelining FIFO overlaps.
++pub(crate) const EXEC_INDIRECT3_ID: u16 = 67;
++
+ pub(crate) const UNSUPPORTED: &str = "the command is not supported at this binary version";
+ /// The text of commands 4, 6, 7, 8 and 54 naming another task.
+ pub(crate) const KERNEL_ONLY: &str = "the command must name a kernel task";
+diff --git a/crates/reims-vgpu-core/src/fifo/commands/exec.rs b/crates/reims-vgpu-core/src/fifo/commands/exec.rs
+index cce756c8..87ce3cb6 100644
+--- a/crates/reims-vgpu-core/src/fifo/commands/exec.rs
++++ b/crates/reims-vgpu-core/src/fifo/commands/exec.rs
+@@ -141,11 +141,35 @@ pub(super) fn exec_indirect2<P: Platform>(c: &mut Command<'_, P>) {
+ /// 67.
+ pub(super) fn exec_indirect3<P: Platform>(c: &mut Command<'_, P>) {
+     let hold = c.hold;
++    // LOCAL (Atlas, VM-B): a pipelining FIFO settles what it can before the exec
++    // (`fifo::pipeline`), sends a remote task's exec without waiting for its reply, and runs a local
++    // task's on the base path once everything pending is settled.
++    let pipelining = c.fifo.pipelining();
++    if pipelining {
++        c.fifo.settle_before_exec();
++    }
+     let Some((task, rc, cbc)) = c.f_class(|c, _| prologue(c, Kind::Exec3)) else {
+         return;
+     };
+     let (resources, cmd_buffers) = records::<P, CmdExecIndirectResource3>(c, rc, cbc, RESOURCE3);
+     let done = c.completion();
++    if pipelining {
++        if let Task::Remote(t) = &task {
++            let pending = t.exec_indirect3_pipelined(
++                ExecArgs {
++                    cmd_buffers,
++                    resources,
++                    stamp_index: c.fifo.stamp_index(),
++                    fifo_event: c.fifo.event.as_ref(),
++                    fifo_event_value: &c.fifo.event_value,
++                },
++                done,
++            );
++            c.fifo.keep_pending(pending);
++            return;
++        }
++        c.fifo.settle_all();
++    }
+     // Outside any handler.
+     if let Err(r) = task.exec_indirect3(
+         hold,
+diff --git a/crates/reims-vgpu-core/src/fifo/pipeline.rs b/crates/reims-vgpu-core/src/fifo/pipeline.rs
+new file mode 100644
+index 00000000..9734e771
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/fifo/pipeline.rs
+@@ -0,0 +1,238 @@
++//! LOCAL (Atlas, VM-B, branch atlas/deep-multisim-pipeline-exec): pipelined remote execs.
++//!
++//! The base FIFO thread blocks in each remote exec until the task's service replied
++//! (`tasks::remote::RemoteTask::exec`), so every task's execs on one FIFO run one after
++//! another. A pipelining FIFO sends a remote exec and goes on; the part of the exec that followed
++//! the reply (the kernel task's shared-texture invalidation, a failure's completion) runs later on
++//! the FIFO's thread, in send order, at a settlement:
++//! - before each pipelined exec, every pending exec whose reply came (no wait), and the oldest
++//!   while [`WINDOW`] are pending (a wait);
++//! - before every other command, all of them (waits): every non-exec command sees what it sees on
++//!   the base path;
++//! - before the thread waits for ring bytes, the replied ones, and the wait is then at most
++//!   [`IDLE_POLL`] while any is pending; at the loop's end, all of them.
++//!
++//! Per task, the task's serial connection and service queues keep its execs in order. Across
++//! tasks the FIFO's shared-event chain keeps them in order on the GPU (`gpu_task::exec`): the FIFO's
++//! event value is reserved at the send, and a refused or faulted exec still moves the chain on
++//! (the service's fill, or the host's signal at settlement after a crash).
++//!
++//! The switch: `REIMS_VGPU_PIPELINE_EXEC=<path>`; pipelining is on while that file exists, looked
++//! at most once a second and only while nothing is pending. Unset: the base path, unchanged.
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++use parking_lot::Mutex;
++
++use super::Fifo;
++use crate::platform::Platform;
++use crate::rt::Hold;
++use crate::rt::held::Held;
++use crate::rt::pool::Pool;
++
++/// The most remote execs a FIFO keeps sent and unsettled.
++pub const WINDOW: usize = 8;
++
++/// While execs are pending, the longest wait for ring bytes before the replied ones settle.
++pub const IDLE_POLL: Duration = Duration::from_micros(500);
++
++/// One remote exec sent and not settled.
++pub trait PendingExec: Send + Sync {
++    /// Whether its reply came (its settlement will not wait).
++    fn replied(&self) -> bool;
++    /// What followed the reply on the base path, after waiting for it.
++    fn settle(self: Box<Self>, hold: Hold<'_>);
++}
++
++/// The switch file, and its last look.
++struct Switch {
++    path: Option<std::path::PathBuf>,
++    look: Mutex<(Option<Instant>, bool)>,
++}
++
++fn switch() -> &'static Switch {
++    static S: OnceLock<Switch> = OnceLock::new();
++    S.get_or_init(|| Switch {
++        path: std::env::var_os("REIMS_VGPU_PIPELINE_EXEC")
++            .filter(|p| !p.is_empty())
++            .map(std::path::PathBuf::from),
++        look: Mutex::new((None, false)),
++    })
++}
++
++/// Counts for the log, all FIFOs together: execs sent pipelined, settlements that waited for a
++/// reply (and of those, the ones the full window forced), and the settlements of pending execs a
++/// non-exec command forced, by opcode.
++struct Stats {
++    sent: AtomicU64,
++    waited: AtomicU64,
++    full: AtomicU64,
++    forced: [AtomicU64; 128],
++    last: Mutex<Option<Instant>>,
++}
++
++static STATS: Stats = Stats {
++    sent: AtomicU64::new(0),
++    waited: AtomicU64::new(0),
++    full: AtomicU64::new(0),
++    forced: [const { AtomicU64::new(0) }; 128],
++    last: Mutex::new(None),
++};
++
++/// Logs the counts (and resets them) at most every 10 s.
++fn log_stats() {
++    let now = Instant::now();
++    {
++        let mut last = STATS.last.lock();
++        match *last {
++            None => {
++                *last = Some(now);
++                return;
++            }
++            Some(t) if now.duration_since(t) < Duration::from_secs(10) => return,
++            Some(_) => *last = Some(now),
++        }
++    }
++    let sent = STATS.sent.swap(0, Ordering::Relaxed);
++    let waited = STATS.waited.swap(0, Ordering::Relaxed);
++    let full = STATS.full.swap(0, Ordering::Relaxed);
++    let mut forced = String::new();
++    for (op, n) in STATS.forced.iter().enumerate() {
++        let n = n.swap(0, Ordering::Relaxed);
++        if n != 0 {
++            forced.push_str(&format!(" {op}:{n}"));
++        }
++    }
++    if sent != 0 {
++        log::info!("FIFO exec pipelining: {sent} sent, {waited} waited ({full} window full), forced by opcode:{forced}");
++    }
++}
++
++/// Whether pipelining is wanted now (the file, looked at most once a second).
++fn wanted() -> bool {
++    let s = switch();
++    let Some(path) = &s.path else {
++        return false;
++    };
++    let mut look = s.look.lock();
++    let now = Instant::now();
++    if look.0.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
++        log_stats();
++        let on = path.exists();
++        if on != look.1 {
++            log::info!("FIFO exec pipelining {}", if on { "on" } else { "off" });
++        }
++        *look = (Some(now), on);
++    }
++    look.1
++}
++
++impl<P: Platform> Fifo<P> {
++    /// Whether this FIFO pipelines its next remote exec: it follows the switch only while nothing
++    /// is pending.
++    pub(crate) fn pipelining(&self) -> bool {
++        if self.pending.lock().is_empty() {
++            let on = wanted();
++            self.pipelining.store(on, Ordering::Relaxed);
++            on
++        } else {
++            self.pipelining.load(Ordering::Relaxed)
++        }
++    }
++
++    /// Settles `p` under a pool and a holder of its own, as a command's.
++    fn settle_one(&self, p: Box<dyn PendingExec>) {
++        if !p.replied() {
++            STATS.waited.fetch_add(1, Ordering::Relaxed);
++        }
++        let pool = Pool::push(&*self.platform);
++        let held = Held::new();
++        p.settle(Hold::of(&held));
++        drop(held);
++        drop(pool);
++    }
++
++    /// Before a pipelined exec: settles the replied execs at the front, then the oldest while the
++    /// window is full.
++    pub(crate) fn settle_before_exec(&self) {
++        loop {
++            let next = {
++                let mut q = self.pending.lock();
++                match q.front() {
++                    Some(f) if f.replied() => q.pop_front(),
++                    Some(_) if q.len() >= WINDOW => {
++                        STATS.full.fetch_add(1, Ordering::Relaxed);
++                        q.pop_front()
++                    }
++                    _ => None,
++                }
++            };
++            match next {
++                Some(p) => self.settle_one(p),
++                None => return,
++            }
++        }
++    }
++
++    /// Settles the replied execs at the front (no wait).
++    pub(crate) fn settle_replied(&self) {
++        loop {
++            let next = {
++                let mut q = self.pending.lock();
++                match q.front() {
++                    Some(f) if f.replied() => q.pop_front(),
++                    _ => None,
++                }
++            };
++            match next {
++                Some(p) => self.settle_one(p),
++                None => return,
++            }
++        }
++    }
++
++    /// Whether an exec is pending.
++    pub(crate) fn has_pending(&self) -> bool {
++        !self.pending.lock().is_empty()
++    }
++
++    /// Keeps a sent exec for its settlement.
++    pub(crate) fn keep_pending(&self, p: Box<dyn PendingExec>) {
++        STATS.sent.fetch_add(1, Ordering::Relaxed);
++        self.pending.lock().push_back(p);
++    }
++
++    /// Before a command other than ExecIndirect3: settles every pending exec, counted under the
++    /// command's opcode.
++    pub(crate) fn settle_for_command(&self, command_id: u16) {
++        if self.settle_all() {
++            let i = usize::from(command_id).min(STATS.forced.len() - 1);
++            if let Some(n) = STATS.forced.get(i) {
++                n.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++    }
++
++    /// Settles every pending exec, oldest first; whether there was one.
++    pub(crate) fn settle_all(&self) -> bool {
++        let mut any = false;
++        loop {
++            let next = self.pending.lock().pop_front();
++            match next {
++                Some(p) => {
++                    any = true;
++                    self.settle_one(p);
++                }
++                None => return any,
++            }
++        }
++    }
++
++    /// Tests: how many execs are pending.
++    #[cfg(test)]
++    pub(crate) fn pending_count(&self) -> usize {
++        self.pending.lock().len()
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/fifo/ring.rs b/crates/reims-vgpu-core/src/fifo/ring.rs
+index 5331dc88..4a8cd0c3 100644
+--- a/crates/reims-vgpu-core/src/fifo/ring.rs
++++ b/crates/reims-vgpu-core/src/fifo/ring.rs
+@@ -213,7 +213,13 @@ impl<P: Platform> Fifo<P> {
+     fn wait_for_bytes(&self, g: &mut MutexGuard<'_, ()>) {
+         #[cfg(test)]
+         self.waiting_for_bytes.fetch_add(1, Ordering::SeqCst);
+-        self.bytes.wait(g);
++        // LOCAL (Atlas, VM-B): while pipelined execs are pending, a short wait, so their
++        // settlement follows their replies (`fifo::pipeline`).
++        if self.has_pending() {
++            let _ = self.bytes.wait_for(g, crate::fifo::pipeline::IDLE_POLL);
++        } else {
++            self.bytes.wait(g);
++        }
+         #[cfg(test)]
+         self.waiting_for_bytes.fetch_sub(1, Ordering::SeqCst);
+     }
+@@ -249,6 +255,9 @@ impl<P: Platform> Fifo<P> {
+                 .load(Ordering::SeqCst)
+                 .wrapping_sub(r.read.load(Ordering::SeqCst));
+             if available == 0 {
++                // LOCAL (Atlas, VM-B): the replied pending execs settle before the wait for bytes;
++                // with execs still pending the wait is short (`fifo::pipeline`).
++                self.settle_replied();
+                 let mut g = self.lock.lock();
+                 if !self.quiesced.load(Ordering::SeqCst)
+                     && r.written.load(Ordering::SeqCst) == r.read.load(Ordering::SeqCst)
+@@ -307,6 +316,9 @@ impl<P: Platform> Fifo<P> {
+             // The cache is reloaded only when too small; a lowered `written` wraps.
+             let count = available(dst.len());
+             if count == 0 {
++                // LOCAL (Atlas, VM-B): the replied pending execs settle before the wait for bytes;
++                // with execs still pending the wait is short (`fifo::pipeline`).
++                self.settle_replied();
+                 let mut g = self.lock.lock();
+                 if !self.quiesced.load(Ordering::SeqCst) && available(dst.len()) == 0 {
+                     self.wait_for_bytes(&mut g);
+diff --git a/crates/reims-vgpu-core/src/fifo/thread.rs b/crates/reims-vgpu-core/src/fifo/thread.rs
+index 8d6a6f8a..cb381144 100644
+--- a/crates/reims-vgpu-core/src/fifo/thread.rs
++++ b/crates/reims-vgpu-core/src/fifo/thread.rs
+@@ -280,6 +280,11 @@ impl<P: Platform> Fifo<P> {
+             }
+             self.push_stamp(command.stamp_value, command.command_id);
+             let body = payload.get(..payload_len).unwrap_or(&[]);
++            // LOCAL (Atlas, VM-B): every command but a pipelined exec sees the pending execs
++            // settled, as on the base path (`fifo::pipeline`).
++            if command.command_id != crate::fifo::commands::EXEC_INDIRECT3_ID {
++                self.settle_for_command(command.command_id);
++            }
+             self.dispatch(&command, body);
+             // ran: FIFO, opcode, stamp value: its handler returned
+             crate::trace::event(
+@@ -292,6 +297,8 @@ impl<P: Platform> Fifo<P> {
+             );
+         }
+         drop(payload);
++        // LOCAL (Atlas, VM-B): nothing stays pending past the loop.
++        self.settle_all();
+         // Outside the lock
+         self.rewind();
+         let _g = self.lock.lock();
+diff --git a/crates/reims-vgpu-core/src/gpu_task/exec.rs b/crates/reims-vgpu-core/src/gpu_task/exec.rs
+index f038b3b8..9ac17a94 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/exec.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/exec.rs
+@@ -131,6 +131,7 @@ impl<P: Platform> GpuTask<P> {
+         stamp_index: u32,
+         fifo_event_value_in: u64,
+         gpu_completion: u64,
++        fill_on_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+         reply: Reply<(u32, Option<Vec<u8>>, u32)>,
+     ) {
+         self.job(move |this, hold| {
+@@ -142,11 +143,55 @@ impl<P: Platform> GpuTask<P> {
+                 stamp_index,
+                 fifo_event_value_in,
+                 gpu_completion,
++                fill_on_failure.as_deref(),
+                 &reply,
+             )
+         });
+     }
+ 
++    /// LOCAL (Atlas, VM-B): an exec of a pipelining FIFO that was refused or faulted before its
++    /// commit still moves the FIFO's event chain on, as its success would have: one command buffer
++    /// that waits as the exec's would (`fifo_event_value_in`, unless 0 or this task's own last
++    /// value), stores and signals `fifo_event_value_in + 1` when scheduled, and commits. A later
++    /// exec of another task, sent with that value before this reply, waits for it. `false` when
++    /// nothing was committed (no FIFO event, no command queue, or a raise, landed): the host's
++    /// settlement then signals it (`tasks::remote::PendingRemoteExec`).
++    fn fill_chain(&self, hold: Hold<'_>, stamp_index: u32, fifo_event_value_in: u64) -> bool {
++        let Some((event, signaled)) = self.fifo(stamp_index) else {
++            return false;
++        };
++        if event.is_none() {
++            return false;
++        }
++        let filled = (|| -> RaiseResult<bool> {
++            let command_queue = self.command_queue.lock().as_ref().map(Handle::clone_ref);
++            let command_buffer = match &command_queue {
++                Some(q) => q.command_buffer(OnFault::Return)?,
++                None => None,
++            };
++            let Some(b) = &command_buffer else {
++                return Ok(false);
++            };
++            let signaled_value = signaled.load(Ordering::SeqCst);
++            if fifo_event_value_in != 0 && fifo_event_value_in != signaled_value {
++                b.encode_wait(event.as_ref().map(EventRef::Shared), fifo_event_value_in)?;
++            }
++            let value = fifo_event_value_in.wrapping_add(1);
++            signaled.store(value, Ordering::SeqCst);
++            b.encode_signal_when_scheduled(event.as_ref(), value)?;
++            b.commit(OnFault::Return)?;
++            Ok(true)
++        })();
++        match filled {
++            Ok(f) => f,
++            Err(t) => {
++                log::warn!("task {}: the FIFO chain's fill faulted: {}", self.id(), exception(&t));
++                hold.land(t);
++                false
++            }
++        }
++    }
++
+     /// The exec, under the shared task lock: the object lists mapped (2 when they cannot be),
+     /// the payload's size and the FIFO checked (2), then, under a handler that replies 2: the
+     /// resources paged in, one command buffer that waits on the paging event (when a paging
+@@ -169,11 +214,24 @@ impl<P: Platform> GpuTask<P> {
+         stamp_index: u32,
+         fifo_event_value_in: u64,
+         gpu_completion: u64,
++        fill_on_failure: Option<&std::sync::atomic::AtomicBool>,
+         reply: &Reply<(u32, Option<Vec<u8>>, u32)>,
+     ) {
+         let _lock = self.task_lock(Access::Shared);
++        // LOCAL (Atlas, VM-B): a refusal or a fault of a pipelining FIFO's exec keeps its place in
++        // the FIFO's event chain before the reply: its own buffer was committed, or `fill_chain`.
++        let fill = |committed: bool| {
++            // The flag tells the host the chain's value is the service's to signal: the exec's own
++            // committed buffer carries it, or the fill does.
++            if let Some(filled) = fill_on_failure
++                && (committed || self.fill_chain(hold, stamp_index, fifo_event_value_in))
++            {
++                filled.store(true, Ordering::SeqCst);
++            }
++        };
+         if let Err(t) = self.ensure_object_list_mapped(hold) {
+             log::warn!("task {}: exec refused: {}", self.id(), exception(&t));
++            fill(false);
+             reply.call((2, None, 0));
+             hold.land(t);
+             return;
+@@ -185,6 +243,7 @@ impl<P: Platform> GpuTask<P> {
+                 self.id(),
+                 data.len()
+             );
++            fill(false);
+             reply.call((2, None, 0));
+             return;
+         }
+@@ -200,6 +259,7 @@ impl<P: Platform> GpuTask<P> {
+         let wait_value = fifo_event_value_in;
+         let signaled_value = signaled.load(Ordering::SeqCst);
+         let mut shared_texture_backing_ids: Vec<u32> = Vec::new();
++        let committed = std::cell::Cell::new(false);
+         let executed = (|| -> RaiseResult<_> {
+             let prepare_event = if wait_value == 0 || wait_value == signaled_value {
+                 None
+@@ -255,6 +315,7 @@ impl<P: Platform> GpuTask<P> {
+             }
+             if let Some(b) = &command_buffer {
+                 b.commit(OnFault::Return)?;
++                committed.set(true);
+             }
+             let complete = CompleteSync {
+                 needs_complete: sync.needs_complete,
+@@ -273,6 +334,7 @@ impl<P: Platform> GpuTask<P> {
+         })();
+         if let Err(t) = executed {
+             log::warn!("task {}: exec faulted: {}", self.id(), exception(&t));
++            fill(committed.get());
+             reply.call((2, None, 0));
+             hold.land(t);
+             return;
+@@ -693,6 +755,7 @@ mod tests {
+             stamp_index,
+             fifo_event_value_in,
+             gpu_completion,
++            fill_on_failure: None,
+             reply,
+         }
+     }
+@@ -721,6 +784,7 @@ mod tests {
+                 stamp_index: index,
+                 fifo_event_value_in: 0,
+                 gpu_completion: 0x77,
++                fill_on_failure: None,
+                 reply,
+             });
+             let v: Vec<u32> = got.lock().iter().map(|r| r.0).collect();
+@@ -762,6 +826,48 @@ mod tests {
+         assert_eq!(*tx.host.sent.lock(), vec!["complete 119 1".to_owned()]);
+     }
+ 
++    /// LOCAL (Atlas, VM-B): a refused exec of a pipelining FIFO commits the fill before its
++    /// reply: it waits for the value it was sent with, stores and signals the next one; a refusal
++    /// with no FIFO event leaves the flag down (the host signals). Without the flag nothing is
++    /// committed, as on the base path.
++    #[test]
++    fn a_refused_pipelined_exec_fills_the_chain_before_its_reply() {
++        let tx = ready(&rw_pages(4));
++        with_fifo(&tx, 1);
++        let refused = |index: u32, flag: Option<Arc<AtomicBool>>| {
++            let seen = Arc::new(Mutex::new(Vec::new()));
++            let (s2, f2) = (seen.clone(), flag.clone());
++            tx.send(ToService::ExecIndirect3 {
++                data: vec![0; 8],
++                cmd_buffer_count: 1,
++                resource_count: 0,
++                stamp_index: index,
++                fifo_event_value_in: 5,
++                gpu_completion: 0x77,
++                fill_on_failure: flag,
++                reply: Reply::new(move |r: (u32, Option<Vec<u8>>, u32)| {
++                    s2.lock()
++                        .push((r.0, f2.as_ref().map(|f| f.load(Ordering::SeqCst))));
++                }),
++            });
++            let v = seen.lock().clone();
++            v
++        };
++        let mark = tx.p.call_log().mark();
++        assert_eq!(refused(1, None), vec![(2, None)]);
++        assert!(!tx.p.call_log().sels_since(mark).contains(&"commit"));
++        let mark = tx.p.call_log().mark();
++        let flag = Arc::new(AtomicBool::new(false));
++        assert_eq!(refused(1, Some(flag.clone())), vec![(2, Some(true))]);
++        let sels = tx.p.call_log().sels_since(mark);
++        let pos = |s: &str| sels.iter().position(|x| *x == s).unwrap();
++        assert!(pos("encodeWaitForEvent:value:") < pos("encodeSignalEventScheduled:value:"));
++        assert!(pos("encodeSignalEventScheduled:value:") < pos("commit"));
++        assert_eq!(tx.task.fifos.lock()[&1].signaled.load(Ordering::SeqCst), 6);
++        let flag = Arc::new(AtomicBool::new(false));
++        assert_eq!(refused(3, Some(flag.clone())), vec![(2, Some(false))]);
++    }
++
+     /// A wait value other than the last signalled one makes the exec wait on the FIFO
+     #[test]
+     fn exec_waits_for_the_fifo() {
+diff --git a/crates/reims-vgpu-core/src/gpu_task/service.rs b/crates/reims-vgpu-core/src/gpu_task/service.rs
+index 861d9b35..afdcf70d 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/service.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/service.rs
+@@ -622,6 +622,7 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
+                 stamp_index,
+                 fifo_event_value_in,
+                 gpu_completion,
++                fill_on_failure,
+                 reply,
+             } => self.exec(
+                 data,
+@@ -630,6 +631,7 @@ impl<P: Platform> ServiceSide<P> for GpuTask<P> {
+                 stamp_index,
+                 fifo_event_value_in,
+                 gpu_completion,
++                fill_on_failure,
+                 reply,
+             ),
+             ToService::InfoIndirect {
+diff --git a/crates/reims-vgpu-core/src/tasks/remote.rs b/crates/reims-vgpu-core/src/tasks/remote.rs
+index a1d20c18..c2abd64d 100644
+--- a/crates/reims-vgpu-core/src/tasks/remote.rs
++++ b/crates/reims-vgpu-core/src/tasks/remote.rs
+@@ -414,6 +414,7 @@ impl<P: Platform> RemoteTask<P> {
+             // Read at the send.
+             fifo_event_value_in: fifo_event_value.load(Ordering::Relaxed),
+             gpu_completion: token.id(),
++            fill_on_failure: None,
+             reply,
+         });
+         let status = gpu_token.wait();
+@@ -440,6 +441,127 @@ impl<P: Platform> RemoteTask<P> {
+     }
+ }
+ 
++/// LOCAL (Atlas, VM-B): a remote exec a pipelining FIFO sent and has not settled
++/// (`fifo::pipeline`): what `RemoteTask::exec` does after its reply, run at the settlement.
++pub(crate) struct PendingRemoteExec<P: Platform> {
++    /// The reply's wait: its handler stores nothing (the value was reserved at the send).
++    gpu_token: Arc<Token>,
++    /// The completion token, completed here on a failure as on the base path.
++    token: Arc<Token>,
++    backings: Arc<Mutex<Backings>>,
++    endpoint: Arc<Endpoint<P>>,
++    /// The FIFO's event and the value this exec waits for: on a failure the service did not
++    /// carry, the host signals `value_in + 1` once `value_in` is reached.
++    event: Option<P::SharedEvent>,
++    value_in: u64,
++    /// Set by the service when the chain's value is its to signal (`GpuTask::fill_chain`).
++    carried: Arc<std::sync::atomic::AtomicBool>,
++}
++
++/// How long a failure's settlement waits for the chain to reach its value before it signals the
++/// next one anyway.
++const CHAIN_WAIT_MS: u64 = 5000;
++
++impl<P: Platform> crate::fifo::pipeline::PendingExec for PendingRemoteExec<P> {
++    fn replied(&self) -> bool {
++        self.gpu_token.is_complete()
++    }
++
++    fn settle(self: Box<Self>, hold: Hold<'_>) {
++        let status = self.gpu_token.wait();
++        let ids = backing_ids(&self.backings);
++        self.endpoint
++            .device_link()
++            .invalidate_shared_texture_backings(hold, &ids);
++        if status != ExecStatus::OK && status != ExecStatus::CRASHED {
++            self.endpoint.completions().complete(&self.token, status);
++        }
++        if status != ExecStatus::OK
++            && !self.carried.load(Ordering::SeqCst)
++            && let Some(event) = &self.event
++        {
++            // The chain waits for this exec's value: once the previous one is reached, and unless
++            // this one already is (a dead task's committed buffer), the host signals it.
++            let next = self.value_in.wrapping_add(1);
++            if !event.wait_until_signaled_value(self.value_in, CHAIN_WAIT_MS) {
++                log::warn!(
++                    "FIFO chain: value {} not reached in {CHAIN_WAIT_MS} ms; signalling {next}",
++                    self.value_in
++                );
++            }
++            if !event.wait_until_signaled_value(next, 0) {
++                if let Err(e) = event.set_signaled_value(next) {
++                    log::warn!("FIFO chain: signalling {next} failed: {}", e.exception());
++                    hold.land(e);
++                }
++            }
++        }
++    }
++}
++
++/// The reply's count of ids, bounded by the ids it sent (the service always sends as many as it
++/// counts).
++fn backing_ids(backings: &Mutex<Backings>) -> Vec<u32> {
++    let b = backings.lock();
++    let all: Vec<u32> = b
++        .data
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|w| u32::from_ne_bytes(*w))
++        .collect();
++    let n = b.count.to_usize().min(all.len());
++    all.get(..n).map(<[u32]>::to_vec).unwrap_or_default()
++}
++
++impl<P: Platform> RemoteTask<P> {
++    /// LOCAL (Atlas, VM-B): ExecIndirect3 on a pipelining FIFO: shares the FIFO's event, reserves
++    /// the FIFO's event value (the base path advances it on the reply of 1), sends the command with
++    /// the fill flag, and returns what follows the reply, for the FIFO's settlement.
++    pub(crate) fn exec_indirect3_pipelined(
++        &self,
++        args: ExecArgs<'_, P, CmdExecIndirectResource3>,
++        done: Completion,
++    ) -> Box<dyn crate::fifo::pipeline::PendingExec> {
++        let data = command_data(&args.resources, &args.cmd_buffers);
++        self.share_fifo_event(args.fifo_event, args.stamp_index);
++        let value_in = args.fifo_event_value.fetch_add(1, Ordering::SeqCst);
++        let gpu_token = self.endpoint.completions().issue();
++        let backings = Arc::new(Mutex::new(Backings::default()));
++        let token = self.endpoint.completions().issue_with(completing(done));
++        let carried = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let reply = {
++            let reply = ExecReply {
++                gpu_token: gpu_token.clone(),
++                _token: token.clone(),
++                backings: backings.clone(),
++                endpoint: self.endpoint.clone(),
++                _task: self.me.upgrade(),
++            };
++            Reply::new(move |v: (u32, Option<Vec<u8>>, u32)| reply.invoke(v))
++        };
++        self.link.send(ToService::ExecIndirect3 {
++            data,
++            cmd_buffer_count: args.cmd_buffers.count(),
++            resource_count: args.resources.count(),
++            stamp_index: args.stamp_index,
++            fifo_event_value_in: value_in,
++            gpu_completion: token.id(),
++            fill_on_failure: Some(carried.clone()),
++            reply,
++        });
++        Box::new(PendingRemoteExec {
++            gpu_token,
++            token,
++            backings,
++            endpoint: self.endpoint.clone(),
++            event: args.fifo_event.map(Handle::clone_ref),
++            value_in,
++            carried,
++        })
++    }
++}
++
+ impl<P: Platform> Drop for RemoteTask<P> {
+     /// Drains, invalidates the link, then releases the FIFO events in index order.
+     fn drop(&mut self) {
+@@ -2504,4 +2626,186 @@ mod tests {
+             assert_eq!(v.load(Ordering::SeqCst), 0);
+         }
+     }
++
++    /// LOCAL (Atlas, VM-B): the pipelined exec (`fifo::pipeline`).
++    mod pipelined {
++        use super::*;
++        use crate::fifo::pipeline::PendingExec;
++        use crate::tasks::test_support::Lines;
++
++        const EXEC3: &str = "execIndirect3WithData:cmdBufferCount:resourceCount:stampIndex:fifoEventValueIn:gpuCompletion:reply:";
++
++        fn send(
++            t: &RemoteTask<P>,
++            event: Option<&<P as Platform>::SharedEvent>,
++            value: &Arc<AtomicU64>,
++            d: Completion,
++        ) -> Box<dyn PendingExec> {
++            let (bytes, split) = payload(&res3(), &cmd());
++            let args = ExecArgs {
++                cmd_buffers: Records::new(&bytes[split..], 1).unwrap(),
++                resources: Records::new(&bytes[..split], 2).unwrap(),
++                stamp_index: 2,
++                fifo_event: event,
++                fifo_event_value: value,
++            };
++            t.exec_indirect3_pipelined(args, d)
++        }
++
++        /// The send returns before the reply, with the value reserved; the settlement follows the
++        /// reply, and the completion comes from the service as on the base path.
++        #[test]
++        fn sends_without_waiting_and_reserves_the_value() {
++            let gate = Gate::default();
++            let g2 = gate.clone();
++            let h = harness(move |ctx, m| match m {
++                ToService::ExecIndirect3 {
++                    gpu_completion,
++                    reply,
++                    fill_on_failure,
++                    ..
++                } => {
++                    assert!(fill_on_failure.is_some());
++                    g2.wait();
++                    reply.call((1, None, 0));
++                    ctx.complete(gpu_completion, 1);
++                }
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let ev = h.event();
++            let v = Arc::new(AtomicU64::new(41));
++            let (s, d) = done();
++            let p = send(&t, Some(&ev), &v, d);
++            assert_eq!(v.load(Ordering::SeqCst), 42);
++            h.wait_for(3);
++            assert_eq!(h.msgs()[2].sel, EXEC3);
++            assert_eq!(h.msgs()[2].nums[3], 41);
++            assert!(!p.replied());
++            gate.open();
++            wait_until(|| p.replied());
++            in_command(|hold| p.settle(hold));
++            wait_until(|| *s.lock() == vec![1]);
++            // A success leaves the chain to the exec's own command buffer.
++            assert!(!ev.wait_until_signaled_value(42, 0));
++        }
++
++        /// A failure the service did not carry: the settlement completes it and signals the next
++        /// value once the exec's own is reached.
++        #[test]
++        fn an_uncarried_failure_signals_the_next_value() {
++            let h = harness(|ctx, m| match m {
++                ToService::ExecIndirect3 { reply, .. } => reply.call((2, None, 0)),
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let ev = h.event();
++            ev.set_signaled_value(41).unwrap();
++            let v = Arc::new(AtomicU64::new(41));
++            let (s, d) = done();
++            let p = send(&t, Some(&ev), &v, d);
++            wait_until(|| p.replied());
++            in_command(|hold| p.settle(hold));
++            assert_eq!(*s.lock(), vec![2]);
++            assert!(ev.wait_until_signaled_value(42, 0));
++        }
++
++        /// A failure the service carried (its fill command buffer signals): the host does not.
++        #[test]
++        fn a_carried_failure_leaves_the_chain_to_the_service() {
++            let h = harness(|ctx, m| match m {
++                ToService::ExecIndirect3 {
++                    reply,
++                    fill_on_failure,
++                    ..
++                } => {
++                    fill_on_failure.unwrap().store(true, Ordering::SeqCst);
++                    reply.call((2, None, 0));
++                }
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let ev = h.event();
++            ev.set_signaled_value(41).unwrap();
++            let v = Arc::new(AtomicU64::new(41));
++            let (s, d) = done();
++            let p = send(&t, Some(&ev), &v, d);
++            wait_until(|| p.replied());
++            in_command(|hold| p.settle(hold));
++            assert_eq!(*s.lock(), vec![2]);
++            assert!(!ev.wait_until_signaled_value(42, 0));
++        }
++
++        /// An uncarried failure waits for the chain to reach its value before it signals the next:
++        /// the value never goes ahead of an earlier exec.
++        #[test]
++        fn an_uncarried_failure_waits_for_its_value() {
++            let h = harness(|ctx, m| match m {
++                ToService::ExecIndirect3 { reply, .. } => reply.call((2, None, 0)),
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let ev = h.event();
++            ev.set_signaled_value(40).unwrap();
++            let v = Arc::new(AtomicU64::new(41));
++            let (_s, d) = done();
++            let p = send(&t, Some(&ev), &v, d);
++            wait_until(|| p.replied());
++            let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
++            let s2 = settled.clone();
++            let th = std::thread::spawn(move || {
++                in_command(|hold| p.settle(hold));
++                s2.store(true, Ordering::SeqCst);
++            });
++            std::thread::sleep(Duration::from_millis(30));
++            assert!(!settled.load(Ordering::SeqCst));
++            assert!(!ev.wait_until_signaled_value(42, 0));
++            ev.set_signaled_value(41).unwrap();
++            th.join().unwrap();
++            assert!(ev.wait_until_signaled_value(42, 0));
++        }
++
++        /// A crash during the exec: 4 from the crash, and the host moves the chain on.
++        #[test]
++        fn a_crash_moves_the_chain_on() {
++            let h = harness(dies_on(EXEC3));
++            let t = h.task();
++            let ev = h.event();
++            ev.set_signaled_value(41).unwrap();
++            let v = Arc::new(AtomicU64::new(41));
++            let (s, d) = done();
++            let p = send(&t, Some(&ev), &v, d);
++            wait_until(|| p.replied());
++            in_command(|hold| p.settle(hold));
++            assert_eq!(*s.lock(), vec![4]);
++            assert!(ev.wait_until_signaled_value(42, 0));
++        }
++
++        /// The reply's backings go to the kernel task at the settlement, not before.
++        #[test]
++        fn the_backings_are_invalidated_at_the_settlement() {
++            let h = kernel_harness(|ctx, m| match m {
++                ToService::ExecIndirect3 {
++                    gpu_completion,
++                    reply,
++                    ..
++                } => {
++                    reply.call((1, Some([7u32, 8].as_bytes().to_vec()), 2));
++                    ctx.complete(gpu_completion, 1);
++                }
++                other => standard(ctx, other),
++            });
++            let t = h.task();
++            let lines = Lines::capture();
++            let v = Arc::new(AtomicU64::new(0));
++            let (s, d) = done();
++            let p = send(&t, None, &v, d);
++            wait_until(|| p.replied());
++            wait_until(|| *s.lock() == vec![1]);
++            let miss = |l: &Vec<String>| l.iter().filter(|l| l.starts_with("shared texture backing ")).count();
++            assert_eq!(miss(&lines.take()), 0);
++            in_command(|hold| p.settle(hold));
++            assert_eq!(miss(&lines.take()), 2);
++        }
++    }
+ }
+diff --git a/crates/reims-vgpu-core/src/tasks/remote/completions.rs b/crates/reims-vgpu-core/src/tasks/remote/completions.rs
+index 27142c19..7d04da8f 100644
+--- a/crates/reims-vgpu-core/src/tasks/remote/completions.rs
++++ b/crates/reims-vgpu-core/src/tasks/remote/completions.rs
+@@ -110,6 +110,11 @@ impl Token {
+         self.cond.notify_all();
+     }
+ 
++    /// LOCAL (Atlas, VM-B): whether the token is complete, without waiting.
++    pub fn is_complete(&self) -> bool {
++        *imp::lock(&self.status) != ExecStatus::NOT_COMPLETE
++    }
++
+     /// Waits, with no timeout, until the token is complete, and returns its status.
+     pub fn wait(&self) -> ExecStatus {
+         let mut st = imp::lock(&self.status);
+diff --git a/crates/reims-vgpu-core/src/tasks/wire.rs b/crates/reims-vgpu-core/src/tasks/wire.rs
+index 5b9aa5e2..e92cdc13 100644
+--- a/crates/reims-vgpu-core/src/tasks/wire.rs
++++ b/crates/reims-vgpu-core/src/tasks/wire.rs
+@@ -190,6 +190,10 @@ pub enum ToService<P: Platform> {
+         fifo_event_value_in: u64,
+         /// `gpuCompletion`.
+         gpu_completion: u64,
++        /// LOCAL (Atlas, VM-B): the FIFO pipelines its execs (`Fifo::pipelining`). A refusal or a
++        /// fault before the commit then still moves the FIFO's event chain on, with a fill
++        /// command buffer (`GpuTask::fill_chain`), which sets the flag. `None` on the base path.
++        fill_on_failure: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+         /// `reply`.
+         reply: Reply<(u32, Option<Vec<u8>>, u32)>,
+     },

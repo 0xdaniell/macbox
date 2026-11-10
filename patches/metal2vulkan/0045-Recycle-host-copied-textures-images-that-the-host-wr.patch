@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Fri, 6 Nov 2026 14:46:21 +0000
+Subject: [PATCH 45/92] Recycle host-copied textures' images that the host
+ writes too
+
+host_placed_image made each Shared or Managed texture's host-transfer image
+directly (placed_image_read), bypassing the image recycler the non-host
+images already use. Images the host writes too (host_reads=false) now go
+through recycled_image with the hosted plan, whose HOST_TRANSFER usage
+already separates their making from non-host images; a miss is
+placed_image's, as before. Images the host only reads (a trapping surface's,
+possibly in non-coherent memory with atom padding) keep the direct path and
+are never parked or taken: their making does not tell those placements apart.
+
+The recycler's bounds, last-holder parking, UNDEFINED hand-over and the
+host zeroing of new textures are unchanged. Tests on the CPU ICD: a
+recycled host-copied texture reads zero on the host and through a blit;
+sixty frames make images in the first frame alone; an uncommitted command
+buffer's texture is not parked until it completed and went.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/recycle.rs    |   5 +-
+ .../metal2vulkan-runtime/src/tests/recycle.rs | 203 +++++++++++++++++-
+ crates/metal2vulkan-runtime/src/texture.rs    |  21 +-
+ 3 files changed, 219 insertions(+), 10 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/recycle.rs b/crates/metal2vulkan-runtime/src/recycle.rs
+index fc916fdd..6493f373 100644
+--- a/crates/metal2vulkan-runtime/src/recycle.rs
++++ b/crates/metal2vulkan-runtime/src/recycle.rs
+@@ -36,7 +36,10 @@
+ //! - **When.** As the last holder goes: every command buffer that used the image or buffer
+ //!   completed (they hold it), so no GPU work reaches it. Not an image of a shareable texture, one
+ //!   that took its storage form, one presenting a stand-in, or one whose memory is not its
+-//!   placement alone; not a heap's buffer, nor a buffer of the caller's or over host pages.
++//!   placement alone, nor one with host-transfer usage the host only reads (LOCAL (Atlas): a
++//!   trapping surface's, whose memory may be mapped without coherence; one the host copies into
++//!   too is recycled, its usage in its making's plan); not a heap's buffer, nor a buffer of the
++//!   caller's or over host pages.
+ //! - **Which.** A take hands out the latest parked object of its making, found through a map of
+ //!   each making's parked objects (a hash of the making, not a search of every parked one).
+ //! - **Bounded.** At most [`IMAGES`]' and [`BUFFERS`]' count and bytes parked, and none parked
+diff --git a/crates/metal2vulkan-runtime/src/tests/recycle.rs b/crates/metal2vulkan-runtime/src/tests/recycle.rs
+index f948b651..7ce08241 100644
+--- a/crates/metal2vulkan-runtime/src/tests/recycle.rs
++++ b/crates/metal2vulkan-runtime/src/tests/recycle.rs
+@@ -23,12 +23,24 @@
+ //!   the same length was filled and released: the inplace-surface probe's `fresh` mode).
+ //! - **Each frame's buffers, recycled.** Eight `Private` buffers made, filled and released each of
+ //!   sixty frames take parked buffers from the second frame on.
++//! - **A recycled host-copied texture reads zero.** A `Shared` texture's image, made with
++//!   host-transfer usage and zeroed on the host (`images_started_on_the_host`), cleared to a
++//!   colour and released, then a texture of the same descriptor: it takes the parked image (the
++//!   same `VkImage`, none made), zeroed on the host again, and every texel reads zero, on the host
++//!   and through a blit, never the colour.
++//! - **Each frame's host-copied textures, recycled.** Eight such textures made, cleared and
++//!   released each of sixty frames: images made in the first frame alone, every later texture's
++//!   a parked one, each zeroed on the host.
++//! - **A command buffer's texture is not recycled before it completes.** A `Shared` texture an
++//!   uncommitted command buffer clears, released: a texture of the same descriptor made meanwhile
++//!   takes no parked image; once the command buffer completed and went, the next one takes its
++//!   image, zeroed on the host, never the colour.
+ 
+ use super::blit_holds::{Scratch, WAIT};
+ use crate::{
+     BlitOption, Buffer, ClearColor, CommandBufferStatus, CommandQueue, Device, DeviceKind,
+-    DeviceOptions, LoadAction, Origin, RenderPassDescriptor, ResourceOptions, ShaderCacheOptions,
+-    Size, StoreAction, Texture, TextureDescriptor,
++    DeviceOptions, LoadAction, Origin, Region, RenderPassDescriptor, ResourceOptions,
++    ShaderCacheOptions, Size, StoreAction, Texture, TextureDescriptor,
+ };
+ use metal2vulkan::metal::{PixelFormat, TextureUsage};
+ use std::path::Path;
+@@ -356,3 +368,190 @@ fn each_frames_buffers_take_parked_buffers() {
+         "every frame after the first recycles"
+     );
+ }
++
++/// [`descriptor`]'s, `Shared`: its image takes host copies where the device has them.
++fn shared_descriptor() -> TextureDescriptor {
++    let mut descriptor = descriptor();
++    descriptor.resource_options = ResourceOptions::shared();
++    descriptor
++}
++
++/// The bytes of `texture`, copied out on the host (`get_bytes`).
++fn host_read(texture: &Texture) -> Vec<u8> {
++    let mut bytes = vec![0xcd; (SIDE * SIDE * 4) as usize];
++    texture
++        .get_bytes(
++            &mut bytes,
++            SIDE * 4,
++            0,
++            Region::new_2d(0, 0, SIDE, SIDE),
++            0,
++            0,
++        )
++        .unwrap();
++    bytes
++}
++
++#[test]
++fn a_recycled_host_copied_texture_reads_zero() {
++    let scratch = Scratch::new("recycle-host-fresh");
++    let device = device(&scratch.0);
++    let queue = device.new_command_queue().unwrap();
++    let start = device.work_counts();
++    let first = device.new_texture(&shared_descriptor()).unwrap();
++    assert_eq!(
++        device.work_counts().images_started_on_the_host - start.images_started_on_the_host,
++        1,
++        "the texture's image took host copies and was zeroed on the host"
++    );
++    let raw = first.raw_image().unwrap();
++    assert!(
++        host_read(&first).iter().all(|&b| b == 0),
++        "a new texture reads zero"
++    );
++    clear(&queue, &first);
++    assert!(
++        host_read(&first).iter().all(|&b| b != 0),
++        "the clear wrote every texel"
++    );
++    let before = device.work_counts();
++    drop(first);
++    parked_at_least(&device, before.object_churn.images_parked + 1);
++    let second = device.new_texture(&shared_descriptor()).unwrap();
++    let after = device.work_counts();
++    assert_eq!(
++        after.object_churn.images_recycled - before.object_churn.images_recycled,
++        1,
++        "the second texture took the first one's parked image"
++    );
++    assert_eq!(second.raw_image().unwrap(), raw, "the same VkImage");
++    assert_eq!(
++        after.object_churn.vk_images_made, before.object_churn.vk_images_made,
++        "no image made"
++    );
++    assert_eq!(
++        after.images_started_on_the_host - before.images_started_on_the_host,
++        1,
++        "the recycled image was zeroed on the host"
++    );
++    let copies = after.host_texel_copies;
++    assert!(
++        host_read(&second).iter().all(|&b| b == 0),
++        "every texel of the recycled texture reads zero on the host, not the colour"
++    );
++    assert!(
++        device.work_counts().host_texel_copies > copies,
++        "the read copied on the host"
++    );
++    assert!(
++        read(&device, &queue, &second).iter().all(|&b| b == 0),
++        "every texel of the recycled texture reads zero through a blit, not the colour"
++    );
++}
++
++#[test]
++fn each_frames_host_copied_textures_take_parked_images() {
++    let scratch = Scratch::new("recycle-host-frames");
++    let device = device(&scratch.0);
++    let queue = device.new_command_queue().unwrap();
++    const FRAMES: u64 = 60;
++    const TEXTURES: u64 = 8;
++    let start = device.work_counts();
++    let mut first_frame = None;
++    for frame in 1..=FRAMES {
++        let textures: Vec<Texture> = (0..TEXTURES)
++            .map(|_| device.new_texture(&shared_descriptor()).unwrap())
++            .collect();
++        for texture in &textures {
++            clear(&queue, texture);
++        }
++        if frame == 1 {
++            first_frame = Some(device.work_counts().object_churn.vk_images_made);
++        }
++        drop(textures);
++        // The images go as their command buffers' holds do, which a completion may let go of
++        // after the wait returned.
++        parked_at_least(&device, start.object_churn.images_parked + frame * TEXTURES);
++    }
++    let end = device.work_counts();
++    let recycled = end.object_churn.images_recycled - start.object_churn.images_recycled;
++    eprintln!(
++        "RECYCLE: {FRAMES} frames of {TEXTURES} host-copied textures: {recycled} images recycled, \
++         {} made, {} started on the host, {} evicted",
++        end.object_churn.vk_images_made - start.object_churn.vk_images_made,
++        end.images_started_on_the_host - start.images_started_on_the_host,
++        end.object_churn.images_evicted - start.object_churn.images_evicted
++    );
++    assert_eq!(
++        end.images_started_on_the_host - start.images_started_on_the_host,
++        FRAMES * TEXTURES,
++        "every texture's image was zeroed on the host"
++    );
++    assert_eq!(
++        recycled,
++        (FRAMES - 1) * TEXTURES,
++        "every frame after the first recycles"
++    );
++    assert_eq!(
++        end.object_churn.vk_images_made,
++        first_frame.unwrap(),
++        "no image made after the first frame"
++    );
++}
++
++#[test]
++fn a_command_buffers_host_copied_texture_waits_for_it() {
++    let scratch = Scratch::new("recycle-host-pending");
++    let device = device(&scratch.0);
++    let queue = device.new_command_queue().unwrap();
++    let first = device.new_texture(&shared_descriptor()).unwrap();
++    let raw = first.raw_image().unwrap();
++    let command_buffer = queue.command_buffer().unwrap();
++    {
++        let mut pass = RenderPassDescriptor::new();
++        let color = &mut pass.color_attachments[0];
++        color.texture = Some(first.clone());
++        color.load_action = LoadAction::Clear;
++        color.store_action = StoreAction::Store;
++        color.clear_color = ClearColor::new(0.25, 0.5, 0.75, 1.0);
++        command_buffer
++            .render_command_encoder(&pass)
++            .unwrap()
++            .end_encoding()
++            .unwrap();
++    }
++    let before = device.work_counts().object_churn;
++    drop(first);
++    // The uncommitted command buffer holds the texture: its image is not parked.
++    let meanwhile = device.new_texture(&shared_descriptor()).unwrap();
++    let after = device.work_counts().object_churn;
++    assert_eq!(after.images_parked, before.images_parked, "nothing parked");
++    assert_eq!(
++        after.images_recycled, before.images_recycled,
++        "the texture made meanwhile took no parked image"
++    );
++    assert_ne!(meanwhile.raw_image().unwrap(), raw, "a new VkImage");
++    command_buffer.commit().unwrap();
++    assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
++    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
++    drop(command_buffer);
++    parked_at_least(&device, before.images_parked + 1);
++    let started = device.work_counts();
++    let next = device.new_texture(&shared_descriptor()).unwrap();
++    let taken = device.work_counts();
++    assert_eq!(
++        taken.object_churn.images_recycled - started.object_churn.images_recycled,
++        1,
++        "the next texture took the completed command buffer's image"
++    );
++    assert_eq!(next.raw_image().unwrap(), raw, "the same VkImage");
++    assert_eq!(
++        taken.images_started_on_the_host - started.images_started_on_the_host,
++        1,
++        "zeroed on the host"
++    );
++    assert!(
++        host_read(&next).iter().all(|&b| b == 0),
++        "every texel reads zero, not the pending clear's colour"
++    );
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index f8ac72a6..53ddc844 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3102,13 +3102,20 @@ impl Device {
+         }
+         let mut hosted = plan.clone();
+         hosted.usage |= ImageUsageFlags::HOST_TRANSFER;
+-        let (raw, placement) = (self.placed_image_read(
+-            &hosted,
+-            texture_type,
+-            class,
+-            shared.sharing(),
+-            host_reads,
+-        ))
++        // An image the host writes too is a parked one of its making where one is parked
++        // (`recycle.rs`), its host-transfer usage in its plan: on a miss, `placed_image`'s, as
++        // before. One the host only reads (a trapping surface's) may lie in memory the host maps
++        // without coherence, which its making does not tell apart: never parked nor taken.
++        let (raw, placement) = match host_reads {
++            true => self.placed_image_read(
++                &hosted,
++                texture_type,
++                class,
++                shared.sharing(),
++                true,
++            ),
++            false => self.recycled_image(&hosted, texture_type, class, shared.sharing()),
++        }
+         .ok()?;
+         Some((hosted, raw, placement))
+     }

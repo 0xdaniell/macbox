@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 13:19:25 +0000
+Subject: [PATCH 67/92] print who makes a large lazy surface's shadow, lazy
+ identities in reports (lab diagnostics)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/buffer_texture.rs                     | 40 ++++++++++++++-----
+ .../src/shadow_coherent.rs                    |  4 +-
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  3 +-
+ 3 files changed, 33 insertions(+), 14 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+index 4a8e11b7..f80893be 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
+@@ -1398,6 +1398,34 @@ impl Texels {
+         // A copy back dispatches, and a merge fetches, over one region copied in place alone.
+         let one_region = regions.len() == 1 && slices == 1 && staging.is_none();
+         let (bytes, tracked) = self.buffer.tracked(layout.offset..layout.end());
++        // LOCAL (Atlas): `shadow_lazy.rs`.
++        let lazy = super::shadow_lazy::Lazy::of(
++            self.buffer.device(),
++            self.backing() == super::shadow::Backing::Surface,
++            || self.buffer.host_range(),
++            [
++                (self.layout.row_bytes / self.texel_bytes) as u32,
++                self.layout.rows as u32,
++            ],
++            self.layout.row_bytes / self.texel_bytes * u64::from(self.layout.rows),
++        );
++        // LOCAL (Atlas, lab diagnostics): who makes a large lazy surface's shadow (first 24).
++        if let Some(lazy) = lazy.as_ref().filter(|_| self.layout.rows >= 1400) {
++            static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
++                eprintln!(
++                    "m2v-lazy-made: {:p} {:?} texel {} row_bytes {} words {} unorm {} aspects {:#x}\n{}",
++                    Arc::as_ptr(lazy),
++                    lazy.size_and_taken().0,
++                    self.texel_bytes,
++                    self.layout.row_bytes,
++                    words.is_some(),
++                    unorm.is_some(),
++                    aspects.as_raw(),
++                    std::backtrace::Backtrace::force_capture()
++                );
++            }
++        }
+         Ok(ShadowCopies {
+             source: ShadowSource::Bytes {
+                 buffer: ShadowBuffer::of(&self.buffer, buffer),
+@@ -1426,17 +1454,7 @@ impl Texels {
+             merge_scratch: ScratchSpares::default(),
+             touched: AtomicU64::new(0),
+             stood: AtomicU64::new(0),
+-            // LOCAL (Atlas): `shadow_lazy.rs`.
+-            lazy: super::shadow_lazy::Lazy::of(
+-                self.buffer.device(),
+-                self.backing() == super::shadow::Backing::Surface,
+-                || self.buffer.host_range(),
+-                [
+-                    (self.layout.row_bytes / self.texel_bytes) as u32,
+-                    self.layout.rows as u32,
+-                ],
+-                self.layout.row_bytes / self.texel_bytes * u64::from(self.layout.rows),
+-            ),
++            lazy,
+         })
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index e3edc4c9..d00e5e28 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -762,9 +762,9 @@ impl Coherent {
+                 if SHOWN.fetch_add(1, Ordering::Relaxed) < 8 {
+                     let other = list.iter().find(|one| meets(one)).map(|one| {
+                         let lazy = one.lazy.upgrade();
+-                        (one.range(), lazy.map(|l| l.size_and_taken()))
++                        (one.range(), lazy.map(|l| (Arc::as_ptr(&l), l.size_and_taken())))
+                     });
+-                    let me = self.lazy.upgrade().map(|l| l.size_and_taken());
++                    let me = self.lazy.upgrade().map(|l| (Arc::as_ptr(&l), l.size_and_taken()));
+                     eprintln!(
+                         "m2v-overlap-closed: me {:?} {:?} age {:?} other {:?}\n{}",
+                         range, me, self.made.elapsed(), other,
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 95222b09..1f9dc7da 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1039,8 +1039,9 @@ fn report() {
+     }
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+-            "surface_lazy:   {:#x} {}x{} displayed {} taken {} refused {} in {} presents {} \
++            "surface_lazy:   {:p} {:#x} {}x{} displayed {} taken {} refused {} in {} presents {} \
+              coherent {}/{} defer-no {:?}",
++            Arc::as_ptr(lazy),
+             lazy.pages.as_ref().map_or(0, |pages| pages.start),
+             lazy.size[0],
+             lazy.size[1],

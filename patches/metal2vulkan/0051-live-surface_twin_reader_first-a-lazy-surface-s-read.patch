@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sat, 7 Nov 2026 23:43:02 +0000
+Subject: [PATCH 51/92] live surface_twin_reader_first: a lazy surface's reader
+ made first is its first shadow
+
+A reader (ShaderRead only) made before its surface's writer stayed an image in place over the
+pages, and the writer's shadow beside it brought its bytes back every frame (about one copy back
+per Sim frame under Coherent). With the switch on (default off) such a reader becomes the
+surface's first lazy shadow, planned with RenderTarget | ShaderRead, so the writer made after
+it binds it through surface_twin. Counted as readers-first in the surface_lazy report.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 10 +++++-
+ crates/metal2vulkan-runtime/src/texture.rs    | 10 +++++-
+ .../src/texture/surface_twin.rs               | 34 +++++++++++++++++++
+ 3 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index dfe3a73c..6354f6d0 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -144,6 +144,8 @@ static FLUSHED_TEXELS: AtomicU64 = AtomicU64::new(0);
+ static DISCARDED: AtomicU64 = AtomicU64::new(0);
+ /// Textures that bound a surface's image (`surface_twin.rs`).
+ static TWINS: AtomicU64 = AtomicU64::new(0);
++/// Readers made first that became their surface's first shadow (`surface_twin.rs`).
++static READERS_FIRST: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS: AtomicU64 = AtomicU64::new(0);
+ static PRESENTS_UNMATCHED: AtomicU64 = AtomicU64::new(0);
+ /// Milliseconds since the first report's chance at the last report.
+@@ -912,7 +914,7 @@ fn report() {
+         "surface_lazy: taken {taken} refused {refused} resyncs {resyncs} | refused: touched {} \
+          written {} epoch {} own {} uncommitted {} no-standing {} | in: first {} beyond-held {} \
+          changed {} bounded {} | ahead: deferred {} shared {} flushes {} whole {} texels {} \
+-         discarded {} presents {} unmatched {} twins {}",
++         discarded {} presents {} unmatched {} twins {} readers-first {}",
+         by[Refused::Touched as usize],
+         by[Refused::Written as usize],
+         by[Refused::Epoch as usize],
+@@ -932,6 +934,7 @@ fn report() {
+         read(&PRESENTS),
+         read(&PRESENTS_UNMATCHED),
+         read(&TWINS),
++        read(&READERS_FIRST),
+     );
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+@@ -953,6 +956,11 @@ pub(crate) fn twin_bound() {
+     TWINS.fetch_add(1, Ordering::Relaxed);
+ }
+ 
++/// A lazy surface's reader made first became its first shadow (`surface_twin.rs`).
++pub(crate) fn reader_first() {
++    READERS_FIRST.fetch_add(1, Ordering::Relaxed);
++}
++
+ /// The counts so far, for a lane or a stderr line: standings taken, refused, and resyncs.
+ pub fn counts() -> (u64, u64, u64) {
+     (
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index ed552832..834ee016 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2175,7 +2175,13 @@ impl Device {
+             .facts(self.compile_device().profile());
+         // The buffer's rows lay the texels out, whatever `allowGPUOptimizedContents` says: the
+         // image is planned for the texture's own usage.
+-        let usage = texture_usage(descriptor.usage, descriptor.swizzle);
++        let mut usage = texture_usage(descriptor.usage, descriptor.swizzle);
++        // LOCAL (Atlas): a lazy surface's reader made before its writer is the surface's first
++        // shadow, with the writer's usage, so the writer binds it (`surface_twin.rs`).
++        let reader_first = self.surface_reader_first(&texels, layout, usage);
++        if reader_first {
++            usage |= TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++        }
+         let plan = plan_image(layout, usage, false, &facts)
+             .map_err(|refusal| image_error(call, refusal))?;
+         // Over host pages (a no-copy buffer's, or a no-copy heap's buffer's, imported by their
+@@ -2206,6 +2212,8 @@ impl Device {
+                          texture was made"
+                             .to_owned(),
+                     )
++                } else if reader_first {
++                    ShadowCause::RenderTarget
+                 } else {
+                     // The check's own textures measure the device whatever its policy.
+                     let policy = match checking {
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+index fb35755d..6a09fb3c 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_twin.rs
+@@ -89,6 +89,40 @@ impl Device {
+         })
+     }
+ 
++    /// Whether a texture of `usage` (checked as `layout`) over `texels` is a lazy surface's reader
++    /// made before any shadow of it: with the live switch `surface_twin_reader_first` on, it is
++    /// made the surface's first shadow, planned with a writer's usage too, so the writer made
++    /// after it binds it as a later reader binds a writer's ([`surface_twin`](Self::surface_twin))
++    /// instead of making a shadow beside the reader's image in place, whose bytes the writer's
++    /// copies would bring back every frame. Off: the module's order.
++    pub(super) fn surface_reader_first(
++        &self,
++        texels: &Texels,
++        layout: &TextureLayout,
++        usage: TextureUsage,
++    ) -> bool {
++        if !crate::live::on(SWITCH, true) || !crate::live::on("surface_twin_reader_first", false) {
++            return false;
++        }
++        if usage.intersects(TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC)
++            || !texels.lies_lazily()
++            || texels.buffer.detached()
++            || crate::in_place::checking()
++            || surface_depth_unit(layout.pixel_format).is_some()
++        {
++            return false;
++        }
++        let Some(key) = texels.surface_key() else {
++            return false;
++        };
++        let twins = lock(&self.shared().textures.twins.0);
++        let first = twins.get(&key).is_some_and(|first| first.texels.strong_count() > 0);
++        if !first {
++            crate::shadow_lazy::reader_first();
++        }
++        !first
++    }
++
+     /// Note `storage`, a new texture's, where it is the first shadow of a lazy surface.
+     pub(super) fn note_surface_first(&self, storage: &Storage) {
+         let Storage::Shadow { image, texels, copies, first: None } = storage else {

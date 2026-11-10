@@ -2,21 +2,35 @@
 
 ## Where the time goes
 
-On every GPU measured so far, the GPU is the limit. A 3x iOS Simulator keeps an Arrow Lake iGPU
-96 to 98% busy at its full clock, while QEMU's CPU threads have room to spare. So the frame rate
-follows two things: how many pixels are drawn (1x, 2x, 3x; the desktop's resolution), and how much
-work the translation adds per frame (Metal → Vulkan).
+On every GPU measured so far, the GPU is the limit. With the build macbox makes now, one 3x iOS
+Simulator reaches its screen's 120 Hz on an Arrow Lake iGPU at about 7.7 ms of GPU time per frame,
+and with two or three simulators the GPU runs 80 to 93% busy at its top clock (1950 MHz) while
+QEMU's CPU threads have room to spare. So the frame rate follows two things: how many pixels are
+drawn (1x, 2x, 3x; the desktop's resolution), and how much work the translation adds per frame
+(Metal → Vulkan).
 
 Before macbox's patches, most of that added work was copies: macOS's framebuffer and the
 simulator's display surface lie in guest RAM, and metal2vulkan copied each into a GPU image and back
 around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67%
 with the desktop. Patch 0004 renders those textures in place, and Coherent (patches 0009 onwards,
 with QEMU's census) removes most of the copies left ([patches/README.md](../patches/README.md)).
+What is left of a 3x simulator frame, measured with the pass timer on 2026-11-09:
+
+| GPU time per 3x frame (~7.7–8.2 ms) | ms | |
+|---|---|---|
+| the simulator's own render passes on its screen | ~3.2 | the real rendering |
+| iOS's own full-screen compute pass (a masked copy of the screen) | ~1.5 | the real rendering, near the memory bandwidth |
+| copies for draws that read the pass they draw into (Liquid Glass backdrops) | ~0.76 | translation: Vulkan can't read an attachment where Metal can |
+| between command buffers: barriers, pipeline drains, ~200 command buffers | ~2.4 | translation, and the open work |
+
+Copying a frame back to guest RAM, the cost Coherent was built to remove, is down to bookkeeping: in
+a 90-minute census of the desktop at 3440x1440, 0.2% of what eager copies back would have cost
+(about 5 µs a frame), and 2% for the simulators' screens.
 
 ## Measurements
 
 The reference host: Intel Core Ultra 7 265 (Arrow Lake iGPU), 128 GB DDR5 at 4400 MT/s, Mesa 26.2.4,
-a NVMe disk; the VM had 8 vCPUs and 12 GB, macOS 26.7.1, iOS 26.5, one simulator booted at a time.
+a NVMe disk; the VM had 8 vCPUs and 12 GB, macOS 26.7.1, iOS 26.5.
 
 ### iOS Simulator at 3x, step by step
 
@@ -27,15 +41,39 @@ Pro at 3x (1206x2622), frames per second counted at the simulator's own screen:
 |---|---|---|
 | Reims 2ce3209 as upstream shipped it (2026-10-26) | 17.2 | |
 | macbox, 2026-10-28 (in place rendering, 0004) | 38.5 / 39.5 | 25.0 ms/frame |
-| macbox cohwl, Coherent off (flat32) | **50.6** (p95 21.4 ms, p99 25.8 ms) | 97% busy |
-| macbox cohwl, `MACBOX_COHERENT=on` | **70.0** (p95 17.7 ms, p99 22.0 ms); 63–66 in a later run | 70% busy |
+| macbox cohwl, Coherent off (flat32), 2026-11-05 | 50.6 (p95 21.4 ms, p99 25.8 ms) | 97% busy |
+| macbox cohwl, Coherent on, 2026-11-05 | 70.0 (p95 17.7 ms, p99 22.0 ms) | 70% busy |
+| **macbox now** (Coherent and the switches below, 2026-11-09) | **117** (114–121 over runs) | 7.7 ms/frame |
 
-The last two rows are one A/B in one window on 2026-11-05: fresh headless boots, a quiet gate
-before each round (guest background CPU and `mediaanalysisd` low), means of the valid rounds. The
-first two are earlier days, on the same host but not in the same window. With Coherent, QEMU's CPU
-use rises by about 1.6 cores (333% to 491%): the GPU waits less, the CPU traps more.
+The iPhone 17 Pro's screen runs at up to 120 Hz, so 117 is close to the most a single simulator can
+show; GlassBench's own content animates at 60 Hz, and the simulator redraws on top of it. The
+cohwl rows are one A/B in one window; the last row comes from the soak and A/B runs of 2026-11-09
+and -10 (fresh headless boots, Simulator.app closed). flat32 also has an A/B of its own against the
+build before it: 41.6 → 48–50 fps.
 
-flat32 also has an A/B of its own against the build before it: 41.6 → 48–50 fps at 3x.
+### Several simulators at once, and the desktop under load
+
+The build macbox makes now, 3x iPhone 17 Pro simulators all running GlassBench, the macOS desktop at
+3440x1440 (2026-11-09, soak with simulators booted and shut down in cycles, 0 GPU hangs):
+
+| Load | Each simulator, fps | GPU |
+|---|---|---|
+| 1 simulator | 114–121 | 7.7 ms/frame |
+| 1 simulator while a window is dragged on the desktop | 99–102 | |
+| 2 simulators | 51–54 each (~105 frames/s in total) | 80–85% busy, ~8 ms/frame |
+| 3 simulators | 31–32 each (~95 in total) | 93% busy |
+
+| Desktop: dragging a window (display-link ticks per second, p99 interval) | |
+|---|---|
+| alone | 240/s, p99 10 ms |
+| with 1 simulator running | 126–128/s, p99 22–26 ms |
+| with 2 simulators running | 96–102/s, p99 32–38 ms |
+
+Two or more simulators share the GPU: about 105 simulator frames a second in total on this iGPU,
+whatever their number. All guest work reaches the GPU in one order, so the desktop's frames wait
+behind the simulators' earlier work; that, not the desktop's own cost, is its latency under load.
+These runs placed the VM's vCPUs on the CPU's performance cores and QEMU's other threads on all
+cores (`MACBOX_CPUSET` pins all of QEMU instead).
 
 ### Earlier measurements, the 2026-10-28 build
 
@@ -46,17 +84,17 @@ flat32 also has an A/B of its own against the build before it: 41.6 → 48–50 
 | 3x (1206x2622) | 17.2 | 19.2 | 21.9 | 38.5 / 39.5 (25.0 ms) |
 | Safari at 3x, blurred floating bar | n/a | 39.5 | 44.5 | 66.4 / 64.2 |
 
-1x and 2x haven't been measured again on cohwl.
+1x and 2x haven't been measured again since.
 
-### The macOS desktop
+### The macOS desktop, 2026-11-05
 
-| 3440x1440 desktop | Coherent off | Coherent on |
+| 3440x1440 desktop (cohwl) | Coherent off | Coherent on |
 |---|---|---|
 | dragging a 600x400 window (presents per second) | 105–107 | 129–130 |
 | Safari scrolling a local page (presents per second) | 75–79 | 110 |
 | Genie minimize of a 2400x1100 window (frames per animation; ~12 upstream) | 19.5 (the 10-28 build) | 29.5 / 30.5 |
 
-The first two rows are the same A/B as above. The Genie number with Coherent comes from a smoke
+The first two rows are the cohwl A/B above. The Genie number with Coherent comes from a smoke
 check, not a matched A/B. A 0.5 s animation at 60 Hz would be 30 frames.
 
 ### Disk
@@ -99,6 +137,7 @@ With the macbox build (`MACBOX_GPU_TUNING=auto`, the default), `macbox up` sets:
 | `M2V_LIVE=$MACBOX_HOME/run/live.conf` | metal2vulkan's live switches (patch 0003). The file holds `host_rt_in_place=1` |
 | `M2V_ARL_FACTS=<11 facts>` | only on an Arrow Lake GPU (PCI ids 7d67, 7dd1, 7d41, 7d51, 7d45) |
 | `REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1` | skips a new Private texture's first page-up (Reims patch 0013) |
+| Coherent and the switches below | with `MACBOX_COHERENT=auto` (the default) on an Arrow Lake GPU |
 
 `host_rt_in_place` is read when a texture is made: change it in `live.conf`, then remake the
 surfaces (change the resolution, or restart the VM). `MACBOX_GPU_TUNING=off` turns all of it off.
@@ -107,25 +146,42 @@ On another GPU, in place rendering still runs its device check per memory kind a
 the check fails; it has only been measured on Arrow Lake. Measure your own GPU before and after:
 the facts list is specific to Arrow Lake and is never set elsewhere.
 
-### Coherent (experimental, off by default)
+### Coherent and the switches measured with it (on by default on Arrow Lake)
 
-`MACBOX_COHERENT=on` in the config, then `macbox down && macbox up`. macbox then also sets
-`REIMS_VGPU_CENSUS=$MACBOX_HOME/run/coherent`, `REIMS_VGPU_COHERENT=1` and a report a minute, and
-adds `surface_lazy=1`, `surface_lazy_scoped=1` and `surface_coherent=1` to `live.conf`.
-`MACBOX_COHERENT=off` removes them all again.
+`MACBOX_COHERENT=auto` (the default) turns this on with an Arrow Lake iGPU, the GPU it runs on day
+to day; `on` turns it on with any GPU, `off` turns it off. A change applies at the next
+`macbox down && macbox up`. With it, macbox sets:
 
-It is off by default because it isn't settled yet:
-- **One GPU hang with it on.** On 2026-11-05, the day it went into daily use, i915
-  reset the GPU's render engine and QEMU stopped. The guard did its job: the next boot came up without
-  coherent pages. A later hang with Coherent off, on a newer development build, has the same error
-  code, so the cause is open, not pinned on Coherent.
-- **A write-loss risk the counters flagged once,** during a test that killed Safari mid-frame
-  (`overwrite_risk` 1 in the census report), and that hasn't been reproduced or ruled out since.
+| | |
+|---|---|
+| `REIMS_VGPU_CENSUS=$MACBOX_HOME/run/coherent`, `REIMS_VGPU_COHERENT=1` | QEMU's census traps the guest CPU's touches of the surfaces metal2vulkan keeps on the GPU (a report a minute) |
+| `surface_lazy`, `surface_lazy_scoped`, `surface_coherent` | the simulator's and the desktop's surfaces stay on the GPU; a page syncs only when the guest's CPU touches it |
+| `surface_lazy_max_texels=6000000`, `surface_twin_reader_first`, `surface_coherent_own_back`, `surface_lazy_open_ids`, `surface_twin_make_once` | fixes the lanes and the census found on top of it: which surfaces qualify, a race between two textures over one surface (`make_once`: 91 → 100 fps over 12 boots), and exact answers about committed command buffers |
+| `inline_lazy`, `inline_checks` | a lazy surface's first pass instance is recorded inline; a batch's submission checks run in the scheduler's pass, so no chained batch waits a round for them |
+| `REIMS_VGPU_GROUPED=1`, `group_batches=64`, `group_deadline_us=500`, `group_keep=0`, `group_events=0` | grouped completion: up to 64 batches complete together; keep and events off, which ended a class of fence timeouts under several simulators |
+| `REIMS_VGPU_STAGED_PAGE_UP`, `REIMS_VGPU_STAGED_ZERO` | a new texture's first page-up copies guest pages into a staging buffer instead of mapping a view per page run (55k mappings a second and a storm of TLB shootdowns before: simulator 89 → 101 fps), and pages of zeros write nothing |
+| `REIMS_VGPU_PIPELINE_EXEC`, `REIMS_VGPU_IRQ_MODERATE` | a FIFO's execs pipelined (8 in flight), and one interrupt outstanding at a time |
+| `facts_on=SubmissionsWithoutSignalsMerge` | Arrow Lake only: submissions without signals merge |
 
-If a coherent run crashes, `$MACBOX_HOME/run/coherent/coherent.running` stays behind and every later
-start boots without coherent pages. `macbox coherent status` says so; `macbox coherent reset`
-(VM stopped) allows the next try. It needs a kernel with `UFFD_USER_MODE_ONLY` (Linux 5.11 or
-later), which works with `vm.unprivileged_userfaultfd=0`.
+The four `REIMS_VGPU_*` switches that name a file are on while the file exists
+(`$MACBOX_HOME/run/switches/`), so each can be turned off without a restart. `live.conf` lines are
+re-read every second; macbox rewrites its own lines at every start and leaves yours alone.
+
+What to know before relying on it:
+- **The crash guard.** If a coherent run crashes, `$MACBOX_HOME/run/coherent/coherent.running`
+  stays behind and every later start boots without coherent pages. `macbox coherent status` says
+  so; `macbox coherent reset` (VM stopped) allows the next try. A fault costs one crash, not a crash
+  loop.
+- **It needs** a kernel with `UFFD_USER_MODE_ONLY` (Linux 5.11 or later), which works with
+  `vm.unprivileged_userfaultfd=0`. In the cohwl A/B QEMU used about 1.6 more CPU cores with it:
+  the GPU waits less, the CPU traps more.
+- **A rare GPU hang is still open.** Under repeated boots and shutdowns of three simulators, a
+  command buffer is occasionally begun again while the GPU still runs it, and i915 resets the GPU.
+  It is traced to command-buffer reuse in metal2vulkan's submission path, not to Coherent's pages,
+  and is being hunted with an exact detector in Mesa.
+- **Write-loss check.** The census counts `overwrite_risk`, a guest write a held GPU copy could
+  overwrite. It was flagged once in an early test that killed Safari mid-frame; across 64
+  production boots since 2026-11-08 (16,850 reports) it stayed at 0.
 
 ## Tried, no gain
 
@@ -147,6 +203,13 @@ later), which works with `vm.unprivileged_userfaultfd=0`.
 | a reaper for deleted textures | Safari 5–8 fps slower, and Genie breaks |
 | executing the FIFO from its own thread (fifoexec) | a GPU hang on its first day; rolled back |
 | merging adjacent page runs of a mapping | negligible: 49 merges in 629,632 pages of a real trace |
+| chaining a submission's primary command buffers in ANV (one preamble, one end) | 13 → 2 µs per command buffer in a micro benchmark, 0–1% on a real frame: the barrier before already drains the GPU |
+| precise barriers (no L3 flush between images) | within boot-to-boot noise: real frames leave little dirty |
+| lossless compression (CCS) on the simulator's surfaces, in three forms | no GPU time saved; a lone simulator lost a third of its frames to host copies |
+| several Vulkan queues (`ANV_QUEUE_OVERRIDE=gc=18`) | about 0% (+4% with three simulators): the GPU is already busy; one i915 context per queue (`gc=8`) was unstable |
+| keeping groups of batches open (`group_keep=1`) | +6–7% with two simulators, but held groups stalled frames up to 200 ms |
+| lowering a simulator's draws on a second thread | 90 → 72 fps: the first thread waits for it |
+| a deeper FIFO pipeline (32 execs instead of 8) | slower: 109 → 97 fps, desktop p99 27 → 37 ms |
 
 ## Known limits
 
@@ -154,7 +217,8 @@ later), which works with `vm.unprivileged_userfaultfd=0`.
   sends no vblank while nothing is presenting, so the first frame of an animation waits a median
   114 ms for display timing (8 ms when something already animates).
   [steelbrain/reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141).
-- **3x is GPU-bound** at about 50 fps on this iGPU in heavy Liquid Glass scenes (70 with Coherent).
+- **The GPU is shared.** One 3x simulator reaches 120 Hz; two or three share about 105 frames a
+  second on this iGPU, and the desktop's frames wait behind theirs.
 - **x86-64 macOS ends with macOS 26.** iOS 27 simulators are arm64 only.
 - **Recording** uses `simctl io recordVideo`, H.264 in software in the VM: about 50 fps with one
   simulator animating, 18 each with three. `sim-fps` counts what the simulator wrote, and it writes

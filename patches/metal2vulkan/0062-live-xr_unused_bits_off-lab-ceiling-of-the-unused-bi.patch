@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 09:49:39 +0000
+Subject: [PATCH 62/92] live xr_unused_bits_off, lab ceiling of the unused-bits
+ load pass's cost
+
+Measurement-only switch, default off: records no extended-range load pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/render/unused_bits_load.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+index 0f9afa2c..a2c9fbcf 100644
+--- a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
++++ b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+@@ -536,6 +536,12 @@ fn record_taken(
+     reach: TileReach<'_>,
+     frames: bool,
+ ) -> Result<(), Error> {
++    // LOCAL (Atlas, lab measurement only): live `xr_unused_bits_off` records no load pass, the
++    // attachments' unused bits kept as the device's pass keeps them (inexact: the ceiling of what
++    // skipping a canonical region's rewrite saves). Off by default; never in production.
++    if crate::live::on("xr_unused_bits_off", false) {
++        return Ok(());
++    }
+     for color in layout.colors.iter().flatten() {
+         let Some(taken) = takes(color, false) else {
+             continue;

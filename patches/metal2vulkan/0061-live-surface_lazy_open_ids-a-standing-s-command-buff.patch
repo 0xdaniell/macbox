@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 07:01:52 +0000
+Subject: [PATCH 61/92] live surface_lazy_open_ids: a standing's command buffer
+ committed is asked exactly
+
+The last 256 committed command buffers of every process made a standing stale within a fraction of
+a second under several Sims and the desktop, refused as uncommitted, each a whole copy in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/mod.rs                 |  4 ++
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 53 ++++++++++++++++++-
+ 2 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 8f3cb31d..3a0b2881 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1753,6 +1753,10 @@ impl Drop for CommandBufferShared {
+         // state.
+         let (pool, replays) = {
+             let mut state = lock(&self.state);
++            // LOCAL (Atlas): a command buffer gone uncommitted leaves no standing open.
++            if let Some(id) = state.shadow_carry.as_ref().map(ShadowCarry::id) {
++                crate::shadow_lazy::dropped(id);
++            }
+             (state.pool.take(), state.replays.take())
+         };
+         if let Some(pool) = pool {
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 5062ab66..f99e10da 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -194,6 +194,53 @@ fn committed_ids() -> &'static Mutex<VecDeque<u64>> {
+     IDS.get_or_init(Mutex::default)
+ }
+ 
++/// LOCAL (Atlas): live `surface_lazy_open_ids` (default off): whether a standing's command buffer
++/// committed is asked of the command buffers that left a standing and have not committed or gone
++/// yet, exactly, instead of the last [`COMMITTED_KEPT`] committed. Those let a standing go stale
++/// after 256 commits of every process, a fraction of a second with several Sims and the desktop,
++/// so a surface idle that long (the desktop's, a triple buffer's) copied its whole bytes in again
++/// as `uncommitted` (2026-11-08 loadlab: 57564 such, 64802 whole copies in).
++const OPEN_IDS: &str = "surface_lazy_open_ids";
++/// The open command buffers kept at most: past it the exact answer is given up for good.
++const OPEN_KEPT: usize = 1 << 16;
++static OPEN_OVERFLOW: AtomicBool = AtomicBool::new(false);
++
++fn open_ids() -> &'static Mutex<HashSet<u64>> {
++    static IDS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
++    IDS.get_or_init(Mutex::default)
++}
++
++fn open_exact() -> bool {
++    crate::live::on(OPEN_IDS, false) && !OPEN_OVERFLOW.load(Ordering::Relaxed)
++}
++
++/// Whether the command buffer `id`, whose encoder left a standing, has committed (or gone).
++fn was_committed(id: u64) -> bool {
++    if open_exact() {
++        !open_ids().lock().unwrap().contains(&id)
++    } else {
++        committed_ids().lock().unwrap().contains(&id)
++    }
++}
++
++/// Note an encoder of the command buffer `id` left a standing while it encodes.
++fn note_open(id: u64) {
++    if !crate::live::on(OPEN_IDS, false) || committed_ids().lock().unwrap().contains(&id) {
++        return;
++    }
++    let mut open = open_ids().lock().unwrap();
++    if open.len() >= OPEN_KEPT {
++        OPEN_OVERFLOW.store(true, Ordering::Relaxed);
++        return;
++    }
++    open.insert(id);
++}
++
++/// LOCAL (Atlas): the command buffer `id` went without a commit: it holds no standing open.
++pub(crate) fn dropped(id: u64) {
++    open_ids().lock().unwrap().remove(&id);
++}
++
+ /// LOCAL (Atlas): the command buffers committed whose last batch the scheduler has not planned
+ /// yet ([`planned`]), and the last [`PLANNED_KEPT`] that it planned.
+ #[derive(Default)]
+@@ -493,6 +540,7 @@ pub(crate) fn active() -> bool {
+ 
+ /// Note the command buffer of identity `id` committed.
+ pub(crate) fn committed(id: u64) {
++    open_ids().lock().unwrap().remove(&id);
+     let mut ids = committed_ids().lock().unwrap();
+     if ids.len() == COMMITTED_KEPT {
+         ids.pop_front();
+@@ -1234,7 +1282,7 @@ impl Lazy {
+     /// Whether a standing stands, from a command buffer already committed.
+     fn standing_committed(&self) -> bool {
+         let stood = *self.stood.lock().unwrap();
+-        stood.is_some_and(|stood| committed_ids().lock().unwrap().contains(&stood.id))
++        stood.is_some_and(|stood| was_committed(stood.id))
+     }
+ 
+     /// `settled` is what ran and is not in the pages, and whether any record stays at all.
+@@ -1527,6 +1575,7 @@ impl Lazy {
+         stale: Option<[u32; 4]>,
+     ) {
+         self.register((key, alias, range));
++        note_open(id);
+         *self.stood.lock().unwrap() = Some(Stood {
+             id,
+             touched,
+@@ -1767,7 +1816,7 @@ impl Lazy {
+             Some(Refused::OwnBuffer)
+         } else if own {
+             None
+-        } else if !committed_ids().lock().unwrap().contains(&stood.id) {
++        } else if !was_committed(stood.id) {
+             Some(Refused::Uncommitted)
+         } else {
+             None

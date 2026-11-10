@@ -15,7 +15,7 @@ eval "$_env"
 : "${MACBOX_GUEST_USER:=dev}" "${MACBOX_CPUS:=8}" "${MACBOX_MEMORY:=12G}" "${MACBOX_DISK_SIZE:=160G}"
 : "${MACBOX_RESOLUTION:=1920x1080}" "${MACBOX_REFRESH:=60}" "${MACBOX_CPUSET:=}"
 : "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=none}" "${MACBOX_GPU_TUNING:=auto}"
-: "${MACBOX_COHERENT:=off}"
+: "${MACBOX_COHERENT:=auto}"
 : "${MACBOX_SIM_PREFIX:=macbox}" "${MACBOX_POOL:=full slim-1 slim-2 sharp small}"
 : "${MACBOX_T3_HOST_ID:=$MACBOX_SSH_HOST}" "${MACBOX_T3_SETTINGS:=$HOME/.t3/userdata/settings.json}"
 DOCKER="${MACBOX_DOCKER:-docker}"
@@ -95,28 +95,65 @@ tuning_on() {
     *) [[ "$(build_id)" == *-macbox ]] ;;
   esac
 }
+# Coherent with the switches measured on top of it, the build that runs day to day on the Arrow
+# Lake iGPU ("production I", docs/performance.md): metal2vulkan's live lines, then Reims's switches
+# (each of the file-named ones is on while its file exists, so it can be flipped without a restart).
+COHERENT_LIVE="surface_lazy surface_lazy_scoped surface_lazy_max_texels surface_coherent surface_twin_reader_first surface_coherent_own_back surface_lazy_open_ids surface_twin_make_once inline_lazy inline_checks group_batches group_deadline_us group_keep group_events facts_on"
+COHERENT_ENV="REIMS_VGPU_CENSUS REIMS_VGPU_COHERENT REIMS_VGPU_CENSUS_FLUSH_MS REIMS_VGPU_GROUPED REIMS_VGPU_STAGED_PAGE_UP REIMS_VGPU_STAGED_ZERO REIMS_VGPU_PIPELINE_EXEC REIMS_VGPU_IRQ_MODERATE"
+coherent_on() {  # auto: on with the Arrow Lake iGPU it was measured on
+  case "$MACBOX_COHERENT" in
+    on) return 0 ;; off) return 1 ;;
+    *) gpu_is_arl ;;
+  esac
+}
+drop_managed() {  # drop_managed <live file>: the lines macbox writes, so a change of mode applies
+  [ -f "$1" ] || return 0
+  local k
+  for k in $COHERENT_LIVE; do sed -i "/^$k=/d" "$1"; done
+}
 apply_tuning() {  # before each start
-  local live="$RUN/live.conf"
+  local live="$RUN/live.conf" k
   if tuning_on; then
     [ -s "$live" ] || printf '# metal2vulkan live switches (patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$live"
-    sed -i '/^surface_\(lazy\|lazy_scoped\|coherent\)=/d' "$live"
+    drop_managed "$live"
     local env=(--env "M2V_LIVE=$live" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=1)
     if gpu_is_arl; then env+=(--env "M2V_ARL_FACTS=$ARL_FACTS"); else env+=(--env "M2V_ARL_FACTS="); fi
-    if [ "$MACBOX_COHERENT" = on ]; then
+    if coherent_on; then
       # QEMU's census traps the guest CPU's touches of the surfaces metal2vulkan renders in place.
       # A run that doesn't end well leaves coherent/coherent.running, and every later start then
       # boots without Coherent until that file is removed (macbox coherent reset).
-      mkdir -p "$RUN/coherent"
-      printf 'surface_lazy=1\nsurface_lazy_scoped=1\nsurface_coherent=1\n' >>"$live"
-      env+=(--env "REIMS_VGPU_CENSUS=$RUN/coherent" --env REIMS_VGPU_COHERENT=1 --env REIMS_VGPU_CENSUS_FLUSH_MS=60000)
+      mkdir -p "$RUN/coherent" "$RUN/switches"
+      cat >>"$live" <<'LIVE'
+surface_lazy=1
+surface_lazy_scoped=1
+surface_lazy_max_texels=6000000
+surface_coherent=1
+surface_twin_reader_first=1
+surface_coherent_own_back=1
+surface_lazy_open_ids=1
+surface_twin_make_once=1
+inline_lazy=1
+inline_checks=1
+group_batches=64
+group_deadline_us=500
+group_keep=0
+group_events=0
+LIVE
+      gpu_is_arl && echo 'facts_on=SubmissionsWithoutSignalsMerge' >>"$live"
+      for k in staged-page-up staged-zero pipeline-exec irq-moderate; do : >"$RUN/switches/$k"; done
+      env+=(--env "REIMS_VGPU_CENSUS=$RUN/coherent" --env REIMS_VGPU_COHERENT=1 --env REIMS_VGPU_CENSUS_FLUSH_MS=60000
+        --env REIMS_VGPU_GROUPED=1 --env "REIMS_VGPU_STAGED_PAGE_UP=$RUN/switches/staged-page-up"
+        --env "REIMS_VGPU_STAGED_ZERO=$RUN/switches/staged-zero" --env "REIMS_VGPU_PIPELINE_EXEC=$RUN/switches/pipeline-exec"
+        --env "REIMS_VGPU_IRQ_MODERATE=$RUN/switches/irq-moderate")
     else
-      env+=(--env REIMS_VGPU_CENSUS= --env REIMS_VGPU_COHERENT= --env REIMS_VGPU_CENSUS_FLUSH_MS=)
+      for k in $COHERENT_ENV; do env+=(--env "$k="); done
     fi
     ctl set "$MACBOX_VM" "${env[@]}" >/dev/null
   else
-    [ -f "$live" ] && sed -i '/^surface_\(lazy\|lazy_scoped\|coherent\)=/d' "$live"
-    ctl set "$MACBOX_VM" --env "M2V_LIVE=" --env "M2V_ARL_FACTS=" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP= \
-      --env REIMS_VGPU_CENSUS= --env REIMS_VGPU_COHERENT= --env REIMS_VGPU_CENSUS_FLUSH_MS= >/dev/null
+    drop_managed "$live"
+    local env=(--env "M2V_LIVE=" --env "M2V_ARL_FACTS=" --env REIMS_VGPU_PRIVATE_SKIP_PAGE_UP=)
+    for k in $COHERENT_ENV; do env+=(--env "$k="); done
+    ctl set "$MACBOX_VM" "${env[@]}" >/dev/null
   fi
 }
 
@@ -169,7 +206,8 @@ MACBOX_RENDER_NODE=${node:-$MACBOX_RENDER_NODE}
 MACBOX_DISK_CACHE=$MACBOX_DISK_CACHE
 # auto: macbox's metal2vulkan tuning with the macbox build; on; off
 MACBOX_GPU_TUNING=$MACBOX_GPU_TUNING
-# on: Coherent, zero-copy IOSurfaces (docs/performance.md). Experimental: one GPU hang with it on
+# auto (on with an Arrow Lake iGPU, where it runs day to day), on, off: Coherent, zero-copy
+# IOSurfaces, and the switches measured with it (docs/performance.md)
 MACBOX_COHERENT=$MACBOX_COHERENT
 # iOS Simulator pool: names are "<device> (<prefix> <label>)"
 MACBOX_SIM_PREFIX=$MACBOX_SIM_PREFIX
@@ -542,7 +580,7 @@ PY
 }
 
 coherent_state() {
-  if [ "$MACBOX_COHERENT" != on ] || ! tuning_on; then echo "off (MACBOX_COHERENT=on to try it)"
+  if ! coherent_on || ! tuning_on; then echo "off (MACBOX_COHERENT=on to turn it on)"
   elif [ -e "$RUN/coherent/coherent.running" ] && ! vm_running; then
     echo "on, but held off: the last coherent run did not end well (macbox coherent reset)"
   else echo "on"; fi
@@ -601,7 +639,7 @@ Day to day:
   macbox ssh [command]
   macbox screenshot [out.png] | click X Y [right|double] | move X Y | scroll X Y N
   macbox type TEXT|-  |  key COMBO...  |  wait SECONDS [out.png]
-  macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=on, experimental)
+  macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=auto|on|off)
   macbox backup <name>
 EOF
 }

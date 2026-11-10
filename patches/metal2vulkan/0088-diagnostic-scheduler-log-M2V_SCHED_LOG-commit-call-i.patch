@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 10:01:30 +0000
+Subject: [PATCH 88/92] diagnostic: scheduler log (M2V_SCHED_LOG): commit call
+ -> inbox post -> take -> submit start, per logical queue
+
+---
+ .../src/command_buffer/mod.rs                 |  9 ++
+ .../src/command_buffer/submit.rs              |  2 +
+ crates/metal2vulkan-runtime/src/gpu_time.rs   |  5 +
+ crates/metal2vulkan-runtime/src/lib.rs        |  1 +
+ crates/metal2vulkan-runtime/src/sched_log.rs  | 97 +++++++++++++++++++
+ .../metal2vulkan-runtime/src/scheduler/mod.rs |  2 +
+ 6 files changed, 116 insertions(+)
+ create mode 100644 crates/metal2vulkan-runtime/src/sched_log.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 13e06af0..4181fbb0 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2481,6 +2481,8 @@ impl CommandBuffer {
+     /// [`commit`](Self::commit) for `call`, or, with `failure`,
+     /// [`commit_failed`](Self::commit_failed).
+     fn commit_as(&self, call: &'static str, failure: Option<CommitFailure>) -> Result<(), Error> {
++        // LOCAL (Atlas) diagnostic: the commit call's start (`sched_log.rs`).
++        crate::sched_log::mark(&self.0.kernel.called);
+         // Left to wait for the last render encoder's end, where its call left it to the device's
+         // lowering thread and the thread has not lowered it, or for the commits left so.
+         if failure.is_none() && self.queue_commit(call)? {
+@@ -3426,6 +3428,13 @@ impl CommandBuffer {
+     }
+ }
+ 
++impl CommandBufferShared {
++    /// LOCAL (Atlas) diagnostic (`sched_log.rs`): its kernel times, for the scheduler's marks.
++    pub(crate) fn kernel_times(&self) -> &KernelTimes {
++        &self.kernel
++    }
++}
++
+ impl CommandBufferShared {
+     /// The device.
+     pub(super) fn device(&self) -> &Device {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 4d59cc9b..a4ba9028 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -506,6 +506,8 @@ impl CommandBufferShared {
+         // One a hang's thread made `Scheduled` early began then (`hang.rs`).
+         if index == 0 && self.kernel.start() == 0 {
+             self.kernel.begin();
++            // LOCAL (Atlas) diagnostic: where the commit waited (`sched_log.rs`).
++            crate::sched_log::note(self.queue.id(), queue, &self.kernel);
+         }
+         let slot = state
+             .times
+diff --git a/crates/metal2vulkan-runtime/src/gpu_time.rs b/crates/metal2vulkan-runtime/src/gpu_time.rs
+index fbe7cee4..14705afd 100644
+--- a/crates/metal2vulkan-runtime/src/gpu_time.rs
++++ b/crates/metal2vulkan-runtime/src/gpu_time.rs
+@@ -940,6 +940,11 @@ pub(crate) struct KernelTimes {
+     start: AtomicU64,
+     /// The scheduler finished submitting its last batch.
+     end: AtomicU64,
++    /// LOCAL (Atlas) diagnostic (`sched_log.rs`): the commit call began, its batches were posted
++    /// to the scheduler's inbox, and a pass took them into the order; 0 unless `M2V_SCHED_LOG`.
++    pub(crate) called: AtomicU64,
++    pub(crate) posted: AtomicU64,
++    pub(crate) taken: AtomicU64,
+ }
+ 
+ impl KernelTimes {
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 4036c1c7..0a0d08df 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -166,6 +166,7 @@ mod owned_kernel;
+ // LOCAL (Atlas) diagnostic: the pass timer (M2V_PASS_TIMES).
+ mod pass_times;
+ mod barrier_log; // LOCAL (Atlas) diagnostic: M2V_BARRIER_LOG
++mod sched_log; // LOCAL (Atlas) diagnostic: M2V_SCHED_LOG
+ mod pending_dispatch;
+ mod pipeline;
+ mod pixel_format_info;
+diff --git a/crates/metal2vulkan-runtime/src/sched_log.rs b/crates/metal2vulkan-runtime/src/sched_log.rs
+new file mode 100644
+index 00000000..6be9bec1
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/sched_log.rs
+@@ -0,0 +1,97 @@
++//! LOCAL (Atlas) diagnostic: the scheduler log, `M2V_SCHED_LOG=1`. Where a command buffer waits
++//! between its commit call and the scheduler's first submission of its work, per logical queue:
++//! the call to the inbox post (`commit` settling ends, queued commits), the post to a pass taking
++//! it into the order (the scheduler's thread busy or asleep), and the take to the submission's
++//! start (event and binary waits, the queue's earlier batches, gates, checks, the pass's cap).
++//! Logged every 10 s for each queue with 20 or more command buffers in the window. Unset (or
++//! `0`), each hook is one check of a `OnceLock`.
++
++use crate::gpu_time::{host_nanos, KernelTimes};
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++/// Whether the log is on: read once.
++pub(crate) fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_SCHED_LOG").is_ok_and(|v| !v.is_empty() && v != "0"))
++}
++
++/// Stores the host time into `at` where the log is on.
++pub(crate) fn mark(at: &AtomicU64) {
++    if on() {
++        at.store(host_nanos(), Ordering::Release);
++    }
++}
++
++/// Per logical queue: its `VkQueue` and the waits in microseconds, call->post, post->take,
++/// take->begin.
++type Table = HashMap<u64, (usize, [Vec<u32>; 3])>;
++
++static TABLE: Mutex<Option<Table>> = Mutex::new(None);
++static LAST: AtomicU64 = AtomicU64::new(0);
++
++/// The scheduler began submitting the first batch of a command buffer of logical queue `queue`
++/// on `VkQueue` `vk_queue`, whose marks `kernel` holds.
++pub(crate) fn note(queue: u64, vk_queue: usize, kernel: &KernelTimes) {
++    if !on() {
++        return;
++    }
++    let now = host_nanos();
++    let called = kernel.called.load(Ordering::Acquire);
++    let posted = kernel.posted.load(Ordering::Acquire);
++    let taken = kernel.taken.load(Ordering::Acquire);
++    let us = |a: u64, b: u64| -> u32 {
++        if a == 0 || b == 0 {
++            u32::MAX
++        } else {
++            (b.saturating_sub(a) / 1000).min(u64::from(u32::MAX - 1)) as u32
++        }
++    };
++    let row = [us(called, posted), us(posted, taken), us(taken, now)];
++    let Ok(mut table) = TABLE.lock() else { return };
++    let entry = table
++        .get_or_insert_with(HashMap::new)
++        .entry(queue)
++        .or_insert_with(|| (vk_queue, [Vec::new(), Vec::new(), Vec::new()]));
++    for (list, value) in entry.1.iter_mut().zip(row) {
++        if value != u32::MAX {
++            list.push(value);
++        }
++    }
++    let last = LAST.load(Ordering::Relaxed);
++    if last == 0 {
++        LAST.store(now, Ordering::Relaxed);
++        return;
++    }
++    if now.saturating_sub(last) < 10_000_000_000 {
++        return;
++    }
++    LAST.store(now, Ordering::Relaxed);
++    let secs = now.saturating_sub(last) as f64 / 1e9;
++    let Some(rows) = table.take() else { return };
++    drop(table);
++    let mut rows: Vec<(u64, (usize, [Vec<u32>; 3]))> = rows.into_iter().collect();
++    rows.sort_by_key(|(_, (_, lists))| std::cmp::Reverse(lists[2].len()));
++    let mut text = format!("m2v sched log: {secs:.1} s window\n");
++    for (queue, (vk_queue, mut lists)) in rows {
++        let n = lists[2].len();
++        if n < 20 {
++            continue;
++        }
++        text += &format!("m2v sched log:   queue {queue} vk {vk_queue} n {n} ({:.0}/s)", n as f64 / secs);
++        for (name, list) in ["call>post", "post>take", "take>begin"].iter().zip(lists.iter_mut()) {
++            list.sort_unstable();
++            let at = |p: usize| list.get((list.len() * p / 100).min(list.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 1000.0;
++            text += &format!(
++                " | {name} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2}",
++                at(50),
++                at(90),
++                at(99),
++                list.last().copied().unwrap_or(0) as f64 / 1000.0
++            );
++        }
++        text += " ms\n";
++    }
++    eprint!("{text}");
++}
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 64de47fe..f3975540 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -656,6 +656,7 @@ impl Scheduler {
+         batches: Vec<BatchSync>,
+     ) {
+         let shared = &*self.shared;
++        crate::sched_log::mark(&buffer.kernel_times().posted); // LOCAL (Atlas) diagnostic
+         let committed = Committed {
+             buffer: buffer.hold(),
+             queue,
+@@ -1082,6 +1083,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+     } in commits.drain(..)
+     {
+         let count = batches.len();
++        crate::sched_log::mark(&buffer.kernel_times().taken); // LOCAL (Atlas) diagnostic
+         let State { order, binary, .. } = &mut *state;
+         let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
+             buffer: buffer.hold(),

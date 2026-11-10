@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 01:07:36 +0000
+Subject: [PATCH 52/92] diagnostic: compute census in the pass timer
+
+A dispatch's unit notes the compute pipeline last bound on the thread and its group counts;
+compute pipelines made write a census line (entry, module) and modules their SPIR-V, while the
+pass timer is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/pass_times.rs | 44 ++++++++++++++++++-
+ .../src/pipeline/objects.rs                   |  8 ++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/pass_times.rs b/crates/metal2vulkan-runtime/src/pass_times.rs
+index 933b7d8a..3bc09c55 100644
+--- a/crates/metal2vulkan-runtime/src/pass_times.rs
++++ b/crates/metal2vulkan-runtime/src/pass_times.rs
+@@ -152,6 +152,8 @@ pub(crate) enum PassAt {
+ thread_local! {
+     /// A copy's description for the unit it opens (`hook!`'s copies), taken by [`work`].
+     static COPY_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
++    /// LOCAL (Atlas) diagnostic: the compute pipeline last bound on this thread, for a dispatch's note.
++    pub(crate) static LAST_COMPUTE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+     static SCOPE: Cell<Option<Tag>> = const { Cell::new(None) };
+     static SITE: Cell<Option<&'static Location<'static>>> = const { Cell::new(None) };
+ }
+@@ -1129,6 +1131,8 @@ macro_rules! hook {
+     (before cmd_bind_pipeline, $st:expr, $cb:ident, $point:ident, $pipeline:ident) => {
+         if $crate::pass_times::on() && $point == ash::vk::PipelineBindPoint::GRAPHICS {
+             $crate::pass_times::draw_state($cb, Some(ash::vk::Handle::as_raw($pipeline)), None)
++        } else if $crate::pass_times::on() && $point == ash::vk::PipelineBindPoint::COMPUTE {
++            $crate::pass_times::LAST_COMPUTE.with(|c| c.set(ash::vk::Handle::as_raw($pipeline)))
+         }
+     };
+     (before cmd_set_scissor, $st:expr, $cb:ident, $first:ident, $count:ident, $scissors:ident) => {
+@@ -1156,9 +1160,12 @@ macro_rules! hook {
+     (before cmd_draw_mesh_tasks_indirect_count, $st:expr, $cb:ident $(, $a:ident)*) => {
+         $crate::pass_times::hook!(@draw $cb)
+     };
+-    (before cmd_dispatch, $st:expr, $cb:ident $(, $a:ident)*) => {
++    (before cmd_dispatch, $st:expr, $cb:ident, $x:ident, $y:ident, $z:ident) => {{
++        if $crate::pass_times::on() {
++            $crate::pass_times::dispatch_note($x, $y, $z);
++        }
+         $crate::pass_times::hook!(@work $st, $cb, Compute, "vkCmdDispatch")
+-    };
++    }};
+     (before cmd_dispatch_indirect, $st:expr, $cb:ident $(, $a:ident)*) => {
+         $crate::pass_times::hook!(@work $st, $cb, Compute, "vkCmdDispatchIndirect")
+     };
+@@ -1412,6 +1419,39 @@ pub(crate) fn read(capture: Arc<Capture>, placement: Placement<'_>) {
+ /// graphics pipeline made, appended to `<dir>/pipes-<pid>.csv` (its handle, which the draw units
+ /// name, its color blend states, its pass's shape and its stages' SPIR-V digests), and each stage's
+ /// SPIR-V written once to `<dir>/spv/<digest>.spv`.
++/// LOCAL (Atlas) diagnostic: a dispatch of `x`x`y`x`z` groups of the compute pipeline last bound on
++/// this thread, as the note of the unit it opens.
++pub(crate) fn dispatch_note(x: u32, y: u32, z: u32) {
++    if LIVE.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    let pipe = LAST_COMPUTE.with(std::cell::Cell::get);
++    COPY_NOTE.with(|n| *n.borrow_mut() = Some(format!("pipe={pipe:#x};groups={x}x{y}x{z}")));
++}
++
++/// LOCAL (Atlas) diagnostic: a compute pipeline made, of `entry` in `module`: a census line.
++pub(crate) fn compute_made(raw: vk::Pipeline, entry: &str, module: vk::ShaderModule) {
++    let Some(dir) = dir() else {
++        return;
++    };
++    let line = format!("compute,{:#x},{entry},m{:x}\n", raw.as_raw(), module.as_raw());
++    let path = dir.join(format!("pipes-{}.csv", std::process::id()));
++    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
++        let _ = file.write_all(line.as_bytes());
++    }
++}
++
++/// LOCAL (Atlas) diagnostic: a shader module made of `spirv`, kept as `spv/m<handle>.spv`.
++pub(crate) fn module_made(module: vk::ShaderModule, spirv: &[u32]) {
++    let Some(dir) = dir() else {
++        return;
++    };
++    let spv = dir.join("spv");
++    let _ = std::fs::create_dir_all(&spv);
++    let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
++    let _ = std::fs::write(spv.join(format!("m{:x}.spv", module.as_raw())), bytes);
++}
++
+ pub(crate) fn pipeline_made(
+     raw: vk::Pipeline,
+     blends: &[vk::PipelineColorBlendAttachmentState],
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+index 8c62eb1c..52c35e5b 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/objects.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+@@ -322,6 +322,10 @@ pub(crate) fn shader_module(
+         let info = vk::ShaderModuleCreateInfo::default().code(spirv);
+         // SAFETY: the code is live SPIR-V words for the call.
+         let raw = unsafe { shared.vk().create_shader_module(&info, None) }.map_err(vulkan)?;
++        // LOCAL (Atlas) diagnostic: the module's words for the compute census (`pass_times.rs`).
++        if crate::pass_times::on() {
++            crate::pass_times::module_made(raw, spirv);
++        }
+         Ok::<_, Error>(ShaderModule { raw })
+     });
+     let gone = modules.sweep();
+@@ -1037,6 +1041,10 @@ impl VariantObjects {
+             .copied()
+             .ok_or_else(|| internal("the driver made no pipeline"))?;
+         self.device.shared().counts.variant_pipeline_made();
++        // LOCAL (Atlas) diagnostic: the compute census (`pass_times.rs`).
++        if crate::pass_times::on() {
++            crate::pass_times::compute_made(raw, &c.object.entry.to_string_lossy(), c.object.module());
++        }
+         let pipeline = RawPipeline {
+             device: self.device.clone(),
+             raw,

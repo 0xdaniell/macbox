@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 02:56:23 +0000
+Subject: [PATCH 56/92] diagnostic: M2V_BESIDE_LOG names the commands writing a
+ trapping lazy surface's bytes beside its image
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 6354f6d0..1ac92c0e 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -519,6 +519,28 @@ pub(super) fn note_writes(uses: &[Use<ResourceKey>], id: u64, noted: &mut Noted)
+         for lazy in all.iter().filter_map(Weak::upgrade) {
+             if lazy.meets(used) && !lazy.own_thread() {
+                 let count = lazy.written.fetch_add(1, Ordering::Relaxed) + 1;
++                // LOCAL (Atlas) diagnostic: who writes a lazy surface's bytes beside its image,
++                // where `M2V_BESIDE_LOG` is set (the first 60, with the recording's frames).
++                if lazy.coherent().is_some() && std::env::var_os("M2V_BESIDE_LOG").is_some() {
++                    static N: AtomicU64 = AtomicU64::new(0);
++                    if N.fetch_add(1, Ordering::Relaxed) < 60 {
++                        eprintln!(
++                            "m2v-beside: surface {:?} {}x{} cb {id:#x} use {:?} | {}",
++                            lazy.pages.as_ref().map(|p| p.start),
++                            lazy.size[0],
++                            lazy.size[1],
++                            used,
++                            std::backtrace::Backtrace::force_capture()
++                                .to_string()
++                                .lines()
++                                .filter(|l| l.contains("metal2vulkan_runtime::"))
++                                .map(str::trim)
++                                .take(10)
++                                .collect::<Vec<_>>()
++                                .join(" < "),
++                        );
++                    }
++                }
+                 if lazy.note_beside(count, id, used) {
+                     noted.push((Arc::downgrade(&lazy), count));
+                 } else {

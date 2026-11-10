@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 04:03:59 +0000
+Subject: [PATCH 58/92] live surface_usage_shadow_image: a lazy surface without
+ storage usage takes its image's shadow
+
+A draw sampling a lazy Sim surface it renders (an attachment read) took a shadow over the bytes
+where the surface's sRGB image has no storage usage: a second lazy surface over the same pages,
+copied back after each encoder, beside the first image (coherent taking_beside risk).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/texture/usage_shadow.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+index 1af00981..707c12aa 100644
+--- a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
+@@ -240,7 +240,14 @@ impl Texture {
+         // copied from the bytes it would leave that image's writes to go back for it, each frame.
+         if let Storage::Shadow { image, copies, .. } = &self.0.storage {
+             let both = ImageUsageFlags::SAMPLED | ImageUsageFlags::STORAGE;
+-            if copies.lazy.is_some() && image.plan().usage.contains(both) {
++            // LOCAL (Atlas): live `surface_usage_shadow_image` (default off) takes that image for
++            // one without the storage usage too (a Sim's sRGB surface, which no storage view
++            // takes): its shadow copies image to image both ways, where the bytes' way made a
++            // second lazy surface over the same pages whose copies back after each encoder wrote
++            // beside the first image (the coherent census's `taking_beside` risk, 2026-11-08).
++            let image_way = image.plan().usage.contains(both)
++                || crate::live::on("surface_usage_shadow_image", false);
++            if copies.lazy.is_some() && image_way {
+                 let root = &self.root().0.record;
+                 let over = Some(Arc::clone(copies));
+                 match device.image_shadow(call, image, root, &wider, refused, over) {

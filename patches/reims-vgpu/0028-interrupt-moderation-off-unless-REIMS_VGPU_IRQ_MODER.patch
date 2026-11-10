@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 17:07:53 +0000
+Subject: [PATCH 28/33] interrupt moderation (off unless
+ REIMS_VGPU_IRQ_MODERATE names an existing file)
+
+A raise goes out only while none is outstanding; a read of 0x1018/0x1014 ends the
+outstanding one before the bits are taken, so no bit is left without a raise. A raise
+held past 2 ms goes out anyway. Experiment, not for adoption.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-core/src/device.rs          |   4 +
+ crates/reims-vgpu-core/src/device/fifos.rs    |   4 +-
+ .../src/device/irq_moderation.rs              | 181 ++++++++++++++++++
+ .../reims-vgpu-core/src/device/lifecycle.rs   |   1 +
+ crates/reims-vgpu-core/src/device/mmio.rs     |  10 +-
+ crates/reims-vgpu-core/src/device/root.rs     |   1 +
+ 6 files changed, 198 insertions(+), 3 deletions(-)
+ create mode 100644 crates/reims-vgpu-core/src/device/irq_moderation.rs
+
+diff --git a/crates/reims-vgpu-core/src/device.rs b/crates/reims-vgpu-core/src/device.rs
+index 3f21d031..9a370356 100644
+--- a/crates/reims-vgpu-core/src/device.rs
++++ b/crates/reims-vgpu-core/src/device.rs
+@@ -37,6 +37,7 @@
+ pub mod config;
+ pub mod displays;
+ pub mod fifos;
++pub mod irq_moderation;
+ pub mod lifecycle;
+ pub mod mmio;
+ pub mod root;
+@@ -953,6 +954,8 @@ pub struct DeviceCore<P: Platform> {
+     display_port_count: AtomicU32,
+     display_port_connection_types: AtomicU32,
+     interrupt_display: AtomicU32,
++    /// LOCAL (Atlas, ARCH): interrupt moderation (off unless switched on).
++    irq_moderation: irq_moderation::Moderation,
+     displays: StagedMutex<DisplaysLocked<P>>,
+     interrupt_stamp: AtomicU32,
+     stamp_memory: Mutex<Option<GuestPtr>>,
+@@ -1257,6 +1260,7 @@ impl<P: Platform> DeviceCore<P> {
+                     display_port_count: AtomicU32::new(display_port_count),
+                     display_port_connection_types: AtomicU32::new(display_port_connection_types),
+                     interrupt_display: AtomicU32::new(0),
++                    irq_moderation: irq_moderation::Moderation::default(),
+                     displays: StagedMutex::new(DisplaysLocked {
+                         display_port_busy_mask: 0,
+                         guest_display: Default::default(),
+diff --git a/crates/reims-vgpu-core/src/device/fifos.rs b/crates/reims-vgpu-core/src/device/fifos.rs
+index 717bacb3..6cbf844e 100644
+--- a/crates/reims-vgpu-core/src/device/fifos.rs
++++ b/crates/reims-vgpu-core/src/device/fifos.rs
+@@ -428,7 +428,9 @@ impl<P: Platform> DeviceCore<P> {
+             };
+             // irq: the guest interrupt raised
+             crate::trace::event("irq", &[]);
+-            raise(0);
++            if self.irq_moderation.should_raise() {
++                raise(0);
++            }
+         }
+     }
+ 
+diff --git a/crates/reims-vgpu-core/src/device/irq_moderation.rs b/crates/reims-vgpu-core/src/device/irq_moderation.rs
+new file mode 100644
+index 00000000..987dfbb0
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/device/irq_moderation.rs
+@@ -0,0 +1,181 @@
++//! LOCAL (Atlas, ARCH experiment, branch atlas/arch-irqmod): interrupt moderation.
++//!
++//! Every stamp signal and display poke raised the guest interrupt (~100 raises per Sim frame,
++//! ~1.9 per read of the status under load). The status the guest's ISR reads is read-to-clear
++//! (0x1018 stamps, 0x1014 display) and its completion is level-based on stamp memory
++//! (`notifyStamp` reads the stamp values): a raise while an earlier one is not yet read adds
++//! nothing the guest's next read would not see. With the switch on, a raise goes out only when
++//! none is outstanding; a read of 0x1018 or 0x1014 ends the outstanding one *before* the bits
++//! are taken, so a bit set after the read always raises again (no lost interrupt):
++//! - writer: set bit, then `pending.swap(true)`; raise when it was false;
++//! - reader: `pending.store(false)`, then take the bits.
++//!
++//! A bit set before the read is either taken by it, or its writer's swap came after the
++//! store and raised. As a safety net a raise held more than [`RESCUE`] after the outstanding
++//! one goes out anyway (a raise the guest never read: MSI off then, a lost message).
++//! A reset or a restore ends the outstanding raise.
++//!
++//! The switch: `REIMS_VGPU_IRQ_MODERATE=<path>`; moderation is on while that file exists,
++//! looked at most once a second. Unset: every raise goes out, as before.
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++/// The longest a raise is held behind an outstanding one.
++pub const RESCUE: Duration = Duration::from_millis(2);
++
++const LOOK_EVERY_NS: u64 = 1_000_000_000;
++const LOG_EVERY_NS: u64 = 10_000_000_000;
++
++fn base() -> Instant {
++    static B: OnceLock<Instant> = OnceLock::new();
++    *B.get_or_init(Instant::now)
++}
++
++fn now_ns() -> u64 {
++    u64::try_from(base().elapsed().as_nanos()).unwrap_or(u64::MAX)
++}
++
++struct Switch {
++    path: Option<std::path::PathBuf>,
++    on: AtomicBool,
++    /// When the file was last looked at (ns after `base`, `u64::MAX` before the first look).
++    looked: AtomicU64,
++}
++
++fn switch() -> &'static Switch {
++    static S: OnceLock<Switch> = OnceLock::new();
++    S.get_or_init(|| Switch {
++        path: std::env::var_os("REIMS_VGPU_IRQ_MODERATE")
++            .filter(|p| !p.is_empty())
++            .map(std::path::PathBuf::from),
++        on: AtomicBool::new(false),
++        looked: AtomicU64::new(u64::MAX),
++    })
++}
++
++fn switched_on(now: u64) -> bool {
++    let s = switch();
++    let Some(path) = &s.path else {
++        return false;
++    };
++    let looked = s.looked.load(Ordering::Relaxed);
++    if (looked == u64::MAX || now.saturating_sub(looked) >= LOOK_EVERY_NS)
++        && s
++            .looked
++            .compare_exchange(looked, now, Ordering::Relaxed, Ordering::Relaxed)
++            .is_ok()
++    {
++        let on = path.exists();
++        if s.on.swap(on, Ordering::SeqCst) != on {
++            log::info!("irq moderation {}", if on { "on" } else { "off" });
++        }
++    }
++    s.on.load(Ordering::SeqCst)
++}
++
++/// A device's moderation state.
++#[derive(Default)]
++pub struct Moderation {
++    pending: AtomicBool,
++    since: AtomicU64,
++    raised: AtomicU64,
++    held: AtomicU64,
++    rescued: AtomicU64,
++    logged: AtomicU64,
++}
++
++impl Moderation {
++    /// Whether this raise goes out (always, with the switch off).
++    pub fn should_raise(&self) -> bool {
++        let now = now_ns();
++        if !switched_on(now) {
++            return true;
++        }
++        self.log(now);
++        self.decide(now)
++    }
++
++    /// The moderation itself, with the switch on.
++    fn decide(&self, now: u64) -> bool {
++        if !self.pending.swap(true, Ordering::SeqCst) {
++            self.since.store(now, Ordering::SeqCst);
++            self.raised.fetch_add(1, Ordering::Relaxed);
++            return true;
++        }
++        let since = self.since.load(Ordering::SeqCst);
++        let rescue = u64::try_from(RESCUE.as_nanos()).unwrap_or(u64::MAX);
++        if now.saturating_sub(since) > rescue
++            && self
++                .since
++                .compare_exchange(since, now, Ordering::SeqCst, Ordering::SeqCst)
++                .is_ok()
++        {
++            self.rescued.fetch_add(1, Ordering::Relaxed);
++            return true;
++        }
++        self.held.fetch_add(1, Ordering::Relaxed);
++        false
++    }
++
++    /// The guest read its status (or the device reset or restored): the outstanding raise ends.
++    /// Before the bits are taken.
++    pub fn acked(&self) {
++        self.pending.store(false, Ordering::SeqCst);
++    }
++
++    fn log(&self, now: u64) {
++        let last = self.logged.load(Ordering::Relaxed);
++        if now.saturating_sub(last) >= LOG_EVERY_NS
++            && self
++                .logged
++                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
++                .is_ok()
++        {
++            log::info!(
++                "irq moderation: raised {} held {} rescued {}",
++                self.raised.load(Ordering::Relaxed),
++                self.held.load(Ordering::Relaxed),
++                self.rescued.load(Ordering::Relaxed)
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const MS: u64 = 1_000_000;
++
++    #[test]
++    fn holds_behind_an_outstanding_raise_until_the_read() {
++        let m = Moderation::default();
++        assert!(m.decide(10 * MS)); // first raise goes out
++        assert!(!m.decide(10 * MS + 1)); // held: the guest has not read
++        assert!(!m.decide(11 * MS));
++        m.acked(); // the ISR's read of 0x1018, before it takes the bits
++        assert!(m.decide(11 * MS + 1)); // a bit after the read raises again
++        assert_eq!(m.held.load(Ordering::Relaxed), 2);
++    }
++
++    #[test]
++    fn rescues_a_raise_the_guest_never_read() {
++        let m = Moderation::default();
++        assert!(m.decide(0));
++        assert!(!m.decide(MS));
++        assert!(m.decide(3 * MS)); // past RESCUE (2 ms)
++        assert!(!m.decide(3 * MS + 1)); // the rescue restarts the clock
++        assert_eq!(m.rescued.load(Ordering::Relaxed), 1);
++    }
++
++    #[test]
++    fn off_without_the_switch() {
++        let m = Moderation::default();
++        for _ in 0..4 {
++            assert!(m.should_raise());
++        }
++        assert!(!m.pending.load(Ordering::SeqCst));
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/device/lifecycle.rs b/crates/reims-vgpu-core/src/device/lifecycle.rs
+index bd00794d..76b663a2 100644
+--- a/crates/reims-vgpu-core/src/device/lifecycle.rs
++++ b/crates/reims-vgpu-core/src/device/lifecycle.rs
+@@ -421,6 +421,7 @@ impl<P: Platform> DeviceCore<P> {
+             .store(device_state.interrupt_display, Ordering::SeqCst);
+         self.interrupt_stamp
+             .store(device_state.interrupt_stamp, Ordering::SeqCst);
++        self.irq_moderation.acked();
+         self.interrupt_fault_mask.store(0, Ordering::SeqCst);
+         {
+             let e = self.displays.atomics();
+diff --git a/crates/reims-vgpu-core/src/device/mmio.rs b/crates/reims-vgpu-core/src/device/mmio.rs
+index 8f9d2de5..9571f0d9 100644
+--- a/crates/reims-vgpu-core/src/device/mmio.rs
++++ b/crates/reims-vgpu-core/src/device/mmio.rs
+@@ -156,8 +156,14 @@ impl<P: Platform> DeviceCore<P> {
+                 let fifo = self.root_fifo.atomics().root_fifo();
+                 fifo.and_then(|f| f.root_read()).unwrap_or(0)
+             }
+-            Register::InterruptDisplay => self.interrupt_display.swap(0, Ordering::SeqCst),
+-            Register::InterruptStamp => self.interrupt_stamp.swap(0, Ordering::SeqCst),
++            Register::InterruptDisplay => {
++                self.irq_moderation.acked();
++                self.interrupt_display.swap(0, Ordering::SeqCst)
++            }
++            Register::InterruptStamp => {
++                self.irq_moderation.acked();
++                self.interrupt_stamp.swap(0, Ordering::SeqCst)
++            }
+             Register::RootPage => self
+                 .root_task
+                 .atomics()
+diff --git a/crates/reims-vgpu-core/src/device/root.rs b/crates/reims-vgpu-core/src/device/root.rs
+index ad965a9f..d14647ce 100644
+--- a/crates/reims-vgpu-core/src/device/root.rs
++++ b/crates/reims-vgpu-core/src/device/root.rs
+@@ -163,6 +163,7 @@ impl<P: Platform> DeviceCore<P> {
+         self.interrupt_fault_mask.store(0, Ordering::SeqCst);
+         self.interrupt_stamp.store(0, Ordering::SeqCst);
+         self.interrupt_display.store(0, Ordering::SeqCst);
++        self.irq_moderation.acked();
+         {
+             let _rt = self.root_task.lock();
+             let info = self.root_task.atomics().task_info();

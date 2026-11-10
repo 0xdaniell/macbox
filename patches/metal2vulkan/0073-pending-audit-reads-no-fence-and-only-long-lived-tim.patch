@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 17:10:48 +0000
+Subject: [PATCH 73/92] pending audit reads no fence and only long-lived
+ timelines (a destroyed fence's read crashed ANV)
+
+---
+ .../metal2vulkan-runtime/src/pending_audit.rs | 30 +++++++++++++++----
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/pending_audit.rs b/crates/metal2vulkan-runtime/src/pending_audit.rs
+index cb98b9ef..8f0549fc 100644
+--- a/crates/metal2vulkan-runtime/src/pending_audit.rs
++++ b/crates/metal2vulkan-runtime/src/pending_audit.rs
+@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{LazyLock, Mutex};
+ use std::time::Instant;
+ 
++/// Submissions a semaphore must have signalled before it is read.
++const LONG_LIVED: u64 = 64;
++
+ /// The most lines written.
+ const MOST_LINES: u64 = 300;
+ 
+@@ -49,6 +52,9 @@ struct Sub {
+ 
+ #[derive(Default)]
+ struct State {
++    /// How many submissions signalled each semaphore: only one seen in [`LONG_LIVED`] is read
++    /// (a queue's timeline, which lives with its device).
++    seen: HashMap<u64, u64>,
+     /// Each command buffer's begins so far.
+     generation: HashMap<u64, u64>,
+     /// A primary's executed secondaries since its last begin, with each one's generation then.
+@@ -86,12 +92,9 @@ fn pending(sub: &Sub) -> Option<String> {
+             }
+         }
+     }
+-    if sub.signals.is_empty() && sub.fence != vk::Fence::null() {
+-        // SAFETY: as above (a fence the runtime may have reset or reused since: a hint).
+-        if let Ok(false) = unsafe { device.get_fence_status(sub.fence) } {
+-            return Some(format!("fence {:#x} unsignalled", vk::Handle::as_raw(sub.fence)));
+-        }
+-    }
++    // No fence is read: the runtime destroys its fences, and a read of a destroyed one
++    // crashed the driver (PAUD 2026-11-08).
++    let _ = sub.fence;
+     None
+ }
+ 
+@@ -255,6 +258,21 @@ pub(crate) fn submits(
+         .collect();
+     let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+     let at = Instant::now();
++    for list in &signals {
++        for &(semaphore, _) in list {
++            *state.seen.entry(vk::Handle::as_raw(semaphore)).or_insert(0) += 1;
++        }
++    }
++    let signals: Vec<Vec<(vk::Semaphore, u64)>> = signals
++        .into_iter()
++        .map(|list| {
++            list.into_iter()
++                .filter(|&(s, _)| {
++                    state.seen.get(&vk::Handle::as_raw(s)).copied().unwrap_or(0) >= LONG_LIVED
++                })
++                .collect()
++        })
++        .collect();
+     for (index, info) in infos.iter().enumerate() {
+         if info.p_command_buffers.is_null() || info.command_buffer_count == 0 {
+             continue;

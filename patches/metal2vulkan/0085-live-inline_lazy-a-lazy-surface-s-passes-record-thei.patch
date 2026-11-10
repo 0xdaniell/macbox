@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 22:31:17 +0000
+Subject: [PATCH 85/92] live inline_lazy: a lazy surface's passes record their
+ first instance inline (no secondary)
+
+---
+ .../metal2vulkan-runtime/src/render/inline_first.rs  |  4 +++-
+ crates/metal2vulkan-runtime/src/texture.rs           | 12 ++++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+index e67b4acd..ffda157a 100644
+--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
+@@ -259,7 +259,9 @@ pub(super) fn opens_inline(
+                 return Err(NotInline::Actions(refused));
+             }
+         }
+-        if texture.over_buffer() && !texture.image_over_buffer() {
++        // LOCAL (Atlas), live `inline_lazy=1`: a lazy surface's image renders inline too.
++        let lazy = crate::live::on("inline_lazy", false) && texture.lazy_surface_attached();
++        if texture.over_buffer() && !texture.image_over_buffer() && !lazy {
+             return Err(NotInline::BufferTextures);
+         }
+         let own = color.stand_in.is_none()
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 797a3dbf..105e3937 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -4430,6 +4430,18 @@ impl Texture {
+         }
+     }
+ 
++    /// LOCAL (Atlas), live `inline_lazy`: whether the texture is a lazy surface's image (a shadow
++    /// whose copies are lazy, `shadow_lazy.rs`) with its bytes attached, which a pass renders in
++    /// place as it renders an image over a buffer's bytes (`render/inline_first.rs`).
++    pub(crate) fn lazy_surface_attached(&self) -> bool {
++        match &self.0.storage {
++            Storage::Shadow { image, copies, .. } => {
++                copies.lazy.is_some() && lock(&image.detached).is_none()
++            }
++            _ => false,
++        }
++    }
++
+     /// Whether the texture is a buffer's bytes: a texture buffer or a shadowed texture.
+     pub(super) fn over_buffer(&self) -> bool {
+         !matches!(self.0.storage, Storage::Image(_))

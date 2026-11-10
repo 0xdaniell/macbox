@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 18:02:33 +0000
+Subject: [PATCH 76/92] lab: M2V_FLAT_TILE=TWxTH: a flat grid's 32-bit index
+ walks each plane in TW x TH tiles (a bijection onto the same positions), for
+ 2-D locality
+
+---
+ crates/metal2vulkan/src/lower/dispatch.rs | 85 +++++++++++++++++++----
+ 1 file changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/crates/metal2vulkan/src/lower/dispatch.rs b/crates/metal2vulkan/src/lower/dispatch.rs
+index e49b0bc2..9a5d83e0 100644
+--- a/crates/metal2vulkan/src/lower/dispatch.rs
++++ b/crates/metal2vulkan/src/lower/dispatch.rs
+@@ -1348,12 +1348,7 @@ impl KernelDecl {
+         let first: ArmFn<'_, ()> = Box::new(move |fb, _| {
+             let first = fb.convert(ConvOp::UConvert, start, u32_)?;
+             let index = fb.binary(BinOp::IAdd, first, lin)?;
+-            let x = fb.binary(BinOp::UMod, index, gx)?;
+-            let row = fb.binary(BinOp::UDiv, index, gx)?;
+-            let y = fb.binary(BinOp::UMod, row, gy)?;
+-            let z = fb.binary(BinOp::UDiv, row, gy)?;
+-            let inside = fb.binary(BinOp::ULessThan, z, gz)?;
+-            Ok(ArmEnd::FallThrough(vec![x, y, z, inside]))
++            Ok(ArmEnd::FallThrough(Self::position32(fb, index, [gx, gy, gz])?))
+         });
+         let narrow: ArmFn<'_, ()> = Box::new(move |fb, _| {
+             let group = fb.binary(BinOp::IMul, wz, ny)?;
+@@ -1362,12 +1357,7 @@ impl KernelDecl {
+             let group = fb.binary(BinOp::IAdd, group, wx)?;
+             let first = fb.binary(BinOp::IMul, group, n)?;
+             let index = fb.binary(BinOp::IAdd, first, lin)?;
+-            let x = fb.binary(BinOp::UMod, index, gx)?;
+-            let row = fb.binary(BinOp::UDiv, index, gx)?;
+-            let y = fb.binary(BinOp::UMod, row, gy)?;
+-            let z = fb.binary(BinOp::UDiv, row, gy)?;
+-            let inside = fb.binary(BinOp::ULessThan, z, gz)?;
+-            Ok(ArmEnd::FallThrough(vec![x, y, z, inside]))
++            Ok(ArmEnd::FallThrough(Self::position32(fb, index, [gx, gy, gz])?))
+         });
+         let wide: ArmFn<'_, ()> = Box::new(move |fb, _| {
+             let w = |fb: &mut FunctionBuilder<'_>, v: SValue| fb.convert(ConvOp::UConvert, v, u64_);
+@@ -1419,6 +1409,65 @@ impl KernelDecl {
+         Ok((pos, inside))
+     }
+ 
++    /// A flat grid's thread position from its 32-bit `index` over the grid `[gx, gy, gz]`, and
++    /// whether it lies inside (`z < gz`): `x` fastest, then `y`, then `z` ([`emit_entry`]'s
++    /// order), or, under LOCAL (Atlas) `M2V_FLAT_TILE=TWxTH` ([`flat_tile`]), a bijection of the
++    /// same indices onto the same positions that walks each plane in bands of `TH` rows and each
++    /// band in tiles of `TW` columns (the last band and the last tile of a band narrower), so a
++    /// threadgroup's consecutive indices cover a 2-D tile rather than a run of one row: the
++    /// partition-oblivious kernel reads and writes the same texels, with 2-D locality in tiled
++    /// images. The tiled form is taken only where `gx` and `gy` are below 2^16 (so a plane and a
++    /// band count in 32 bits); elsewhere the plain one.
++    fn position32(
++        fb: &mut FunctionBuilder<'_>,
++        index: SValue,
++        [gx, gy, gz]: [SValue; 3],
++    ) -> BResult<Vec<SValue>> {
++        let x = fb.binary(BinOp::UMod, index, gx)?;
++        let row = fb.binary(BinOp::UDiv, index, gx)?;
++        let y = fb.binary(BinOp::UMod, row, gy)?;
++        let z = fb.binary(BinOp::UDiv, row, gy)?;
++        let inside = fb.binary(BinOp::ULessThan, z, gz)?;
++        let Some((tw, th)) = flat_tile() else {
++            return Ok(vec![x, y, z, inside]);
++        };
++        let min = |fb: &mut FunctionBuilder<'_>, a: SValue, b: SValue| -> BResult<SValue> {
++            let less = fb.binary(BinOp::ULessThan, a, b)?;
++            fb.select(less, a, b)
++        };
++        let (tw, th) = (Self::k(fb, tw)?, Self::k(fb, th)?);
++        let plane = fb.binary(BinOp::IMul, gx, gy)?;
++        let tz = fb.binary(BinOp::UDiv, index, plane)?;
++        let r = fb.binary(BinOp::UMod, index, plane)?;
++        let band = fb.binary(BinOp::IMul, th, gx)?;
++        let b = fb.binary(BinOp::UDiv, r, band)?;
++        let j = fb.binary(BinOp::UMod, r, band)?;
++        let top = fb.binary(BinOp::IMul, b, th)?;
++        let left_rows = fb.binary(BinOp::ISub, gy, top)?;
++        let rows = min(fb, th, left_rows)?;
++        let tile = fb.binary(BinOp::IMul, tw, rows)?;
++        let c = fb.binary(BinOp::UDiv, j, tile)?;
++        let k = fb.binary(BinOp::UMod, j, tile)?;
++        let left = fb.binary(BinOp::IMul, c, tw)?;
++        let left_cols = fb.binary(BinOp::ISub, gx, left)?;
++        let w = min(fb, tw, left_cols)?;
++        let kx = fb.binary(BinOp::UMod, k, w)?;
++        let ky = fb.binary(BinOp::UDiv, k, w)?;
++        let tx = fb.binary(BinOp::IAdd, left, kx)?;
++        let ty = fb.binary(BinOp::IAdd, top, ky)?;
++        let tinside = fb.binary(BinOp::ULessThan, tz, gz)?;
++        let bound = Self::k(fb, 1 << 16)?;
++        let small_x = fb.binary(BinOp::ULessThan, gx, bound)?;
++        let small_y = fb.binary(BinOp::ULessThan, gy, bound)?;
++        let small = fb.binary(BinOp::LogicalAnd, small_x, small_y)?;
++        Ok(vec![
++            fb.select(small, tx, x)?,
++            fb.select(small, ty, y)?,
++            fb.select(small, tz, z)?,
++            fb.select(small, tinside, inside)?,
++        ])
++    }
++
+     /// The quotient (low word, high word) and remainder of the `u64` `n` (`[low, high]`) by the
+     /// `u32` `d` (not 0), in 32-bit operations: `hi / d` and `r = hi % d` (so `r < d`), then 32
+     /// restoring steps over the low word's bits, highest first, each `r = 2r + bit` and, when
+@@ -1727,3 +1776,15 @@ impl KernelDecl {
+ 
+ #[cfg(test)]
+ mod tests;
++
++/// LOCAL (Atlas, lab): the flat grid's tile, `M2V_FLAT_TILE=TWxTH` (each 1 to 1024), read once
++/// per process; unset or malformed, none ([`KernelDecl::position32`]'s plain order).
++fn flat_tile() -> Option<(u32, u32)> {
++    static TILE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
++    *TILE.get_or_init(|| {
++        let v = std::env::var("M2V_FLAT_TILE").ok()?;
++        let (a, b) = v.split_once('x')?;
++        let (a, b) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
++        ((1..=1024).contains(&a) && (1..=1024).contains(&b)).then_some((a, b))
++    })
++}

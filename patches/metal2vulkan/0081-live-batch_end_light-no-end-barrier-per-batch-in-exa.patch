@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 20:50:21 +0000
+Subject: [PATCH 81/92] live batch_end_light: no end barrier per batch in exact
+ order (i915 flushes at each request end)
+
+---
+ crates/metal2vulkan-runtime/src/batch_order.rs | 8 ++++++++
+ crates/metal2vulkan-runtime/src/tracker.rs     | 9 +++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/batch_order.rs b/crates/metal2vulkan-runtime/src/batch_order.rs
+index 1fef7309..0d5a352d 100644
+--- a/crates/metal2vulkan-runtime/src/batch_order.rs
++++ b/crates/metal2vulkan-runtime/src/batch_order.rs
+@@ -58,6 +58,14 @@ fn ends_order(driver: Option<DriverId>) -> bool {
+ pub(crate) fn end(by_ends: bool) -> Barrier {
+     match by_ends {
+         true => Barrier::to_all(),
++        // LOCAL (Atlas), live `batch_end_light=1`, exact order only: no memory barrier at a
++        // batch's end. The host reads a batch's writes only after its queue's timeline signal,
++        // which a group gives only at its last batch; i915 ends every kernel submission (request)
++        // with a pipe control that flushes the render, depth, data and tile caches with a CS stall
++        // before the seqno write (gen12 fini breadcrumb), so the writes are in memory when the
++        // signal lands. Inside a group the batches' GPU order is the exact form's start barriers.
++        // cbbench (ARL, ANV 26.2.4): an ALL -> HOST end costs 27 us a Sim-sized pass (58.9 vs 31.8).
++        false if crate::live::on("batch_end_light", false) => Barrier::nothing(),
+         false => Barrier::to_host(),
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/tracker.rs b/crates/metal2vulkan-runtime/src/tracker.rs
+index 5905bd90..d32cb2ca 100644
+--- a/crates/metal2vulkan-runtime/src/tracker.rs
++++ b/crates/metal2vulkan-runtime/src/tracker.rs
+@@ -354,6 +354,15 @@ impl Barrier {
+ 
+     /// The end of every batch: every earlier write before the host's reads and writes, so the CPU
+     /// sees the GPU's writes once the batch completes, and before the batch's signals.
++    /// LOCAL (Atlas): a barrier that orders nothing (top of pipe to bottom of pipe, no access):
++    /// drivers record no flush or stall for it (`batch_order::end`, `batch_end_light`).
++    pub(crate) fn nothing() -> Barrier {
++        Barrier {
++            src: Access::new(vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE),
++            dst: Access::new(vk::PipelineStageFlags2::BOTTOM_OF_PIPE, vk::AccessFlags2::NONE),
++        }
++    }
++
+     pub(super) fn to_host() -> Barrier {
+         Barrier {
+             src: Access::new(

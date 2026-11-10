@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Mon, 9 Nov 2026 05:28:43 +0000
+Subject: [PATCH 31/33] staged page-ups: a new texture's first page-up copies
+ its guest pages into a runtime buffer when no live view covers them
+
+A new paged texture's first page-up went through a view: one mmap per run of guest pages
+(~600 for a 2.4 MB texture of the Sim's compositor), a Vulkan import and, at its release, a
+munmap that flushes the TLB once per run on every CPU the process ran on, the vCPUs too.
+Measured with one Sim: ~520 views/s, all first page-ups of new Shared render targets, 15%
+of the Sim task thread, ~57k TLB shootdowns/s.
+
+memory::page_refs counts the live views over each guest page (new_range_mapping adds,
+Mapping's last release removes). The GPU reaches guest RAM only through such views, each
+alive until the runtime frees its last buffer, after the GPU's last use; so pages no live
+view covers have no GPU access pending, and a CPU copy at the exec reads the bytes the
+view's blit would read. Covered pages take the view as ever.
+
+Switch: REIMS_VGPU_STAGED_PAGE_UP=<path> counts from the start and stages while the file
+exists (looked at once a second). Unset: nothing counted, nothing changed.
+---
+ crates/reims-vgpu-core/src/gpu_task/memory.rs |  72 +++++
+ .../reims-vgpu-core/src/gpu_task/service.rs   |   9 +
+ crates/reims-vgpu-core/src/memory.rs          |   1 +
+ crates/reims-vgpu-core/src/memory/map.rs      |  41 ++-
+ crates/reims-vgpu-core/src/memory/mapping.rs  |  36 ++-
+ .../reims-vgpu-core/src/memory/page_refs.rs   | 262 ++++++++++++++++++
+ crates/reims-vgpu-core/src/resources/host.rs  |  13 +
+ .../reims-vgpu-core/src/resources/texture.rs  |  13 +
+ .../src/resources/texture/blit.rs             |  37 ++-
+ 9 files changed, 474 insertions(+), 10 deletions(-)
+ create mode 100644 crates/reims-vgpu-core/src/memory/page_refs.rs
+
+diff --git a/crates/reims-vgpu-core/src/gpu_task/memory.rs b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+index f6fbc6a0..936ccb15 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/memory.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/memory.rs
+@@ -29,6 +29,8 @@ use crate::memory::mapping::Mapping;
+ use crate::num::{ToU64, ToUsize};
+ use crate::platform::Platform;
+ use crate::platform::device::GpuDevice;
++use crate::platform::resource::Buffer as _;
++use crate::platform::values::BufferDesc;
+ use crate::platform::os::clock::{Clock, MonoTime};
+ use crate::platform::types::ResourceAddressRange;
+ use crate::raise::{Kept, keep_forever};
+@@ -565,6 +567,76 @@ impl<P: Platform> GpuTask<P> {
+         Ok(buffer)
+     }
+ 
++    /// LOCAL (Atlas): a new buffer holding a copy of the task's pages `page..page + length`, for
++    /// a texture's first page-up, when page-ups are staged and no live view covers any of the
++    /// pages (`memory::page_refs` says why that copy is the bytes a view's blit would read);
++    /// `None` takes the view as ever. Raises as the view's walk would.
++    pub(super) fn staged_page_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        if !crate::memory::page_refs::staging() || length == 0 || length & PAGE_MASK != 0 {
++            return Ok(None);
++        }
++        let offset = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
++        Self::check_task_range(offset, length, self.task_length())?;
++        let (Some(map), Some(device)) = (self.map(), self.device_handle()) else {
++            return Ok(None);
++        };
++        let Some(refs) = map.page_refs().cloned() else {
++            return Ok(None);
++        };
++        let started = self.mono();
++        let runs = self.task_page_runs(hold, offset, length)?;
++        let total = runs
++            .ranges
++            .iter()
++            .try_fold(0_u64, |sum, r| sum.checked_add(r.physical_length));
++        if total != Some(length) {
++            return Ok(None);
++        }
++        if refs.covered(&runs.ranges) {
++            crate::memory::page_refs::note_covered();
++            return Ok(None);
++        }
++        let Some(buffer) = device.new_buffer(BufferDesc {
++            length,
++            options: Vec::new(),
++            pinned_gpu_address: None,
++            contents: None,
++            no_copy: false,
++            deallocator: None,
++        })?
++        else {
++            return Ok(None);
++        };
++        let contents = buffer.contents();
++        if contents.is_null() {
++            return Ok(None);
++        }
++        #[allow(unsafe_code)] // architecture 17.3: the new buffer's own bytes, written once
++        // SAFETY: `contents` is the CPU address of the `length` bytes of a `Shared` buffer made
++        // just now, which nothing else holds yet, and `buffer` keeps them for this borrow.
++        let bytes = unsafe { std::slice::from_raw_parts_mut(contents.as_ptr::<u8>(), length.to_usize()) };
++        let mut at: usize = 0;
++        for r in &runs.ranges {
++            let end = at.wrapping_add(r.physical_length.to_usize());
++            let Some(dst) = bytes.get_mut(at..end) else {
++                return Ok(None);
++            };
++            if !map.read(r.physical_address, dst) {
++                return Ok(None);
++            }
++            at = end;
++        }
++        let ns = u64::try_from(self.mono().saturating_duration_since(started).as_nanos())
++            .unwrap_or(u64::MAX);
++        crate::memory::page_refs::note_staged(length, ns);
++        Ok(Some(buffer))
++    }
++
+     /// LOCAL (Atlas): the buffer a paged texture pages through: a kept one over exactly the pages
+     /// the task maps at `page` now, else a new one, kept (`paged_buffers`). Every call walks the
+     /// page table, so a stale entry is never used.
+diff --git a/crates/reims-vgpu-core/src/gpu_task/service.rs b/crates/reims-vgpu-core/src/gpu_task/service.rs
+index afdcf70d..dee53297 100644
+--- a/crates/reims-vgpu-core/src/gpu_task/service.rs
++++ b/crates/reims-vgpu-core/src/gpu_task/service.rs
+@@ -716,6 +716,15 @@ impl<P: Platform> ResourceHost<P> for GpuTask<P> {
+         GpuTask::paged_texture_buffer(self, hold, page, length)
+     }
+ 
++    fn staged_page_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        GpuTask::staged_page_buffer(self, hold, page, length)
++    }
++
+     fn fresh_page_up_mode(&self, page: u32) -> u8 {
+         self.fresh_page_ups
+             .mode_at(page, super::paged_buffers::resumed())
+diff --git a/crates/reims-vgpu-core/src/memory.rs b/crates/reims-vgpu-core/src/memory.rs
+index 2ee0182c..3ec4e69b 100644
+--- a/crates/reims-vgpu-core/src/memory.rs
++++ b/crates/reims-vgpu-core/src/memory.rs
+@@ -50,6 +50,7 @@ pub mod cursor;
+ pub mod descriptor;
+ pub mod map;
+ pub mod mapping;
++pub mod page_refs;
+ pub mod page_table;
+ pub mod tracker;
+ 
+diff --git a/crates/reims-vgpu-core/src/memory/map.rs b/crates/reims-vgpu-core/src/memory/map.rs
+index b9221d50..14ef2fdd 100644
+--- a/crates/reims-vgpu-core/src/memory/map.rs
++++ b/crates/reims-vgpu-core/src/memory/map.rs
+@@ -9,6 +9,7 @@ use crate::host::{HostPtr, PhysRange};
+ use crate::memory::DeathKind;
+ use crate::memory::descriptor::MemoryMapDescriptor;
+ use crate::memory::mapping::{Mapping, Teardown};
++use crate::memory::page_refs::PageRefs;
+ use crate::num::{ToU64, ToUsize};
+ use crate::platform::Platform;
+ use crate::platform::os::vm::VmProt;
+@@ -33,6 +34,9 @@ pub struct MemoryMapRange {
+ pub struct MemoryMap<P: Platform> {
+     platform: Arc<P>,
+     ranges: Vec<MemoryMapRange>,
++    /// LOCAL (Atlas): the live views over each page, shared by copies; `None` unless counting
++    /// (`page_refs`).
++    refs: Option<Arc<PageRefs>>,
+ }
+ 
+ impl<P: Platform> std::fmt::Debug for MemoryMap<P> {
+@@ -130,7 +134,23 @@ impl<P: Platform> MemoryMap<P> {
+             return None;
+         }
+ 
+-        Some(Arc::new(MemoryMap { platform, ranges }))
++        let refs = crate::memory::page_refs::counting()
++            .then(|| {
++                let start = ranges.iter().map(|r| r.physical_address).min()?;
++                let end = ranges.iter().map(|r| r.physical_end).max()?;
++                PageRefs::new(start, end).map(Arc::new)
++            })
++            .flatten();
++        Some(Arc::new(MemoryMap {
++            platform,
++            ranges,
++            refs,
++        }))
++    }
++
++    /// LOCAL (Atlas): the live views over each page, when counting (`page_refs`).
++    pub(crate) fn page_refs(&self) -> Option<&Arc<PageRefs>> {
++        self.refs.as_ref()
+     }
+ 
+     /// A plain init (no validation): the same ranges.
+@@ -138,6 +158,7 @@ impl<P: Platform> MemoryMap<P> {
+         Arc::new(MemoryMap {
+             platform: self.platform.clone(),
+             ranges: self.ranges.clone(),
++            refs: self.refs.clone(),
+         })
+     }
+ 
+@@ -361,13 +382,25 @@ impl<P: Platform> MemoryMap<P> {
+             free_all();
+         }
+         // Writable unless read-only; making the mapping never fails.
++        let teardown = Teardown::Vm {
++            platform: self.platform.clone(),
++        };
++        // LOCAL (Atlas): counted while it lives (`page_refs`).
++        if let Some(refs) = &self.refs {
++            refs.add(ranges);
++            return Some(Mapping::new_counted(
++                address,
++                total_length,
++                read_only == 0,
++                teardown,
++                (Arc::clone(refs), ranges.into()),
++            ));
++        }
+         Some(Mapping::new(
+             address,
+             total_length,
+             read_only == 0,
+-            Teardown::Vm {
+-                platform: self.platform.clone(),
+-            },
++            teardown,
+         ))
+     }
+ 
+diff --git a/crates/reims-vgpu-core/src/memory/mapping.rs b/crates/reims-vgpu-core/src/memory/mapping.rs
+index d7cff8c6..b25503df 100644
+--- a/crates/reims-vgpu-core/src/memory/mapping.rs
++++ b/crates/reims-vgpu-core/src/memory/mapping.rs
+@@ -3,7 +3,8 @@
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicU64;
+ 
+-use crate::host::{HostPtr, HostTask};
++use crate::host::{HostPtr, HostTask, PhysRange};
++use crate::memory::page_refs::PageRefs;
+ use crate::memory::DeathKind;
+ use crate::platform::Platform;
+ use crate::seams::links::MappingDeviceLink;
+@@ -48,6 +49,8 @@ pub struct Mapping<P: Platform> {
+     length: u64,
+     writable: bool,
+     teardown: Teardown<P>,
++    /// LOCAL (Atlas): the page counts this view is in, and its guest ranges (`page_refs`).
++    counted: Option<(Arc<PageRefs>, Box<[PhysRange]>)>,
+ }
+ 
+ impl<P: Platform> std::fmt::Debug for Mapping<P> {
+@@ -89,9 +92,28 @@ impl<P: Platform> Mapping<P> {
+             length,
+             writable,
+             teardown,
++            counted: None,
+         })
+     }
+ 
++    /// LOCAL (Atlas): a map's view, as [`Mapping::new`], counted in `counted`'s pages until its
++    /// last release (the caller added it there).
++    pub(crate) fn new_counted(
++        virtual_address: HostPtr,
++        length: u64,
++        writable: bool,
++        teardown: Teardown<P>,
++        counted: (Arc<PageRefs>, Box<[PhysRange]>),
++    ) -> Arc<Self> {
++        let mut mapping = Mapping::new(virtual_address, length, writable, teardown);
++        match Arc::get_mut(&mut mapping) {
++            Some(m) => m.counted = Some(counted),
++            // Unreachable: the mapping was just made. Uncounted, it would stay counted for good.
++            None => std::mem::forget(counted),
++        }
++        mapping
++    }
++
+     /// Where the range is mapped.
+     pub fn virtual_address(&self) -> HostPtr {
+         self.virtual_address
+@@ -110,6 +132,18 @@ impl<P: Platform> Mapping<P> {
+ 
+ impl<P: Platform> Drop for Mapping<P> {
+     fn drop(&mut self) {
++        // LOCAL (Atlas): uncounted after the teardown below.
++        let counted = self.counted.take();
++        self.tear_down();
++        if let Some((refs, ranges)) = counted {
++            refs.remove(&ranges);
++        }
++    }
++}
++
++impl<P: Platform> Mapping<P> {
++    /// What the last release does.
++    fn tear_down(&mut self) {
+         match &self.teardown {
+             Teardown::None => {}
+             Teardown::Vm { platform } => {
+diff --git a/crates/reims-vgpu-core/src/memory/page_refs.rs b/crates/reims-vgpu-core/src/memory/page_refs.rs
+new file mode 100644
+index 00000000..5ebfa14e
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/memory/page_refs.rs
+@@ -0,0 +1,262 @@
++//! LOCAL (Atlas): the live views over each guest page, and the staged page-up they allow.
++//!
++//! **What it is for.** A new paged texture's first page-up copies its guest pages into the host
++//! texture through a view: one `mmap` per run of guest pages (a 2.4 MB texture of the Sim's
++//! compositor is about 600 of them), a Vulkan import, and at the view's release a `munmap` whose
++//! dirty shared PTEs flush the TLB once per run on every CPU the process ran on, the vCPUs among
++//! them. Measured 2026-11-09 with one Sim: ~520 such views a second, all first page-ups of new
++//! `Shared` render targets, 15% of the Sim task thread, and ~57k TLB shootdowns a second. A staged
++//! page-up instead copies the pages on the CPU into a new buffer of the runtime's own and blits
++//! from it: no view, no import, no `munmap`.
++//!
++//! **Why the copy is the same bytes.** The view's blit reads the pages on the GPU, after every
++//! earlier exec's GPU work (the paging command buffer waits on the FIFO's chain). A copy at the
++//! exec reads them earlier. The two can differ only by a GPU write still pending at the exec, and
++//! the GPU reaches guest RAM only through views a [`MemoryMap`](super::map::MemoryMap) makes
++//! (`new_range_mapping`), each alive until the runtime frees the last buffer over it, after the
++//! GPU's last use. So a page no live view covers has nothing pending, and the copy is taken only
++//! when no page of the texture is covered; else the view is made as ever. The guest's CPU writing
++//! the pages of a committed command buffer's resource is outside Metal's rules either way.
++//!
++//! **The switch.** `REIMS_VGPU_STAGED_PAGE_UP=<path>`: views are counted from the start, and
++//! page-ups are staged while that file exists (looked at once a second). Unset: nothing is
++//! counted and nothing changes. Counts stay at `u16::MAX` once they reach it (the page then
++//! always takes the view).
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++use crate::guest::records::{APV_PAGE_MASK, APV_PAGE_SHIFT};
++use crate::host::PhysRange;
++use crate::num::ToUsize;
++
++/// The variable naming the switch file.
++pub const ENV_VAR: &str = "REIMS_VGPU_STAGED_PAGE_UP";
++
++/// The switch file and its last look.
++struct Switch {
++    path: Option<std::path::PathBuf>,
++    look: crate::sync::Mutex<(Option<Instant>, bool)>,
++}
++
++fn switch() -> &'static Switch {
++    static S: OnceLock<Switch> = OnceLock::new();
++    S.get_or_init(|| Switch {
++        path: std::env::var_os(ENV_VAR)
++            .filter(|p| !p.is_empty())
++            .map(std::path::PathBuf::from),
++        look: crate::sync::Mutex::new((None, false)),
++    })
++}
++
++/// Whether views are counted: the variable is set (read once).
++pub(crate) fn counting() -> bool {
++    !cfg!(test) && switch().path.is_some()
++}
++
++/// Whether page-ups are staged now: counting, and the file exists at the last look.
++pub(crate) fn staging() -> bool {
++    let s = switch();
++    let Some(path) = &s.path else {
++        return false;
++    };
++    if cfg!(test) {
++        return false;
++    }
++    let mut look = s.look.lock();
++    let now = Instant::now();
++    if look.0.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
++        *look = (Some(now), path.exists());
++    }
++    look.1
++}
++
++/// The staged page-ups' counters, all tasks together.
++struct Stats {
++    staged: AtomicU64,
++    staged_bytes: AtomicU64,
++    covered: AtomicU64,
++    copy_ns: AtomicU64,
++    last: crate::sync::Mutex<Option<Instant>>,
++}
++
++static STATS: Stats = Stats {
++    staged: AtomicU64::new(0),
++    staged_bytes: AtomicU64::new(0),
++    covered: AtomicU64::new(0),
++    copy_ns: AtomicU64::new(0),
++    last: crate::sync::Mutex::new(None),
++};
++
++/// Counts a staged page-up of `bytes`, whose buffer and copy took `ns`.
++pub(crate) fn note_staged(bytes: u64, ns: u64) {
++    STATS.staged.fetch_add(1, Ordering::Relaxed);
++    STATS.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
++    STATS.copy_ns.fetch_add(ns, Ordering::Relaxed);
++    log_stats();
++}
++
++/// Counts a page-up that took the view because a live view covered one of its pages.
++pub(crate) fn note_covered() {
++    STATS.covered.fetch_add(1, Ordering::Relaxed);
++    log_stats();
++}
++
++/// Logs the counts (and resets them) at most every 10 s.
++fn log_stats() {
++    let now = Instant::now();
++    {
++        let mut last = STATS.last.lock();
++        match *last {
++            None => {
++                *last = Some(now);
++                return;
++            }
++            Some(t) if now.duration_since(t) < Duration::from_secs(10) => return,
++            Some(_) => *last = Some(now),
++        }
++    }
++    let staged = STATS.staged.swap(0, Ordering::Relaxed);
++    let bytes = STATS.staged_bytes.swap(0, Ordering::Relaxed);
++    let covered = STATS.covered.swap(0, Ordering::Relaxed);
++    let ns = STATS.copy_ns.swap(0, Ordering::Relaxed);
++    log::info!(
++        "staged page-ups: {staged} staged ({} KiB, {} us making and copying), {covered} took \
++         the view (a live view covered a page)",
++        bytes >> 10,
++        ns.wrapping_div(1000)
++    );
++}
++
++/// The live views over each guest page of `first..first + counts.len()` pages.
++pub struct PageRefs {
++    first: u64,
++    counts: Box<[AtomicU16]>,
++}
++
++impl std::fmt::Debug for PageRefs {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("PageRefs")
++            .field("first", &self.first)
++            .field("pages", &self.counts.len())
++            .finish()
++    }
++}
++
++impl PageRefs {
++    /// Counts for the guest physical range `start..end`, all zero; `None` for an empty or
++    /// overflowing range.
++    pub(crate) fn new(start: u64, end: u64) -> Option<Self> {
++        let first = start >> APV_PAGE_SHIFT;
++        let last = end.checked_add(APV_PAGE_MASK)? >> APV_PAGE_SHIFT;
++        let pages = last.checked_sub(first).filter(|&n| n != 0)?.to_usize();
++        let counts = std::iter::repeat_with(|| AtomicU16::new(0))
++            .take(pages)
++            .collect();
++        Some(PageRefs { first, counts })
++    }
++
++    /// The pages of `range`, as indices: `None` when one lies outside.
++    fn indices(&self, range: &PhysRange) -> Option<std::ops::Range<usize>> {
++        let start = range.physical_address >> APV_PAGE_SHIFT;
++        let end = range
++            .physical_address
++            .checked_add(range.physical_length)?
++            .checked_add(APV_PAGE_MASK)?
++            >> APV_PAGE_SHIFT;
++        let from = start.checked_sub(self.first)?.to_usize();
++        let to = end.checked_sub(self.first)?.to_usize();
++        (to <= self.counts.len()).then_some(from..to)
++    }
++
++    /// A view over `ranges` was made.
++    pub(crate) fn add(&self, ranges: &[PhysRange]) {
++        for r in ranges {
++            if let Some(pages) = self.indices(r) {
++                for c in &self.counts[pages] {
++                    // Saturates, and then stays.
++                    let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
++                        n.checked_add(1)
++                    });
++                }
++            }
++        }
++    }
++
++    /// A view over `ranges` is gone.
++    pub(crate) fn remove(&self, ranges: &[PhysRange]) {
++        for r in ranges {
++            if let Some(pages) = self.indices(r) {
++                for c in &self.counts[pages] {
++                    // A saturated count stays; 0 stays (never reached by a counted view).
++                    let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
++                        (n != 0 && n != u16::MAX).then(|| n.wrapping_sub(1))
++                    });
++                }
++            }
++        }
++    }
++
++    /// Whether a live view covers a page of `ranges`, or a page lies outside the counts.
++    pub(crate) fn covered(&self, ranges: &[PhysRange]) -> bool {
++        ranges.iter().any(|r| match self.indices(r) {
++            Some(pages) => self.counts[pages]
++                .iter()
++                .any(|c| c.load(Ordering::Acquire) != 0),
++            None => true,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const PAGE: u64 = 1 << APV_PAGE_SHIFT;
++
++    fn pr(at: u64, len: u64) -> PhysRange {
++        PhysRange {
++            physical_address: at,
++            physical_length: len,
++        }
++    }
++
++    #[test]
++    fn a_page_is_covered_while_a_view_over_it_lives() {
++        let refs = PageRefs::new(PAGE, 9 * PAGE).unwrap();
++        let view = [pr(2 * PAGE, PAGE), pr(5 * PAGE, 2 * PAGE)];
++        assert!(!refs.covered(&[pr(PAGE, 8 * PAGE)]));
++        refs.add(&view);
++        refs.add(&view[..1]);
++        assert!(refs.covered(&[pr(6 * PAGE, PAGE)]));
++        assert!(!refs.covered(&[pr(3 * PAGE, 2 * PAGE), pr(7 * PAGE, PAGE)]));
++        refs.remove(&view);
++        assert!(!refs.covered(&[pr(5 * PAGE, 2 * PAGE)]));
++        assert!(refs.covered(&[pr(2 * PAGE, PAGE)]));
++        refs.remove(&view[..1]);
++        assert!(!refs.covered(&[pr(PAGE, 8 * PAGE)]));
++    }
++
++    #[test]
++    fn pages_outside_the_counts_count_as_covered() {
++        let refs = PageRefs::new(PAGE, 3 * PAGE).unwrap();
++        assert!(refs.covered(&[pr(0, PAGE)]));
++        assert!(refs.covered(&[pr(2 * PAGE, 2 * PAGE)]));
++        assert!(refs.covered(&[pr(u64::MAX - 1, 2)]));
++        refs.add(&[pr(3 * PAGE, PAGE)]);
++        assert!(!refs.covered(&[pr(PAGE, 2 * PAGE)]));
++    }
++
++    #[test]
++    fn a_saturated_count_stays() {
++        let refs = PageRefs::new(PAGE, 2 * PAGE).unwrap();
++        for _ in 0..u32::from(u16::MAX) + 2 {
++            refs.add(&[pr(PAGE, PAGE)]);
++        }
++        for _ in 0..u32::from(u16::MAX) + 2 {
++            refs.remove(&[pr(PAGE, PAGE)]);
++        }
++        assert!(refs.covered(&[pr(PAGE, PAGE)]));
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/resources/host.rs b/crates/reims-vgpu-core/src/resources/host.rs
+index d65a4c52..c440733f 100644
+--- a/crates/reims-vgpu-core/src/resources/host.rs
++++ b/crates/reims-vgpu-core/src/resources/host.rs
+@@ -84,6 +84,19 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
+         self.new_buffer_for_virtual_page(hold, page, length)
+     }
+ 
++    /// LOCAL (Atlas): a new buffer holding a copy of the guest's pages, for a texture's first
++    /// page-up, when no GPU access to them can be pending (`memory::page_refs`); `None` pages
++    /// through the transfer buffer as ever.
++    fn staged_page_buffer(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Option<P::Buffer>> {
++        let _ = (hold, page, length);
++        Ok(None)
++    }
++
+     /// LOCAL (Atlas): whether a Private paged texture at task page `page` may skip its first
+     /// page-up (`PagedTexture::skip_first_page_up`): 0 no, else the mode. Only a task of a guest
+     /// process says yes, never the kernel's.
+diff --git a/crates/reims-vgpu-core/src/resources/texture.rs b/crates/reims-vgpu-core/src/resources/texture.rs
+index b5b88bb0..878bc401 100644
+--- a/crates/reims-vgpu-core/src/resources/texture.rs
++++ b/crates/reims-vgpu-core/src/resources/texture.rs
+@@ -420,6 +420,19 @@ impl<P: Platform> PagedTexture<P> {
+         Ok(())
+     }
+ 
++    /// LOCAL (Atlas): for a page-up of a texture with no transfer buffer, a staged copy of its
++    /// pages to blit from instead (`memory::page_refs`), or `None`. The texture keeps no buffer:
++    /// a later page-down makes its view then.
++    pub(crate) fn staged(&self, hold: Hold<'_>) -> RaiseResult<Option<P::Buffer>> {
++        if self.transfer_buffer.lock().is_some() {
++            return Ok(None);
++        }
++        let Some(task) = self.task.upgrade() else {
++            return Ok(None);
++        };
++        task.staged_page_buffer(hold, self.page, self.length)
++    }
++
+     /// Drops the guest pages and makes the texture volatile; host-valid is kept.
+     pub(crate) fn discard(&self, state: &ResourceState) -> RaiseResult<()> {
+         drop(self.transfer_buffer.lock().take());
+diff --git a/crates/reims-vgpu-core/src/resources/texture/blit.rs b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+index e4f5b2d8..55e4875c 100644
+--- a/crates/reims-vgpu-core/src/resources/texture/blit.rs
++++ b/crates/reims-vgpu-core/src/resources/texture/blit.rs
+@@ -57,7 +57,20 @@ pub(crate) fn page<P: Platform>(
+     is_download: bool,
+     planes: &[(&TextureDimensionRecord, u64)],
+ ) -> RaiseResult<()> {
+-    let transfer = paged.transfer_buffer.lock();
++    page_through(paged, encoder, is_download, planes, None)
++}
++
++/// [`page`] through `staged` instead of the transfer buffer when given (LOCAL (Atlas): a
++/// staged page-up, `PagedTexture::staged`).
++pub(crate) fn page_through<P: Platform>(
++    paged: &PagedTexture<P>,
++    encoder: Option<&P::BlitEncoder>,
++    is_download: bool,
++    planes: &[(&TextureDimensionRecord, u64)],
++    staged: Option<&P::Buffer>,
++) -> RaiseResult<()> {
++    let held = paged.transfer_buffer.lock();
++    let transfer = staged.or(held.as_ref());
+     let Some(&(first, _)) = planes.first() else {
+         return Ok(());
+     };
+@@ -106,7 +119,7 @@ pub(crate) fn page<P: Platform>(
+                                     source_level: level,
+                                     source_origin: MtlOrigin::new(0, 0, 0),
+                                     source_size: size,
+-                                    destination_buffer: transfer.as_ref(),
++                                    destination_buffer: transfer,
+                                     destination_offset: offset,
+                                     destination_bytes_per_row: bytes_per_row,
+                                     destination_bytes_per_image: bytes_per_image,
+@@ -125,7 +138,7 @@ pub(crate) fn page<P: Platform>(
+                             encode(
+                                 OnFault::Return,
+                                 BlitCmd::CopyBufferToTextureOptions {
+-                                    source_buffer: transfer.as_ref(),
++                                    source_buffer: transfer,
+                                     source_offset: offset,
+                                     source_bytes_per_row: bytes_per_row,
+                                     source_bytes_per_image: bytes_per_image,
+@@ -242,11 +255,25 @@ impl SinglePlane {
+         state: &ResourceState,
+         encoder: Option<&P::BlitEncoder>,
+     ) -> RaiseResult<()> {
++        // LOCAL (Atlas): a first page-up may blit from a staged copy (`PagedTexture::staged`).
++        let staged = std::cell::OnceCell::new();
+         paged.prepare(
+             state,
+-            || paged.ensure_physical(hold),
++            || match paged.staged(hold)? {
++                Some(buffer) => {
++                    let _ = staged.set(buffer);
++                    Ok(())
++                }
++                None => paged.ensure_physical(hold),
++            },
+             || {
+-                self.page(paged, encoder, false)?;
++                page_through(
++                    paged,
++                    encoder,
++                    false,
++                    &[(&self.dimension, self.blit_option)],
++                    staged.get(),
++                )?;
+                 if self.generate_mipmaps {
+                     nil_send!(
+                         encoder,

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Thu, 5 Nov 2026 16:05:56 +0000
+Subject: [PATCH 36/92] no group kept while Coherent's wait_settled waits
+ (HostWait)
+
+VM-A review of grouped submissions: wait_settled is bounded (50 ms) and counts overwrite_risk on
+timeout, so a record held in a kept group must not make it wait. While a host waiter waits,
+Group::keeps keeps nothing, and the waiter wakes the scheduler to send a group kept before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/group.rs               | 32 ++++++++++++++++++-
+ .../src/command_buffer/mod.rs                 |  1 +
+ .../src/shadow_coherent.rs                    | 13 ++++++++
+ .../metal2vulkan-runtime/src/shadow_lazy.rs   |  5 +++
+ 4 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index a87bd837..179ed0f6 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -181,6 +181,34 @@ impl CommandBufferShared {
+     }
+ }
+ 
++/// LOCAL (Atlas, DEEP-GPU): how many host waiters outside a command buffer's own wait (Coherent's
++/// `wait_settled`, which waits for the GPU writes of running command buffers over a surface's
++/// pages within a bounded time) wait now. While any waits, no group is kept ([`Group::keeps`]),
++/// so a record held in a group never makes such a wait time out; [`HostWait`] wakes each
++/// scheduler it is given as it begins, which then sends a group kept before.
++static HOST_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// LOCAL (Atlas, DEEP-GPU): a host waiter of [`HOST_WAITERS`], counted until dropped.
++pub(crate) struct HostWait(());
++
++impl HostWait {
++    /// Begins a host wait: no group is kept until it ends, and `device`'s scheduler is woken to
++    /// send one kept now.
++    pub(crate) fn begin(device: Option<&Device>) -> HostWait {
++        HOST_WAITERS.fetch_add(1, Ordering::SeqCst);
++        if let Some(device) = device {
++            device.shared().scheduler.wake();
++        }
++        HostWait(())
++    }
++}
++
++impl Drop for HostWait {
++    fn drop(&mut self) {
++        HOST_WAITERS.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
+ /// A command buffer's `group_hold` bit: a batch of it is held in the scheduler's group.
+ const IN_GROUP: u8 = 1;
+ 
+@@ -401,7 +429,9 @@ impl Group {
+             return None;
+         }
+         let counts = &device.shared().counts;
+-        if (self.members.iter()).any(|member| member.submission.buffer().is_waited_for()) {
++        if HOST_WAITERS.load(Ordering::SeqCst) != 0
++            || (self.members.iter()).any(|member| member.submission.buffer().is_waited_for())
++        {
+             if self.kept {
+                 counts.group_sent_for_wait();
+             }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index c660f223..18824b72 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -56,6 +56,7 @@ pub(super) use first_submission::{NotedTable, ReplayTable};
+ #[cfg(test)]
+ pub(crate) use group::merges_submissions;
+ pub(super) use group::{group_batches, Group, GroupEnd};
++pub(crate) use group::HostWait; // LOCAL (Atlas, DEEP-GPU)
+ use rebound_use::{ReboundUse, Unlogged};
+ pub(super) use submit::{BatchLists, Submitting};
+ 
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 7cbcbee4..dee6bf93 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -1204,6 +1204,10 @@ impl Coherent {
+         skip_held: bool,
+     ) -> (MutexGuard<'a, State>, bool) {
+         let until = Instant::now() + Duration::from_millis(knob("surface_coherent_wait_ms", DEFAULT_WAIT_MS));
++        // LOCAL (Atlas, DEEP-GPU): while it waits, no submission group is kept, so a record held
++        // in one goes now and is seen complete at its own end, not after later batches
++        // (`command_buffer::HostWait`, VM-A's review of grouped submissions).
++        let mut host_wait = None;
+         loop {
+             // With `skip_held`, a record held for an event is not waited for: on the command
+             // thread (an encoder's take, a reader's copy back) its signal comes from the guest
+@@ -1220,6 +1224,15 @@ impl Coherent {
+             if left.is_zero() {
+                 return (state, false);
+             }
++            if host_wait.is_none() {
++                // The scheduler is woken without this surface's lock held (its submissions take
++                // it, `before_flush`), and what is busy is looked at again after.
++                drop(state);
++                let lazy = self.lazy.upgrade();
++                host_wait = Some(super::command_buffer::HostWait::begin(lazy.as_deref().and_then(Lazy::device)));
++                state = self.lock();
++                continue;
++            }
+             let (guard, _) = self.moved.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner());
+             state = guard;
+         }
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index f0cce7be..bc393926 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1117,6 +1117,11 @@ pub(crate) struct Lazy {
+ }
+ 
+ impl Lazy {
++    /// LOCAL (Atlas, DEEP-GPU): the [`Device`] its queue comes from.
++    pub(crate) fn device(&self) -> Option<&Device> {
++        self.device.downcast_ref::<Device>()
++    }
++
+     /// The state of a new shadow of `size` and `texels` texels of `device` with `surface` as its
+     /// backing over the host addresses `pages`, where the switch takes it.
+     pub(super) fn of(

@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 11:36:38 +0000
+Subject: [PATCH 64/92] count copy-back dispatches by site (lab diagnostics)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/command_buffer/submit.rs                   |  3 +++
+ crates/metal2vulkan-runtime/src/encoder.rs         |  3 +++
+ crates/metal2vulkan-runtime/src/shadow.rs          | 14 ++++++++++++++
+ crates/metal2vulkan-runtime/src/shadow_lazy.rs     | 12 ++++++++++++
+ crates/metal2vulkan-runtime/src/shadow_merge.rs    |  8 +++++++-
+ 5 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 30fed418..c6fc03ce 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1241,6 +1241,9 @@ impl CommandBufferShared {
+         let mut planned = Vec::new();
+         for (copy, _) in &copies {
+             let dispatched = copy.dispatched(device);
++            if dispatched.is_some() {
++                crate::shadow::count_back_site(1, copy.texels_back()); // LOCAL (Atlas): diagnostics
++            }
+             let rows = match dispatched {
+                 Some(_) => None,
+                 None => copy.staged_back(device),
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 6cacdf3b..25504a87 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -1640,6 +1640,9 @@ impl EncoderCore {
+             }
+             // A shadow takes the view a dispatch reads on a device that dispatches alone.
+             let dispatched = copy.dispatched(&device);
++            if dispatched.is_some() {
++                crate::shadow::count_back_site(0, copy.texels_back()); // LOCAL (Atlas): diagnostics
++            }
+             let rows = match dispatched {
+                 Some(_) => None,
+                 None => copy.staged_back(&device),
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 1211c06a..f00d845d 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -196,6 +196,20 @@ pub(crate) const BACK_WHY_NAMES: [&str; 12] = [
+     "ahead-not-alone", "ahead-merge", "ahead-no-lazy", "ahead-refused", "other",
+ ];
+ const BACK_WHY_MIN_TEXELS: u64 = 2_000_000;
++/// LOCAL (Atlas, lab diagnostics): copy-back dispatches recorded, by site
++/// ([`BACK_SITE_NAMES`]): `[large (at least BACK_WHY_MIN_TEXELS moved)?][site]` counts and texels.
++pub(crate) static BACK_SITE: [[std::sync::atomic::AtomicU64; 4]; 2] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2];
++pub(crate) static BACK_SITE_TEXELS: [[std::sync::atomic::AtomicU64; 4]; 2] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2];
++pub(crate) const BACK_SITE_NAMES: [&str; 4] = ["encoder", "late-batch", "merge-copy", "other"];
++/// LOCAL (Atlas): count one copy-back dispatch of `texels` texels at `site`.
++pub(crate) fn count_back_site(site: usize, texels: u64) {
++    use std::sync::atomic::Ordering::Relaxed;
++    let large = usize::from(texels >= 1_000_000);
++    BACK_SITE[large][site].fetch_add(1, Relaxed);
++    BACK_SITE_TEXELS[large][site].fetch_add(texels, Relaxed);
++}
+ use std::ops::Range;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::Arc;
+diff --git a/crates/metal2vulkan-runtime/src/shadow_lazy.rs b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+index 9061bd11..8ef612fc 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_lazy.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_lazy.rs
+@@ -1025,6 +1025,18 @@ fn report() {
+             eprintln!("copy_back_why {name}: {}", parts.join(" "));
+         }
+     }
++    for (large, name) in [(1usize, ">=1M"), (0, "<1M")] {
++        let parts: Vec<String> = (0..4)
++            .filter_map(|w| {
++                let n = super::shadow::BACK_SITE[large][w].load(Ordering::Relaxed);
++                let t = super::shadow::BACK_SITE_TEXELS[large][w].load(Ordering::Relaxed);
++                (n > 0).then(|| format!("{} {n}/{}M", super::shadow::BACK_SITE_NAMES[w], t / 1_000_000))
++            })
++            .collect();
++        if !parts.is_empty() {
++            eprintln!("copy_back_site {name}: {}", parts.join(" "));
++        }
++    }
+     for lazy in surfaces().iter().take(16) {
+         eprintln!(
+             "surface_lazy:   {:#x} {}x{} displayed {} taken {} refused {} in {} presents {}",
+diff --git a/crates/metal2vulkan-runtime/src/shadow_merge.rs b/crates/metal2vulkan-runtime/src/shadow_merge.rs
+index 97cc4455..bce187a5 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_merge.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_merge.rs
+@@ -1168,7 +1168,13 @@ fn dispatched_out(
+         buffer_offset: part.at,
+         ..*region
+     };
+-    CopyBack::new(device, *words, part.raw, &region)
++    let back = CopyBack::new(device, *words, part.raw, &region);
++    if back.is_some() {
++        // LOCAL (Atlas): diagnostics.
++        let e = region.image_extent;
++        crate::shadow::count_back_site(2, u64::from(e.width) * u64::from(e.height));
++    }
++    back
+ }
+ 
+ /// Where a cut rectangle's rows lie in the buffer's `VkBuffer`.

@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 01:49:42 +0000
+Subject: [PATCH 54/92] diagnostic: overwrite_risk by site in the coherent
+ census (risk_by)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/shadow_coherent.rs                    | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index dee6bf93..ca151e3d 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -595,6 +595,11 @@ struct Counts {
+     late_compare_ns_max: AtomicU64,
+     /// Rectangles held batches copied in that other imports wrote ([`Coherent::taking_beside`]).
+     late_beside: AtomicU64,
++    /// LOCAL (Atlas) diagnostic: `overwrite_risk` by site: 0 a trap's write over an unsettled copy
++    /// (`wrote`), 1 a taking over an unsettled copy or a held record (`taking`), 2 `taking_late`
++    /// with a copy back in flight or owed, 3 `taking_late` behind a record without a cut compare,
++    /// 4 `taking_late` whole after the compare, 5 `taking_beside`, 6 a sync over an unsettled copy.
++    risk_by: [AtomicU64; 8],
+ }
+ 
+ #[derive(Default)]
+@@ -1285,6 +1290,7 @@ impl Coherent {
+         self.sync_done(&mut state, SyncBy::Trap);
+         if !clear {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            self.counts.risk_by[0].fetch_add(1, Ordering::Relaxed);
+         }
+         state.guest = Some(self.layout.whole());
+         state.wrote_at = Some(Instant::now());
+@@ -1430,6 +1436,7 @@ impl Coherent {
+                 });
+                 if !clear || held_over {
+                     self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++                    self.counts.risk_by[1].fetch_add(1, Ordering::Relaxed);
+                 }
+             }
+             // LOCAL (Atlas): if a held batch is still pending for this surface (an entry in
+@@ -1530,6 +1537,7 @@ impl Coherent {
+         };
+         let behind = ahead(&state, &[area]);
+         let mut busy = (state.flushing != 0 || !state.owed.is_empty()) && !state.snapshots.is_empty();
++        let mut why = if busy { 2 } else { 0 };
+         let mut rects = vec![area];
+         if behind && cut && !state.snapshots.is_empty() {
+             self.sync_done(&mut state, SyncBy::CopyIn);
+@@ -1545,6 +1553,9 @@ impl Coherent {
+             LATE_COMPARE_NS.fetch_add(ns, Ordering::Relaxed);
+             LATE_COMPARE_NS_MAX.fetch_max(ns, Ordering::Relaxed);
+             rects = changed;
++            if why == 0 && whole && ahead(&state, &rects) {
++                why = 4;
++            }
+             busy |= whole && ahead(&state, &rects);
+             state.guest = None;
+             // A page the guest reached as the marks moved came with no snapshot: its rectangle
+@@ -1553,11 +1564,15 @@ impl Coherent {
+             state.snapshots.clear();
+             state.opened = false;
+         } else {
++            if why == 0 && behind {
++                why = 3;
++            }
+             busy |= behind;
+             self.take_guest(&mut state);
+         }
+         if busy {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            self.counts.risk_by[why].fetch_add(1, Ordering::Relaxed);
+             self.counts.late_busy.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyInBusy);
+         }
+@@ -1624,6 +1639,7 @@ impl Coherent {
+             .any(|record| areas.iter().any(|area| meet(record.area, *area)));
+         if busy {
+             self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++            self.counts.risk_by[5].fetch_add(1, Ordering::Relaxed);
+             self.counts.late_busy.fetch_add(1, Ordering::Relaxed);
+             count(Fallback::LateCopyInBusy);
+         }
+@@ -1769,6 +1785,7 @@ impl Coherent {
+             }
+             if !clear {
+                 self.counts.overwrite_risk.fetch_add(1, Ordering::Relaxed);
++                self.counts.risk_by[6].fetch_add(1, Ordering::Relaxed);
+             }
+         }
+         let held = (state.running.iter())
+@@ -2050,7 +2067,7 @@ impl Coherent {
+              \"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+              \"overwrite_risk\":{},\"sync_errors\":{},\"late_copies\":{},\"late_busy\":{},\
+              \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+-             \"late_beside\":{},\"pending_done\":{},\"open_pages\":{},\
++             \"late_beside\":{},\"risk_by\":[{}],\"pending_done\":{},\"open_pages\":{},\
+              \"per_present_ns\":{{\"detect\":{detect:.0},\"sync\":{sync:.0},\"fetch\":{fetch:.0},\
+              \"total\":{total:.0},\"eager_would\":{eager:.0}}},\"pays\":{}}}\n",
+             self.layout.first_page(),
+@@ -2098,6 +2115,7 @@ impl Coherent {
+             read(&c.late_compare_ns),
+             read(&c.late_compare_ns_max),
+             read(&c.late_beside),
++            c.risk_by.iter().map(|n| read(n).to_string()).collect::<Vec<_>>().join(","),
+             state.done.len(),
+             state.snapshots.len(),
+             read(&c.spent_ns) < read(&c.saved_ns),

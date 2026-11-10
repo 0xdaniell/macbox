@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 21:26:40 +0000
+Subject: [PATCH 83/92] live view_render_direct: an A8Unorm view of an R8Unorm
+ image renders into the image (no render shadow copies)
+
+---
+ .../src/texture/rotation.rs                   |  5 +++
+ .../src/texture/view_shadow.rs                | 41 +++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/texture/rotation.rs b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+index e0570caf..c5f36459 100644
+--- a/crates/metal2vulkan-runtime/src/texture/rotation.rs
++++ b/crates/metal2vulkan-runtime/src/texture/rotation.rs
+@@ -123,6 +123,11 @@ impl Texture {
+         // A view its bindings present in its image's own format renders into its render shadow
+         // (`texture/view_shadow.rs`).
+         if record.read_as.is_some() {
++            if crate::live::on("view_render_direct", false) {
++                if let Some(direct) = self.view_render_direct() {
++                    return Ok(direct);
++                }
++            }
+             return self.view_render_shadow("render_command_encoder");
+         }
+         let rotation = record.presented.rotation;
+diff --git a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+index d2b5ef59..2dee1c90 100644
+--- a/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
++++ b/crates/metal2vulkan-runtime/src/texture/view_shadow.rs
+@@ -253,6 +253,47 @@ impl Texture {
+         Ok(texture)
+     }
+ 
++    /// LOCAL (Atlas), live `view_render_direct=1`: a view its bindings read through its image's
++    /// own format (`read_as`) renders into that image itself where the view's own color
++    /// attachment format is the image's: an `A8Unorm` view of an `R8Unorm` texture on a device
++    /// without `A8_UNORM`, whose attachment is `R8_UNORM` with Metal's alpha in red
++    /// (`FormatEmulation::AlphaInRed`, lowered by the pipeline's attachment format). The render
++    /// shadow there is an `R8_UNORM` image copied in from and back to the same bytes' layout
++    /// (Liquid Glass masks over the Sim screen: ~2400 copies a second, 0.8 ms a frame). `None`
++    /// elsewhere, where the shadow stays.
++    pub(crate) fn view_render_direct(&self) -> Option<Texture> {
++        let mut held = lock(&self.0.render_shadow);
++        if let Some(texture) = held.as_ref() {
++            return Some(texture.clone());
++        }
++        let Storage::Image(image) = &self.0.storage else {
++            return None;
++        };
++        let base = truth(image);
++        let device = self.device();
++        let profile = device.compile_device().profile();
++        let usage = [metal2vulkan::device::FormatUsage::ColorAttachment].into();
++        let mapping =
++            metal2vulkan::metal::format::vk_format(self.0.record.pixel_format, &usage, profile).ok()?;
++        let plan = base.plan();
++        if mapping.format != plan.format || !plan.usage.contains(ImageUsageFlags::COLOR_ATTACHMENT) {
++            return None;
++        }
++        let record = ViewRecord {
++            read_as: None,
++            ..self.0.record
++        };
++        let texture = Texture::made(
++            device,
++            Storage::Image(Arc::clone(base)),
++            record,
++            Some(self.clone()),
++            IdUse::Runtime,
++        );
++        *held = Some(texture.clone());
++        Some(texture)
++    }
++
+     /// The texture views are made from, at the root of `parentTexture`.
+     pub(super) fn root(&self) -> &Texture {
+         let mut root = self;

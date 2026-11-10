@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Sun, 8 Nov 2026 17:21:20 +0000
+Subject: [PATCH 74/92] pending audit: device index no longer shadowed by the
+ info index; tracks pools' command buffers (a pool destroyed while one is
+ pending is reported) and stops reading destroyed semaphores
+
+---
+ crates/metal2vulkan-runtime/src/device/mod.rs |  3 +
+ .../metal2vulkan-runtime/src/device/prime.rs  |  3 +
+ .../metal2vulkan-runtime/src/pending_audit.rs | 58 +++++++++++++++++--
+ .../src/recorder/replays.rs                   |  1 +
+ crates/metal2vulkan-runtime/src/release.rs    |  2 +
+ 5 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 4814fae2..920f2e14 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -612,6 +612,9 @@ impl DeviceShared {
+             self.vk().allocate_command_buffers(info)
+         };
+         exit_guard::called(Call::AllocateCommandBuffers);
++        if let Ok(buffers) = &allocated {
++            crate::pending_audit::allocated(info.command_pool, buffers);
++        }
+         allocated.map_err(super::error::vulkan)
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
+index b0b2de77..a0ecd0d1 100644
+--- a/crates/metal2vulkan-runtime/src/device/prime.rs
++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
+@@ -663,6 +663,9 @@ impl Primer<'_> {
+             self.loader_word.restore();
+             self.device.allocate_command_buffers(info)
+         };
++        if let Ok(made) = &buffers {
++            crate::pending_audit::allocated(info.command_pool, made);
++        }
+         Ok(buffers.map_err(vulkan)?[0])
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/pending_audit.rs b/crates/metal2vulkan-runtime/src/pending_audit.rs
+index 8f0549fc..73f11b7c 100644
+--- a/crates/metal2vulkan-runtime/src/pending_audit.rs
++++ b/crates/metal2vulkan-runtime/src/pending_audit.rs
+@@ -63,6 +63,8 @@ struct State {
+     executed_by: HashMap<u64, Vec<u64>>,
+     /// A primary's last submission since its last begin.
+     subs: HashMap<u64, Sub>,
++    /// Each command pool's command buffers, as allocated.
++    pools: HashMap<u64, Vec<u64>>,
+ }
+ 
+ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
+@@ -78,10 +80,15 @@ fn line(text: String) {
+ }
+ 
+ /// Why `sub` is still pending, or `None` where it completed (or nothing tells).
+-fn pending(sub: &Sub) -> Option<String> {
++fn pending(seen: &HashMap<u64, u64>, sub: &Sub) -> Option<String> {
+     let devices = DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+     let device = devices.get(sub.device)?;
+     for &(semaphore, value) in &sub.signals {
++        // Only a semaphore still live and long-lived: a destroyed one is out of `seen`
++        // ([`released`]), and one made again at its handle starts its count over.
++        if seen.get(&vk::Handle::as_raw(semaphore)).copied().unwrap_or(0) < LONG_LIVED {
++            continue;
++        }
+         // SAFETY: a semaphore of the device a submission signalled; read only.
+         if let Ok(now) = unsafe { device.get_semaphore_counter_value(semaphore) } {
+             if now < value {
+@@ -102,7 +109,7 @@ fn pending(sub: &Sub) -> Option<String> {
+ fn check_and_forget(state: &mut State, buffer: u64, site: &'static str) {
+     CHECKED.fetch_add(1, Ordering::Relaxed);
+     if let Some(sub) = state.subs.get(&buffer) {
+-        if let Some(why) = pending(sub) {
++        if let Some(why) = pending(&state.seen, sub) {
+             let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
+             line(format!(
+                 "#{n} {site}: command buffer {buffer:#x} itself, submitted at {} {:.2} ms ago, is pending ({why})",
+@@ -115,7 +122,7 @@ fn check_and_forget(state: &mut State, buffer: u64, site: &'static str) {
+         for primary in primaries {
+             match state.subs.get(primary) {
+                 Some(sub) => {
+-                    if let Some(why) = pending(sub) {
++                    if let Some(why) = pending(&state.seen, sub) {
+                         let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
+                         line(format!(
+                             "#{n} {site}: secondary {buffer:#x} executed by primary {primary:#x}, submitted at {} {:.2} ms ago, is pending ({why})",
+@@ -221,7 +228,7 @@ pub(crate) fn submits(
+     if !*ON {
+         return;
+     }
+-    let index = {
++    let device_index = {
+         let mut devices = DEVICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+         match devices.iter().position(|d| d.handle() == device.handle()) {
+             Some(at) => at,
+@@ -302,7 +309,7 @@ pub(crate) fn submits(
+                 }
+             }
+             if let Some(previous) = state.subs.get(&p) {
+-                if let Some(why) = pending(previous) {
++                if let Some(why) = pending(&state.seen, previous) {
+                     let n = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
+                     line(format!(
+                         "#{n} {site}: primary {p:#x} submitted again while its submission at {} {:.2} ms ago is pending ({why})",
+@@ -314,7 +321,7 @@ pub(crate) fn submits(
+             state.subs.insert(
+                 p,
+                 Sub {
+-                    device: index,
++                    device: device_index,
+                     site,
+                     at,
+                     signals: mine.clone(),
+@@ -332,6 +339,45 @@ pub(crate) fn submits(
+     }
+ }
+ 
++/// A `vkAllocateCommandBuffers` from `pool` that made `buffers`.
++pub(crate) fn allocated(pool: vk::CommandPool, buffers: &[vk::CommandBuffer]) {
++    if !*ON {
++        return;
++    }
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let list = state.pools.entry(vk::Handle::as_raw(pool)).or_default();
++    list.extend(buffers.iter().map(|&b| key(b)));
++}
++
++/// A release (`release.rs`) of the object `raw` by `call`, before it: a command pool's command
++/// buffers are checked as by a reset and forgotten (their handles may be made again); a
++/// semaphore is no longer read.
++pub(crate) fn released(call: crate::exit_guard::Call, raw: u64) {
++    if !*ON {
++        return;
++    }
++    use crate::exit_guard::Call;
++    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    match call {
++        Call::DestroyCommandPool => {
++            let Some(buffers) = state.pools.remove(&raw) else {
++                return;
++            };
++            for buffer in buffers {
++                check_and_forget(&mut state, buffer, "pool destroy");
++                state.generation.remove(&buffer);
++                state.executed_by.remove(&buffer);
++                state.executes.remove(&buffer);
++                state.subs.remove(&buffer);
++            }
++        }
++        Call::DestroySemaphore => {
++            state.seen.remove(&raw);
++        }
++        _ => {}
++    }
++}
++
+ /// The routed commands' hook (`recorder/thunks.rs`), for a command that reaches the driver.
+ macro_rules! hook {
+     (begin_command_buffer, $cb:ident, $info:ident) => {
+diff --git a/crates/metal2vulkan-runtime/src/recorder/replays.rs b/crates/metal2vulkan-runtime/src/recorder/replays.rs
+index 7e673d29..6fec2282 100644
+--- a/crates/metal2vulkan-runtime/src/recorder/replays.rs
++++ b/crates/metal2vulkan-runtime/src/recorder/replays.rs
+@@ -553,6 +553,7 @@ impl Replays {
+             raw.allocate_command_buffers(&info)
+         }?[0];
+         exit_guard::called(Call::AllocateCommandBuffers);
++        crate::pending_audit::allocated(info.command_pool, &[buffer]);
+         pool.made(level, buffer);
+         Ok((buffer, false))
+     }
+diff --git a/crates/metal2vulkan-runtime/src/release.rs b/crates/metal2vulkan-runtime/src/release.rs
+index 684d84ec..dad738c7 100644
+--- a/crates/metal2vulkan-runtime/src/release.rs
++++ b/crates/metal2vulkan-runtime/src/release.rs
+@@ -144,6 +144,8 @@ macro_rules! released {
+                 unsafe fn destroy(self, device: &ash::Device, _: Door) {
+                     // LOCAL (Atlas) diagnostic: the image census and registry (`image_log.rs`).
+                     crate::image_log::released(Call::$call, vk::Handle::as_raw(self));
++                    // LOCAL (Atlas) diagnostic: the pending audit (`pending_audit.rs`).
++                    crate::pending_audit::released(Call::$call, vk::Handle::as_raw(self));
+                     // SAFETY: the caller's.
+                     unsafe { device.$method(self, None) }
+                 }
