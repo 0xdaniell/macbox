@@ -13,7 +13,7 @@ Before macbox's patches, most of that added work was copies: macOS's framebuffer
 simulator's display surface lie in guest RAM, and metal2vulkan copied each into a GPU image and back
 around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67%
 with the desktop. Patch 0004 renders those textures in place, and Coherent (patches 0009 onwards,
-with QEMU's census) removes most of the copies left ([patches/README.md](../patches/README.md)).
+with QEMU's census) removes most of the copies left ([src/patches/README.md](../src/patches/README.md)).
 What is left of a 3x simulator frame, measured with the pass timer on 2026-11-09:
 
 | GPU time per 3x frame (~7.7–8.2 ms) | ms | |
@@ -104,7 +104,7 @@ Inside macOS, emulated SATA → NVMe: a warm 4K random read 0.54 → 0.36 ms, an
 latency again.
 
 How they were measured:
-- `simfps` (in `guest/bench`, if present) counts the frames a simulator's screen produces through
+- `simfps` (in `src/guest/bench`, if present) counts the frames a simulator's screen produces through
   CoreSimulator's framebuffer, with no encoder in the way.
 - GPU time per frame from QEMU's DRM fdinfo.
 - Warm-up pass first; nothing else animating; Simulator.app closed.

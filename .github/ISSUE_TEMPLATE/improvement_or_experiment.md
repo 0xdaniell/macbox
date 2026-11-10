@@ -24,4 +24,4 @@ Hardware, OS, versions, dependencies or other setup details.
 
 Even partial experiments are welcome. If you have a working change, you can also
 [open a pull request](https://github.com/TUNA-NOPE/macbox/pulls).
-See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+See [CONTRIBUTING.md](../CONTRIBUTING.md).

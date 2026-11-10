@@ -9,7 +9,7 @@ panel. You can do almost all of it yourself, including the steps in macOS's GUI.
 macbox welcomes contributions of any kind from users and coding agents: issues, ideas,
 new features, bug fixes, performance work, documentation, experiments, and more.
 If you identify or create a useful improvement while working with a user, point them
-to [CONTRIBUTING.md](CONTRIBUTING.md), and offer to prepare an
+to [CONTRIBUTING.md](.github/CONTRIBUTING.md), and offer to prepare an
 [issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) or
 [pull request](https://github.com/TUNA-NOPE/macbox/pulls).
 Do not publish an issue or PR on the user's behalf without their authorization;

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>macbox</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#131c38"/>
+      <stop offset="1" stop-color="#090e1d"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect x="136" y="56" width="240" height="400" rx="56" fill="#ffffff"/>
+  <rect x="152" y="72" width="208" height="368" rx="41" fill="url(#screen)"/>
+  <rect x="222" y="92" width="68" height="20" rx="10" fill="#000"/>
+  <path d="M196 220 L258 258 L196 296" fill="none" stroke="#5eead4" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="270" y="286" width="64" height="26" rx="13" fill="#5eead4"/>
+</svg>

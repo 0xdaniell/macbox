@@ -57,7 +57,7 @@ Fix every FAIL. WARN lines are advice.
 
 This builds the Docker image (`macbox:run`: Ubuntu 26.10, Mesa, sway, passt, the stream's
 dependencies), then, in a container, Reims vGPU and its QEMU on metal2vulkan with macbox's patches
-([patches/README.md](../patches/README.md)), and `reims-ctl` and `reims-util`. The first build
+([src/patches/README.md](../src/patches/README.md)), and `reims-ctl` and `reims-util`. The first build
 takes 20 to 60 minutes and about 25 GB; later ones are incremental. `./macbox build --upstream`
 builds Reims's current master as it is, without macbox's patches.
 
@@ -154,7 +154,7 @@ up to twice as fast. OpenCore finds the disk by itself.
 ./macbox provision
 ```
 
-Copies `guest/` to `~/.macbox` on the Mac and runs it ([guest/README.md](../guest/README.md)):
+Copies `guest/` to `~/.macbox` on the Mac and runs it ([src/guest/README.md](../src/guest/README.md)):
 passwordless sudo (it asks for the password once), no sleep or screen lock, Spotlight indexing and
 automatic update downloads off, Node, Ruby 3.4 and CocoaPods, simslim, the `setmode` tool, and the
 LaunchAgent that keeps the Device panel's stream light. Safe to run again.
@@ -212,7 +212,7 @@ hub's own source. Run it again after T3 updates its hub. [docs/t3-code.md](t3-co
 
 Links `mac-sim`, `sim-fps`, `android-sim` and `macbox` into `~/.local/bin`, the `simulators` (and
 `phone-builds`) skill into `~/.claude/skills` and `~/.agents/skills`, and enables the timer that
-shuts idle simulators down. Add [agents/simulators-snippet.md](../agents/simulators-snippet.md) to your
+shuts idle simulators down. Add [src/agents/simulators-snippet.md](../src/agents/simulators-snippet.md) to your
 `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`. [docs/agents.md](agents.md) explains it.
 
 Check it from any Expo app's checkout:

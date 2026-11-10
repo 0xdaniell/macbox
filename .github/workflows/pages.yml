@@ -1,4 +1,4 @@
-# Builds the website (site/) and publishes it to GitHub Pages: https://tuna-nope.github.io/macbox/
+# Builds the website (docs/site/) and publishes it to GitHub Pages: https://tuna-nope.github.io/macbox/
 # Pull requests only build and check it; pushes to main deploy it, then tell IndexNow (Bing and
 # others) which pages exist. Google reads the sitemap through Search Console.
 name: Website
@@ -6,9 +6,9 @@ name: Website
 on:
   push:
     branches: [main]
-    paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
+    paths: ["docs/site/**", "docs/images/**", "macbox", "src/sims/bin/mac-sim", ".github/workflows/pages.yml"]
   pull_request:
-    paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
+    paths: ["docs/site/**", "docs/images/**", "macbox", "src/sims/bin/mac-sim", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -27,11 +27,11 @@ jobs:
         with:
           python-version: "3.13"
       - name: Build and check
-        run: python3 site/build.py
+        run: python3 docs/site/build.py
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request'
         with:
-          path: site/_site
+          path: docs/site/_site
 
   deploy:
     if: github.event_name != 'pull_request'
