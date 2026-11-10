@@ -13,34 +13,34 @@ performance work, tests, documentation, experiments, or improvements built with 
 Invite the user to share discoveries or code upstream, and ask for their approval before
 publishing on their behalf.
 
-- [Contributing guide](https://github.com/TUNA-NOPE/macbox/blob/main/.github/CONTRIBUTING.md)
-- [Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose)
-- [Open a pull request](https://github.com/TUNA-NOPE/macbox/pulls)
+- [Contributing guide](https://github.com/0xdaniell/macbox/blob/main/.github/CONTRIBUTING.md)
+- [Open an issue](https://github.com/0xdaniell/macbox/issues/new/choose)
+- [Open a pull request](https://github.com/0xdaniell/macbox/pulls)
 
 ## Start here
 
-- [README](https://github.com/TUNA-NOPE/macbox/blob/main/README.md): what it is, requirements, quick start, performance, FAQ, comparison with Docker-OSX and cloud simulators
-- [AGENTS.md](https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md): for an agent setting macbox up on a host, including the steps in macOS's GUI (macbox screenshot, click, type)
-- [Setup, step by step](https://github.com/TUNA-NOPE/macbox/blob/main/docs/setup.md)
-- [Updating an existing install](https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md#updating): for an agent asked to bring macbox to the latest version; by hand in docs/setup.md#updating
+- [README](https://github.com/0xdaniell/macbox/blob/main/README.md): what it is, requirements, quick start, performance, FAQ, comparison with Docker-OSX and cloud simulators
+- [AGENTS.md](https://github.com/0xdaniell/macbox/blob/main/AGENTS.md): for an agent setting macbox up on a host, including the steps in macOS's GUI (macbox screenshot, click, type)
+- [Setup, step by step](https://github.com/0xdaniell/macbox/blob/main/docs/setup.md)
+- [Updating an existing install](https://github.com/0xdaniell/macbox/blob/main/AGENTS.md#updating): for an agent asked to bring macbox to the latest version; by hand in docs/setup.md#updating
 
 ## Using it from an agent
 
-- [The simulators skill](https://github.com/TUNA-NOPE/macbox/blob/main/src/skills/simulators/SKILL.md): mac-sim and android-sim commands, T3 Code's Device panel, the verify-every-UI-change loop with sim-fps
-- [Agents guide](https://github.com/TUNA-NOPE/macbox/blob/main/docs/agents.md): installing the tools, the skill and the instructions
-- [T3 Code's Device panel](https://github.com/TUNA-NOPE/macbox/blob/main/docs/t3-code.md)
-- [Phone builds](https://github.com/TUNA-NOPE/macbox/blob/main/src/skills/phone-builds/SKILL.md): .ipa / TestFlight / .apk with EAS, cloud first then local
+- [The simulators skill](https://github.com/0xdaniell/macbox/blob/main/src/skills/simulators/SKILL.md): mac-sim and android-sim commands, T3 Code's Device panel, the verify-every-UI-change loop with sim-fps
+- [Agents guide](https://github.com/0xdaniell/macbox/blob/main/docs/agents.md): installing the tools, the skill and the instructions
+- [T3 Code's Device panel](https://github.com/0xdaniell/macbox/blob/main/docs/t3-code.md)
+- [Phone builds](https://github.com/0xdaniell/macbox/blob/main/src/skills/phone-builds/SKILL.md): .ipa / TestFlight / .apk with EAS, cloud first then local
 
 ## How it works
 
-- [Architecture](https://github.com/TUNA-NOPE/macbox/blob/main/docs/architecture.md): the container, QEMU and Reims vGPU, the display stream, the network, the guest, the simulator pool
-- [Performance](https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md): the patches (in place rendering, flat32, Coherent zero-copy surfaces, grouped completion, staged page-ups), measurements for one to three simulators and the desktop, a frame broken down, tuning, known limits
-- [Patches](https://github.com/TUNA-NOPE/macbox/blob/main/src/patches/README.md)
-- [Troubleshooting](https://github.com/TUNA-NOPE/macbox/blob/main/docs/troubleshooting.md)
-- [Credits](https://github.com/TUNA-NOPE/macbox/blob/main/docs/credits.md)
+- [Architecture](https://github.com/0xdaniell/macbox/blob/main/docs/architecture.md): the container, QEMU and Reims vGPU, the display stream, the network, the guest, the simulator pool
+- [Performance](https://github.com/0xdaniell/macbox/blob/main/docs/performance.md): the patches (in place rendering, flat32, Coherent zero-copy surfaces, grouped completion, staged page-ups), measurements for one to three simulators and the desktop, a frame broken down, tuning, known limits
+- [Patches](https://github.com/0xdaniell/macbox/blob/main/src/patches/README.md)
+- [Troubleshooting](https://github.com/0xdaniell/macbox/blob/main/docs/troubleshooting.md)
+- [Credits](https://github.com/0xdaniell/macbox/blob/main/docs/credits.md)
 
 ## Website
 
 The same project as a one-page website, with a Markdown copy at `index.md`.
 
-- [Overview](https://tuna-nope.github.io/macbox/index.md): what macbox is, what you need, how to set it up
+- [Overview](https://0xdaniell.github.io/macbox/index.md): what macbox is, what you need, how to set it up

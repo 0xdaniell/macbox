@@ -13,10 +13,10 @@ from the repo itself (docs/images), so they have one source.
 import datetime, html, json, os, re, shutil, sys
 from pathlib import Path
 
-SITE_URL = os.environ.get("MACBOX_SITE_URL", "https://tuna-nope.github.io/macbox").rstrip("/")
+SITE_URL = os.environ.get("MACBOX_SITE_URL", "https://0xdaniell.github.io/macbox").rstrip("/")
 BASE_PATH = "/" + SITE_URL.split("://", 1)[1].partition("/")[2] if "/" in SITE_URL.split("://", 1)[1] else ""
 BASE_PATH = BASE_PATH.rstrip("/")
-REPO_URL = "https://github.com/TUNA-NOPE/macbox"
+REPO_URL = "https://github.com/0xdaniell/macbox"
 NAME = "macbox"
 
 HERE = Path(__file__).resolve().parent

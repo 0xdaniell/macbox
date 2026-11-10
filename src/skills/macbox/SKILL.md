@@ -20,7 +20,7 @@ Settings: `~/.config/macbox/macbox.env`. The checkout holds the docs: `readlink 
 
 ## Setting it up
 
-Follow `AGENTS.md` in macbox's checkout (https://github.com/TUNA-NOPE/macbox). In short:
+Follow `AGENTS.md` in macbox's checkout (https://github.com/0xdaniell/macbox). In short:
 `macbox init`, `doctor`, `build` (20 to 60 minutes), `create`, `boot-picker on`, `up`. Then the
 GUI steps, which you can do yourself with `macbox screenshot` / `click` / `type` / `key` / `wait`:
 install macOS, `macbox recovery-fix` from Recovery's Terminal, Setup Assistant, then

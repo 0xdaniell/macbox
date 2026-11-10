@@ -1,4 +1,4 @@
-# Builds the website (docs/site/) and publishes it to GitHub Pages: https://tuna-nope.github.io/macbox/
+# Builds the website (docs/site/) and publishes it to GitHub Pages: https://0xdaniell.github.io/macbox/
 # Pull requests only build and check it; pushes to main deploy it, then tell IndexNow (Bing and
 # others) which pages exist. Google reads the sitemap through Search Console.
 name: Website
@@ -49,11 +49,11 @@ jobs:
       - name: Submit the sitemap's URLs to IndexNow
         continue-on-error: true
         env:
-          SITE: https://tuna-nope.github.io/macbox
+          SITE: https://0xdaniell.github.io/macbox
           KEY: d0f80829b645869eb473963b6ad2dd95
         run: |
           sleep 30   # let the new deployment reach the CDN
           urls=$(curl -fsS "$SITE/sitemap.xml" | grep -o '<loc>[^<]*' | sed 's/<loc>//' | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')
-          body=$(printf '{"host":"tuna-nope.github.io","key":"%s","keyLocation":"%s/%s.txt","urlList":%s}' "$KEY" "$SITE" "$KEY" "$urls")
+          body=$(printf '{"host":"0xdaniell.github.io","key":"%s","keyLocation":"%s/%s.txt","urlList":%s}' "$KEY" "$SITE" "$KEY" "$urls")
           curl -sS -o /dev/null -w 'IndexNow: HTTP %{http_code}\n' -X POST https://api.indexnow.org/indexnow \
             -H 'Content-Type: application/json; charset=utf-8' -d "$body"

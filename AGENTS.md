@@ -12,8 +12,8 @@ macbox welcomes contributions of any kind from users and coding agents: issues, 
 new features, bug fixes, performance work, documentation, experiments, and more.
 If you identify or create a useful improvement while working with a user, point them
 to [CONTRIBUTING.md](.github/CONTRIBUTING.md), and offer to prepare an
-[issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) or
-[pull request](https://github.com/TUNA-NOPE/macbox/pulls).
+[issue](https://github.com/0xdaniell/macbox/issues/new/choose) or
+[pull request](https://github.com/0xdaniell/macbox/pulls).
 Do not publish an issue or PR on the user's behalf without their authorization;
 include what was actually tested, and be clear about anything unverified.
 
