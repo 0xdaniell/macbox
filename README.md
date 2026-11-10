@@ -123,13 +123,12 @@ downloads keeps its own license ([docs/credits.md](docs/credits.md)).
 
 ## Disclaimer
 
-**macbox comes as is, with no warranty of any kind, and its authors accept no liability for anything
-that comes of using it** (the license's "No Liability" section). It runs a virtual machine with
-direct access to your GPU, and can lose the VM's data, for example with `MACBOX_DISK_CACHE=unsafe`
-and a crash of the host.
+**macbox is provided as is, without warranty, and the licensor disclaims liability to the extent
+permitted by law.** See the [license](LICENSE#no-liability) and the full [disclaimer](DISCLAIMER.md),
+including risks of data loss, security exposure and third-party license violations. Back up your data
+before use.
 
-macbox ships no Apple software. macOS, Xcode and the simulator runtimes download from Apple, under
-Apple's terms, and **you alone are responsible for complying with them. Apple's software license
-agreement for macOS allows it to run only on Apple-branded hardware; running it in a VM on other
-hardware breaches that agreement.** macbox is not affiliated with, sponsored or endorsed by Apple Inc.
-macOS, iOS, Xcode and Metal are trademarks of Apple Inc.
+macbox ships no Apple software and grants no rights to it. Apple's macOS license restricts use to
+Apple-branded hardware; running macOS on other hardware can breach that license. Review the
+[applicable Apple terms](https://www.apple.com/legal/sla/) before installation. You are responsible
+for obtaining the rights needed for your use. macbox is not affiliated with or endorsed by Apple Inc.

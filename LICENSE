@@ -74,6 +74,9 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 
 Required Notice: Copyright 2026 TUNA-NOPE (https://github.com/TUNA-NOPE)
 
-Scope: these terms cover macbox's own files. The files in patches/ modify Reims vGPU and metal2vulkan,
+Scope: these terms cover macbox's own files. The files in src/patches/ modify Reims vGPU and metal2vulkan,
 which are GPL-2.0-or-later OR LGPL-3.0-or-later, and are offered under those same terms; those in
 src/patches/qemu modify QEMU and are GPL-2.0-or-later (src/patches/README.md). The projects macbox builds and downloads keep their own licenses (docs/credits.md).
+
+See DISCLAIMER.md for additional notices about risks, third-party software, and the limits of
+the permissions granted by this license. Those notices do not modify the PolyForm terms above.
