@@ -226,6 +226,39 @@ mac-sim up && mac-sim run && mac-sim shot /tmp/home.png && mac-sim down
 `android-sim` runs a pool of Android emulators on the host itself, with KVM and the GPU. It needs
 the Android SDK; see [docs/agents.md](agents.md#android).
 
+## Updating
+
+New versions come as commits on `main`. With an agent, paste this:
+
+```
+Update macbox on this machine to the latest version: https://github.com/TUNA-NOPE/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
+```
+
+By hand, in the checkout:
+
+```sh
+git status                        # local changes? keep them aside first (git stash)
+git pull --ff-only
+./macbox agents install           # links the tools, skills and units again (paths change between versions)
+./macbox doctor
+git diff --stat ORIG_HEAD -- src/versions.env src/patches   # anything here: rebuild
+./macbox build                    # 20 to 60 minutes; the running VM keeps its QEMU meanwhile
+./macbox down && ./macbox up      # the new build and switches; closes what runs in the VM
+./macbox status && ./macbox coherent status
+```
+
+- **Your config stays yours.** `~/.config/macbox/macbox.env` keeps the values `macbox init` wrote,
+  so a new default doesn't reach you by itself. Compare it with the table in
+  [2. Config and checks](#2-config-and-checks). For example, `MACBOX_COHERENT=off` in it is what `init` wrote
+  before the default became `auto`, which turns on Coherent and the switches measured with it on
+  an Arrow Lake iGPU.
+- **Nothing inside macOS needs redoing** unless the release notes say so (then `./macbox provision`).
+  After a T3 Code update, run `./macbox t3 fix-hub` again, as always.
+- **Going back:** every build stays installed beside the others in
+  `$MACBOX_HOME/home/.local/share/reims-ctl/qemu/`, and `qemu/current` points at the one that
+  starts. Point it at the previous one (`ln -sfn <id> .../qemu/current`), or check out the previous
+  commit and `./macbox build`, then `./macbox down && ./macbox up`.
+
 ## Day to day
 
 ```sh

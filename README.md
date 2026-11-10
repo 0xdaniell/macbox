@@ -67,6 +67,17 @@ git clone https://github.com/TUNA-NOPE/macbox && cd macbox
 `macbox next` walks you through the rest: installing macOS, Xcode, the simulator pool and the
 agent tools. [docs/setup.md](docs/setup.md) has every step.
 
+## Update
+
+Already running macbox? Give your agent this:
+
+```
+Update macbox on this machine to the latest version: https://github.com/TUNA-NOPE/macbox. Follow the "Updating" section of its AGENTS.md and ask me before you restart the VM or change the host.
+```
+
+It pulls the new version, links the tools again, rebuilds if the GPU stack changed, and restarts the
+VM when you say so. By hand: [docs/setup.md, Updating](docs/setup.md#updating).
+
 ## Performance
 
 <picture>

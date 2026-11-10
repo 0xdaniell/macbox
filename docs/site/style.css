@@ -239,6 +239,5 @@ td strong { color: var(--ink); font-weight: 600; }
 @media (max-width: 760px) { .cols { grid-template-columns: 1fr 1fr; } .cols > div { grid-column: 1 / -1; } }
 @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
 
-.hero .eyebrow{display:flex;flex-direction:column;align-items:center;gap:14px}
-.hero .eyebrow .mark{width:72px;height:72px;filter:drop-shadow(0 8px 24px rgba(91,77,230,.28))}
 .brand img{display:block;border-radius:6px}
+#update { margin-top: 40px; }

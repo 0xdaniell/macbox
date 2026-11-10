@@ -22,6 +22,7 @@ publishing on their behalf.
 - [README](https://github.com/TUNA-NOPE/macbox/blob/main/README.md): what it is, requirements, quick start, performance, FAQ, comparison with Docker-OSX and cloud simulators
 - [AGENTS.md](https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md): for an agent setting macbox up on a host, including the steps in macOS's GUI (macbox screenshot, click, type)
 - [Setup, step by step](https://github.com/TUNA-NOPE/macbox/blob/main/docs/setup.md)
+- [Updating an existing install](https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md#updating): for an agent asked to bring macbox to the latest version; by hand in docs/setup.md#updating
 
 ## Using it from an agent
 
