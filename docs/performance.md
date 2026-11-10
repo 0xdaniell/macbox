@@ -43,11 +43,11 @@ Pro at 3x (1206x2622), frames per second counted at the simulator's own screen:
 | macbox, 2026-10-28 (in place rendering, 0004) | 38.5 / 39.5 | 25.0 ms/frame |
 | macbox cohwl, Coherent off (flat32), 2026-11-05 | 50.6 (p95 21.4 ms, p99 25.8 ms) | 97% busy |
 | macbox cohwl, Coherent on, 2026-11-05 | 70.0 (p95 17.7 ms, p99 22.0 ms) | 70% busy |
-| **macbox now** (Coherent and the switches below, 2026-11-09) | **117** (114–121 over runs) | 7.7 ms/frame |
+| **macbox now** (Coherent and the switches below, 2026-11-10) | **120** (118.7–120.9 over runs) | 7.7 ms/frame |
 
-The iPhone 17 Pro's screen runs at up to 120 Hz, so 117 is close to the most a single simulator can
+The iPhone 17 Pro's screen runs at up to 120 Hz, so 120 is the most a single simulator can
 show; GlassBench's own content animates at 60 Hz, and the simulator redraws on top of it. The
-cohwl rows are one A/B in one window; the last row comes from the soak and A/B runs of 2026-11-09
+cohwl rows are one A/B in one window; the last row comes from the soak, A/B and lab runs of 2026-11-09
 and -10 (fresh headless boots, Simulator.app closed). flat32 also has an A/B of its own against the
 build before it: 41.6 → 48–50 fps.
 

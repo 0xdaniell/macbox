@@ -9,7 +9,7 @@ ROWS = [  # label, sublabel, fps (3x, mean of the valid rounds), kind
     ("macbox, Oct 28", "in place rendering", (38.5 + 39.5) / 2, "after"),
     ("macbox, Nov 5", "cohwl: flat32", 50.6, "after"),
     ("+ Coherent", "zero-copy surfaces, Nov 5", 70.0, "after"),
-    ("macbox now", "Coherent + grouped completion", 117.0, "now"),
+    ("macbox now", "Coherent + grouped completion", 120.0, "now"),
 ]
 MODES = {
     "light": dict(surface="#fcfcfb", text="#0b0b0b", text2="#52514e", grid="#e4e3df", before="#eb6834", after="#2a78d6"),
@@ -49,7 +49,7 @@ def svg(m):
         o.append(f'<text x="{X0 - 14}" y="{y + 13}" font-size="13.5" font-weight="600" text-anchor="end" fill="{c["text"]}">{label}</text>')
         o.append(f'<text x="{X0 - 14}" y="{y + 28}" font-size="11.5" text-anchor="end" fill="{c["text2"]}">{sub}</text>')
         o.append(bar(y, v, col, 1.0 if kind in ("before", "now") else 0.55))
-        o.append(f'<text x="{x(v) + 8:.1f}" y="{y + BAR / 2 + 5}" font-size="13.5" font-weight="600" fill="{c["text"]}">{v:.1f}</text>')
+        o.append(f'<text x="{x(v) + 8:.1f}" y="{y + BAR / 2 + 5}" font-size="13.5" font-weight="600" fill="{c["text"]}">{v:g}</text>')
         y += BAR + GAP
     o.append("</svg>")
     return "\n".join(o) + "\n"

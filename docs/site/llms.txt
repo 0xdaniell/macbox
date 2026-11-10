@@ -1,6 +1,6 @@
 # macbox
 
-> Run macOS, Xcode and the real iOS Simulator on a Linux host, in Docker, with GPU acceleration (Metal through Reims vGPU and metal2vulkan on the host's Vulkan GPU), for AI coding agents such as Claude Code, Codex and T3 Code. An iPhone 17 Pro simulator at 3x runs a Liquid Glass benchmark at 117 fps on an Intel Arrow Lake iGPU (17 before macbox's patches). No Mac and no cloud service: one CLI, `macbox`, builds and runs it, and `mac-sim` gives each agent checkout its own iOS Simulator to build, run, tap, screenshot, record and measure at 60 fps.
+> Run macOS, Xcode and the real iOS Simulator on a Linux host, in Docker, with GPU acceleration (Metal through Reims vGPU and metal2vulkan on the host's Vulkan GPU), for AI coding agents such as Claude Code, Codex and T3 Code. An iPhone 17 Pro simulator at 3x runs a Liquid Glass benchmark at 120 fps on an Intel Arrow Lake iGPU (17 before macbox's patches). No Mac and no cloud service: one CLI, `macbox`, builds and runs it, and `mac-sim` gives each agent checkout its own iOS Simulator to build, run, tap, screenshot, record and measure at 60 fps.
 
 License: PolyForm Noncommercial 1.0.0 for macbox's own code (noncommercial use; commercial use needs permission); the patches stay GPL-2.0-or-later OR LGPL-3.0-or-later (GPL-2.0-or-later for the QEMU ones).
 
