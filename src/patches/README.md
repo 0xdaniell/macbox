@@ -59,13 +59,14 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0030 `REIMS_VGPU_PAGED_BUFFER_BY_PAGES` | finds kept paged buffers by their guest pages; off |
 | 0031–0033 staged page-ups | `REIMS_VGPU_STAGED_PAGE_UP`, `REIMS_VGPU_STAGED_ZERO`: a new texture's first page-up copies its pages into a staging buffer (one copy per run) when no live view covers them, and pages of zeros write nothing. Before, each page run took its own mapping: 55k a second and a storm of TLB shootdowns; the simulator went from 89 to 101 fps. On with Coherent |
 
-## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 13 patches
+## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 14 patches
 
 | Patches | What they do |
 |---|---|
 | 0001–0003, 0006–0009 the census | memslots move to a second mapping of guest RAM that only KVM uses, and userfaultfd markers there report the guest CPU's touches of tracked pages (`UFFD_USER_MODE_ONLY`: no capability or `/dev/userfaultfd` needed). QEMU's own loads, stores and DMA reach it too. Off unless `REIMS_VGPU_CENSUS` is set. |
 | 0004, 0005 coherent pages | with `REIMS_VGPU_COHERENT=1` the same markers serve metal2vulkan's trap-coherent surfaces. A run that doesn't end well leaves `coherent.running` in the census directory, and every later start boots without coherent pages until it's removed (`macbox coherent reset`), so a fault there costs one crash, not a crash loop. |
 | 0010–0013 KVM shortcuts for the GPU device | `x-irqfd` (interrupts through a KVM irqfd), `x-halt-poll-ns`, `x-ioeventfd` (doorbells through KVM ioeventfds): device properties, all off unless set |
+| 0014 the video devices | upstream's own 4895365e5b (on `steelbrain/reims-vgpu`, after bd95509), unchanged: `apple-videotoolbox-pci` (106b:1a03) and `apple-m2scaler-pci` (106b:1a0b), the transports of Reims's VideoToolbox and scaler devices. Without it the build can't attach them. Drop it when `QEMU_REF` moves past 4895365e5b. The devices stay detached unless `MACBOX_VIDEO=on` |
 
 ## Licenses
 
