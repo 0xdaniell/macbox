@@ -214,6 +214,26 @@ already be NV12 laid out that way. And the bitrate it reaches is close to the ta
 the same bitrate, measured on a recorded scroll at full size (SSIM): H.264 0.982 at 4 Mbit/s and
 0.998 at 12 Mbit/s; HEVC 0.998 and 0.9996.
 
+### Where a streamed frame's time goes
+
+Measured on 2026-11-13 with the hardware encoder, an iPhone 17 Pro at 1206x2622:
+
+| Stage | Time |
+|---|---|
+| reading the 12.7 MB framebuffer IOSurface (memcpy) | 5 ms cold, 1.4 ms warm |
+| `IOSurfaceLock` before that read | 0.01 ms on a still screen; while the screen changes, until the GPU has finished the frame the simulator just announced (GlassBench ~10 ms, Safari scrolling 42-63 ms) |
+| BGRA to NV12 with vImage, including that wait | 18 ms p50 (GlassBench) |
+| hardware encode | 7.4 ms p50, 8.4 ms p95 |
+| decode in the browser (WebCodecs) | 1.4-5 ms |
+
+The lock's wait is not a copy back from the GPU: an idle simulator's surface locks at once while the GPU is
+busy, and the wait follows the simulator's own frame rate. So the stream gets what the simulator draws: GlassBench
+45-50 frames a second at `--fps 60` (439 of 456 frames new pictures), Safari's JS-driven pages about 20 (the
+compositor redraws 50-70 times a second, mostly with the same pixels). Faster panels come from a faster
+simulator, which is the GPU: with Coherent's surfaces off the render engine runs 86% busy with one GlassBench
+simulator. Reading with `kIOSurfaceLockAvoidSync` returns stale or torn pictures, and overlapping several synced
+reads gains nothing.
+
 ## Tried, no gain
 
 | | Result |
