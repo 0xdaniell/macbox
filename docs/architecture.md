@@ -56,7 +56,7 @@ and the QEMU command line; `reims-ctl command mac` (inside the container) prints
   container's port 22 to the guest, and Docker publishes that as `127.0.0.1:$MACBOX_SSH_PORT`.
   reims-ctl's own forward would listen on the container's loopback, which Docker can't publish.
 - `-set drive.disk.discard=unmap` (guest TRIM frees space) and `cache=$MACBOX_DISK_CACHE`.
-- `--video-acceleration=false` (no VideoToolbox/M2 scaler devices), a borderless window,
+- `--video-acceleration=false`, a borderless window,
   `REIMS_VGPU_STATS=1` (a line of frame statistics a second in `logs/qemu.log`).
 - Before each start: `WAYLAND_DISPLAY` (sway's, or the host's), and the GPU tuning:
   `M2V_LIVE=$MACBOX_HOME/run/live.conf` with `host_rt_in_place=1`,
@@ -64,6 +64,9 @@ and the QEMU command line; `reims-ctl command mac` (inside the container) prints
   Coherent (`MACBOX_COHERENT`, on by default with an Arrow Lake GPU) the census, Coherent and the
   switches measured with it, in `live.conf` and Reims's environment ([performance.md](performance.md)).
   The disk's options in `extra_args` are written again, so a changed `MACBOX_DISK_CACHE` applies.
+- With `MACBOX_VIDEO=on`, Reims's VideoToolbox (`apple-videotoolbox-pci`, slot 8) and M2 scaler
+  (`apple-m2scaler-pci`, slot 9) devices in `extra_args`, where reims-ctl's newer releases put them.
+  The guest drives them with reims-util's x86-64 ports of Apple's drivers (`macbox video-kexts`).
 
 The system disk starts on SATA, because macOS's installer may not find a disk on NVMe, and moves to
 NVMe with `macbox disk nvme` once macOS is installed.

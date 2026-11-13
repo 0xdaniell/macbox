@@ -190,6 +190,30 @@ What to know before relying on it:
   boot with it (2026-11-14), streamed iPhone screens refused 11 arms, all counted as reads, and the
   write-loss gates stayed clean over 2,060 surface reports.
 
+## Hardware video encoding (`MACBOX_VIDEO`)
+
+Without Reims's video devices, macOS in the VM has only VideoToolbox's software H.264 encoder.
+Streaming an iPhone 17 Pro simulator at its full 1206x2622 (T3 Code's Device panel) keeps
+`VTEncoderXPCService` at about 610 MB and, while the screen scrolls, 75-100% of a core. With
+`MACBOX_VIDEO=on` and the video kexts, VideoToolbox picks Reims's hardware encoder, which encodes on
+the host's GPU through VA-API (Intel iHD on Arrow Lake: H.264 and HEVC; no AV1 encoder is exposed,
+and macOS's VideoToolbox has none either). Measured on Tahoe on 2026-11-13, one boot, the same
+simulator, A/B in two rounds:
+
+| | Software encoder | Hardware encoder |
+|---|---|---|
+| `VTEncoderXPCService` memory | 613-620 MB | 9-18 MB |
+| its CPU while scrolling | 73-75% of a core | ~0% |
+| encode per frame | 82 ms (p50, scrolling) | 8-9 ms, of which ~7 on the host's GPU |
+| host GPU video engine | | 4-10% |
+
+Two things decide whether the hardware path is cheap. VideoToolbox converts anything but 4:2:0
+NV12 (`420v`) with 64-byte row and plane alignment on the guest's GPU first, a Metal pass that
+waits behind the simulators' own rendering (57 ms against 8 ms), so the frames given to it should
+already be NV12 laid out that way. And the bitrate it reaches is close to the target; quality at
+the same bitrate, measured on a recorded scroll at full size (SSIM): H.264 0.982 at 4 Mbit/s and
+0.998 at 12 Mbit/s; HEVC 0.998 and 0.9996.
+
 ## Tried, no gain
 
 | | Result |
