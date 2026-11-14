@@ -276,6 +276,9 @@ frames it sends would save most of that. The throttle is in Simlock's `SimlockCa
 | lossless compression (CCS) on the simulator's surfaces, in three forms | no GPU time saved; a lone simulator lost a third of its frames to host copies |
 | several Vulkan queues (`ANV_QUEUE_OVERRIDE=gc=18`) | about 0% (+4% with three simulators): the GPU is already busy; one i915 context per queue (`gc=8`) was unstable |
 | keeping groups of batches open (`group_keep=1`) | +6–7% with two simulators, but held groups stalled frames up to 200 ms |
+| KVM halt polling off for the VM (gfx `x-halt-poll-ns=0`, QEMU 0011) | 3 simulators at 3x: +3.6% (96.0 → 99.5 fps, 0.8 fewer QEMU cores). One simulator: −3.3% (104.7 → 101.2), with more groups held 8 ms or longer. Halt polling stays on (2026-11-14) |
+| a read trap waits for a write running over its surface (`surface_coherent_trap_wait=1`, 0097) | No faster: 1 simulator −0.5%, 3 simulators +1.4%. It never waited once in 6,222 census reports, and a screenshot taken with it on still tore (1 in 90). The tears come by another path. Off (2026-11-14) |
+| holding a group open until its deadline (`group_keep=1 group_wake=1`, 0096) | 3 simulators at 3x: +0.4%, within noise (2026-11-14) |
 | lowering a simulator's draws on a second thread | 90 → 72 fps: the first thread waits for it |
 | a deeper FIFO pipeline (32 execs instead of 8) | slower: 109 → 97 fps, desktop p99 27 → 37 ms |
 
