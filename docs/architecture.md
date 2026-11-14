@@ -103,7 +103,7 @@ Everything inside macOS comes from [guest/](../src/guest/README.md), copied to `
 | the pool | macOS | `macbox-guest pool create`: simulators named `<device> (<prefix> <label>)`, custom 1x device types copied from the stock profile with `mainScreenScale` changed |
 | `mac-sim` | host | claims a pool simulator per checkout (git root), copies the checkout to the Mac, builds there, runs Metro on the host (`macbox-sim-metro-<name>`, a user unit) and reaches it from the Mac through an SSH reverse tunnel, drives the simulator with agent-device. State in `~/.local/state/macbox/mac-sim/` |
 | `mac-sim-remote` | macOS, `~/.local/lib/mac-sim/` | the Mac side of mac-sim; mac-sim copies it there when it changes |
-| `mac-sim-idle.timer` | host | every 5 minutes, shuts down pool simulators idle for 20 minutes (no mac-sim command, no viewer, no app coming to the front) |
+| `mac-sim-idle.timer` | host | every 5 minutes, shuts down pool simulators idle for 15 minutes (no mac-sim command, no viewer, no app coming to the front) |
 | `sim-fps` | host | reads a recording; fps and dropped frames per stretch of motion |
 | `android-sim` | host | the same shape for local Android emulators |
 

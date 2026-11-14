@@ -80,7 +80,7 @@ The iOS Simulator draws on the host's GPU through the VM's virtual GPU, so the h
 
 ## Rules
 
-- **Close it when the task is done: `mac-sim down` / `android-sim down`.** The pools are shared with other agents and the user. Idle iOS simulators shut down after 20 minutes without a `mac-sim` command or a viewer; a forgotten Android emulator stops after 6 hours.
+- **Close it when the task is done: `mac-sim down` / `android-sim down`.** The pools are shared with other agents and the user. Idle iOS simulators shut down after 15 minutes without a `mac-sim` command or a viewer; a forgotten Android emulator stops after 6 hours.
 - **Snapshots are the truth.** Refs (`@eN`) change with the screen; take a new snapshot before each tap.
 - Use your checkout's simulator only. Don't erase or reset pool simulators, and don't restart CoreSimulatorService (it shuts down every simulator on the Mac). Don't run Simulator.app or `npx expo run:ios` on the Mac: Simulator.app opens a window per simulator and doubles the GPU work. An Android emulator the user opened from the Device panel is theirs; use it only when they ask.
 - **The `full` iOS simulator is also the user's own.** Don't change its settings or erase it; `mac-sim down` leaves it running.

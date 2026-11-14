@@ -5,7 +5,7 @@ Read the `simulators` skill before you start one. Every simulator runs on this m
 - **Android** (if set up): `android-sim`, local emulators, one per checkout, so don't wait for another agent's. In T3 Code, open yours in the Device panel with `device_open` (`hostId` `local`, the serial `android-sim serial` prints). Leave an emulator alone if the user opened it from the panel.
 - **Web:** run it here (`npx expo start --web`, or the project's own dev server) and look at it in T3 Code's browser.
 - **Verify every UI change in the simulator:** run it, take a screenshot and look at it, record the whole flow and check with `sim-fps` that it holds 60 fps with no dropped frames. The skill has the loop and the checklist.
-- Close it when the task is done: `mac-sim down` / `android-sim down`.
+- **You start it, you stop it.** Start a simulator only when the work needs it, reuse the one your checkout already has, and close it as soon as you're done with it: `mac-sim down` / `android-sim down` (and `device_close` for one you opened in the Device panel). An iOS simulator nobody uses for 15 minutes is shut down anyway.
 - If the Mac doesn't answer: `macbox status`, then `macbox up`.
 - **A real phone** (an `.ipa` for the user's iPhone, TestFlight, an `.apk`): the `phone-builds` skill (`phone-build`). Free EAS cloud builds go first, then the build runs here.
 <!-- macbox:simulators end -->
