@@ -346,7 +346,7 @@ It is an Atlas patch to Simlock's capture for now, not part of macbox.
 | lowering a simulator's draws on a second thread | 90 → 72 fps: the first thread waits for it |
 | a deeper FIFO pipeline (32 execs instead of 8) | slower: 109 → 97 fps, desktop p99 27 → 37 ms |
 | the stream without sway: Selkies' own compositor hosts the window (pixelflux's frontend), not sway + wlr-screencopy | no gain (2026-11-14, 3440x1440, 120 fps counter clip, sway/own/sway/own): the render engine's cost only moves from sway (28–38%) to Selkies' GLES composite (32%); distinct frames 60.4 and 59.9 with sway, 60.0 and 55.9 without. Encode (video 14%) and CPU (12–13%) the same. Only a capture straight from Reims, with no compositor's full-frame pass, would save it |
-| Liquid Glass at 1080 (Reduce Transparency on) | no change: Safari's self-scrolling page 43 vs 44 presents/s. Dock auto-hide +10%, the window dragged 60 px down +28%: the cost follows what the window overlaps, not the transparency (2026-11-14) |
+| Liquid Glass at 1080 (Reduce Transparency on) | no change: Safari's self-scrolling page 43 vs 44 presents/s. Dock auto-hide +10%; the window's position changes it by ±10–28% from run to run, not reproducibly (2026-11-14). Per pass (M2V_PASS_TIMES) the page costs 14 ms of GPU a frame in 140 units and 58 command buffers, with the GPU busy only 68% of the frame: submission overhead, tile-shader dispatch (2.5 ms) and toolbar-sized material passes (3.2 ms) |
 
 ## Known limits
 
