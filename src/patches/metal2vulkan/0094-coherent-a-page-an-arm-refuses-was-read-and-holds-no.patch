@@ -1,0 +1,172 @@
+From 435645c3fa941cad87444bee863579fb90e47f1a Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 09:09:57 +0000
+Subject: [PATCH] coherent: a page an arm refuses was read, and holds no write
+
+QEMU's census keeps a held page read-only since 76860f1918 ("held pages are
+read-only"): a write to it traps first. POISON refuses a page only because a
+vCPU read it as its mapping went, and the page stays held. The library still
+took such a page as the guest's (note_came), from before that change: the next
+held batch's late copy in took the page's rows, and where a record of another
+command buffer was still running over them, the page's older bytes could land
+over its writes. coherent-gates counts that as overwrite_risk (risk_by 3), and
+on 2026-11-13 it turned production's Coherent off: a Device panel capture read
+an iPhone's screen surface each frame, as draws over it completed.
+
+A refused page is synced at once as before (no trap comes for it), counted as
+refused_reads, and nothing copies it in. The probe's refused pages likewise.
+Tests (lavapipe): the incident replayed gives risk_by [0,0,0,1,...] before the
+fix and 0 after; the refused-arm test follows the new contract.
+---
+ .../src/shadow_coherent.rs                    | 26 +++++++---
+ .../src/runtime_lane/surface_coherent.rs      | 49 +++++++++++++++++--
+ 2 files changed, 64 insertions(+), 11 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index 04a2fa5f5..d3b739dc7 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -126,8 +126,10 @@ pub trait Pages: Send + Sync {
+     fn track(&self, start: u64, len: u64) -> bool;
+     /// Every marker off the range [`track`](Self::track) gave that holds `start`; nothing else.
+     fn untrack(&self, start: u64);
+-    /// Held pages armed: the next access traps. Others stay. The pages a CPU reached as their
+-    /// markers moved come back, still held, and they may hold a write: the caller has them.
++    /// Held pages armed: the next access traps. Others stay. The pages a CPU read as their
++    /// markers moved come back, still held: no trap comes for them, so the caller syncs them now.
++    /// They hold no write: a held page is read-only, and a write to it traps first (QEMU's census
++    /// since 76860f1918, "held pages are read-only").
+     fn arm(&self, pages: &[u64]) -> Vec<u64>;
+     /// Armed pages, and open ones with `open_too`, held; the pages a CPU may have reached as the
+     /// markers moved come back.
+@@ -595,6 +597,7 @@ struct Counts {
+     eager: AtomicU64,
+     merges: AtomicU64,
+     came: AtomicU64,
++    refused_reads: AtomicU64,
+     flushes: AtomicU64,
+     flushed_bytes: AtomicU64,
+     copy_ins: AtomicU64,
+@@ -1088,11 +1091,13 @@ impl Coherent {
+         self.counts.arm_ns.fetch_add(spent, Ordering::Relaxed);
+         self.counts.arms.fetch_add(1, Ordering::Relaxed);
+         self.charge(state, spent);
+-        // No trap comes for these: the sync is now, before anyone hears of this completion. A CPU
+-        // write in the rectangle raced the GPU's; one beside it stays, and the image takes it.
++        // No trap comes for these: the sync is now, before anyone hears of this completion. A
++        // refused page was being read, and it stays held, read-only: it holds no write for the
++        // image to take. Taking it as the guest's would copy the page's bytes in over a record
++        // still running there (`taking_late`'s overwrite_risk, risk_by 3).
+         if !refused.is_empty() {
+             self.sync_done(state, SyncBy::Refused);
+-            self.note_came(state, refused);
++            self.note_refused(&refused);
+         }
+     }
+ 
+@@ -1155,6 +1160,11 @@ impl Coherent {
+         self.judge(state);
+     }
+ 
++    /// Pages an arm or a probe left held because a CPU read them: counted, nothing more.
++    fn note_refused(&self, refused: &[u64]) {
++        self.counts.refused_reads.fetch_add(refused.len() as u64, Ordering::Relaxed);
++    }
++
+     /// A page the guest reached as its markers moved may hold a write: the image takes it again.
+     fn note_came(&self, state: &mut State, came: Vec<u64>) {
+         self.counts.came.fetch_add(came.len() as u64, Ordering::Relaxed);
+@@ -2017,8 +2027,9 @@ impl Coherent {
+         state.probed_at = Some(Instant::now());
+         self.counts.probes.fetch_add(1, Ordering::Relaxed);
+         if let Some(mark) = pages() {
++            // A refused page stays held, read-only: the write in flight reruns, and names it.
+             let refused = mark.probe(&self.all_pages());
+-            self.note_came(&mut state, refused);
++            self.note_refused(&refused);
+         }
+     }
+ 
+@@ -2135,7 +2146,7 @@ impl Coherent {
+              \"copy_ns\":{},\"track_ns\":{},\"sync_by\":{{{}}},\"spent_ns\":{},\"saved_ns\":{},\
+              \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
+              \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
+-             \"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
++             \"refused_reads\":{},\"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+              \"overwrite_risk\":{},\"sync_errors\":{},\"late_copies\":{},\"late_busy\":{},\
+              \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+              \"late_beside\":{},\"risk_by\":[{}],\"pending_done\":{},\"open_pages\":{},\
+@@ -2173,6 +2184,7 @@ impl Coherent {
+             read(&c.eager),
+             read(&c.merges),
+             read(&c.came),
++            read(&c.refused_reads),
+             read(&c.probes),
+             read(&c.flushes),
+             read(&c.flushed_bytes),
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+index 4993992e2..ca9100714 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_coherent.rs
+@@ -626,13 +626,54 @@ fn surface_coherent_a_page_refused_its_arm_syncs_at_once_and_goes_back_to_the_im
+         case.draw(RED, None);
+         case.read(0, 0);
+         case.fake.refused.lock().unwrap().push(case.base() + 3 * PAGE);
+-        // The guest's write landed unseen in the window, beside the rectangle.
+-        case.mapping.write((3 * ROW + 400) as usize, &[9, 9, 9, 9]);
+         case.draw(GREEN, scissor(0, 0, 16, 16));
+         assert_eq!(case.behind(0, 3), GREEN_TEXEL, "no trap comes for that page");
+         assert_eq!(case.fake.armed_pages(), 0, "the rectangle went with it");
+-        assert_eq!(case.count("came"), 1);
+-        assert_eq!(case.through_image(100, 3), [9, 9, 9, 0]);
++        // A refused page was read, and stays held (read-only in QEMU's census): no write of the
++        // guest's to take, so nothing goes back to the image.
++        assert_eq!(case.count("came"), 0);
++        assert_eq!(case.count("refused_reads"), 1);
++        assert_eq!(case.through_image(100, 3), [0, 0, 255, 0], "the older texels");
++    });
++}
++
++/// Production 2026-11-13 (a Device panel capture reading an iPhone's screen): a batch held for a
++/// signal, a write of another queue's committed over row 7, then an arm refused a page the guest
++/// was reading, as a third command buffer's draw beside it completed. A refused page counted as
++/// the guest's (`came`) gave the held batch's late copy in that page's rows, with the write still
++/// running there: where it had run first, the page's older bytes would land over it
++/// (overwrite_risk, risk_by 3). It holds no write: nothing copies in.
++#[test]
++fn surface_coherent_a_page_refused_by_a_read_keeps_a_write_in_flight() {
++    on_surface(true, |case| {
++        case.draw(RED, None);
++        assert_eq!(case.read(0, 0), RED_TEXEL);
++        let hold = case.device.new_shared_event().unwrap();
++        let waiting = case.queue.command_buffer().unwrap();
++        blend_after(&case, &waiting, &hold, scissor(0, 64, WIDTH, HEIGHT - 64));
++        waiting.commit().unwrap();
++        let other = case.device.new_command_queue().unwrap();
++        let gate = case.device.new_shared_event().unwrap();
++        let writer = other.command_buffer().unwrap();
++        writer.encode_wait_for_event((&gate).into(), 1).unwrap();
++        case.pass(&writer, GREEN, scissor(0, 7, 64, 1));
++        writer.commit().unwrap();
++        // A draw beside it, over row 7's page, completes while the guest reads that page.
++        case.fake.refused.lock().unwrap().push(case.base() + (7 * ROW / PAGE) * PAGE);
++        let third = case.device.new_command_queue().unwrap();
++        let beside = third.command_buffer().unwrap();
++        case.pass(&beside, RED, scissor(128, 0, 64, 16));
++        run(&beside);
++        hold.set_signaled_value(1);
++        waiting.wait_until_completed_for(SOON).unwrap();
++        gate.set_signaled_value(1);
++        writer.wait_until_completed_for(SOON).unwrap();
++        eprintln!("REFUSED-READ report {}", shadow_coherent::report("refused"));
++        assert_eq!(case.read(8, 7), GREEN_TEXEL, "the write in flight");
++        assert_eq!(case.read(0, 100), [0, 0, 255, 0], "the older texels");
++        assert_eq!(case.count("overwrite_risk"), 0);
++        assert_eq!(case.count("came"), 0);
++        assert_eq!(case.count("refused_reads"), 1);
+     });
+ }
+ 
+-- 
+2.53.0
+
