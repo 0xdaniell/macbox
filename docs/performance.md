@@ -234,6 +234,23 @@ simulator, which is the GPU: with Coherent's surfaces off the render engine runs
 simulator. Reading with `kIOSurfaceLockAvoidSync` returns stale or torn pictures, and overlapping several synced
 reads gains nothing.
 
+With Coherent's surfaces on (2026-11-14) the simulator outran the stream: GlassBench drew 87 frames a second
+(p50 10.8 ms) and the stream carried 50-52. The capture's fps throttle measures each frame against the last one
+it sent, so with frames 11.5 ms apart at `--fps 60` every other one fell inside the interval. Pacing on a grid
+of the interval instead passes one frame per 16.7 ms slot, with a quarter interval's tolerance for jitter.
+Measured through Simlock's gateway, the route T3 Code's panel streams from, with one other simulator running:
+
+| | Throttle on the last frame | Throttle on a grid |
+|---|---|---|
+| GlassBench (simulator at 87 fps) | 50.5-52.0 fps, gaps p50/p95 19-20/25-27 ms | 58.6-58.8 fps, 17.4/26.2 ms |
+| Safari scrolling (simulator at 64 fps) | 28.7 fps | 51.5 fps |
+| tap to decoded frame, p50 (A/B, alternating, 30 taps each) | 64.9 and 64.2 ms | 60.5 and 61.4 ms |
+| copy, encode, capture-to-wire (p50) | 9.5, 9.0, 9.0 ms | 9.2, 9.3, 9.6 ms |
+
+The capture still copies every new frame before the throttle (about 90% of a core at 87 fps); copying only the
+frames it sends would save most of that. The throttle is in Simlock's `SimlockCapture/Lifecycle.swift`
+(`encodeLoop`), shared with serve-sim.
+
 ## Tried, no gain
 
 | | Result |
