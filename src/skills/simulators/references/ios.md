@@ -79,9 +79,9 @@ You run on the same machine as the Mac, so the stream in T3 doesn't matter to yo
 ## Rules
 
 - **Close it when the task is done: `mac-sim down`.** A claim nobody uses for 3 hours (`MAC_SIM_IDLE_HOURS`) is freed by the next `mac-sim` command, and its simulator shut down.
-- **Idle simulators are shut down, the full one too.** Every 5 minutes a user timer (`mac-sim-idle.timer`) shuts down a pool simulator that was booted at least 20 minutes ago (`MAC_SIM_IDLE_MINUTES`) and, for 20 minutes, had no `mac-sim` command, no viewer (T3's Device panel while it's visible, a hub's WebRTC viewer, Simulator.app) and no app coming to the foreground. The claim stays, and so do Metro and the tunnel:
+- **Idle simulators are shut down, the full one too.** Every 5 minutes a user timer (`mac-sim-idle.timer`) shuts down a pool simulator that was booted at least 15 minutes ago (`MAC_SIM_IDLE_MINUTES`) and, for 15 minutes, had no `mac-sim` command, no viewer (T3's Device panel while it's visible, a hub's WebRTC viewer, Simulator.app) and no app coming to the foreground. The claim stays, and so do Metro and the tunnel:
   - The next `mac-sim` command (`up`, `run`, `snapshot`, `ad`, `shot`, `open`...) boots it again and says it had been shut down. Apps that were open are closed: `mac-sim run` again. `mac-sim mac`, `udid` and `t3` don't boot it; `mac-sim up` first.
-  - A build or recording in progress counts as use. Waiting more than 20 minutes between commands without anyone watching doesn't.
+  - A build or recording in progress counts as use. Waiting more than 15 minutes between commands without anyone watching doesn't.
   - Shutdowns and their reasons are in `~/.local/state/macbox/mac-sim/idle.log`; `mac-sim status` shows `off (shut down idle at …)`. Simulators outside the pool are never touched.
 - **Snapshots are the truth.** Refs (`@eN`) change with the screen; take a new snapshot before each tap.
 - Don't restart CoreSimulatorService, don't run `simslim`, and don't erase or delete pool simulators: other agents and the user use them.

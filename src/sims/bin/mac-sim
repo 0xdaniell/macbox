@@ -25,7 +25,7 @@
 #   mac-sim clean             delete this checkout's copy and build on the Mac
 #   mac-sim setup             copy the Mac-side helper and install agent-device on the Mac
 #   mac-sim idle [--dry-run] [name...]
-#                             shut down pool simulators idle for MAC_SIM_IDLE_MINUTES (20); run
+#                             shut down pool simulators idle for MAC_SIM_IDLE_MINUTES (15); run
 #                             every 5 minutes by the user timer mac-sim-idle.timer
 #
 # Each checkout (git root) gets its own simulator, so agents in different checkouts work
@@ -63,7 +63,7 @@ POOL=() MISSING=()
 IDLE_HOURS="${MAC_SIM_IDLE_HOURS:-3}"
 # A booted simulator with no mac-sim command, viewer or app switch for this long is shut down
 # by `mac-sim idle` (its claim stays; the next mac-sim command boots it again).
-IDLE_MIN="${MAC_SIM_IDLE_MINUTES:-20}"
+IDLE_MIN="${MAC_SIM_IDLE_MINUTES:-15}"
 HOST="${MAC_SIM_HOST:-${MACBOX_SSH_HOST:-macbox}}"
 T3_HOST_ID="${MACBOX_T3_HOST_ID:-$HOST}"
 # Metro for the i-th pool simulator listens on METRO_BASE + 2i (android-sim uses 8081 up).

@@ -15,7 +15,7 @@ measure.
 | `mac-sim`, `mac-sim-remote`, `sim-fps`, `android-sim`, `android-gpu-desktop`, `phone-build`, `macbox` | links in `~/.local/bin` |
 | the `simulators`, `phone-builds` and `macbox` skills | links in `~/.claude/skills` and `~/.agents/skills` |
 | the "Simulators" section of the instructions ([src/agents/simulators-snippet.md](../src/agents/simulators-snippet.md)) | between `<!-- macbox:simulators -->` markers in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` (each backed up as `.bak-macbox`) |
-| `mac-sim-idle.timer` | a user unit, enabled: idle pool simulators shut down after 20 minutes |
+| `mac-sim-idle.timer` | a user unit, enabled: idle pool simulators shut down after 15 minutes |
 
 Optional: a Claude Code hook that reminds the agent of the skill whenever a prompt mentions a
 simulator ([src/agents/README.md](../src/agents/README.md)). `./macbox agents uninstall` removes the links
