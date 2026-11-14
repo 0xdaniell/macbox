@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 15:09:00 +0000
+Subject: [PATCH] diagnostic: the long-hold line accounts for the pass that
+ held: CPU, run queue, sleeps, queue lock
+
+hs1's A/B at 3x (3 Sims, 2026-11-14) logged groups held 10-47 ms with `passes 0` and no wakings: the
+batches were grouped and the group submitted inside ONE scheduler pass that ran that long, and the
+frames' p99 (45-55 ms) matches. Under group_hold_log_us each pass now notes the scheduler thread's
+schedstat (on-CPU, run-queue wait) and getrusage switches (voluntary = slept, e.g. a lock; involuntary
+= preempted), and every VkQueue lock (QueueSlot::with) adds the calling thread's wait for the lock and
+its use under it. The line adds pass_cpu_us, pass_runq_us, pass_sleeps, pass_preempted,
+queue_lock_us/_max_us, queue_use_us/_max_us: CPU work, a CPU taken away, a blocked lock or
+vkQueueSubmit tell themselves apart. Off by default: no clock read and no file read without the switch.
+---
+ .../src/command_buffer/group.rs               | 68 ++++++++++++++++++-
+ .../src/command_buffer/mod.rs                 |  2 +-
+ crates/metal2vulkan-runtime/src/device/mod.rs | 11 ++-
+ .../metal2vulkan-runtime/src/scheduler/mod.rs |  1 +
+ 4 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 544762c30..a6fbaf313 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -227,6 +227,59 @@ fn sched_wakes() -> [u64; 4] {
+     std::array::from_fn(|at| SCHED_WAKES[at].load(Ordering::Relaxed))
+ }
+ 
++/// LOCAL (Atlas, lab): whether `group_hold_log_us` is set, read once a pass ([`pass_began`]): the
++/// queue's users then count their lock waits and uses ([`queue_used`]).
++static HOLD_LOG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++thread_local! {
++    /// This thread's [`thread_times`] at its pass's start.
++    static PASS_BASE: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
++    /// This thread's waits for a `VkQueue`'s lock and its uses under it since its pass's start: the
++    /// sum and longest of each, in ns.
++    static PASS_QUEUE: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
++}
++
++/// The calling thread's time on a CPU and waiting on a run queue (ns, `schedstat`), and its
++/// voluntary and involuntary context switches (`getrusage`).
++fn thread_times() -> [u64; 4] {
++    let (mut run, mut wait) = (0, 0);
++    if let Ok(text) = std::fs::read_to_string("/proc/thread-self/schedstat") {
++        let mut values = text.split_ascii_whitespace().map(|v| v.parse::<u64>().unwrap_or(0));
++        run = values.next().unwrap_or(0);
++        wait = values.next().unwrap_or(0);
++    }
++    // SAFETY: `getrusage` writes the zeroed struct it is given.
++    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
++    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
++    [run, wait, usage.ru_nvcsw as u64, usage.ru_nivcsw as u64]
++}
++
++/// LOCAL (Atlas, lab): the scheduler's thread begins a pass. Where `group_hold_log_us` is set, its
++/// times and switches are noted, and its queue waits and uses counted from here, for
++/// [`long_hold`]: whether a long pass ran, waited for a CPU, slept, or waited for the queue.
++pub(crate) fn pass_began() {
++    let on = crate::live::get("group_hold_log_us").is_some_and(|v| !v.is_empty() && v != "0");
++    HOLD_LOG_ON.store(on, Ordering::Relaxed);
++    if on {
++        PASS_BASE.set(thread_times());
++        PASS_QUEUE.set([0; 4]);
++    }
++}
++
++/// Whether [`queue_used`] counts: read before a `VkQueue`'s lock is asked for.
++pub(crate) fn queue_counted() -> bool {
++    HOLD_LOG_ON.load(Ordering::Relaxed)
++}
++
++/// LOCAL (Atlas, lab): the calling thread waited `waited` ns for a `VkQueue`'s lock and used the
++/// queue `used` ns under it (a submission, a present, a wait for idle).
++pub(crate) fn queue_used(waited: u64, used: u64) {
++    PASS_QUEUE.with(|queue| {
++        let [w, w_max, u, u_max] = queue.get();
++        queue.set([w + waited, w_max.max(waited), u + used, u_max.max(used)]);
++    });
++}
++
+ /// LOCAL (Atlas, lab): live `group_hold_log_us=N` (0 or unset: off): a group whose first batch
+ /// waited N us or longer before its `vkQueueSubmit` writes one `m2v long-hold:` line to stderr,
+ /// at most 20 a second: how long, how many batches, how often [`Group::keeps`] kept it and when
+@@ -257,9 +310,14 @@ fn long_hold(group: &Group, now: u64) {
+     let wakes = sched_wakes();
+     let woke: Vec<u64> = (0..4).map(|at| wakes[at].saturating_sub(first.wakes_at_hold[at])).collect();
+     let deadline_us = crate::live::get("group_deadline_us").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
++    // This pass's own account (the thread submitting the group made it): its time on a CPU and
++    // waiting for one, its sleeps and preemptions, and its waits for and uses of the queue.
++    let (base, times, queue) = (PASS_BASE.get(), thread_times(), PASS_QUEUE.get());
++    let since = |at: usize| times[at].saturating_sub(base[at]);
+     eprintln!(
+         "m2v long-hold: held_us {} batches {} kept {} last_kept_us_ago {} passes {} woke commit/completion/host/slice {:?} \
+-         max_pass_us {} last_pass_us_ago {} deadline_us {} armed_deadline {} host_waiters {}",
++         max_pass_us {} last_pass_us_ago {} deadline_us {} armed_deadline {} host_waiters {} \
++         pass_cpu_us {} pass_runq_us {} pass_sleeps {} pass_preempted {} queue_lock_us {} queue_lock_max_us {} queue_use_us {} queue_use_max_us {}",
+         held / 1000,
+         group.members.len(),
+         group.kept_times,
+@@ -271,6 +329,14 @@ fn long_hold(group: &Group, now: u64) {
+         deadline_us,
+         KEPT_DEADLINE.load(Ordering::Relaxed) != 0,
+         HOST_WAITERS.load(Ordering::SeqCst),
++        since(0) / 1000,
++        since(1) / 1000,
++        since(2),
++        since(3),
++        queue[0] / 1000,
++        queue[1] / 1000,
++        queue[2] / 1000,
++        queue[3] / 1000,
+     );
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 1aceec491..1066b5379 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -56,7 +56,7 @@ pub(super) use first_submission::{NotedTable, ReplayTable};
+ #[cfg(test)]
+ pub(crate) use group::merges_submissions;
+ pub(super) use group::{group_batches, kept_wait, kept_wake, Group, GroupEnd};
+-pub(super) use group::{SCHED_PASSES, SCHED_PASS_AT, SCHED_PASS_NS_MAX, SCHED_WAKES}; // LOCAL (Atlas, lab)
++pub(super) use group::{pass_began, queue_counted, queue_used, SCHED_PASSES, SCHED_PASS_AT, SCHED_PASS_NS_MAX, SCHED_WAKES}; // LOCAL (Atlas, lab)
+ pub(crate) use group::HostWait; // LOCAL (Atlas, DEEP-GPU)
+ use rebound_use::{ReboundUse, Unlogged};
+ pub(super) use submit::{BatchLists, Submitting};
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 920f2e145..1f45eb9a0 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -855,10 +855,19 @@ pub(super) struct QueueSlot {
+ impl QueueSlot {
+     /// `f` with the queue, under its lock, its loader word put back first.
+     pub(super) fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
++        // LOCAL (Atlas, lab): under `group_hold_log_us`, the wait for the lock and the use under
++        // it count toward the calling thread's pass (`command_buffer/group.rs`'s long-hold line).
++        let asked = crate::command_buffer::queue_counted().then(crate::gpu_time::host_nanos);
+         let queue = lock(&self.raw);
++        let locked = asked.map(|_| crate::gpu_time::host_nanos());
+         // SAFETY: the queue lives while its slot does.
+         unsafe { self.word.restore() };
+-        f(*queue)
++        let used = f(*queue);
++        if let (Some(asked), Some(locked)) = (asked, locked) {
++            let done = crate::gpu_time::host_nanos();
++            crate::command_buffer::queue_used(locked.saturating_sub(asked), done.saturating_sub(locked));
++        }
++        used
+     }
+ 
+     /// The host saw the timeline reach `value`.
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 18822986b..159603c48 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -1059,6 +1059,7 @@ fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -
+         let began = crate::gpu_time::host_nanos();
+         super::command_buffer::SCHED_PASSES.fetch_add(1, Ordering::Relaxed);
+         super::command_buffer::SCHED_PASS_AT.store(began, Ordering::Relaxed);
++        super::command_buffer::pass_began();
+         pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
+         super::command_buffer::SCHED_PASS_NS_MAX
+             .fetch_max(crate::gpu_time::host_nanos().saturating_sub(began), Ordering::Relaxed);
+-- 
+2.53.0
+

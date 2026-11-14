@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Tue, 10 Nov 2026 00:13:43 +0000
+Subject: [PATCH] live group_wake=1: the scheduler's sleep ends at a kept
+ group's deadline
+
+A group kept under group_deadline_us waited for the scheduler's next pass, which a completion wake or the
+100 ms slice brings: kept groups were held up to 200 ms (ANVC-20261109). With group_wake=1 Group::keeps arms the
+deadline and both sleeps (condvar, GPU wait) end there. Off by default; production keeps group_keep=0.
+KEEPW-20261109: fixes the 1-Sim stalls (98 ms -> 5 ms), not all holds with 2-3 Sims (another holder remains).
+---
+ .../src/command_buffer/group.rs               | 22 +++++++++++++++++++
+ .../src/command_buffer/mod.rs                 |  2 +-
+ .../metal2vulkan-runtime/src/scheduler/mod.rs | 14 ++++++++++--
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index f592cb4f4..2b7b2bd5f 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -103,6 +103,24 @@ pub(crate) const GROUP_BATCHES: usize = 64;
+ /// `group_batches` (`live.rs`), 4 where unset, at least 1 and at most [`GROUP_BATCHES`]. Measured
+ /// on the Arrow Lake iGPU (Mesa 26.2.4, i915): each kernel submission a merge saves is about 50 us
+ /// of render-engine time in a Simulator frame's shape (DEEP-GPU lane, 2026-11-05).
++/// LOCAL (Atlas): the host time (`gpu_time::host_nanos`) at which the deadline of the group kept ends, 0 while none
++/// is armed. With the live switch `group_wake=1` [`Group::keeps`] arms it for a group it keeps under
++/// `group_deadline_us`, and the scheduler's sleep ends there ([`kept_wait`], [`kept_wake`]) rather than at its
++/// slice (100 ms): measured 2026-11-09 (ANVC), kept groups waited up to 200 ms for a completion wake.
++static KEPT_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// How long the scheduler may sleep before the kept group's deadline, where one is armed.
++pub(crate) fn kept_wait() -> Option<std::time::Duration> {
++    let at = KEPT_DEADLINE.load(Ordering::Relaxed);
++    (at != 0).then(|| std::time::Duration::from_nanos(at.saturating_sub(gpu_time::host_nanos()).max(20_000)))
++}
++
++/// A sleep ended at its time: whether a deadline was armed, disarmed here (the pass arms it again
++/// where the group stays kept), so a stale one wakes the thread once.
++pub(crate) fn kept_wake() -> bool {
++    KEPT_DEADLINE.swap(0, Ordering::Relaxed) != 0
++}
++
+ pub(crate) fn group_batches() -> usize {
+     crate::live::get("group_batches")
+         .and_then(|value| value.parse::<usize>().ok())
+@@ -485,6 +503,7 @@ impl Group {
+         // not kept past its pass. On Arrow Lake (one `VkQueue`) groups kept past a pass sat behind
+         // waits submitted ahead of them by paths that do not look at the group, until i915's
+         // fence timeout (strong A/B 2026-11-07). Default: kept, as build A.
++        KEPT_DEADLINE.store(0, Ordering::Relaxed);
+         if crate::live::get("group_keep").as_deref() == Some("0") {
+             return None;
+         }
+@@ -513,6 +532,9 @@ impl Group {
+             return None;
+         }
+         let value = device.shared().queues[self.queue].pending_beyond_one()?;
++        if deadline_us != 0 && crate::live::get("group_wake").as_deref() == Some("1") {
++            KEPT_DEADLINE.store(first.held_at + deadline_us * 1000, Ordering::Relaxed);
++        }
+         if !self.kept {
+             self.kept = true;
+             counts.group_kept_pending();
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 69b0cc926..0fc2cbd1b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -55,7 +55,7 @@ pub(super) use first_submission::{NotedTable, ReplayTable};
+ /// (`tests::batches::only_drivers_measured_to_merge_their_submissions_group_their_batches`).
+ #[cfg(test)]
+ pub(crate) use group::merges_submissions;
+-pub(super) use group::{group_batches, Group, GroupEnd};
++pub(super) use group::{group_batches, kept_wait, kept_wake, Group, GroupEnd};
+ pub(crate) use group::HostWait; // LOCAL (Atlas, DEEP-GPU)
+ use rebound_use::{ReboundUse, Unlogged};
+ pub(super) use submit::{BatchLists, Submitting};
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 8fb340aa1..0ae70f54e 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -917,14 +917,19 @@ fn run(shared: &SchedulerShared) {
+                 continue;
+             }
+             state.asleep = true;
++            // LOCAL (Atlas): the sleep ends at a kept group's deadline (`group.rs`, live `group_wake=1`).
++            let slice = super::command_buffer::kept_wait().unwrap_or(WAIT_SLICE);
+             let (woke, waited) = shared
+                 .wake
+-                .wait_timeout(state, WAIT_SLICE)
++                .wait_timeout(state, slice)
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+             state = woke;
+             state.asleep = false;
+             if waited.timed_out() {
+                 shared.wakings[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
++                if super::command_buffer::kept_wake() {
++                    state.dirty = true;
++                }
+             }
+         }
+         if state.stopping {
+@@ -957,6 +962,8 @@ fn wait_for_gpu<'a>(
+     gpu: &mut GpuWait,
+ ) -> std::sync::MutexGuard<'a, State> {
+     shared.gpu_waits.fetch_add(1, Ordering::Relaxed);
++    // LOCAL (Atlas): the wait ends at a kept group's deadline (`group.rs`, live `group_wake=1`).
++    let slice = super::command_buffer::kept_wait().unwrap_or(WAIT_SLICE);
+     let target = state.nudge_value + 1;
+     state.on_gpu = Some(target);
+     drop(state);
+@@ -972,7 +979,7 @@ fn wait_for_gpu<'a>(
+         // the thread stopped; each value is a submitted signal's, or the nudge's next, which a
+         // waker signals.
+         let waited =
+-            unsafe { (nudge.functions.get()).wait_semaphores(&info, WAIT_SLICE.as_nanos() as u64) };
++            unsafe { (nudge.functions.get()).wait_semaphores(&info, slice.as_nanos() as u64) };
+         exit_guard::called(exit_guard::Call::WaitSemaphores);
+         waited
+     });
+@@ -997,6 +1004,9 @@ fn wait_for_gpu<'a>(
+         Some(Ok(())) => {}
+         Some(Err(vk::Result::TIMEOUT)) => {
+             shared.wakings[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
++            if super::command_buffer::kept_wake() {
++                state.dirty = true;
++            }
+         }
+         // A failed wait (a lost device) or an exit: a pass finds out.
+         _ => state.dirty = true,
+-- 
+2.53.0
+
