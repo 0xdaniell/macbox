@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 11:56:36 +0000
+Subject: [PATCH] coherent: a read trap waits for a write running over its
+ surface (live surface_coherent_trap_wait=1)
+
+A CPU read trap synced only completed records. While the next frame ran over the surface, its
+completion armed the pages again mid-read, and the rest of the read trapped into the newer frame:
+one screenshot of two frames, split at a page (simctl io screenshot of a scrolling 3x Simulator,
+3 of 18 on 2026-11-14). A read now waits, bounded by surface_coherent_wait_ms and with no group
+kept, for running records over the surface, as IOSurfaceLock waits for a Mac GPU's pending writes,
+then syncs once. A record held for an event is not waited for (its signal may come from the guest).
+Counted: trap_waits, trap_wait_timeouts, trap_wait_ns. Off by default.
+
+Tests (no GPU): tests::coherent_trap_wait, the torn read without the switch and one frame with it.
+---
+ .../src/shadow_coherent.rs                    | 37 ++++++-
+ .../src/tests/coherent_trap_wait.rs           | 98 +++++++++++++++++++
+ crates/metal2vulkan-runtime/src/tests/mod.rs  |  1 +
+ 3 files changed, 135 insertions(+), 1 deletion(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/tests/coherent_trap_wait.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index d3b739dc7..ddc22e8a2 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -598,6 +598,12 @@ struct Counts {
+     merges: AtomicU64,
+     came: AtomicU64,
+     refused_reads: AtomicU64,
++    /// LOCAL (Atlas): read traps that found a write running over the surface and waited for it
++    /// (`surface_coherent_trap_wait`, [`Coherent::fault`]), those the bound cut short, and the ns
++    /// they waited.
++    trap_waits: AtomicU64,
++    trap_wait_timeouts: AtomicU64,
++    trap_wait_ns: AtomicU64,
+     flushes: AtomicU64,
+     flushed_bytes: AtomicU64,
+     copy_ins: AtomicU64,
+@@ -1312,6 +1318,32 @@ impl Coherent {
+             self.counts.unique_pages.fetch_add(1, Ordering::Relaxed);
+         }
+         self.sync_done(&mut state, SyncBy::Trap);
++        // LOCAL (Atlas): a read that finds a write running over the surface waits for it, a bounded
++        // time, and takes it too, as IOSurfaceLock waits for the GPU's pending writes on a Mac.
++        // Without it the read takes the completed frame while the next one runs; that one's
++        // completion arms the pages again, and the rest of the read, a few ms later, traps into the
++        // newer frame: one screenshot of two frames, split at a page (a Simulator screen read while
++        // it is rendered). A record held for an event is not waited for: its signal may come from
++        // the guest. Live switch `surface_coherent_trap_wait=1`; off, a read takes what completed.
++        if !write && crate::live::on("surface_coherent_trap_wait", false) {
++            let whole = self.layout.whole();
++            let running = (state.running.iter())
++                .any(|record| meet(record.area, whole) && !Self::held_for_event(&state, record.id));
++            if running {
++                let start = Instant::now();
++                self.counts.trap_waits.fetch_add(1, Ordering::Relaxed);
++                let (settled, clear) = self.wait_settled(state, Some(whole), true);
++                state = settled;
++                if !clear {
++                    self.counts.trap_wait_timeouts.fetch_add(1, Ordering::Relaxed);
++                }
++                self.counts.trap_wait_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++                if !state.tracked {
++                    return;
++                }
++                self.sync_done(&mut state, SyncBy::Trap);
++            }
++        }
+         let mark = pages();
+         // Another vCPU's probe may be about to rerun on these pages: only the last of them, which
+         // lets it name its page, ends the probing.
+@@ -2146,7 +2178,7 @@ impl Coherent {
+              \"copy_ns\":{},\"track_ns\":{},\"sync_by\":{{{}}},\"spent_ns\":{},\"saved_ns\":{},\
+              \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
+              \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
+-             \"refused_reads\":{},\"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
++             \"refused_reads\":{},\"trap_waits\":{},\"trap_wait_timeouts\":{},\"trap_wait_ns\":{},\"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+              \"overwrite_risk\":{},\"sync_errors\":{},\"late_copies\":{},\"late_busy\":{},\
+              \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+              \"late_beside\":{},\"risk_by\":[{}],\"pending_done\":{},\"open_pages\":{},\
+@@ -2185,6 +2217,9 @@ impl Coherent {
+             read(&c.merges),
+             read(&c.came),
+             read(&c.refused_reads),
++            read(&c.trap_waits),
++            read(&c.trap_wait_timeouts),
++            read(&c.trap_wait_ns),
+             read(&c.probes),
+             read(&c.flushes),
+             read(&c.flushed_bytes),
+diff --git a/crates/metal2vulkan-runtime/src/tests/coherent_trap_wait.rs b/crates/metal2vulkan-runtime/src/tests/coherent_trap_wait.rs
+new file mode 100644
+index 000000000..61a354005
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/coherent_trap_wait.rs
+@@ -0,0 +1,98 @@
++//! LOCAL (Atlas): a CPU read trap of a trapping surface while the next frame's write runs over it
++//! (`shadow_coherent::Coherent::fault`, live `surface_coherent_trap_wait`). No GPU: the surface's
++//! image is a frame number its reader writes into every texel, and the marks are a stub.
++
++use crate::shadow_coherent::{self, Coherent, Layout, Pages};
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::{Arc, Mutex, Weak};
++use std::time::Duration;
++
++/// The marks: everything given, nothing refused.
++struct Marks;
++
++impl Pages for Marks {
++    fn track(&self, _: u64, _: u64) -> bool {
++        true
++    }
++    fn untrack(&self, _: u64) {}
++    fn arm(&self, _: &[u64]) -> Vec<u64> {
++        Vec::new()
++    }
++    fn hold(&self, _: &[u64], _: bool) -> Vec<u64> {
++        Vec::new()
++    }
++    fn probe(&self, _: &[u64]) -> Vec<u64> {
++        Vec::new()
++    }
++    fn open(&self, _: &[u64]) {}
++    fn freeze(&self, _: &[u64]) {}
++    fn thaw(&self, _: &[u64]) {}
++}
++
++const PAGE: u64 = 4096;
++/// One page a row: 1024 texels of 4 bytes, 8 rows.
++const ROWS: u32 = 8;
++static SERIAL: Mutex<()> = Mutex::new(());
++
++/// A read of the surface's first and last rows as frame 1 has completed and frame 2 runs over the
++/// whole surface, completing 20 ms after the first page traps: the frame each row shows.
++fn read_while_the_next_frame_runs(wait: bool, ids: [u64; 2]) -> [u8; 2] {
++    // Kept for the process: the surface stays in the list of tracked ones, by its address.
++    let memory: &'static mut [u8] = Box::leak(vec![0u8; ((ROWS as u64 + 1) * PAGE) as usize].into_boxed_slice());
++    let base = (memory.as_ptr() as u64).next_multiple_of(PAGE);
++    let layout = Layout { base, row: PAGE, texel: 4, width: 1024, height: ROWS };
++    let frame = Arc::new(AtomicU8::new(1));
++    let image = frame.clone();
++    let reader = Box::new(move |area: [u32; 4], to: *mut u8, row_texels: u32| {
++        let value = image.load(Ordering::SeqCst);
++        for y in 0..(area[3] - area[1]) as usize {
++            let width = ((area[2] - area[0]) * 4) as usize;
++            // SAFETY: `to` is the area's first texel in the surface's rows, which the test owns.
++            unsafe { std::ptr::write_bytes(to.add(y * row_texels as usize * 4), value, width) };
++        }
++        true
++    });
++    crate::live::set("surface_coherent", Some("1"));
++    crate::live::set("surface_coherent_trap_wait", wait.then_some("1"));
++    shadow_coherent::set_pages(Some(Arc::new(Marks)));
++    let surface = Coherent::new(layout, reader, Weak::new());
++    assert!(surface.tracks());
++    let [first, second] = ids;
++    assert!(surface.defers(first, None));
++    surface.committed(first);
++    surface.completing(first);
++    assert!(surface.defers(second, None));
++    surface.committed(second);
++    let running = surface.clone();
++    let gpu = std::thread::spawn(move || {
++        std::thread::sleep(Duration::from_millis(20));
++        frame.store(2, Ordering::SeqCst);
++        running.completing(second);
++    });
++    let row = |y: u64| -> u8 {
++        // SAFETY: inside the surface's rows.
++        unsafe { *((base + y * PAGE) as *const u8) }
++    };
++    shadow_coherent::fault(base, false);
++    let top = row(0);
++    gpu.join().unwrap();
++    // The rest of the read reaches the last page: armed again where frame 2 completed meanwhile.
++    shadow_coherent::fault(base + u64::from(ROWS - 1) * PAGE, false);
++    let bottom = row(u64::from(ROWS - 1));
++    crate::live::set("surface_coherent_trap_wait", None);
++    crate::live::set("surface_coherent", None);
++    shadow_coherent::set_pages(None);
++    [top, bottom]
++}
++
++#[test]
++fn a_read_that_takes_only_completed_frames_tears_at_a_page() {
++    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    assert_eq!(read_while_the_next_frame_runs(false, [u64::MAX - 101, u64::MAX - 102]), [1, 2]);
++}
++
++#[test]
++fn a_read_waits_for_the_frame_running_and_shows_one() {
++    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    assert_eq!(read_while_the_next_frame_runs(true, [u64::MAX - 103, u64::MAX - 104]), [2, 2]);
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index 87e655e97..5ac33c98c 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -246,6 +246,7 @@ mod shader_cache_off_thread;
+ mod shader_cache_queue;
+ mod shader_cache_time;
+ mod coherent_late;
++mod coherent_trap_wait;
+ mod shadow;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod shadow_carried_read;
+-- 
+2.53.0
+

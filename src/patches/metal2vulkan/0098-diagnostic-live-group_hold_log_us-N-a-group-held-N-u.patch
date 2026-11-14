@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 11:59:18 +0000
+Subject: [PATCH] diagnostic: live group_hold_log_us=N: a group held N us or
+ more says what the scheduler did meanwhile
+
+One m2v long-hold line per such group (at most 20 a second): its hold, batches, how often keeps()
+kept it and when last, the scheduler's passes and wakings by kind since its first batch, its longest
+pass meanwhile, the age of its last pass, the deadline and whether a wake is armed. KEEPW-20261109
+left 20-140 ms holds with 2-3 Sims under group_keep=1 group_wake=1 unexplained. Off by default.
+Also trap_wait_ns_max beside trap_wait_ns.
+---
+ .../src/command_buffer/group.rs               | 74 +++++++++++++++++++
+ .../src/command_buffer/mod.rs                 |  1 +
+ .../metal2vulkan-runtime/src/scheduler/mod.rs | 11 +++
+ .../src/shadow_coherent.rs                    |  8 +-
+ 4 files changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 2b7b2bd5f..544762c30 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -214,6 +214,66 @@ struct HoldStats {
+     last: std::sync::atomic::AtomicU64,
+ }
+ 
++/// LOCAL (Atlas, lab): the scheduler thread's passes and wakings by kind (`scheduler::Woken`:
++/// commit, completion, host, slice), and its longest pass since the last group went, for
++/// [`long_hold`]: what the thread did while a batch sat in a group.
++pub(crate) static SCHED_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static SCHED_WAKES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++pub(crate) static SCHED_PASS_NS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++/// The last pass's start (`gpu_time::host_nanos`).
++pub(crate) static SCHED_PASS_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++fn sched_wakes() -> [u64; 4] {
++    std::array::from_fn(|at| SCHED_WAKES[at].load(Ordering::Relaxed))
++}
++
++/// LOCAL (Atlas, lab): live `group_hold_log_us=N` (0 or unset: off): a group whose first batch
++/// waited N us or longer before its `vkQueueSubmit` writes one `m2v long-hold:` line to stderr,
++/// at most 20 a second: how long, how many batches, how often [`Group::keeps`] kept it and when
++/// last, the scheduler's passes and wakings by kind since its first batch, its longest pass
++/// meanwhile, and how long before the submission its last pass began. KEEPW-20261109 left holds
++/// of 20-140 ms with 2-3 Sims under `group_keep=1 group_wake=1` unexplained.
++fn long_hold(group: &Group, now: u64) {
++    let max_pass = SCHED_PASS_NS_MAX.swap(0, Ordering::Relaxed);
++    let Some(threshold) = crate::live::get("group_hold_log_us").and_then(|v| v.parse::<u64>().ok()).filter(|&v| v != 0) else {
++        return;
++    };
++    let Some(first) = group.members.first() else {
++        return;
++    };
++    let held = now.saturating_sub(first.held_at);
++    if held < threshold * 1000 {
++        return;
++    }
++    static WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    static IN_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let second = now / 1_000_000_000;
++    if WINDOW.swap(second, Ordering::Relaxed) != second {
++        IN_WINDOW.store(0, Ordering::Relaxed);
++    }
++    if IN_WINDOW.fetch_add(1, Ordering::Relaxed) >= 20 {
++        return;
++    }
++    let wakes = sched_wakes();
++    let woke: Vec<u64> = (0..4).map(|at| wakes[at].saturating_sub(first.wakes_at_hold[at])).collect();
++    let deadline_us = crate::live::get("group_deadline_us").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
++    eprintln!(
++        "m2v long-hold: held_us {} batches {} kept {} last_kept_us_ago {} passes {} woke commit/completion/host/slice {:?} \
++         max_pass_us {} last_pass_us_ago {} deadline_us {} armed_deadline {} host_waiters {}",
++        held / 1000,
++        group.members.len(),
++        group.kept_times,
++        group.kept_last.map_or(-1, |at| (now.saturating_sub(at) / 1000) as i64),
++        SCHED_PASSES.load(Ordering::Relaxed).saturating_sub(first.passes_at_hold),
++        woke,
++        max_pass / 1000,
++        now.saturating_sub(SCHED_PASS_AT.load(Ordering::Relaxed)) / 1000,
++        deadline_us,
++        KEPT_DEADLINE.load(Ordering::Relaxed) != 0,
++        HOST_WAITERS.load(Ordering::SeqCst),
++    );
++}
++
+ static HOLD_STATS: HoldStats = HoldStats {
+     groups: std::sync::atomic::AtomicU64::new(0),
+     batches: std::sync::atomic::AtomicU64::new(0),
+@@ -366,6 +426,9 @@ struct Member {
+     submission: Submission,
+     /// LOCAL (Atlas, DEEP-GPU): when it was held (`gpu_time::host_nanos`), for [`HoldStats`].
+     held_at: u64,
++    /// LOCAL (Atlas, lab): the scheduler's passes and wakings then, for [`long_hold`].
++    passes_at_hold: u64,
++    wakes_at_hold: [u64; 4],
+ }
+ 
+ /// The batches held for one kernel submission on one `VkQueue` (the module docs), in the
+@@ -396,6 +459,10 @@ pub(crate) struct Group {
+     /// What the group's last submission did, until the scheduler takes it
+     /// ([`take_outcome`](Group::take_outcome)): made ([`made`](Group::made)), or failed.
+     outcome: Option<Result<(), CommandBufferError>>,
++    /// LOCAL (Atlas, lab): how often [`Group::keeps`] kept the batches held now, and when last
++    /// (`gpu_time::host_nanos`), for [`long_hold`].
++    kept_times: u32,
++    kept_last: Option<u64>,
+ }
+ 
+ /// A batch submitted after the group, in the same `vkQueueSubmit` ([`Group::submit`]).
+@@ -478,6 +545,8 @@ impl Group {
+             buffers,
+             submission,
+             held_at: gpu_time::host_nanos(),
++            passes_at_hold: SCHED_PASSES.load(Ordering::Relaxed),
++            wakes_at_hold: sched_wakes(),
+         });
+     }
+ 
+@@ -539,6 +608,8 @@ impl Group {
+             self.kept = true;
+             counts.group_kept_pending();
+         }
++        self.kept_times += 1;
++        self.kept_last = Some(gpu_time::host_nanos());
+         Some(value)
+     }
+ 
+@@ -649,6 +720,9 @@ impl Group {
+         let outcome = match submitted {
+             Ok(()) => {
+                 let now = gpu_time::host_nanos();
++                long_hold(self, now);
++                self.kept_times = 0;
++                self.kept_last = None;
+                 HOLD_STATS.group(now, (self.members.iter()).map(|member| now.saturating_sub(member.held_at)));
+                 for member in self.members.drain(..) {
+                     self.spare.push(member.infos);
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 0fc2cbd1b..1aceec491 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -56,6 +56,7 @@ pub(super) use first_submission::{NotedTable, ReplayTable};
+ #[cfg(test)]
+ pub(crate) use group::merges_submissions;
+ pub(super) use group::{group_batches, kept_wait, kept_wake, Group, GroupEnd};
++pub(super) use group::{SCHED_PASSES, SCHED_PASS_AT, SCHED_PASS_NS_MAX, SCHED_WAKES}; // LOCAL (Atlas, lab)
+ pub(crate) use group::HostWait; // LOCAL (Atlas, DEEP-GPU)
+ use rebound_use::{ReboundUse, Unlogged};
+ pub(super) use submit::{BatchLists, Submitting};
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 0ae70f54e..18822986b 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -387,10 +387,12 @@ impl SchedulerShared {
+         match asleep {
+             Asleep::OnCondvar => {
+                 self.wakings[woken as usize].fetch_add(1, Ordering::Relaxed);
++                super::command_buffer::SCHED_WAKES[woken as usize].fetch_add(1, Ordering::Relaxed);
+                 self.wake.notify_all();
+             }
+             Asleep::Nudged => {
+                 self.wakings[woken as usize].fetch_add(1, Ordering::Relaxed);
++                super::command_buffer::SCHED_WAKES[woken as usize].fetch_add(1, Ordering::Relaxed);
+             }
+             Asleep::No | Asleep::OnGpu => {
+                 self.spared.fetch_add(1, Ordering::Relaxed);
+@@ -927,6 +929,7 @@ fn run(shared: &SchedulerShared) {
+             state.asleep = false;
+             if waited.timed_out() {
+                 shared.wakings[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
++            super::command_buffer::SCHED_WAKES[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
+                 if super::command_buffer::kept_wake() {
+                     state.dirty = true;
+                 }
+@@ -998,12 +1001,14 @@ fn wait_for_gpu<'a>(
+     match waited {
+         Some(Ok(())) if !by_waker => {
+             shared.wakings[Woken::Completion as usize].fetch_add(1, Ordering::Relaxed);
++            super::command_buffer::SCHED_WAKES[Woken::Completion as usize].fetch_add(1, Ordering::Relaxed);
+             state.dirty = true;
+         }
+         // Nudged: the waker counted the waking and marked the state.
+         Some(Ok(())) => {}
+         Some(Err(vk::Result::TIMEOUT)) => {
+             shared.wakings[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
++            super::command_buffer::SCHED_WAKES[Woken::Slice as usize].fetch_add(1, Ordering::Relaxed);
+             if super::command_buffer::kept_wake() {
+                 state.dirty = true;
+             }
+@@ -1050,7 +1055,13 @@ fn run_work(kind: Kind, work: Work) -> bool {
+ fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
+     (shared.inbox).pass(|state, commits| {
+         shared.passes.fetch_add(1, Ordering::Relaxed);
++        // LOCAL (Atlas, lab): for `group.rs`'s long-hold line.
++        let began = crate::gpu_time::host_nanos();
++        super::command_buffer::SCHED_PASSES.fetch_add(1, Ordering::Relaxed);
++        super::command_buffer::SCHED_PASS_AT.store(began, Ordering::Relaxed);
+         pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
++        super::command_buffer::SCHED_PASS_NS_MAX
++            .fetch_max(crate::gpu_time::host_nanos().saturating_sub(began), Ordering::Relaxed);
+         !passed.exiting && left.is_empty() && !passed.more
+     });
+     passed.more = false;
+diff --git a/crates/metal2vulkan-runtime/src/shadow_coherent.rs b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+index ddc22e8a2..6feaa5579 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_coherent.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_coherent.rs
+@@ -604,6 +604,7 @@ struct Counts {
+     trap_waits: AtomicU64,
+     trap_wait_timeouts: AtomicU64,
+     trap_wait_ns: AtomicU64,
++    trap_wait_ns_max: AtomicU64,
+     flushes: AtomicU64,
+     flushed_bytes: AtomicU64,
+     copy_ins: AtomicU64,
+@@ -1337,7 +1338,9 @@ impl Coherent {
+                 if !clear {
+                     self.counts.trap_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+                 }
+-                self.counts.trap_wait_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++                let waited = start.elapsed().as_nanos() as u64;
++                self.counts.trap_wait_ns.fetch_add(waited, Ordering::Relaxed);
++                self.counts.trap_wait_ns_max.fetch_max(waited, Ordering::Relaxed);
+                 if !state.tracked {
+                     return;
+                 }
+@@ -2178,7 +2181,7 @@ impl Coherent {
+              \"copy_ns\":{},\"track_ns\":{},\"sync_by\":{{{}}},\"spent_ns\":{},\"saved_ns\":{},\
+              \"trap_ns\":{},\"trap_ns_max\":{},\"resumes\":{},\"arm_ns\":{},\"arms\":{},\
+              \"hold_ns\":{},\"demotions\":{},\"eager_frames\":{},\"merges\":{},\"came\":{},\
+-             \"refused_reads\":{},\"trap_waits\":{},\"trap_wait_timeouts\":{},\"trap_wait_ns\":{},\"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
++             \"refused_reads\":{},\"trap_waits\":{},\"trap_wait_timeouts\":{},\"trap_wait_ns\":{},\"trap_wait_ns_max\":{},\"probes\":{},\"flushes\":{},\"flushed_bytes\":{},\"copy_ins\":{},\"copy_in_bytes\":{},\
+              \"overwrite_risk\":{},\"sync_errors\":{},\"late_copies\":{},\"late_busy\":{},\
+              \"late_compares\":{},\"late_compare_ns\":{},\"late_compare_ns_max\":{},\
+              \"late_beside\":{},\"risk_by\":[{}],\"pending_done\":{},\"open_pages\":{},\
+@@ -2220,6 +2223,7 @@ impl Coherent {
+             read(&c.trap_waits),
+             read(&c.trap_wait_timeouts),
+             read(&c.trap_wait_ns),
++            read(&c.trap_wait_ns_max),
+             read(&c.probes),
+             read(&c.flushes),
+             read(&c.flushed_bytes),
+-- 
+2.53.0
+
