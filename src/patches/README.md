@@ -40,7 +40,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0062, 0068, 0076, 0077, 0080, 0081, 0083, 0084, 0086, 0090 experiments | `xr_unused_bits_off`, `surface_coherent_writer_wins`, `M2V_FLAT_TILE`, `shared_ccs`, `host_mutable`, `batch_end_light`, `view_render_direct`, `precise_barriers`, `checks_first`: live switches, all off. Most are in [docs/performance.md](../../docs/performance.md#tried-no-gain) |
 | 0047, 0048, 0052–0057, 0063–0067, 0071–0075, 0078, 0079, 0082, 0086–0089, 0091 diagnostics | the pass timer's units and censuses, logs of views, twins, barriers and the scheduler, counters of why shadows copy back, and `M2V_PENDING_AUDIT` (command buffers begun while their submission is pending). Off unless their variable is set |
 
-## Reims vGPU (on 7198fe6), 35 patches
+## Reims vGPU (on 7198fe6), 36 patches
 
 | Patches | What they do |
 |---|---|
@@ -62,6 +62,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0030 `REIMS_VGPU_PAGED_BUFFER_BY_PAGES` | finds kept paged buffers by their guest pages; off |
 | 0031–0033 staged page-ups | `REIMS_VGPU_STAGED_PAGE_UP`, `REIMS_VGPU_STAGED_ZERO`: a new texture's first page-up copies its pages into a staging buffer (one copy per run) when no live view covers them, and pages of zeros write nothing. Before, each page run took its own mapping: 55k a second and a storm of TLB shootdowns; the simulator went from 89 to 101 fps. On with Coherent |
 | 0034, 0035 the detach check | Every submission is checked, on metal2vulkan's scheduler thread, against the objects detached now. That list is now made once per change (a detach, an attach or a release), sorted, and asked by binary search (metal2vulkan 0100). Before, it was made again for every check and scanned: 18–24% of that thread's time. On by default. Live `detached_sorted=0` brings back the check as before, for an A/B in one boot. Measured: 1 simulator +3.5%, 3 simulators +5.3% ([performance.md](../../docs/performance.md#several-simulators-at-once-and-the-desktop-under-load)). |
+| 0036 `REIMS_VGPU_WINDOW_COMPOSITOR_FILE` | the windows move to another Wayland compositor while the VM runs: the file names the socket. Reims connects to it itself and hands SDL the connection; when the file changes, each window lets its input go, its render thread lets the swapchain and surface go, SDL's video restarts on the new socket, and the windows open there. On failure they go back. `<file>.on` says where they are. Off unless set; `MACBOX_VIEW_SWITCH=on` sets it. |
 
 ## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 14 patches
 

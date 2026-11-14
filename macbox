@@ -15,7 +15,7 @@ eval "$_env"
 : "${MACBOX_GUEST_USER:=dev}" "${MACBOX_CPUS:=8}" "${MACBOX_MEMORY:=12G}" "${MACBOX_DISK_SIZE:=160G}"
 : "${MACBOX_RESOLUTION:=1920x1080}" "${MACBOX_REFRESH:=60}" "${MACBOX_CPUSET:=}"
 : "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=none}" "${MACBOX_GPU_TUNING:=auto}"
-: "${MACBOX_COHERENT:=auto}" "${MACBOX_VIDEO:=off}"
+: "${MACBOX_COHERENT:=auto}" "${MACBOX_VIDEO:=off}" "${MACBOX_VIEW_SWITCH:=off}"
 : "${MACBOX_SIM_PREFIX:=macbox}" "${MACBOX_POOL:=full slim-1 slim-2 sharp small}"
 : "${MACBOX_T3_HOST_ID:=$MACBOX_SSH_HOST}" "${MACBOX_T3_SETTINGS:=$HOME/.t3/userdata/settings.json}"
 DOCKER="${MACBOX_DOCKER:-docker}"
@@ -59,9 +59,10 @@ container_start() {
   local e dev=(--device /dev/kvm --device "$MACBOX_RENDER_NODE") vol=() wl
   mapfile -t e < <(cenv)
   [ -e /dev/udmabuf ] && dev+=(--device /dev/udmabuf)   # AMD GPUs import guest memory through it
-  if [ "$(view)" = local ]; then
+  # With MACBOX_VIEW_SWITCH=on the host's desktop is reachable whatever the view, for a later move.
+  if [ "$(view)" = local ] || [ "$MACBOX_VIEW_SWITCH" = on ]; then
     if wl=$(host_wayland); then vol=(-v "$wl:/tmp/host-wayland/wayland-0")
-    else warn "view local, but this shell has no Wayland session (WAYLAND_DISPLAY): the window goes to the browser stream"; fi
+    elif [ "$(view)" = local ]; then warn "view local, but this shell has no Wayland session (WAYLAND_DISPLAY): the window goes to the browser stream"; fi
   fi
   # seccomp/AppArmor unconfined: passt, the VM's network, needs a user namespace.
   $DOCKER run -d --name "$C" --init "${e[@]}" \
@@ -74,6 +75,29 @@ vm_exists() { [ -f "$VMDIR/vm.toml" ]; }
 vm_running() { container_up && ctl list 2>/dev/null | grep -qE "^${MACBOX_VM}[[:space:]]+running"; }
 qemu_pid() { $DOCKER top "$C" -eo pid,args 2>/dev/null | awk '/qemu-system-x86_64/ {print $1; exit}'; }
 view() { cat "$RUN/view" 2>/dev/null || echo stream; }
+stream_socket() {  # sway's socket in the container, the stream's (display-up.sh starts it if needed)
+  echo "/tmp/xdg/$(in_c "$REPO/src/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')"
+}
+# Moves the running VM's window to view $1 without a restart (MACBOX_VIEW_SWITCH=on): Reims reads
+# the socket from run/compositor once a second and says where its windows are in run/compositor.on.
+view_move() {
+  local to _
+  case "$1" in
+    local) in_c test -S /tmp/host-wayland/wayland-0 ||
+      die "this desktop isn't reachable from the container (it started without WAYLAND_DISPLAY): macbox down && macbox up from a shell on the desktop"
+      to=/tmp/host-wayland/wayland-0 ;;
+    stream) to=$(stream_socket) ;;
+  esac
+  [ "$(cat "$RUN/compositor.on" 2>/dev/null)" = "$to" ] && { echo "$1" >"$RUN/view"; say "view: $1 (already)"; return 0; }
+  echo "$to" >"$RUN/compositor.tmp" && mv "$RUN/compositor.tmp" "$RUN/compositor"
+  for _ in $(seq 40); do
+    if [ "$(cat "$RUN/compositor.on" 2>/dev/null)" = "$to" ]; then
+      echo "$1" >"$RUN/view"; say "view: $1, no restart"; return 0
+    fi
+    sleep 0.5
+  done
+  die "the window didn't move to $to in 20 s (macbox logs qemu); run/compositor.on: $(cat "$RUN/compositor.on" 2>/dev/null)"
+}
 resolution() { cat "$RUN/resolution" 2>/dev/null || echo "$MACBOX_RESOLUTION"; }
 build_id() { readlink "$DATA/qemu/current" 2>/dev/null || true; }
 ssh_ok() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$MACBOX_SSH_HOST" true >/dev/null 2>&1; }
@@ -215,6 +239,9 @@ MACBOX_COHERENT=$MACBOX_COHERENT
 # on: Reims's hardware VideoToolbox (H.264/HEVC encode and decode on the host's GPU through VA-API)
 # and M2 scaler devices; needs the video kexts in OpenCore (macbox video-kexts). off: as before
 MACBOX_VIDEO=$MACBOX_VIDEO
+# on: macbox view local|stream moves the running VM's window between this desktop and the browser
+# stream without a restart (Reims's REIMS_VGPU_WINDOW_COMPOSITOR_FILE); off: view restarts the VM
+MACBOX_VIEW_SWITCH=$MACBOX_VIEW_SWITCH
 # iOS Simulator pool: names are "<device> (<prefix> <label>)"
 MACBOX_SIM_PREFIX=$MACBOX_SIM_PREFIX
 MACBOX_POOL="$MACBOX_POOL"
@@ -358,15 +385,24 @@ cmd_up() {
   vm_exists || die "no VM yet: macbox create"
   rm -f "$RUN/stopping"
   container_start
-  local wd
-  if in_c test -S /tmp/host-wayland/wayland-0; then
+  local wd sw=()
+  if [ "$MACBOX_VIEW_SWITCH" = on ]; then
+    # Both places run, and the window moves between them (view_move).
+    wd=$(stream_socket)
+    [ "$(view)" = local ] && in_c test -S /tmp/host-wayland/wayland-0 && wd=/tmp/host-wayland/wayland-0
+    vm_running || echo "$wd" >"$RUN/compositor"
+    sw=(--env "REIMS_VGPU_WINDOW_COMPOSITOR_FILE=$RUN/compositor")
+  elif in_c test -S /tmp/host-wayland/wayland-0; then
     wd=/tmp/host-wayland/wayland-0
     in_c mkdir -p -m 700 /tmp/xdg   # the window's XDG_RUNTIME_DIR (vm.toml), which sway makes otherwise
   else
     wd=$(in_c "$REPO/src/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
   fi
+  # Switched off again: Reims connects as before (an empty value is unset).
+  [ ${#sw[@]} -eq 0 ] && grep -q REIMS_VGPU_WINDOW_COMPOSITOR_FILE "$VMDIR/vm.toml" 2>/dev/null &&
+    sw=(--env "REIMS_VGPU_WINDOW_COMPOSITOR_FILE=")
   if ! vm_running; then
-    ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" --extra-args "$(qemu_extra)" >/dev/null
+    ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" "${sw[@]}" --extra-args "$(qemu_extra)" >/dev/null
     apply_tuning
     ctl start "$MACBOX_VM"
   fi
@@ -397,8 +433,14 @@ cmd_status() {
   ctl list | sed 's/^/  /'
   local pid; pid=$(qemu_pid)
   [ -n "$pid" ] && ps -o pid,pcpu,rss,etime -p "$pid" | sed 's/^/  /'
+  if [ "$MACBOX_VIEW_SWITCH" = on ]; then
+    [ "$(cat "$RUN/compositor.on" 2>/dev/null)" = /tmp/host-wayland/wayland-0 ] &&
+      say "  view: local (a window on the host's desktop; macbox view stream moves it, no restart)" ||
+      { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/ (macbox view local moves it, no restart)"; in_c "$REPO/src/container/stream-up.sh" status | sed 's/^/  /'; }
+  else
   in_c test -S /tmp/host-wayland/wayland-0 && say "  view: local (a window on the host's desktop)" ||
     { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/"; in_c "$REPO/src/container/stream-up.sh" status | sed 's/^/  /'; }
+  fi
   say "  build: $(build_id)$(tuning_on && echo ', GPU tuning on' || echo ', GPU tuning off')"
   say "  coherent: $(coherent_state)"
   say "  screen: $(resolution)"
@@ -655,7 +697,8 @@ Setup (docs/setup.md):
 
 Day to day:
   macbox up | down | status | logs [qemu|selkies|sway]
-  macbox view local|stream    the VM's window on this desktop, or in the browser stream
+  macbox view local|stream    the VM's window on this desktop, or in the browser stream (a restart;
+                              none with MACBOX_VIEW_SWITCH=on)
   macbox stream selkies|novnc
   macbox resolution WxH       macOS's screen size (restarts a running VM)
   macbox ssh [command]
@@ -685,7 +728,9 @@ case "$sub" in
   view)
     case "${1:-}" in
       "") say "view: $(view)" ;;
-      local|stream) echo "$1" >"$RUN/view"; if container_up; then cmd_down; cmd_up; fi ;;
+      local|stream)
+        if [ "$MACBOX_VIEW_SWITCH" = on ] && vm_running; then view_move "$1"
+        else echo "$1" >"$RUN/view"; if container_up; then cmd_down; cmd_up; fi; fi ;;
       *) die "usage: macbox view [local|stream]" ;;
     esac ;;
   stream) container_up || die "the container isn't running"; in_c "$REPO/src/container/stream-up.sh" "${1:-status}" ;;
