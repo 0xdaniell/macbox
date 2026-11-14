@@ -181,7 +181,14 @@ What to know before relying on it:
   and is being hunted with an exact detector in Mesa.
 - **Write-loss check.** The census counts `overwrite_risk`, a guest write a held GPU copy could
   overwrite. It was flagged once in an early test that killed Safari mid-frame; across 64
-  production boots since 2026-11-08 (16,850 reports) it stayed at 0.
+  production boots since 2026-11-08 (16,850 reports) it stayed at 0. On 2026-11-13 it flagged once
+  more, with a Device panel stream open: the capture reads the simulator's screen with the CPU
+  every frame, and a page it was reading as metal2vulkan armed it was taken for a guest write, so
+  a late copy in could put the page's older bytes over a draw still running. The guest wrote
+  nothing; the copy was the library's own. Patch 0094 fixes it (a refused arm is a read: synced and
+  counted as `refused_reads`, never copied in), and a lane replays the case. On the first production
+  boot with it (2026-11-14), streamed iPhone screens refused 11 arms, all counted as reads, and the
+  write-loss gates stayed clean over 2,060 surface reports.
 
 ## Tried, no gain
 
