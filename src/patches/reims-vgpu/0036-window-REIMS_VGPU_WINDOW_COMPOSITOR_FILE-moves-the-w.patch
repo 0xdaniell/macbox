@@ -1,0 +1,923 @@
+From 0fdf3cc4490f62706c8b28d191f7933ba4be271f Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 22:08:43 +0200
+Subject: [PATCH] window: REIMS_VGPU_WINDOW_COMPOSITOR_FILE moves the windows
+ to another Wayland compositor, no restart
+
+The file names a Wayland socket. The UI thread connects to it itself, hands SDL the connection
+(SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER) and holds SDL's events apart from its video.
+When the file names another socket, each window lets its input go and hides, and its render thread
+lets the swapchain and surface go (a new detach handshake, beside close/released). Once the last SDL
+window is gone, SDL's video restarts on the new connection and the windows open there. The displays,
+their sinks and the guest are untouched. On failure the windows go back to the old compositor.
+<file>.on says where they are. Unset, nothing changes.
+
+Off-Tahoe check (SDL 3.4.18, two sway 1.12, lavapipe): 100 moves in one process, first present
+2-18 ms after a move starts, fds constant. Not yet verified on ANV/dmabuf or with input.
+---
+ crates/reims-vgpu-window/Cargo.toml           |   2 +
+ crates/reims-vgpu-window/src/native/linux.rs  |   5 +
+ .../src/native/linux/render.rs                | 121 ++++-
+ .../reims-vgpu-window/src/native/linux/sdl.rs |  10 +-
+ .../reims-vgpu-window/src/native/linux/ui.rs  | 513 +++++++++++++++++-
+ crates/reims-vgpu-window/src/sdl/shell.rs     |  44 ++
+ 6 files changed, 663 insertions(+), 32 deletions(-)
+
+diff --git a/crates/reims-vgpu-window/Cargo.toml b/crates/reims-vgpu-window/Cargo.toml
+index d5ea7726..4a3b4151 100644
+--- a/crates/reims-vgpu-window/Cargo.toml
++++ b/crates/reims-vgpu-window/Cargo.toml
+@@ -18,6 +18,8 @@ ash.workspace = true
+ [target.'cfg(target_os = "linux")'.dependencies]
+ reims-vgpu-vulkan.workspace = true
+ sdl3-sys.workspace = true
++# libwayland-client's connect, opened at run time, for a move to another compositor (`ui`).
++libc.workspace = true
+ 
+ [features]
+ default = ["macos-sdl"]
+diff --git a/crates/reims-vgpu-window/src/native/linux.rs b/crates/reims-vgpu-window/src/native/linux.rs
+index 93206191..b76d0560 100644
+--- a/crates/reims-vgpu-window/src/native/linux.rs
++++ b/crates/reims-vgpu-window/src/native/linux.rs
+@@ -31,6 +31,11 @@ pub(crate) fn open(window: &Arc<Window>) {
+     let window = Arc::downgrade(window);
+     ui::post(move || {
+         if let Some(window) = window.upgrade() {
++            // During a move to another compositor, the window opens there.
++            if ui::holding() {
++                ui::reopen_later(&window);
++                return;
++            }
+             window.opening();
+             shell::open(&window);
+         }
+diff --git a/crates/reims-vgpu-window/src/native/linux/render.rs b/crates/reims-vgpu-window/src/native/linux/render.rs
+index cd397faf..cfd46e85 100644
+--- a/crates/reims-vgpu-window/src/native/linux/render.rs
++++ b/crates/reims-vgpu-window/src/native/linux/render.rs
+@@ -16,6 +16,13 @@
+ //! copies the sink out of the window's lock before asking it, and holds no lock of the window's
+ //! while it draws.
+ //!
++//! **A move to another compositor** ([`Surface::detach`], `super::ui`'s switch): the render thread
++//! lets its presenter go, which destroys the swapchain and the Vulkan surface, drops any draw it
++//! was to make again, and posts to the UI thread that SDL's window may go
++//! ([`crate::sdl::shell::detached`]); it lives on, and draws again once the window opens on the
++//! other compositor and hands it the new SDL window ([`Surface::set_target`]). A draw under way
++//! ends first: the UI thread waits for the post, not for the thread.
++//!
+ //! It ends at the window's end ([`Surface::close`]): it drops its presenter, which destroys the
+ //! swapchain and the Vulkan surface, and only then posts to the UI thread that SDL's window may go
+ //! ([`crate::sdl::shell::released`]), so the surface always goes before the window under it.
+@@ -109,6 +116,9 @@ struct SurfaceState {
+     dirty: bool,
+     /// The window has ended: the render thread ends.
+     closed: bool,
++    /// SDL's window is going, for one on another compositor: the render thread lets its
++    /// presenter go and says so.
++    detach: bool,
+ }
+ 
+ /// A draw the render thread takes: SDL's window and the layout.
+@@ -117,6 +127,16 @@ struct Work {
+     layout: Layout,
+ }
+ 
++/// What the render thread does next.
++enum Next {
++    /// A draw.
++    Draw(Work),
++    /// Let the presenter go, as SDL's window goes ([`Surface::detach`]).
++    Detach,
++    /// The window's end.
++    End,
++}
++
+ impl SurfaceState {
+     /// The draw to make now, if any: something new, the window shown, its window and layout
+     /// there.
+@@ -135,11 +155,22 @@ impl SurfaceState {
+     /// while the window is shown. None while it is hidden: the draw waits for it to show, which
+     /// asks for one ([`Surface::set_visible`]).
+     fn retake(&mut self, work: Work) -> Option<Work> {
+-        if !self.visible {
++        if !self.visible || self.target.is_none() {
+             return None;
+         }
+         Some(self.take().unwrap_or(work))
+     }
++
++    /// What comes before any draw: the window's end, else a detach, taken once.
++    fn interrupt(&mut self) -> Option<Next> {
++        if self.closed {
++            Some(Next::End)
++        } else if std::mem::take(&mut self.detach) {
++            Some(Next::Detach)
++        } else {
++            None
++        }
++    }
+ }
+ 
+ impl Surface {
+@@ -193,27 +224,37 @@ impl Surface {
+         self.update(|s| s.closed = true);
+     }
+ 
+-    /// Waits for the next draw; `None` at the window's end. `retry` asks for the last draw
+-    /// again after [`RETRY`], where nothing newer comes first.
+-    fn next(&self, retry: Option<Work>) -> Option<Work> {
++    /// SDL's window goes, from the UI thread, for one on another compositor (the module doc):
++    /// nothing is drawn into it from now on, and the render thread lets its presenter go.
++    pub(crate) fn detach(&self) {
++        self.update(|s| {
++            s.target = None;
++            s.detach = true;
++        });
++    }
++
++    /// Waits for what comes next: a draw, a detach or the window's end. `retry` asks for the
++    /// last draw again after [`RETRY`], where nothing newer comes first.
++    fn next(&self, retry: Option<Work>) -> Next {
+         let mut state = self.state.lock();
+         if let Some(work) = retry
+             && !state.closed
++            && !state.detach
+         {
+             self.wake.wait_for(&mut state, RETRY);
+-            if state.closed {
+-                return None;
++            if let Some(next) = state.interrupt() {
++                return next;
+             }
+             if let Some(work) = state.retake(work) {
+-                return Some(work);
++                return Next::Draw(work);
+             }
+         }
+         loop {
+-            if state.closed {
+-                return None;
++            if let Some(next) = state.interrupt() {
++                return next;
+             }
+             if let Some(work) = state.take() {
+-                return Some(work);
++                return Next::Draw(work);
+             }
+             self.wake.wait(&mut state);
+         }
+@@ -237,7 +278,19 @@ fn run(window: &Window) {
+     let surface = window.surface();
+     let mut presenting = Presenting::default();
+     let mut retry = None;
+-    while let Some(work) = surface.next(retry.take()) {
++    loop {
++        let work = match surface.next(retry.take()) {
++            Next::Draw(work) => work,
++            Next::Detach => {
++                // The swapchain and the surface go before SDL's window; the retry went with
++                // `take` above.
++                presenting = Presenting::default();
++                let id = window.id();
++                super::ui::post(move || crate::sdl::shell::detached(id));
++                continue;
++            }
++            Next::End => break,
++        };
+         if presenting.needs_presenter() {
+             // The sink is copied out of the window's lock: none is held while it answers.
+             let Some(sink) = window.sink() else {
+@@ -312,8 +365,12 @@ mod tests {
+         surface.set_layout(a_layout());
+         assert!(surface.state.lock().take().is_none());
+         surface.request_draw();
+-        let work = surface.next(None).unwrap();
+-        let again = surface.next(Some(work)).unwrap();
++        let Next::Draw(work) = surface.next(None) else {
++            panic!("a draw");
++        };
++        let Next::Draw(again) = surface.next(Some(work)) else {
++            panic!("the draw again");
++        };
+         assert_eq!(
+             again.layout,
+             a_layout(),
+@@ -323,7 +380,43 @@ mod tests {
+         surface.set_visible(true);
+         assert!(surface.state.lock().take().is_some());
+         surface.close();
+-        assert!(surface.next(None).is_none());
++        assert!(matches!(surface.next(None), Next::End));
++    }
++
++    /// A detach comes once, before any draw, and drops the draw to make again; nothing is drawn
++    /// until the window on the other compositor hands its target, which is drawn at once
++    #[test]
++    fn a_detach_lets_the_window_go_and_draws_on_the_next_one() {
++        let surface = Surface::new();
++        surface.set_target(a_target());
++        surface.set_layout(a_layout());
++        surface.set_visible(true);
++        let Next::Draw(work) = surface.next(None) else {
++            panic!("a first draw");
++        };
++        surface.request_draw();
++        surface.detach();
++        assert!(matches!(surface.next(Some(work)), Next::Detach));
++        let late = Work {
++            target: a_target(),
++            layout: a_layout(),
++        };
++        assert!(
++            surface.state.lock().retake(late).is_none(),
++            "no draw again into the window gone"
++        );
++        assert!(surface.state.lock().take().is_none(), "nor a new one");
++        surface.set_target(a_target());
++        assert!(matches!(surface.next(None), Next::Draw(_)));
++    }
++
++    /// The window's end comes before a detach: the render thread ends
++    #[test]
++    fn the_end_comes_before_a_detach() {
++        let surface = Surface::new();
++        surface.detach();
++        surface.close();
++        assert!(matches!(surface.next(None), Next::End));
+     }
+ 
+     /// A draw that had no image in time is not made again while the window is hidden: it is
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index 4f8fc2ec..b59935a2 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -350,8 +350,14 @@ pub(crate) fn close(shell: &mut Shell) -> bool {
+     false
+ }
+ 
+-/// The window goes: nothing of Linux's stays.
+-pub(crate) fn destroy(_shell: Shell) {}
++/// The window goes: nothing of Linux's stays. One that goes for a move to another compositor
++/// (`shell::detach_all`) opens there once the move is made, and the move goes on (`super::ui`).
++pub(crate) fn destroy(shell: Shell) {
++    if shell.detaching && !shell.closed {
++        super::ui::reopen_later(&shell.window);
++    }
++    super::ui::window_gone();
++}
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/crates/reims-vgpu-window/src/native/linux/ui.rs b/crates/reims-vgpu-window/src/native/linux/ui.rs
+index e184c5f5..2d487d02 100644
+--- a/crates/reims-vgpu-window/src/native/linux/ui.rs
++++ b/crates/reims-vgpu-window/src/native/linux/ui.rs
+@@ -23,20 +23,56 @@
+ //! primary display) comes first, then the others top to bottom, left to right. A look before the
+ //! first snapshot starts the UI thread and waits for it, up to [`FIRST_SNAPSHOT`]; on the UI
+ //! thread itself it never waits.
++//!
++//! **Moving to another compositor** (`REIMS_VGPU_WINDOW_COMPOSITOR_FILE=<path>`, [`COMPOSITOR_VAR`];
++//! unset, none of this happens and SDL connects as it likes). The file names the Wayland socket
++//! the windows show on, as `WAYLAND_DISPLAY` would (a name in `XDG_RUNTIME_DIR`, or a path); where
++//! it is missing at the start, `WAYLAND_DISPLAY` is. The UI thread connects to it itself and hands
++//! SDL the connection (`SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER`), with SDL's Wayland
++//! driver asked for, and holds SDL's events apart from its video, so the threads that wake it push
++//! their events at any time. It looks at the file once a second, in its wait. When the file names
++//! another socket, the windows move, while their displays and the guest run on: each lets its input
++//! go and hides, its render thread lets the window's swapchain and surface go
++//! (`crate::sdl::shell::detach_all`), and once the last SDL window is gone (posted to this thread,
++//! never waited for here: a render thread may be inside a present), SDL's video stops, the old
++//! connection closes, SDL's video starts on the new one, the host's screens are looked at again,
++//! and the windows open there as they first opened (`crate::sdl::shell::open`). A window whose
++//! display starts meanwhile opens there too. Where the new compositor cannot be reached (no
++//! socket, SDL's video does not start, SDL takes another driver), the windows go back to the old
++//! one, and the file's name is tried again only when it changes; where neither can be reached, no
++//! window shows and the file's socket is tried each second. `<path>.on` says where the windows
++//! are after each start and move: the socket's path, or nothing while no compositor is reached.
++//! Measured off-Tahoe 2026-11-14 with SDL 3.4.18, two sway 1.12 and lavapipe: 100 moves in one
++//! process, the first present 2 to 18 ms after a move starts, no file descriptor left behind.
+ 
+-use std::cell::Cell;
++use std::cell::{Cell, RefCell};
+ use std::collections::VecDeque;
+-use std::ffi::CStr;
++use std::ffi::{CStr, CString, c_char, c_void};
++use std::os::unix::ffi::OsStrExt;
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::{Arc, OnceLock, Weak};
+ use std::time::Duration;
+ 
++use reims_vgpu_core::platform::os::MonoTime;
++
+ use reims_vgpu_core::rt::spawn_named;
+ use reims_vgpu_core::sync::{Condvar, Mutex};
+ use reims_vgpu_vulkan::os::OsThreads;
+ use sdl3_sys::everything::*;
+ 
++use crate::handle::Window;
+ use crate::screens::HostScreen;
+-use crate::sdl::sdl_error;
++use crate::sdl::{sdl_error, shell};
++
++/// The variable naming the compositor file (the module doc).
++pub const COMPOSITOR_VAR: &str = "REIMS_VGPU_WINDOW_COMPOSITOR_FILE";
++
++/// How often the compositor file is looked at.
++const LOOK_EVERY: Duration = Duration::from_secs(1);
++
++/// How long a move waits for the windows' surfaces before the log says so (it waits on).
++const MOVE_SLOW: Duration = Duration::from_secs(2);
+ 
+ /// The UI thread's stack.
+ const STACK: usize = 1024 * 1024;
+@@ -86,6 +122,412 @@ static SCREENS_TAKEN: Condvar = Condvar::new();
+ thread_local! {
+     /// Whether this thread is the UI thread.
+     static ON_UI: Cell<bool> = const { Cell::new(false) };
++    /// The compositor the windows show on, where the file names it (the module doc).
++    static COMPOSITOR: RefCell<Option<Compositor>> = const { RefCell::new(None) };
++}
++
++/// The compositor the windows show on, and a move to another (the module doc).
++struct Compositor {
++    /// The file naming it.
++    file: PathBuf,
++    /// The socket SDL's video runs on and the connection to it; `None` while none is reached.
++    on: Option<(PathBuf, *mut c_void)>,
++    /// The socket the file named at the last look.
++    named: Option<PathBuf>,
++    /// When the file was last looked at.
++    looked: MonoTime,
++    /// The windows to open on the next compositor.
++    reopen: Vec<Weak<Window>>,
++    /// A move under way.
++    moving: Option<Move>,
++}
++
++/// A move to another compositor.
++struct Move {
++    /// The socket it goes to.
++    to: PathBuf,
++    /// Whether the file asked for it now, else it is a quiet retry with no compositor reached.
++    asked: bool,
++    /// When it started.
++    since: MonoTime,
++    /// Whether the log said it is slow.
++    said: bool,
++}
++
++/// libwayland-client's connect and disconnect, the library SDL opens too.
++struct Wl {
++    connect: unsafe extern "C" fn(*const c_char) -> *mut c_void,
++    disconnect: unsafe extern "C" fn(*mut c_void),
++}
++
++/// libwayland-client, opened once; `None` where it is not there.
++fn wl() -> Option<&'static Wl> {
++    static WL: OnceLock<Option<Wl>> = OnceLock::new();
++    WL.get_or_init(|| {
++        // SAFETY: the library's name and symbols are NUL-terminated; the symbols are
++        // libwayland-client's two functions of these types, and the library stays open.
++        unsafe {
++            let lib = libc::dlopen(
++                c"libwayland-client.so.0".as_ptr(),
++                libc::RTLD_NOW | libc::RTLD_GLOBAL,
++            );
++            if lib.is_null() {
++                return None;
++            }
++            let connect = libc::dlsym(lib, c"wl_display_connect".as_ptr());
++            let disconnect = libc::dlsym(lib, c"wl_display_disconnect".as_ptr());
++            if connect.is_null() || disconnect.is_null() {
++                return None;
++            }
++            Some(Wl {
++                connect: std::mem::transmute::<
++                    *mut c_void,
++                    unsafe extern "C" fn(*const c_char) -> *mut c_void,
++                >(connect),
++                disconnect: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(
++                    disconnect,
++                ),
++            })
++        }
++    })
++    .as_ref()
++}
++
++/// The compositor file, where its variable names one (read once).
++fn compositor_file() -> Option<&'static Path> {
++    static FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
++    FILE.get_or_init(|| {
++        std::env::var_os(COMPOSITOR_VAR)
++            .filter(|v| !v.is_empty())
++            .map(PathBuf::from)
++    })
++    .as_deref()
++}
++
++/// The socket a name gives, as libwayland reads `WAYLAND_DISPLAY`: the name where it is a path,
++/// else the name in `runtime_dir`. `None` for an empty name, or a bare one without the directory.
++fn socket_path(name: &str, runtime_dir: Option<&Path>) -> Option<PathBuf> {
++    let name = name.trim();
++    if name.is_empty() {
++        return None;
++    }
++    let path = Path::new(name);
++    if path.is_absolute() {
++        Some(path.to_path_buf())
++    } else {
++        runtime_dir.map(|d| d.join(path))
++    }
++}
++
++/// The socket the file's first line names, `None` where it names none or cannot be read.
++fn named_socket(file: &Path) -> Option<PathBuf> {
++    let text = std::fs::read_to_string(file).ok()?;
++    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
++    socket_path(text.lines().next()?, runtime_dir.as_deref())
++}
++
++/// The socket `WAYLAND_DISPLAY` names.
++fn env_socket() -> Option<PathBuf> {
++    let name = std::env::var("WAYLAND_DISPLAY").ok()?;
++    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
++    socket_path(&name, runtime_dir.as_deref())
++}
++
++/// SDL's video driver now, empty where none runs.
++fn current_driver() -> String {
++    // SAFETY: the driver's name is a string SDL keeps, or null.
++    unsafe {
++        let name = SDL_GetCurrentVideoDriver();
++        if name.is_null() {
++            String::new()
++        } else {
++            CStr::from_ptr(name).to_string_lossy().into_owned()
++        }
++    }
++}
++
++/// Connects to `socket` and starts SDL's video on the connection, with its Wayland driver: the
++/// connection, or why not, with nothing left of the try.
++fn connect_video(socket: &Path) -> Result<*mut c_void, String> {
++    let wl = wl().ok_or("libwayland-client is not there")?;
++    let name = CString::new(socket.as_os_str().as_bytes()).map_err(|_| "a NUL in the path")?;
++    // SAFETY: a NUL-terminated path.
++    let display = unsafe { (wl.connect)(name.as_ptr()) };
++    if display.is_null() {
++        return Err("no compositor there".into());
++    }
++    // SAFETY: SDL's video is stopped; SDL reads the connection as it starts and does not close one
++    // it was given. Its events run apart (the module doc).
++    let started = unsafe {
++        SDL_SetPointerProperty(
++            SDL_GetGlobalProperties(),
++            SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER,
++            display,
++        );
++        SDL_InitSubSystem(SDL_INIT_VIDEO)
++    };
++    let driver = current_driver();
++    if started && driver == "wayland" {
++        return Ok(display);
++    }
++    let why = if started {
++        // SAFETY: SDL's video started on this thread, with no window.
++        unsafe { SDL_QuitSubSystem(SDL_INIT_VIDEO) };
++        format!("SDL took its {driver} driver")
++    } else {
++        format!("SDL's video does not start ({})", sdl_error())
++    };
++    // SAFETY: SDL's video is stopped and holds the connection no more.
++    unsafe {
++        SDL_ClearProperty(
++            SDL_GetGlobalProperties(),
++            SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER,
++        );
++        (wl.disconnect)(display);
++    }
++    Err(why)
++}
++
++/// Stops SDL's video, with no window left, and closes `display`, its connection.
++fn disconnect_video(display: *mut c_void) {
++    // SAFETY: on SDL's thread, with every SDL window destroyed; the connection was made by
++    // `connect_video` and SDL holds it no more once its video stops.
++    unsafe {
++        SDL_QuitSubSystem(SDL_INIT_VIDEO);
++        SDL_ClearProperty(
++            SDL_GetGlobalProperties(),
++            SDL_PROP_GLOBAL_VIDEO_WAYLAND_WL_DISPLAY_POINTER,
++        );
++        if let Some(wl) = wl() {
++            (wl.disconnect)(display);
++        }
++    }
++}
++
++/// Writes `<file>.on`: the socket the windows are on, or nothing.
++fn write_on(file: &Path, on: Option<&Path>) {
++    let mut path = file.as_os_str().to_owned();
++    path.push(".on");
++    let path = PathBuf::from(path);
++    let mut tmp = path.clone().into_os_string();
++    tmp.push(".tmp");
++    let mut text = on
++        .map(|p| p.as_os_str().as_bytes().to_vec())
++        .unwrap_or_default();
++    text.push(b'\n');
++    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
++        log::warn!(target: "reims_vgpu_window", "{} not written: {e}", path.display());
++    }
++}
++
++/// Whether a window that opens now waits for the next compositor: a move is under way, or no
++/// compositor is reached.
++pub(crate) fn holding() -> bool {
++    COMPOSITOR.with(|c| {
++        c.borrow()
++            .as_ref()
++            .is_some_and(|c| c.moving.is_some() || c.on.is_none())
++    })
++}
++
++/// `window` opens on the next compositor.
++pub(crate) fn reopen_later(window: &Arc<Window>) {
++    COMPOSITOR.with(|c| {
++        if let Some(c) = c.borrow_mut().as_mut()
++            && !c.reopen.iter().any(|w| w.as_ptr() == Arc::as_ptr(window))
++        {
++            c.reopen.push(Arc::downgrade(window));
++        }
++    });
++}
++
++/// An SDL window was destroyed: a move goes on once the last is gone, after the destroy (posted).
++pub(crate) fn window_gone() {
++    if COMPOSITOR.with(|c| c.borrow().as_ref().is_some_and(|c| c.moving.is_some())) {
++        post(move_on);
++    }
++}
++
++/// Starts SDL's video on the compositor the file names (the module doc): whether SDL's events
++/// run. Its video may not: the file is looked at again each second.
++fn start_on_file(file: &Path) -> bool {
++    // SAFETY: NUL-terminated strings SDL copies; SDL's events start on this thread.
++    unsafe {
++        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"wayland".as_ptr());
++        if !SDL_Init(SDL_INIT_EVENTS) {
++            return false;
++        }
++    }
++    let named = named_socket(file);
++    let socket = named.clone().or_else(env_socket);
++    let on = socket.and_then(|socket| match connect_video(&socket) {
++        Ok(display) => Some((socket, display)),
++        Err(why) => {
++            log::warn!(
++                target: "reims_vgpu_window",
++                "no window shows on {}: {why}; {} is looked at each second",
++                socket.display(),
++                file.display()
++            );
++            None
++        }
++    });
++    write_on(file, on.as_ref().map(|(s, _)| s.as_path()));
++    if let Some((socket, _)) = &on {
++        log::info!(target: "reims_vgpu_window", "windows show on {}", socket.display());
++    }
++    COMPOSITOR.with(|c| {
++        *c.borrow_mut() = Some(Compositor {
++            file: file.to_path_buf(),
++            on,
++            named,
++            looked: super::now(),
++            reopen: Vec::new(),
++            moving: None,
++        });
++    });
++    true
++}
++
++/// Looks at the compositor file, at most once a second (the module doc): a new socket named
++/// starts a move; with no compositor reached, the named one is tried again.
++fn look() {
++    let move_to = COMPOSITOR.with(|c| {
++        let mut c = c.borrow_mut();
++        let c = c.as_mut()?;
++        let now = super::now();
++        if let Some(m) = &mut c.moving {
++            if !m.said && now.saturating_duration_since(m.since) >= MOVE_SLOW {
++                m.said = true;
++                log::warn!(
++                    target: "reims_vgpu_window",
++                    "the windows' move waits for their render threads to let their surfaces go"
++                );
++            }
++            return None;
++        }
++        if now.saturating_duration_since(c.looked) < LOOK_EVERY {
++            return None;
++        }
++        c.looked = now;
++        let named = named_socket(&c.file);
++        let on = c.on.as_ref().map(|(s, _)| s.clone());
++        let changed = named != c.named;
++        c.named.clone_from(&named);
++        let named = named?;
++        ((changed && Some(&named) != on.as_ref()) || on.is_none()).then_some((named, changed))
++    });
++    if let Some((to, asked)) = move_to {
++        begin_move(to, asked);
++    }
++}
++
++/// Starts a move to `to` (the module doc), asked by the file now (`asked`) or a retry with no
++/// compositor reached: the windows let go, and the move goes on as their SDL windows go.
++fn begin_move(to: PathBuf, asked: bool) {
++    let from = COMPOSITOR.with(|c| {
++        let mut c = c.borrow_mut();
++        let c = c.as_mut()?;
++        c.moving = Some(Move {
++            to: to.clone(),
++            asked,
++            since: super::now(),
++            said: false,
++        });
++        Some(c.on.as_ref().map(|(s, _)| s.clone()))
++    });
++    let Some(from) = from else {
++        return;
++    };
++    let ids = shell::detach_all();
++    if asked {
++        log::info!(
++            target: "reims_vgpu_window",
++            "the windows move from {} to {} ({} to let go)",
++            from.as_deref().map_or("nowhere".into(), |s| s.display().to_string()),
++            to.display(),
++            ids.len()
++        );
++    }
++    move_on();
++}
++
++/// Makes the move once no SDL window is left (the module doc): SDL's video stops, starts on the
++/// new compositor (else on the old one again, else on none), and the windows open there.
++fn move_on() {
++    if !shell::none_open() {
++        return;
++    }
++    let taken = COMPOSITOR.with(|c| {
++        let mut c = c.borrow_mut();
++        let c = c.as_mut()?;
++        let next = c.moving.take()?;
++        Some((next, c.on.take(), c.file.clone()))
++    });
++    let Some((next, old, file)) = taken else {
++        return;
++    };
++    if let Some((_, display)) = &old {
++        disconnect_video(*display);
++    }
++    let on = match connect_video(&next.to) {
++        Ok(display) => Some((next.to.clone(), display)),
++        Err(why) => {
++            if next.asked {
++                log::warn!(
++                    target: "reims_vgpu_window",
++                    "the windows do not move to {}: {why}",
++                    next.to.display()
++                );
++            }
++            old.and_then(|(socket, _)| match connect_video(&socket) {
++                Ok(display) => Some((socket, display)),
++                Err(why) => {
++                    log::warn!(
++                        target: "reims_vgpu_window",
++                        "nor back to {}: {why}; no window shows",
++                        socket.display()
++                    );
++                    None
++                }
++            })
++        }
++    };
++    write_on(&file, on.as_ref().map(|(s, _)| s.as_path()));
++    let up = on.is_some();
++    if let Some((socket, _)) = &on
++        && (next.asked || socket == &next.to)
++    {
++        log::info!(
++            target: "reims_vgpu_window",
++            "windows show on {} ({} ms)",
++            socket.display(),
++            super::now().saturating_duration_since(next.since).as_millis()
++        );
++    }
++    let reopen = COMPOSITOR.with(|c| {
++        let mut c = c.borrow_mut();
++        let Some(c) = c.as_mut() else {
++            return Vec::new();
++        };
++        c.on = on;
++        if up {
++            std::mem::take(&mut c.reopen)
++        } else {
++            Vec::new()
++        }
++    });
++    if !up {
++        return;
++    }
++    snapshot_screens();
++    shell::screens_changed();
++    for window in reopen.iter().filter_map(Weak::upgrade) {
++        if !window.is_closed() {
++            window.opening();
++            shell::open(&window);
++        }
++    }
+ }
+ 
+ /// Whether the caller runs on the UI thread.
+@@ -172,9 +614,13 @@ fn set_hints() {
+ /// Starts SDL's video: whether it started.
+ fn start_video() -> bool {
+     set_hints();
+-    // SAFETY: SDL's video starts on this thread, which becomes its main thread; only the hints,
+-    // which SDL takes on any thread before it starts, came first.
+-    if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
++    let started = match compositor_file() {
++        Some(file) => start_on_file(file),
++        // SAFETY: SDL's video starts on this thread, which becomes its main thread; only the
++        // hints, which SDL takes on any thread before it starts, came first.
++        None => unsafe { SDL_Init(SDL_INIT_VIDEO) },
++    };
++    if !started {
+         log::warn!(
+             target: "reims_vgpu_window",
+             "SDL's video does not start ({}): no window opens",
+@@ -182,18 +628,10 @@ fn start_video() -> bool {
+         );
+         return false;
+     }
+-    // SAFETY: SDL's video runs.
++    // SAFETY: SDL's events run.
+     let kind = unsafe { SDL_RegisterEvents(1) };
+     WAKE.store(kind, Ordering::Release);
+-    // SAFETY: SDL's video runs; the driver's name is a string SDL keeps.
+-    let driver = unsafe {
+-        let name = SDL_GetCurrentVideoDriver();
+-        if name.is_null() {
+-            String::new()
+-        } else {
+-            CStr::from_ptr(name).to_string_lossy().into_owned()
+-        }
+-    };
++    let driver = current_driver();
+     log::info!(
+         target: "reims_vgpu_window",
+         "windows open through SDL's {driver} driver{}",
+@@ -227,6 +665,7 @@ fn run() {
+     QUEUE.lock().phase = Phase::Running;
+     loop {
+         run_jobs();
++        look();
+         // SAFETY: an all-zero event is a valid one for SDL to fill.
+         let mut event: SDL_Event = unsafe { std::mem::zeroed() };
+         // SAFETY: SDL's video runs on this thread.
+@@ -360,6 +799,48 @@ fn mode_pixels(points: i32, density: f64) -> u32 {
+ mod tests {
+     use super::*;
+ 
++    /// A socket is named as libwayland reads `WAYLAND_DISPLAY`: a path as it is, a bare name in
++    /// the runtime directory, nothing for an empty name or a bare one without the directory
++    #[test]
++    fn a_socket_is_named_as_wayland_display_names_it() {
++        let run = Some(Path::new("/run/user/1000"));
++        assert_eq!(
++            socket_path("wayland-1\n", run),
++            Some(PathBuf::from("/run/user/1000/wayland-1"))
++        );
++        assert_eq!(
++            socket_path(" /tmp/host-wayland/wayland-1 ", None),
++            Some(PathBuf::from("/tmp/host-wayland/wayland-1"))
++        );
++        assert_eq!(socket_path("wayland-1", None), None);
++        assert_eq!(socket_path("  ", run), None);
++    }
++
++    /// The file's first line names the socket; a missing file names none
++    #[test]
++    fn the_file_names_the_socket_on_its_first_line() {
++        let dir = std::env::temp_dir().join(format!("reims-compositor-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let file = dir.join("compositor");
++        assert_eq!(named_socket(&file), None);
++        std::fs::write(&file, "/tmp/host-wayland/wayland-1\nignored\n").unwrap();
++        assert_eq!(
++            named_socket(&file),
++            Some(PathBuf::from("/tmp/host-wayland/wayland-1"))
++        );
++        write_on(&file, Some(Path::new("/tmp/sway/wayland-2")));
++        assert_eq!(
++            std::fs::read_to_string(dir.join("compositor.on")).unwrap(),
++            "/tmp/sway/wayland-2\n"
++        );
++        write_on(&file, None);
++        assert_eq!(
++            std::fs::read_to_string(dir.join("compositor.on")).unwrap(),
++            "\n"
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
+     /// X11 in a Wayland session is named XWayland, with why SDL took it; otherwise the driver
+     /// stands alone
+     #[test]
+diff --git a/crates/reims-vgpu-window/src/sdl/shell.rs b/crates/reims-vgpu-window/src/sdl/shell.rs
+index 0b274753..4fd4bf31 100644
+--- a/crates/reims-vgpu-window/src/sdl/shell.rs
++++ b/crates/reims-vgpu-window/src/sdl/shell.rs
+@@ -43,6 +43,11 @@
+ //! pointer's hold and the size's hold with it ([`ended`]), and hides; SDL's window is
+ //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
+ //! swapchain and Vulkan surface go too ([`released`]), whichever of the two comes last.
++//!
++//! **A move to another compositor** (Linux, `native::linux::ui`'s switch): each window lets its
++//! input go as at the end, hides and has its render thread let the window's surface go
++//! ([`detach_all`]); SDL's window is destroyed once it has ([`detached`]), and the window, which
++//! has not ended, opens again on the other compositor as it first opened.
+ 
+ use std::cell::RefCell;
+ use std::sync::Arc;
+@@ -92,6 +97,9 @@ pub(crate) struct Shell {
+     shown: Option<bool>,
+     /// Its render thread has let its surface go.
+     released: bool,
++    /// It goes for a window on another compositor once its render thread has let its surface go
++    /// ([`detach_all`]).
++    pub(crate) detaching: bool,
+ }
+ 
+ /// What an OS made of a window that opened.
+@@ -166,6 +174,7 @@ pub(crate) fn open(window: &Arc<Window>) {
+             closed: false,
+             shown: None,
+             released: false,
++            detaching: false,
+         });
+     });
+     with_shell(window.id(), |shell| {
+@@ -210,6 +219,41 @@ pub(crate) fn released(id: u64) {
+     }
+ }
+ 
++/// Every window open lets its input go as at the end, hides, and has its render thread let its
++/// surface go (the module doc): the ids of those it asked, each destroyed at its [`detached`].
++/// Windows whose display ended go as they would.
++#[cfg(target_os = "linux")]
++pub(crate) fn detach_all() -> Vec<u64> {
++    let ids = each_open(|s| (!s.closed && !s.detaching).then(|| s.window.id()));
++    for &id in &ids {
++        with_shell(id, |shell| {
++            ended(shell);
++            // SDL's cursors go with its video.
++            shell.cursor = CursorCache::default();
++            shell.over_image = false;
++            shell.detaching = true;
++            os::close(shell);
++            shell.window.surface().detach();
++        });
++    }
++    ids
++}
++
++/// Window `id`'s render thread let its surface go for a move ([`detach_all`]): SDL's window goes,
++/// and the window waits to open on the other compositor.
++#[cfg(target_os = "linux")]
++pub(crate) fn detached(id: u64) {
++    if with_shell(id, |shell| shell.detaching) == Some(true) {
++        destroy(id);
++    }
++}
++
++/// Whether no SDL window is left.
++#[cfg(target_os = "linux")]
++pub(crate) fn none_open() -> bool {
++    OPEN.with(|open| open.borrow().is_empty())
++}
++
+ /// Destroys window `id`'s SDL window and forgets it.
+ fn destroy(id: u64) {
+     let shell = OPEN.with(|open| {
+-- 
+2.53.0
+

@@ -40,6 +40,7 @@ node), makes an SSH key `~/.ssh/macbox_ed25519`, and adds a `Host macbox` block 
 | `MACBOX_DISK_CACHE` | none | `writeback` panicked macOS's NVMe driver under heavy swap; `unsafe` is faster, but a crash of the host itself can corrupt the VM's disk. Applies at the next `macbox up` |
 | `MACBOX_COHERENT` | auto | `auto`: on with an Arrow Lake iGPU. Coherent, zero-copy surfaces, and the switches measured with it: a 3x simulator 50 → 120 fps there ([performance.md](performance.md#coherent-and-the-switches-measured-with-it-on-by-default-on-arrow-lake)); `on` with any GPU, `off` |
 | `MACBOX_VIDEO` | off | `on`: Reims's hardware VideoToolbox and M2 scaler devices, so the guest's H.264/HEVC encoding (the Device panel's stream) and decoding run on the host GPU through VA-API instead of VideoToolbox's software encoder. Needs the video kexts in OpenCore first (`macbox video-kexts`); macOS 26.7 (25G241) only. See [performance.md](performance.md#hardware-video-encoding-macbox_video) |
+| `MACBOX_VIEW_SWITCH` | off | `on`: `macbox view local\|stream` moves the running VM's window between the host's desktop and the browser stream without a restart (Reims 0036). Takes effect at the next `macbox up`, which must run from a shell in the Wayland session |
 | `MACBOX_HOME` | ~/.local/share/macbox | everything macbox keeps |
 
 Then:
@@ -74,6 +75,8 @@ builds Reims's current master as it is, without macbox's patches.
 The screen: open http://127.0.0.1:6081/ in a browser on the host (Selkies). Or, if you sit at the
 host and it runs a Wayland desktop, `./macbox view local` opens macOS in a window there, with no
 encoding at all. Click into it to give it the keyboard; Ctrl+Alt+Super gives the keyboard back.
+`view` restarts the VM; with `MACBOX_VIEW_SWITCH=on` the window moves between the two while macOS
+runs (after one `macbox down && macbox up` from a shell on the desktop).
 
 To watch from another machine, forward the port: `ssh -L 6081:127.0.0.1:6081 <host>`, then open
 http://127.0.0.1:6081/ there. Or publish it on a tailnet (`tailscale serve --bg --https=8481

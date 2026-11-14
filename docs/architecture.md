@@ -83,6 +83,11 @@ back from the GPU, 2 to 3 frames a second, so macbox never uses it.
   `macbox stream novnc` switches to noVNC over wayvnc (no rate control).
 - **Local.** `macbox view local` mounts the invoking user's Wayland socket into the container, and
   the window opens on the host's desktop, full screen and 1:1: nothing is captured or encoded.
+- **Switching** (`MACBOX_VIEW_SWITCH=on`). The container gets the host's socket whatever the view,
+  sway runs too, and Reims reads the socket to show on from `run/compositor`
+  (`REIMS_VGPU_WINDOW_COMPOSITOR_FILE`, Reims 0036). `macbox view` rewrites the file and waits for
+  `run/compositor.on`: the window closes on one compositor and opens on the other, while the
+  guest and its display run on. Nothing renders into the place that isn't shown.
 
 The screen's size is `$MACBOX_HOME/run/resolution` (`macbox resolution WxH`); sway's output and
 Selkies follow it.
