@@ -15,7 +15,7 @@ eval "$_env"
 : "${MACBOX_GUEST_USER:=dev}" "${MACBOX_CPUS:=8}" "${MACBOX_MEMORY:=12G}" "${MACBOX_DISK_SIZE:=160G}"
 : "${MACBOX_RESOLUTION:=1920x1080}" "${MACBOX_REFRESH:=60}" "${MACBOX_CPUSET:=}"
 : "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=none}" "${MACBOX_GPU_TUNING:=auto}"
-: "${MACBOX_COHERENT:=auto}"
+: "${MACBOX_COHERENT:=auto}" "${MACBOX_VIDEO:=off}"
 : "${MACBOX_SIM_PREFIX:=macbox}" "${MACBOX_POOL:=full slim-1 slim-2 sharp small}"
 : "${MACBOX_T3_HOST_ID:=$MACBOX_SSH_HOST}" "${MACBOX_T3_SETTINGS:=$HOME/.t3/userdata/settings.json}"
 DOCKER="${MACBOX_DOCKER:-docker}"
@@ -165,6 +165,9 @@ qemu_extra() {  # the network (passt, SSH forwarded by Docker) and the disk's op
     -set "drive.disk.cache=$MACBOX_DISK_CACHE" -set drive.disk.discard=unmap; do
     out+=("$(printf '%q' "$a")")
   done
+  # Reims's VideoToolbox and M2 scaler devices, in the slots reims-ctl gives them (after the mapper)
+  [ "$MACBOX_VIDEO" = on ] && out+=(-device apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8 \
+    -device apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9)
   echo "${out[*]}"
 }
 
@@ -209,6 +212,9 @@ MACBOX_GPU_TUNING=$MACBOX_GPU_TUNING
 # auto (on with an Arrow Lake iGPU, where it runs day to day), on, off: Coherent, zero-copy
 # IOSurfaces, and the switches measured with it (docs/performance.md)
 MACBOX_COHERENT=$MACBOX_COHERENT
+# on: Reims's hardware VideoToolbox (H.264/HEVC encode and decode on the host's GPU through VA-API)
+# and M2 scaler devices; needs the video kexts in OpenCore (macbox video-kexts). off: as before
+MACBOX_VIDEO=$MACBOX_VIDEO
 # iOS Simulator pool: names are "<device> (<prefix> <label>)"
 MACBOX_SIM_PREFIX=$MACBOX_SIM_PREFIX
 MACBOX_POOL="$MACBOX_POOL"
@@ -306,6 +312,22 @@ cmd_build() {
   $DOCKER run --rm "${e[@]}" -v "$MACBOX_HOME:$MACBOX_HOME" -v "$REPO:$REPO:ro" "$MACBOX_IMAGE" \
     "${pin[@]}" nice -n 10 bash "$REPO/src/container/build-reims.sh" "$@"
   if vm_running; then say "the running VM keeps its QEMU; the new build starts with the next macbox down && macbox up"; fi
+}
+
+cmd_video_kexts() {  # [reims-util commit]: its kext/ copied into the guest, then opencore-video-kexts.sh
+  ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"
+  local rev=${1:-8a8a852} src="$MACBOX_HOME/src/reims-util" t
+  [ -d "$src/.git" ] || git clone -q https://github.com/steelbrain/reims-util "$src"
+  git -C "$src" cat-file -e "$rev^{commit}" 2>/dev/null || git -C "$src" fetch -q origin
+  t=$(mktemp -d)
+  git -C "$src" archive "$rev" kext/AppleM2ScalerParavirtDriver.kext kext/AppleVideoToolboxParavirtualization.kext \
+    kext/VtWaitPatch.kext | tar -x -C "$t"
+  guest 'rm -rf /tmp/macbox-video-kexts && mkdir -p /tmp/macbox-video-kexts'
+  tar -C "$t/kext" -c . | guest 'tar -x -C /tmp/macbox-video-kexts'
+  rm -rf "$t"
+  scp -q "$REPO/src/guest/bin/opencore-video-kexts.sh" "$MACBOX_SSH_HOST:/tmp/macbox-video-kexts/"
+  ssh -t "$MACBOX_SSH_HOST" 'bash /tmp/macbox-video-kexts/opencore-video-kexts.sh /tmp/macbox-video-kexts'
+  say "Next: MACBOX_VIDEO=on in $CONF, then macbox down && macbox up"
 }
 
 cmd_create() {
@@ -640,6 +662,7 @@ Day to day:
   macbox screenshot [out.png] | click X Y [right|double] | move X Y | scroll X Y N
   macbox type TEXT|-  |  key COMBO...  |  wait SECONDS [out.png]
   macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=auto|on|off)
+  macbox video-kexts          reims-util's video kexts into OpenCore (for MACBOX_VIDEO=on)
   macbox backup <name>
 EOF
 }
@@ -691,6 +714,7 @@ case "$sub" in
   t3) cmd_t3 "$@" ;;
   agents) cmd_agents "$@" ;;
   coherent) cmd_coherent "$@" ;;
+  video-kexts) cmd_video_kexts "$@" ;;
   backup) cmd_backup "$@" ;;
   help|-h|--help) cmd_help ;;
   *) cmd_help >&2; exit 2 ;;

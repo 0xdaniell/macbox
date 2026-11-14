@@ -190,6 +190,67 @@ What to know before relying on it:
   boot with it (2026-11-14), streamed iPhone screens refused 11 arms, all counted as reads, and the
   write-loss gates stayed clean over 2,060 surface reports.
 
+## Hardware video encoding (`MACBOX_VIDEO`)
+
+Without Reims's video devices, macOS in the VM has only VideoToolbox's software H.264 encoder.
+Streaming an iPhone 17 Pro simulator at its full 1206x2622 (T3 Code's Device panel) keeps
+`VTEncoderXPCService` at about 610 MB and, while the screen scrolls, 75-100% of a core. With
+`MACBOX_VIDEO=on` and the video kexts, VideoToolbox picks Reims's hardware encoder, which encodes on
+the host's GPU through VA-API (Intel iHD on Arrow Lake: H.264 and HEVC; no AV1 encoder is exposed,
+and macOS's VideoToolbox has none either). Measured on Tahoe on 2026-11-13, one boot, the same
+simulator, A/B in two rounds:
+
+| | Software encoder | Hardware encoder |
+|---|---|---|
+| `VTEncoderXPCService` memory | 613-620 MB | 9-18 MB |
+| its CPU while scrolling | 73-75% of a core | ~0% |
+| encode per frame | 82 ms (p50, scrolling) | 8-9 ms, of which ~7 on the host's GPU |
+| host GPU video engine | | 4-10% |
+
+Two things decide whether the hardware path is cheap. VideoToolbox converts anything but 4:2:0
+NV12 (`420v`) with 64-byte row and plane alignment on the guest's GPU first, a Metal pass that
+waits behind the simulators' own rendering (57 ms against 8 ms), so the frames given to it should
+already be NV12 laid out that way. And the bitrate it reaches is close to the target; quality at
+the same bitrate, measured on a recorded scroll at full size (SSIM): H.264 0.982 at 4 Mbit/s and
+0.998 at 12 Mbit/s; HEVC 0.998 and 0.9996.
+
+### Where a streamed frame's time goes
+
+Measured on 2026-11-13 with the hardware encoder, an iPhone 17 Pro at 1206x2622:
+
+| Stage | Time |
+|---|---|
+| reading the 12.7 MB framebuffer IOSurface (memcpy) | 5 ms cold, 1.4 ms warm |
+| `IOSurfaceLock` before that read | 0.01 ms on a still screen; while the screen changes, until the GPU has finished the frame the simulator just announced (GlassBench ~10 ms, Safari scrolling 42-63 ms) |
+| BGRA to NV12 with vImage, including that wait | 18 ms p50 (GlassBench) |
+| hardware encode | 7.4 ms p50, 8.4 ms p95 |
+| decode in the browser (WebCodecs) | 1.4-5 ms |
+
+The lock's wait is not a copy back from the GPU: an idle simulator's surface locks at once while the GPU is
+busy, and the wait follows the simulator's own frame rate. So the stream gets what the simulator draws: GlassBench
+45-50 frames a second at `--fps 60` (439 of 456 frames new pictures), Safari's JS-driven pages about 20 (the
+compositor redraws 50-70 times a second, mostly with the same pixels). Faster panels come from a faster
+simulator, which is the GPU: with Coherent's surfaces off the render engine runs 86% busy with one GlassBench
+simulator. Reading with `kIOSurfaceLockAvoidSync` returns stale or torn pictures, and overlapping several synced
+reads gains nothing.
+
+With Coherent's surfaces on (2026-11-14) the simulator outran the stream: GlassBench drew 87 frames a second
+(p50 10.8 ms) and the stream carried 50-52. The capture's fps throttle measures each frame against the last one
+it sent, so with frames 11.5 ms apart at `--fps 60` every other one fell inside the interval. Pacing on a grid
+of the interval instead passes one frame per 16.7 ms slot, with a quarter interval's tolerance for jitter.
+Measured through Simlock's gateway, the route T3 Code's panel streams from, with one other simulator running:
+
+| | Throttle on the last frame | Throttle on a grid |
+|---|---|---|
+| GlassBench (simulator at 87 fps) | 50.5-52.0 fps, gaps p50/p95 19-20/25-27 ms | 58.6-58.8 fps, 17.4/26.2 ms |
+| Safari scrolling (simulator at 64 fps) | 28.7 fps | 51.5 fps |
+| tap to decoded frame, p50 (A/B, alternating, 30 taps each) | 64.9 and 64.2 ms | 60.5 and 61.4 ms |
+| copy, encode, capture-to-wire (p50) | 9.5, 9.0, 9.0 ms | 9.2, 9.3, 9.6 ms |
+
+The capture still copies every new frame before the throttle (about 90% of a core at 87 fps); copying only the
+frames it sends would save most of that. The throttle is in Simlock's `SimlockCapture/Lifecycle.swift`
+(`encodeLoop`), shared with serve-sim.
+
 ## Tried, no gain
 
 | | Result |
