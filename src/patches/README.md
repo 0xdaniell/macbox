@@ -13,7 +13,7 @@ earlier "cohwl" build (2026-11-05). None of it is upstream yet.
 Most of the new code sits behind a switch and does nothing until it is set. What macbox turns on
 is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 
-## metal2vulkan (on `development` at 0db5825a), 93 patches
+## metal2vulkan (on `development` at 0db5825a), 94 patches
 
 | Patches | What they do |
 |---|---|
@@ -32,6 +32,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0042–0044 render lowering lanes | lowering render calls on a worker thread and on lanes per queue; off unless Reims sets `REIMS_VGPU_RENDER_LOWERING=worker`, which it refuses while the census runs |
 | 0045, 0046 recycled images | host-copied textures' images that the host writes too are recycled |
 | 0050, 0051, 0058–0061, 0069, 0070, 0093 surface fixes | `surface_lazy_max_texels`, `surface_twin_reader_first`, `surface_usage_shadow_image`, `surface_coherent_own_back`, `surface_lazy_open_ids`, `surface_twin_make_once` (a race between two textures over one surface: 91 → 100 fps over 12 boots). 0093: a command buffer dropped without a commit takes the standings its encoders left with it, so `surface_lazy_open_ids` never reads them as committed. All but `surface_usage_shadow_image` on with Coherent |
+| 0094 a refused arm is a read | QEMU's census keeps held pages read-only (QEMU 0007), so a page it refuses to arm was being read and holds no write. metal2vulkan took it as the guest's, from before that change, and the next held batch copied its older bytes in over a draw still running (`overwrite_risk`, the write-loss gate). It is now only synced and counted (`refused_reads`). Found when a Device panel capture, reading the simulator's screen every frame, tripped the gate in production on 2026-11-13 |
 | 0085 `inline_lazy`, 0092 `inline_checks` | a lazy surface's first pass instance recorded inline; a batch's submission checks run in the scheduler's pass. On with Coherent |
 | 0062, 0068, 0076, 0077, 0080, 0081, 0083, 0084, 0086, 0090 experiments | `xr_unused_bits_off`, `surface_coherent_writer_wins`, `M2V_FLAT_TILE`, `shared_ccs`, `host_mutable`, `batch_end_light`, `view_render_direct`, `precise_barriers`, `checks_first`: live switches, all off. Most are in [docs/performance.md](../../docs/performance.md#tried-no-gain) |
 | 0047, 0048, 0052–0057, 0063–0067, 0071–0075, 0078, 0079, 0082, 0086–0089, 0091 diagnostics | the pass timer's units and censuses, logs of views, twins, barriers and the scheduler, counters of why shadows copy back, and `M2V_PENDING_AUDIT` (command buffers begun while their submission is pending). Off unless their variable is set |
