@@ -155,6 +155,7 @@ final class BenchViewController: UITableViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if !noGlass, let host = navigationController?.view, pulse.superview == nil { addFloatingGlass(to: host) }
+        guard link == nil else { return }  // viewDidAppear runs again on every return to the app
         link = CADisplayLink(target: self, selector: #selector(step))
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
         startTime = CACurrentMediaTime()
