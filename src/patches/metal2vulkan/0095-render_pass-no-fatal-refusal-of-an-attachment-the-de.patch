@@ -1,4 +1,4 @@
-From 574a3064a84cc9fc2be5c6137ad8b2fe650e0005 Mon Sep 17 00:00:00 2001
+From bc2a5268c604dda8a2bf4c828c8ae36aced99080 Mon Sep 17 00:00:00 2001
 From: Atlas agent <agent@atlas.local>
 Date: Sat, 14 Nov 2026 14:06:36 +0000
 Subject: [PATCH] render_pass: no fatal refusal of an attachment the device
@@ -18,9 +18,15 @@ Reims aborts on any refusal of that call but nil.
 
 - image_plan::check_image_limits: the all-0 answer (never a supported
   combination's: maxMipLevels and maxArrayLayers are at least 1) is
-  refused Format, naming the image's format and usage, with the whole
-  combination as its symbol: usage, flags, view formats, samples, type,
-  and VK_ERROR_FORMAT_NOT_SUPPORTED.
+  refused Format, needing the image's Vulkan format in its first
+  attachment, storage or sampled usage, and naming the texture's Metal
+  pixel format as its symbol, as every refusal of a format does: Reims
+  reads that symbol as a Metal format's name (ycbcr::pass_refused). The
+  whole combination (Metal and Vulkan formats, usage, flags, view
+  formats, samples, type, VK_ERROR_FORMAT_NOT_SUPPORTED) is said on
+  stderr where the runtime makes an image (check_made_limits:
+  m2v-unmade-image, the first 16, then at powers of two). The format
+  answers (families/formats.rs) check without it.
 - render_pass::stood_format: a texture without RenderTarget usage of a
   format the device renders through its word (WordAttachment:
   RGB9E5Float, R8/RG8 sRGB, the packed 16-bit ones) renders through a
@@ -29,53 +35,74 @@ Reims aborts on any refusal of that call but nil.
   R8Unorm_sRGB one opened but its setRenderPipelineState: was refused
   NotImplemented(Render), also fatal under Reims.
 - RenderPassProblem::CompressedColorAttachment: a color attachment of a
-  compressed format, which no device renders, is answered nil after the
-  foreign-texture and subresource checks; no image is made. Reims takes
-  a nil encoder (NoEncoder) and goes on. Each answer is said on stderr
+  compressed format, which no device renders, is answered nil, naming
+  the first such color. The answer comes after the command buffer's
+  state (render.rs open_render: a pass with a compressed color is
+  refused EncoderOpen or AlreadyCommitted there, as any pass is), after
+  every color attachment's own checks (render_pass::check_colors: custom
+  sample depth store, resolve, YCbCr, foreign texture, level and slice),
+  and before any image of the pass is made. Depth and stencil
+  attachments are checked after it, as before. Reims takes a nil encoder
+  (NoEncoder), skips the pass and goes on. Each answer is said on stderr
   (m2v-compressed-attachment: the texture and the pass's attachments;
   the first 16, then at powers of two). Basis: unknown, plain Metal's
   answer is unmeasured.
 
+Not a scratch stand-in whose writes are discarded: built and tested, it
+opened the pass, but a guest pipeline with a color at that index meets
+an attachment of another format at setRenderPipelineState:, refused
+AttachmentFormat, and Reims sends that call and every draw with
+Policy::Dies (encode_render.rs run). Skipping those calls instead would
+be a new mode across every draw, indirect and tile entry point, with no
+Metal answer to hold it to. Nil skips the pass whole.
+
 Not known: why the guest attached an ASTC texture there. The stderr line
 names the pass the next time it happens.
 
-Tests: tests/image_plan.rs gains the all-0 refusal's naming (no device);
-tests/unrenderable_attachments.rs (device, validation layer on) holds a
-worded texture without RenderTarget usage to a render target's bytes
-through a clear, a load and a draw, a compressed attachment to nil with
-the command buffer completing after it, and every color format to no
-refusal naming a limit of 0. All four fail before (the three device
-tests on ANV, the compressed one with the production refusal, required
-1024; the unit test with no device) and pass after, on ANV and on
-lavapipe. The validation lane's no-RenderTarget color and depth passes
-still pass on ANV. Runtime lib suites keep their failures apart from
-flaky ones (no device: the same 2; lavapipe: flaky ones vary by run).
-docs/REFUSALS.md and api_signatures.tsv gain the variant's rows only.
+Tests: tests/image_plan.rs holds the all-0 refusal to the Metal format's
+name and its words to the whole combination (no device).
+tests/unrenderable_attachments.rs (device, validation layer on) holds:
+every worded format without RenderTarget usage to a render target's
+bytes through a clear, a load and a draw; hand-computed codes for
+R8Unorm_sRGB, RG8Unorm_sRGB, RGB9E5Float and B5G6R5Unorm, unblended and
+blended One/Zero; a SourceAlpha blend to the render target's bytes;
+every compressed format, at color 0 and 1, loaded, cleared or not, to
+nil with its blocks unchanged and the command buffer going on; a
+compressed level or slice to nil once its subresource is checked; a
+pass with a compressed color to EncoderOpen and AlreadyCommitted as any
+pass; a stand-in or compressed color 0 beside a compressed or
+out-of-range color 1 to color 1's answer; and every color format to no
+refusal naming a limit of 0.
+At base 7 of these 8 fail on ANV and on lavapipe, the compressed ones
+with the production refusal (ASTC8x8LDR, required 1024, available 0);
+the blend one, which compares to the render target's answer, passes.
+All 8 pass after on both. An all-format sweep on ANV: 171 refusals of a
+limit of 0 before, none after; the other 804 refusals are unchanged.
+Runtime lib suites keep their failures apart from flaky ones (no
+device: the same 2; lavapipe and the ANV targeted suites: flaky ones,
+render_stage_digests and others, vary by run, at base too). The
+validation lane's no-RenderTarget color and depth passes still pass on
+ANV.
+docs/REFUSALS.md is regenerated (its EncoderOpen row was already behind
+the code); api_signatures.tsv gains the variant's row only.
 ---
- crates/metal2vulkan-runtime/src/image_plan.rs |  64 ++-
- .../metal2vulkan-runtime/src/render_pass.rs   | 144 +++++-
- .../src/tests/image_plan.rs                   | 106 ++++
+ crates/metal2vulkan-runtime/src/image_plan.rs |  96 +-
+ crates/metal2vulkan-runtime/src/render.rs     |   9 +
+ .../metal2vulkan-runtime/src/render_pass.rs   | 258 ++++-
+ .../src/tests/image_plan.rs                   | 114 +-
  crates/metal2vulkan-runtime/src/tests/mod.rs  |   2 +
- .../src/tests/unrenderable_attachments.rs     | 476 ++++++++++++++++++
- crates/metal2vulkan-runtime/src/texture.rs    |   4 +-
+ .../src/tests/unrenderable_attachments.rs     | 988 ++++++++++++++++++
+ crates/metal2vulkan-runtime/src/texture.rs    |  13 +-
+ .../metal2vulkan-runtime/src/texture/heap.rs  |   4 +-
  crates/metal2vulkan/tests/api_signatures.tsv  |   1 +
- docs/REFUSALS.md                              |  18 +-
- 8 files changed, 796 insertions(+), 19 deletions(-)
+ docs/REFUSALS.md                              |  30 +-
+ 10 files changed, 1448 insertions(+), 67 deletions(-)
  create mode 100644 crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
 
 diff --git a/crates/metal2vulkan-runtime/src/image_plan.rs b/crates/metal2vulkan-runtime/src/image_plan.rs
-index 13e3c7b49..8ff8fdf1f 100644
+index 13e3c7b49..484422622 100644
 --- a/crates/metal2vulkan-runtime/src/image_plan.rs
 +++ b/crates/metal2vulkan-runtime/src/image_plan.rs
-@@ -64,7 +64,7 @@ use metal2vulkan::device::{
-     VkProperty,
- };
- use metal2vulkan::error::{
--    Capability, Error as CompileError, Feature, Needs, RuntimeDriverDefect, Unsupported,
-+    Capability, DiagName, Error as CompileError, Feature, Needs, RuntimeDriverDefect, Unsupported,
- };
- use metal2vulkan::metal::format::{
-     alpha_in_red, alpha_in_red_format, direct_format, image_type, is_depth_stencil, srgb_raw_twin,
 @@ -1010,14 +1010,22 @@ fn attachment_flag(depth_stencil: bool, profile: &DeviceProfile) -> ImageUsageFl
  /// Whether a plan's image fits the device's image limits for its format, type, tiling, usage,
  /// and flags (`VkImageFormatProperties`, from `vkGetPhysicalDeviceImageFormatProperties2`).
@@ -101,7 +128,7 @@ index 13e3c7b49..8ff8fdf1f 100644
      let dimension = match texture_type {
          TextureType::Type1D | TextureType::Type1DArray | TextureType::TextureBuffer => {
              VkLimit::MaxImageDimension1D
-@@ -1082,3 +1090,53 @@ pub(super) fn check_image_limits(
+@@ -1082,3 +1090,87 @@ pub(super) fn check_image_limits(
      }
      Ok(())
  }
@@ -116,10 +143,13 @@ index 13e3c7b49..8ff8fdf1f 100644
 +}
 +
 +/// The refusal of `plan`'s image, a combination the device makes no image of
-+/// (`VK_ERROR_FORMAT_NOT_SUPPORTED`): `Format`, naming its format in the first of the attachment,
-+/// storage and sampled usages the plan asks for (the sampled where it asks for none of them), and,
-+/// as the refusal's symbol, the whole combination the device was asked about: the format, every
-+/// usage and create flag, the view formats, the sample count and the image type.
++/// (`VK_ERROR_FORMAT_NOT_SUPPORTED`): `Format`, needing its Vulkan format in the first of the
++/// attachment, storage and sampled usages the plan asks for (the sampled where it asks for none of
++/// them), and naming the texture's pixel format by its Metal enumerator name
++/// (`Unsupported::naming_format`), as every refusal of a format names it: a consumer reads that
++/// symbol as a Metal format's name (a QEMU vGPU host's refused render pass, matched against its
++/// YCbCr attachments). The rest of the combination the device was asked about, its flags, view
++/// formats, samples and type, is [`unmade_words`]'s, for the error stream.
 +pub(super) fn unmade_combination(plan: &ImagePlan) -> Unsupported {
 +    let usage = [
 +        (
@@ -135,17 +165,6 @@ index 13e3c7b49..8ff8fdf1f 100644
 +    .into_iter()
 +    .find(|(flag, _)| plan.usage.contains(*flag))
 +    .map_or(FormatUsage::SampledImage, |(_, usage)| usage);
-+    let combination = format!(
-+        "{:?} with usage {:?}, flags {:?}, view formats {:?}, {:?} samples, {:?}: the device makes \
-+         no such image (vkGetPhysicalDeviceImageFormatProperties2 answers \
-+         VK_ERROR_FORMAT_NOT_SUPPORTED)",
-+        plan.format,
-+        plan.usage,
-+        plan.flags,
-+        plan.view_formats,
-+        plan.samples.as_raw(),
-+        plan.image_type,
-+    );
 +    Unsupported::needs(
 +        Feature::Format,
 +        Capability::Format {
@@ -153,13 +172,75 @@ index 13e3c7b49..8ff8fdf1f 100644
 +            usage,
 +        },
 +    )
-+    .naming(DiagName::new(combination))
++    .naming_format(plan.pixel_format)
 +}
++
++/// [`check_image_limits`] of an image the runtime is about to make, refused as the runtime's error:
++/// where the device makes no image of the combination at all, the whole combination is said on the
++/// error stream ([`unmade_words`]; the first 16, then at each power of two), as the refusal names
++/// its format and one usage alone ([`unmade_combination`]). The format answers
++/// (`families/formats.rs`), which ask of combinations no image is made of, check without it.
++pub(super) fn check_made_limits(
++    plan: &ImagePlan,
++    texture_type: TextureType,
++    limits: &vk::ImageFormatProperties,
++) -> Result<(), super::error::Error> {
++    check_image_limits(plan, texture_type, limits).map_err(|refusal| {
++        if unmade(limits) {
++            // LOCAL (Atlas): said here, as no notice names it.
++            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if said <= 16 || said.is_power_of_two() {
++                eprintln!("m2v-unmade-image ({said} so far): {}", unmade_words(plan));
++            }
++        }
++        super::error::Error::Unsupported(refusal)
++    })
++}
++
++/// The whole combination `plan`'s image asked the device about, in words, where the device makes
++/// no image of it ([`unmade_combination`], which names its format and one usage): the Metal and
++/// Vulkan formats, every usage and create flag, the view formats, the sample count and the image
++/// type.
++pub(super) fn unmade_words(plan: &ImagePlan) -> String {
++    format!(
++        "{:?} as {:?} with usage {:?}, flags {:?}, view formats {:?}, {} samples, {:?}: the \
++         device makes no such image (vkGetPhysicalDeviceImageFormatProperties2 answers \
++         VK_ERROR_FORMAT_NOT_SUPPORTED)",
++        plan.pixel_format,
++        plan.format,
++        plan.usage,
++        plan.flags,
++        plan.view_formats,
++        plan.samples.as_raw(),
++        plan.image_type,
++    )
++}
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index b933b575b..159dbb1e9 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1752,6 +1752,15 @@ impl CommandBuffer {
+         let screen = screen.or_else(|| {
+             (given.rasterization_rate_map.as_ref()).map(|map| map.state().screen_size())
+         });
++        // A pass with a compressed color, which is answered nil (`render_pass::compressed_color`),
++        // meets the command buffer's state first: refused, as any pass is, while an encoder is
++        // open or was abandoned and once the command buffer is committed, not answered nil there.
++        // Every other pass meets it once laid out, below, as before.
++        if again.is_none() && render_pass::attaches_compressed(given) {
++            if let Some(problem) = self.state().refusal() {
++                return Err(invalid(CALL, problem));
++            }
++        }
+         rate_mapped_pass::check_descriptor(CALL, device, given)?;
+         let taken = render_pass::surface_stencil_loads(given);
+         let descriptor = &*taken;
 diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
-index 4eaf142d8..628e87063 100644
+index 4eaf142d8..5c0822e2a 100644
 --- a/crates/metal2vulkan-runtime/src/render_pass.rs
 +++ b/crates/metal2vulkan-runtime/src/render_pass.rs
-@@ -14,12 +14,15 @@
+@@ -14,12 +14,16 @@
  //!   usage, which Metal's validation stops, renders as plain Metal renders it (an M4: cleared,
  //!   drawn, loaded and stored as a render target is, and left as it was under a `DontCare` store;
  //!   Metal probe case `usage_missing`) through a stand-in image that has it
@@ -173,11 +254,12 @@ index 4eaf142d8..628e87063 100644
 -//!   format the device does not copy both ways, are not built (`NotImplemented(Render)`). Every
 +//!   format the device does not copy both ways, are not built (`NotImplemented(Render)`). A color
 +//!   attachment of a compressed format, which no device renders, is answered nil
-+//!   ([`RenderPassProblem::CompressedColorAttachment`]). Every
++//!   ([`RenderPassProblem::CompressedColorAttachment`]), once every color attachment's checks
++//!   pass and before the pass takes any image (`check_colors`). Every
  //!   attachment has one sample count, which the pipelines drawn must have. Metal renders into the
  //!   smallest attachment's extent, further limited by a nonzero `renderTargetWidth` and
  //!   `renderTargetHeight` (measured: an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a
-@@ -695,6 +698,19 @@ pub enum RenderPassProblem {
+@@ -695,6 +699,21 @@ pub enum RenderPassProblem {
          /// The `defaultRasterSampleCount` given.
          count: u64,
      },
@@ -189,7 +271,9 @@ index 4eaf142d8..628e87063 100644
 +    /// of). The encoder is answered nil, an [`Error::Nil`](crate::Error::Nil), as plain Metal
 +    /// answers a pass it makes no encoder for, and the runtime says so on its error stream
 +    /// (`m2v-compressed-attachment`): a caller that takes a nil encoder goes on past the pass,
-+    /// where a refusal of it would end the caller.
++    /// where a refusal of it would end the caller. Answered once the command buffer's state and
++    /// every color attachment's checks pass (a pass refused for either is refused so), and before
++    /// the pass takes any image, naming the first compressed color.
 +    ///
 +    /// Basis: unknown (plain Metal's answer for a compressed color attachment is unmeasured; Metal's
 +    /// pixel format capabilities give a compressed format no color rendering).
@@ -197,28 +281,65 @@ index 4eaf142d8..628e87063 100644
  }
  
  /// One attachment's subresource, checked: the texture, the image level and layer it renders,
-@@ -1539,14 +1555,17 @@ pub(super) fn layout(
-                 Unsupported::not_implemented(Feature::Format).naming_format(texture.pixel_format()),
-             ));
-         }
+@@ -1503,50 +1522,19 @@ pub(super) fn layout(
+     let mut extents = [([0, 0], 0); MAX_COLOR_ATTACHMENTS + 1];
+     let mut attached = 0;
+     let positioned = Some(!descriptor.sample_positions.is_empty());
++    // Every color attachment's own checks, before any of them takes an image of the pass's; then
++    // a compressed one's nil, before any image is made.
++    check_colors(call, device, descriptor)?;
++    compressed_color(call, descriptor)?;
+     for (index, color) in descriptor.color_attachments.iter().enumerate() {
+         let which = Attachment::Color(index as u32);
+-        if color.store_action == StoreAction::CustomSampleDepthStore {
+-            // Of an attachment without a texture, unmeasured.
+-            return Err(match color.texture {
+-                Some(_) => invalid(
+-                    call,
+-                    Problem::RenderPass(RenderPassProblem::CustomSampleDepthStore(which)),
+-                ),
+-                None => not_yet(),
+-            });
+-        }
+         let Some(texture) = &color.texture else {
+-            // A resolve, or store action options, of an attachment without a texture is
+-            // unmeasured.
+-            if color.resolve_texture.is_some()
+-                || color.store_action.resolves()
+-                || color.store_action_options != StoreActionOptions::NONE
+-            {
+-                return Err(not_yet());
+-            }
+             colors.push(None);
+             continue;
+         };
+-        // A two-plane YCbCr attachment loads, stores and blends as Metal's tile of halves
+-        // (`texture/ycbcr_image.rs`); a resolve into or out of one is not measured, nor a load
+-        // of one over a surface of a P3 matrix.
+-        if ycbcr_renders(texture.pixel_format())
+-            && (color.resolve_texture.is_some()
+-                || color.store_action.resolves()
+-                || (color.load_action == LoadAction::Load && texture.ycbcr_codes_alone()))
+-        {
+-            return Err(Error::Unsupported(
+-                Unsupported::not_implemented(Feature::Format).naming_format(texture.pixel_format()),
+-            ));
+-        }
 -        let target = target(
-+        let subresource = (color.level, color.slice, color.depth_plane);
-+        let length = descriptor.render_target_array_length;
-+        compressed_color(
-             call,
-             device,
-             which,
-             texture,
+-            call,
+-            device,
+-            which,
+-            texture,
 -            (color.level, color.slice, color.depth_plane),
 -            descriptor.render_target_array_length,
-+            (subresource, length),
-+            descriptor,
-         )?;
+-        )?;
++        let subresource = (color.level, color.slice, color.depth_plane);
++        let length = descriptor.render_target_array_length;
 +        let target = target(call, device, which, texture, subresource, length)?;
          let memoryless = memoryless(texture);
          // A texture without `RenderTarget` usage renders through a stand-in that has it, copied
          // in where the pass loads it and back where it stores it (`attachment_stand_in.rs`), as
-@@ -1903,7 +1922,8 @@ fn target(
+@@ -1903,7 +1891,8 @@ fn target(
      }
      // A view of another format renders in that format (`attachment_format`); a texture without
      // `RenderTarget` usage, through its stand-in, in its own (the module docs), which for a depth
@@ -228,7 +349,7 @@ index 4eaf142d8..628e87063 100644
      let holds = |format: metal2vulkan::vk::Format| match which {
          Attachment::Color(_) => true,
          Attachment::Depth => format.block().is_some_and(|b| b.depth.is_some()),
-@@ -1911,7 +1931,9 @@ fn target(
+@@ -1911,7 +1900,9 @@ fn target(
      };
      let format = match stood {
          false => attachment_format(which, plan, facts.pixel_format, device)?,
@@ -239,7 +360,7 @@ index 4eaf142d8..628e87063 100644
          true => return Err(Error::NotImplemented(RuntimeGap::Render)),
      };
      Ok(Target {
-@@ -1952,6 +1974,114 @@ pub(super) fn not_2d(target: &Target) -> bool {
+@@ -1952,6 +1943,189 @@ pub(super) fn not_2d(target: &Target) -> bool {
          .is_ok_and(|plan| plan.image_type != metal2vulkan::vk::ImageType::TYPE_2D)
  }
  
@@ -264,28 +385,103 @@ index 4eaf142d8..628e87063 100644
 +    }
 +}
 +
-+/// Answer nil for `which`, a color attachment of `texture` at `(subresource, length)` in a pass
-+/// of `descriptor`, where the texture's format is block-compressed
-+/// ([`RenderPassProblem::CompressedColorAttachment`]), after the checks [`target`] makes of any
-+/// format first (a foreign texture, Metal's validation of the attachment's subresource); nothing
-+/// for any other format. No image is made for the pass. Each such answer is said on the error
-+/// stream, with the pass's attachments, the first 16 in full and then at each power of two.
-+fn compressed_color(
++/// Check each color attachment of `descriptor` as [`layout`] checks it before the attachment
++/// takes an image: a `CustomSampleDepthStore` store action (Metal's validation stops it), a
++/// resolve or store action options of an attachment without a texture, a resolve or a load of a
++/// two-plane YCbCr attachment the runtime does not build, a texture another device made, and
++/// Metal's checks of the attachment's subresource ([`check_target`]). Every color is checked
++/// before any takes a stand-in held by the command buffer, or the pass is answered nil for a
++/// compressed one ([`compressed_color`]), so a pass a later color refuses leaves no image behind,
++/// and the refusal is that color's, whatever an earlier one would have taken.
++fn check_colors(
 +    call: &'static str,
 +    device: &Device,
-+    which: Attachment,
-+    texture: &Texture,
-+    (subresource, length): ((u64, u64, u64), u64),
 +    descriptor: &RenderPassDescriptor,
 +) -> Result<(), Error> {
-+    let facts = Facts::of(texture.record());
-+    if metal2vulkan::metal::format::block_extent(facts.pixel_format).is_none() {
++    let not_yet = || Error::NotImplemented(RuntimeGap::Render);
++    for (index, color) in descriptor.color_attachments.iter().enumerate() {
++        let which = Attachment::Color(index as u32);
++        if color.store_action == StoreAction::CustomSampleDepthStore {
++            // Of an attachment without a texture, unmeasured.
++            return Err(match color.texture {
++                Some(_) => invalid(
++                    call,
++                    Problem::RenderPass(RenderPassProblem::CustomSampleDepthStore(which)),
++                ),
++                None => not_yet(),
++            });
++        }
++        let Some(texture) = &color.texture else {
++            // A resolve, or store action options, of an attachment without a texture is
++            // unmeasured.
++            if color.resolve_texture.is_some()
++                || color.store_action.resolves()
++                || color.store_action_options != StoreActionOptions::NONE
++            {
++                return Err(not_yet());
++            }
++            continue;
++        };
++        // A two-plane YCbCr attachment loads, stores and blends as Metal's tile of halves
++        // (`texture/ycbcr_image.rs`); a resolve into or out of one is not measured, nor a load
++        // of one over a surface of a P3 matrix.
++        if ycbcr_renders(texture.pixel_format())
++            && (color.resolve_texture.is_some()
++                || color.store_action.resolves()
++                || (color.load_action == LoadAction::Load && texture.ycbcr_codes_alone()))
++        {
++            return Err(Error::Unsupported(
++                Unsupported::not_implemented(Feature::Format).naming_format(texture.pixel_format()),
++            ));
++        }
++        if !texture.device().same(device) {
++            return Err(invalid(call, Problem::ForeignObject));
++        }
++        let facts = Facts::of(texture.record());
++        let subresource = (color.level, color.slice, color.depth_plane);
++        check_target(
++            call,
++            which,
++            &facts,
++            subresource,
++            descriptor.render_target_array_length,
++        )?;
++    }
++    Ok(())
++}
++
++/// Whether `texture` is of a block-compressed pixel format (a BC, ETC2, EAC, ASTC or PVRTC one),
++/// which no Vulkan device renders as a color attachment, and Apple's pixel format capabilities
++/// give no color rendering either.
++pub(super) fn compressed(texture: &Texture) -> bool {
++    metal2vulkan::metal::format::block_extent(texture.pixel_format()).is_some()
++}
++
++/// Whether `descriptor` attaches a texture of a compressed format as a color ([`compressed`]),
++/// which [`compressed_color`] answers nil.
++pub(super) fn attaches_compressed(descriptor: &RenderPassDescriptor) -> bool {
++    (descriptor.color_attachments.iter())
++        .filter_map(|color| color.texture.as_ref())
++        .any(compressed)
++}
++
++/// Answer nil for a pass of `descriptor` with a color attachment of a block-compressed format
++/// ([`RenderPassProblem::CompressedColorAttachment`], naming the first such color); nothing for
++/// another pass. Called once every color's checks pass ([`check_colors`]: a foreign texture,
++/// Metal's validation of each subresource) and before the pass takes any image, so no image is
++/// made for it. Each such answer is said on the error stream, with the pass's attachments, the
++/// first 16 in full and then at each power of two.
++fn compressed_color(call: &'static str, descriptor: &RenderPassDescriptor) -> Result<(), Error> {
++    let Some((index, color, texture)) =
++        (descriptor.color_attachments.iter().enumerate()).find_map(|(index, color)| {
++            let texture = color.texture.as_ref().filter(|t| compressed(t))?;
++            Some((index, color, texture))
++        })
++    else {
 +        return Ok(());
-+    }
-+    if !texture.device().same(device) {
-+        return Err(invalid(call, Problem::ForeignObject));
-+    }
-+    check_target(call, which, &facts, subresource, length)?;
++    };
++    let which = Attachment::Color(index as u32);
++    let facts = Facts::of(texture.record());
 +    // LOCAL (Atlas): a pass no image can hold is answered nil rather than refused, which would
 +    // end the caller (a QEMU vGPU host aborts on a refused render pass); said here, as no notice
 +    // names it.
@@ -301,8 +497,8 @@ index 4eaf142d8..628e87063 100644
 +            facts.extent[2],
 +            facts.usage,
 +            facts.samples,
-+            subresource.0,
-+            subresource.1,
++            color.level,
++            color.slice,
 +            pass_summary(descriptor),
 +        );
 +    }
@@ -355,18 +551,38 @@ index 4eaf142d8..628e87063 100644
  /// renders in, over an image of `plan` that has the attachment's usage: the image's own where the
  /// texture presents the image's format. A color view of another format renders in that format's
 diff --git a/crates/metal2vulkan-runtime/src/tests/image_plan.rs b/crates/metal2vulkan-runtime/src/tests/image_plan.rs
-index a4cece2c0..e226e5bc3 100644
+index a4cece2c0..5c816720f 100644
 --- a/crates/metal2vulkan-runtime/src/tests/image_plan.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/image_plan.rs
-@@ -1302,6 +1302,112 @@ fn image_limits_name_the_device_limit_or_sample_count() {
+@@ -7,7 +7,7 @@ use super::super::copy_plan::{copy_unit, BlitOption, ImageRegion};
+ use super::super::driver_defects;
+ use super::super::image_plan::{
+     block_family, check_image_limits, compatible, cube_compatible, holds_srgb_twin, plan_image,
+-    sample_count, srgb_twin, DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal,
++    sample_count, srgb_twin, unmade_words, DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal,
+ };
+ use super::super::memory::MemoryClass;
+ use super::super::pvrtc::{holds_blocks, image_buffer_region, image_region, CARRIERS};
+@@ -21,7 +21,7 @@ use ash::vk;
+ use metal2vulkan::device::{
+     Device, DeviceDescription, DevicePolicy, FormatUsage, VkExtension, VkFeature, VkProperty,
+ };
+-use metal2vulkan::error::{Capability, Feature, Needs, RuntimeDriverDefect};
++use metal2vulkan::error::{Capability, Feature, Needs, RuntimeDriverDefect, Unsupported};
+ use metal2vulkan::metal::format::{
+     alpha_in_red, alpha_in_red_format, direct_format, is_depth_stencil, srgb_raw_twin,
+     storage_image_choice, storage_view_formats, vk_format, FormatEmulation, WordAttachment,
+@@ -1302,6 +1302,116 @@ fn image_limits_name_the_device_limit_or_sample_count() {
      );
  }
  
 +/// A combination the device makes no image of (`VK_ERROR_FORMAT_NOT_SUPPORTED`, which
 +/// `Device::image_limits` reports as properties all 0) is refused naming the image's format in the
-+/// usage the plan asks of it, and the whole combination, never as an image size limit of 0: the
-+/// ANV refusal of an `RGB9E5Float` stand-in's `E5B9G9R9_UFLOAT_PACK32` attachment image read
-+/// `TextureSize` needs `MaxImageDimension2D` 1024, available 0.
++/// usage the plan asks of it, its symbol the texture's Metal pixel format as every format's
++/// refusal names it, never as an image size limit of 0: the ANV refusal of an `RGB9E5Float`
++/// stand-in's `E5B9G9R9_UFLOAT_PACK32` attachment image read `TextureSize` needs
++/// `MaxImageDimension2D` 1024, available 0. The whole combination is in the words the error
++/// stream says (`unmade_words`).
 +#[test]
 +fn an_image_the_device_makes_none_of_is_refused_naming_its_format_and_usage() {
 +    let (name, desc, device) = committed()
@@ -432,12 +648,14 @@ index a4cece2c0..e226e5bc3 100644
 +            }]]),
 +            "{pf:?} {usage:?}"
 +        );
-+        let said = refused
-+            .symbol
-+            .as_ref()
-+            .expect("the combination named")
-+            .to_string();
++        let named = Unsupported::not_implemented(Feature::Format).naming_format(pf);
++        assert_eq!(
++            refused.symbol, named.symbol,
++            "{pf:?} {usage:?}: the Metal format named"
++        );
++        let said = unmade_words(&plan);
 +        for part in [
++            format!("{pf:?}"),
 +            format!("{:?}", plan.format),
 +            format!("{:?}", plan.usage),
 +            format!("{:?}", plan.flags),
@@ -486,27 +704,39 @@ index 87e655e97..fcfd214f0 100644
  #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 diff --git a/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs b/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
 new file mode 100644
-index 000000000..bf2b1c0f6
+index 000000000..459dc98ba
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,988 @@
 +//! Color attachments whose image the device makes no attachment of, as a pass takes them.
 +//!
-+//! - **A texture without `RenderTarget` usage of a format the device renders through its word**
-+//!   (`metal::format::WordAttachment`: `RGB9E5Float`, the 8-bit sRGB and packed 16-bit formats on
-+//!   a device that samples them and does not render them, `E5B9G9R9_UFLOAT_PACK32` and `R8_SRGB`
-+//!   on ANV) renders through a stand-in in the word's format (`render_pass::stood_format`), as a
-+//!   texture of the format with `RenderTarget` usage renders through its word view: a pass that
-+//!   loads, clears and draws leaves the two textures the same bytes. A stand-in in the image's own
-+//!   format was an image the device makes none of, and the pass was refused naming an image size
-+//!   limit of 0 (`TextureSize`, `MaxImageDimension2D` available 0), which ended a QEMU vGPU host.
++//! - **A texture without `RenderTarget` usage** of each format with a word layout
++//!   (`metal::format::WordAttachment`) renders as a texture of the format with `RenderTarget`
++//!   usage does: a pass that clears and draws, and one that loads and draws, leave the two
++//!   textures the same bytes, the loaded texels untouched. Of those, a format the device renders
++//!   through its word (`RGB9E5Float`, `R8Unorm_sRGB` and `RG8Unorm_sRGB` on ANV and lavapipe)
++//!   renders through a stand-in in the word's format (`render_pass::stood_format`), the rest
++//!   through one in their own. A stand-in in the image's own format of a worded one was an image
++//!   the device makes none of, and the pass was refused naming an image size limit of 0
++//!   (`TextureSize`, `MaxImageDimension2D` available 0), which ended a QEMU vGPU host.
++//! - **Metal's codes**: such a pass stores, through the stand-in and through the render target,
++//!   the bytes worked out here by hand from Metal's store rules (`metal/format/word.rs`): the 8-bit
++//!   sRGB encoding of known linear values, `RGB9E5Float`'s shared exponent and truncated
++//!   mantissas, and `B5G6R5Unorm`'s rounded fields.
++//! - **Blending**: a blended pipeline draws over a loaded stand-in as over the render target, or
++//!   is refused as it is; a blend of factors one and zero stores Metal's codes.
 +//! - **A texture of a compressed format** (BC, ETC2, EAC, ASTC, PVRTC), with `RenderTarget` usage
 +//!   or without, as a color attachment: the encoder is answered nil
-+//!   (`RenderPassProblem::CompressedColorAttachment`), and the command buffer goes on: a pass after
-+//!   it on the same command buffer runs, and the command buffer completes.
-+//! - **No pass is refused naming an image limit of 0**: every color format, at 1 and 4 samples and
-+//!   with and without `RenderTarget` usage, opens, is answered nil, or is refused naming what the
-+//!   device lacks.
++//!   (`RenderPassProblem::CompressedColorAttachment`), the texture keeps its blocks, and the
++//!   command buffer goes on: a pass after it on the same command buffer runs, and the command
++//!   buffer completes.
++//! - **The command buffer's checks and every color's come first**: a pass with a compressed color
++//!   is refused while an encoder is open and after the commit as any pass is, and a color's
++//!   refusal (its subresource) is the pass's, whatever an earlier color would have taken or been
++//!   answered.
++//! - **No pass is refused naming an image limit of 0**: every color format, at 1 and 4 samples
++//!   and with and without `RenderTarget` usage, opens or is refused naming what the device lacks,
++//!   and every compressed one is answered nil, nothing else.
 +//!
 +//! A device test: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
 +//! `m2v_cpu_icd`), on the kind of device the cfg selects, asking for the validation layer: an
@@ -520,17 +750,26 @@ index 000000000..bf2b1c0f6
 +use super::layer_claim::Watched;
 +use crate::render_pass::RenderPassProblem;
 +use crate::{
-+    BlitOption, Buffer, ClearColor, CommandBufferStatus, Device, DeviceKind, DeviceOptions, Error,
-+    LoadAction, Origin, PipelineOptions, Problem, RenderPassDescriptor, RenderPipelineState,
-+    ResourceOptions, ShaderCacheOptions, Size, StoreAction, Texture, TextureDescriptor,
++    Attachment, BlitOption, Buffer, ClearColor, CommandBufferStatus, CommandQueue, Device,
++    DeviceKind, DeviceOptions, Error, Invalid, LoadAction, Origin, PipelineOptions, Problem,
++    Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
++    ShaderCacheOptions, Size, StoreAction, Texture, TextureDescriptor,
 +};
 +use metal2vulkan::metal::format::{block_extent, is_depth_stencil, WordAttachment};
-+use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureType, TextureUsage};
++use metal2vulkan::metal::{BlendFactor, PixelFormat, PrimitiveType, TextureType, TextureUsage};
 +use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 +use std::path::{Path, PathBuf};
 +
 +/// The attachments' side.
 +const SIDE: u32 = 16;
++
++/// The pass's clear color: each channel exact in `half`, and none at a rounding tie of any
++/// format below (`R8Unorm_sRGB` 136.96 and `RG8Unorm_sRGB` 99.09 of 255; `B5G6R5Unorm` 7.75,
++/// 7.875 and 23.25).
++const CLEAR: [f64; 4] = [0.25, 0.125, 0.75, 1.0];
++
++/// The draw's color, as [`CLEAR`] (sRGB 255 and 115.14; `B5G6R5Unorm` 31, 10.83 and 1.94).
++const DRAWN: [f32; 4] = [1.0, 0.171875, 0.0625, 0.25];
 +
 +/// The formats with a word layout (`WordAttachment::layout`), and their bytes a texel.
 +const WORDS: [(PixelFormat, u32); 8] = [
@@ -542,6 +781,55 @@ index 000000000..bf2b1c0f6
 +    (PixelFormat::ABGR4Unorm, 2),
 +    (PixelFormat::BGRA4Unorm, 2),
 +    (PixelFormat::BGR5A1Unorm, 2),
++];
++
++/// `RGB9E5Float`'s word of red, green and blue mantissas and a shared exponent.
++const fn e5b9g9r9(red: u32, green: u32, blue: u32, exponent: u32) -> [u8; 4] {
++    (red | green << 9 | blue << 18 | exponent << 27).to_le_bytes()
++}
++
++/// `B5G6R5Unorm`'s texel of its red, green and blue codes.
++const fn b5g6r5(red: u16, green: u16, blue: u16) -> [u8; 2] {
++    (red << 11 | green << 5 | blue).to_le_bytes()
++}
++
++/// Metal's codes of [`CLEAR`] and [`DRAWN`] in a format, worked out by hand (the module docs):
++/// the format, its clear's texel and its draw's.
++///
++/// - 8-bit sRGB: each linear value encoded (`1.055 v^(1/2.4) - 0.055`) times 255, rounded:
++///   0.25 is 136.96, 0.125 is 99.09, 1.0 is 255 and 0.171875 is 115.14.
++/// - `RGB9E5Float`: the shared exponent `floor(log2(largest)) + 16` (0.75 gives 15, 1.0 gives
++///   16) and each mantissa the value over `2^(exponent - 24)`, truncated: 0.25, 0.125 and 0.75
++///   over 2^-9 are 128, 64 and 384; 1.0, 0.171875 and 0.0625 over 2^-8 are 256, 44 and 16.
++/// - `B5G6R5Unorm`: each value times 31, 63 or 31, rounded: 7.75, 7.875 and 23.25 are 8, 8 and
++///   23; 31, 10.83 and 1.94 are 31, 11 and 2.
++const CODES: [(PixelFormat, &[u8], &[u8]); 4] = [
++    (PixelFormat::R8UnormSRGB, &[137], &[255]),
++    (PixelFormat::RG8UnormSRGB, &[137, 99], &[255, 115]),
++    (
++        PixelFormat::RGB9E5Float,
++        &e5b9g9r9(128, 64, 384, 15),
++        &e5b9g9r9(256, 44, 16, 16),
++    ),
++    (
++        PixelFormat::B5G6R5Unorm,
++        &b5g6r5(8, 8, 23),
++        &b5g6r5(31, 11, 2),
++    ),
++];
++
++/// The compressed formats checked, their bytes a block and the side of their texture: one of
++/// each family, and the ASTC format and extent of the texture whose refused pass ended a QEMU
++/// vGPU host.
++const COMPRESSED: [(PixelFormat, u64, u32); 8] = [
++    (PixelFormat::ASTC8x8LDR, 16, 1024),
++    (PixelFormat::ASTC4x4SRGB, 16, SIDE),
++    (PixelFormat::BC7RGBAUnorm, 16, SIDE),
++    (PixelFormat::BC1RGBA, 8, SIDE),
++    (PixelFormat::ETC2RGB8, 8, SIDE),
++    (PixelFormat::EACR11Unorm, 8, SIDE),
++    (PixelFormat::PVRTCRGBA4BPP, 8, SIDE),
++    (PixelFormat::BC6HRGBUfloat, 16, SIDE),
 +];
 +
 +/// A scratch directory for the device's shader cache, removed when dropped.
@@ -617,6 +905,82 @@ index 000000000..bf2b1c0f6
 +        .ok()
 +}
 +
++/// A shared texture of the compressed `pf`, of `texture_type`, `side` square, with `levels` and
++/// `slices`, of `usage`, where the device makes one.
++fn compressed(
++    device: &Device,
++    pf: PixelFormat,
++    (texture_type, side, levels, slices): (TextureType, u32, u64, u64),
++    usage: TextureUsage,
++) -> Option<Texture> {
++    device
++        .new_texture(&TextureDescriptor {
++            texture_type,
++            pixel_format: pf,
++            width: side.into(),
++            height: side.into(),
++            mipmap_level_count: levels,
++            array_length: slices,
++            usage,
++            resource_options: ResourceOptions::shared(),
++            ..TextureDescriptor::default()
++        })
++        .ok()
++}
++
++/// Each level and slice of the compressed `texture` (`bytes` a block): its level, its slice, and
++/// its whole region with its row and image of blocks.
++fn levels_and_slices(texture: &Texture, bytes: u64) -> Vec<(u64, u64, Region, u64, u64)> {
++    let [across, down] = block_extent(texture.pixel_format()).unwrap();
++    let slices = match texture.texture_type() {
++        TextureType::Cube | TextureType::CubeArray => 6 * texture.array_length(),
++        _ => texture.array_length(),
++    };
++    let mut all = Vec::new();
++    for level in 0..texture.mipmap_level_count() {
++        let width = (texture.width() >> level).max(1);
++        let height = (texture.height() >> level).max(1);
++        let row = width.div_ceil(across.into()) * bytes;
++        let image = row * height.div_ceil(down.into());
++        for slice in 0..slices {
++            let region = Region::new_2d(0, 0, width, height);
++            all.push((level, slice, region, row, image));
++        }
++    }
++    all
++}
++
++/// Write a pattern of `seed` into every level and slice of the compressed `texture` (`bytes` a
++/// block); the bytes written, each level and slice's.
++fn fill_blocks(texture: &Texture, bytes: u64, seed: u8) -> Vec<Vec<u8>> {
++    levels_and_slices(texture, bytes)
++        .into_iter()
++        .map(|(level, slice, region, row, image)| {
++            let pattern: Vec<u8> = (0..image)
++                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
++                .collect();
++            texture
++                .replace_region(region, level, slice, &pattern, row, image)
++                .unwrap();
++            pattern
++        })
++        .collect()
++}
++
++/// The bytes of every level and slice of the compressed `texture` (`bytes` a block).
++fn blocks(texture: &Texture, bytes: u64) -> Vec<Vec<u8>> {
++    levels_and_slices(texture, bytes)
++        .into_iter()
++        .map(|(level, slice, region, row, image)| {
++            let mut out = vec![0; image as usize];
++            texture
++                .get_bytes(&mut out, row, image, region, level, slice)
++                .unwrap();
++            out
++        })
++        .collect()
++}
++
 +/// A shared buffer of `values`.
 +fn floats(device: &Device, values: impl IntoIterator<Item = f32>) -> Buffer {
 +    let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
@@ -625,9 +989,8 @@ index 000000000..bf2b1c0f6
 +        .unwrap()
 +}
 +
-+/// The fixture's render pipeline state: `colored_vertex` and `colored_fragment`, writing each
-+/// vertex's color into a color 0 of `pf`.
-+fn state(device: &Device, pf: PixelFormat) -> RenderPipelineState {
++/// The fixture's `colored_vertex` and `colored_fragment`.
++fn functions(device: &Device) -> (StageSource, StageSource) {
 +    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
 +        .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
 +    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
@@ -635,17 +998,32 @@ index 000000000..bf2b1c0f6
 +    let library = device.new_library_with_compile_library(library);
 +    let vertex = library.new_function_with_name("colored_vertex").unwrap();
 +    let fragment = library.new_function_with_name("colored_fragment").unwrap();
-+    let mut descriptor =
-+        RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
-+    descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
-+    descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
-+    device
-+        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
-+        .unwrap()
++    (
++        StageSource::Function(vertex.function_descriptor()),
++        StageSource::Function(fragment.function_descriptor()),
++    )
 +}
 +
-+/// Run `encode` on a command buffer of `device`'s `queue`, commit it and wait: it completes.
-+fn run(queue: &crate::CommandQueue, what: &str, encode: impl FnOnce(&crate::CommandBuffer)) {
++/// The fixture's render pipeline state: `colored_vertex` and `colored_fragment`, writing each
++/// vertex's color into a color 0 described by `color`.
++fn state_of(
++    device: &Device,
++    color: ColorAttachmentDescriptor,
++) -> Result<RenderPipelineState, Error> {
++    let (vertex, fragment) = functions(device);
++    let mut descriptor = RenderPipelineDescriptor::new(vertex);
++    descriptor.fragment = Some(fragment);
++    descriptor.color_attachments[0] = Some(color);
++    device.new_render_pipeline_state(&descriptor, &PipelineOptions::default())
++}
++
++/// [`state_of`] a color 0 of `pf`, unblended.
++fn state(device: &Device, pf: PixelFormat) -> RenderPipelineState {
++    state_of(device, ColorAttachmentDescriptor::new(pf)).unwrap()
++}
++
++/// Run `encode` on a command buffer of `queue`, commit it and wait: it completes.
++fn run(queue: &CommandQueue, what: &str, encode: impl FnOnce(&crate::CommandBuffer)) {
 +    let command_buffer = queue.command_buffer().unwrap();
 +    encode(&command_buffer);
 +    command_buffer.commit().unwrap();
@@ -658,14 +1036,20 @@ index 000000000..bf2b1c0f6
 +    );
 +}
 +
-+/// `texture`'s texels, `bytes` a texel, read by a blit.
-+fn read(device: &Device, queue: &crate::CommandQueue, texture: &Texture, bytes: u32) -> Vec<u8> {
-+    let row = u64::from(SIDE * bytes);
-+    let len = row * u64::from(SIDE);
++/// `texture`'s level 0, `side` square, `bytes` a texel, read by a blit.
++fn read_side(
++    device: &Device,
++    queue: &CommandQueue,
++    texture: &Texture,
++    side: u32,
++    bytes: u32,
++) -> Vec<u8> {
++    let row = u64::from(side * bytes);
++    let len = row * u64::from(side);
 +    let out = device.new_buffer(len, ResourceOptions::shared()).unwrap();
 +    run(queue, "the read", |command_buffer| {
 +        let mut blit = command_buffer.blit_command_encoder().unwrap();
-+        let whole = Size::new(SIDE.into(), SIDE.into(), 1);
++        let whole = Size::new(side.into(), side.into(), 1);
 +        blit.copy_from_texture_to_buffer(
 +            texture,
 +            0,
@@ -685,14 +1069,13 @@ index 000000000..bf2b1c0f6
 +    unsafe { std::slice::from_raw_parts(out.contents().unwrap().as_ptr(), len as usize) }.to_vec()
 +}
 +
++/// [`read_side`] of a texture [`SIDE`] square.
++fn read(device: &Device, queue: &CommandQueue, texture: &Texture, bytes: u32) -> Vec<u8> {
++    read_side(device, queue, texture, SIDE, bytes)
++}
++
 +/// Write `bytes`, a texel each `texel` bytes, into `texture` by a blit.
-+fn write(
-+    device: &Device,
-+    queue: &crate::CommandQueue,
-+    texture: &Texture,
-+    texel: u32,
-+    bytes: &[u8],
-+) {
++fn write(device: &Device, queue: &CommandQueue, texture: &Texture, texel: u32, bytes: &[u8]) {
 +    let row = u64::from(SIDE * texel);
 +    let from = device
 +        .new_buffer_with_bytes(bytes, ResourceOptions::shared())
@@ -717,56 +1100,122 @@ index 000000000..bf2b1c0f6
 +    });
 +}
 +
-+/// A pass over `texture` as color 0, loading by `load`, that draws `state`'s quad over its left
-+/// half in orange and stores it.
-+fn draw_left_half(
-+    device: &Device,
-+    queue: &crate::CommandQueue,
-+    texture: &Texture,
-+    state: &RenderPipelineState,
-+    load: LoadAction,
-+) {
-+    let positions = floats(
-+        device,
-+        [[-1.0, 1.0], [0.0, 1.0], [-1.0, -1.0], [0.0, -1.0]]
-+            .into_iter()
-+            .flatten(),
-+    );
-+    let colors = floats(device, (0..4).flat_map(|_| [1.0, 0.375, 0.125, 0.5]));
-+    let mut pass = RenderPassDescriptor::new();
-+    let color = &mut pass.color_attachments[0];
++/// A pattern of `texel`-byte texels over a texture [`SIDE`] square.
++fn pattern(texel: u32) -> Vec<u8> {
++    (0..SIDE * SIDE * texel)
++        .map(|i| (i * 37 + 11) as u8)
++        .collect()
++}
++
++/// The quad over the left half of the attachments, colored [`DRAWN`]: its positions and colors.
++struct Quad(Buffer, Buffer);
++
++impl Quad {
++    fn new(device: &Device) -> Quad {
++        let positions = floats(
++            device,
++            [[-1.0, 1.0], [0.0, 1.0], [-1.0, -1.0], [0.0, -1.0]]
++                .into_iter()
++                .flatten(),
++        );
++        Quad(positions, floats(device, (0..4).flat_map(|_| DRAWN)))
++    }
++
++    /// Draw it with `state`, refused where setting the state is.
++    fn draw(
++        &self,
++        encoder: &mut RenderCommandEncoder,
++        state: &RenderPipelineState,
++    ) -> Result<(), Error> {
++        encoder.set_render_pipeline_state(state)?;
++        encoder.set_vertex_buffer(Some(&self.0), 0, 0)?;
++        encoder.set_vertex_buffer(Some(&self.1), 0, 1)?;
++        encoder.draw_primitives(PrimitiveType::TriangleStrip, 0, 4, 1, 0)
++    }
++}
++
++/// A color attachment of `texture`, loading by `load`, cleared to [`CLEAR`], stored.
++fn color(pass: &mut RenderPassDescriptor, index: usize, texture: &Texture, load: LoadAction) {
++    let color = &mut pass.color_attachments[index];
 +    color.texture = Some(texture.clone());
 +    color.load_action = load;
 +    color.store_action = StoreAction::Store;
-+    color.clear_color = ClearColor::new(0.25, 0.5, 0.75, 1.0);
-+    run(queue, "the pass", |command_buffer| {
-+        let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
-+        encoder.set_render_pipeline_state(state).unwrap();
-+        encoder.set_vertex_buffer(Some(&positions), 0, 0).unwrap();
-+        encoder.set_vertex_buffer(Some(&colors), 0, 1).unwrap();
-+        encoder
-+            .draw_primitives(PrimitiveType::TriangleStrip, 0, 4, 1, 0)
-+            .unwrap();
-+        encoder.end_encoding().unwrap();
-+    });
++    color.clear_color = ClearColor::new(CLEAR[0], CLEAR[1], CLEAR[2], CLEAR[3]);
 +}
 +
-+/// A texture without `RenderTarget` usage of a format the device renders through its word renders
-+/// as a render target of the format does: a pass that clears and draws, and one that loads and
-+/// draws, leave it the bytes they leave the render target, the loaded texels untouched.
++/// A pass over `texture` as color 0, loading by `load`, that draws `quad` with `state` and stores
++/// it; refused where its encoder or the draw is.
++fn draw_left_half(
++    queue: &CommandQueue,
++    texture: &Texture,
++    (state, quad): (&RenderPipelineState, &Quad),
++    load: LoadAction,
++) -> Result<(), Error> {
++    let mut pass = RenderPassDescriptor::new();
++    color(&mut pass, 0, texture, load);
++    let command_buffer = queue.command_buffer().unwrap();
++    let mut encoder = command_buffer.render_command_encoder(&pass)?;
++    let drawn = quad.draw(&mut encoder, state);
++    encoder.end_encoding().unwrap();
++    command_buffer.commit().unwrap();
++    command_buffer.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(
++        command_buffer.status(),
++        CommandBufferStatus::Completed,
++        "the pass: {:?}",
++        command_buffer.error()
++    );
++    drawn
++}
++
++/// Each row of `texels` (`texel` bytes each, [`SIDE`] a row) is `left` texels left of the
++/// middle and `right` ones from it: one texel each, or a row's half of `right`.
++fn assert_halves(texels: &[u8], texel: usize, left: &[u8], right: Halves<'_>, what: &str) {
++    let row = SIDE as usize * texel;
++    assert_eq!(texels.len(), row * SIDE as usize, "{what}");
++    for (at, got) in texels.chunks(row).enumerate() {
++        let (l, r) = got.split_at(row / 2);
++        assert!(
++            l.chunks(texel).all(|t| t == left),
++            "{what}: row {at} left of the middle: {l:?}, want {left:?} each"
++        );
++        match right {
++            Halves::Each(want) => assert!(
++                r.chunks(texel).all(|t| t == want),
++                "{what}: row {at} from the middle: {r:?}, want {want:?} each"
++            ),
++            Halves::Of(whole) => assert_eq!(
++                r,
++                &whole[at * row + row / 2..(at + 1) * row],
++                "{what}: row {at} from the middle"
++            ),
++        }
++    }
++}
++
++/// What a row's right half holds: one texel each, or that of a whole texture's bytes.
++#[derive(Clone, Copy)]
++enum Halves<'a> {
++    Each(&'a [u8]),
++    Of(&'a [u8]),
++}
++
++/// A texture without `RenderTarget` usage of each format with a word layout renders as a render
++/// target of the format does: a pass that clears and draws, and one that loads and draws, leave
++/// it the bytes they leave the render target, the loaded texels untouched. The device renders at
++/// least one of them through its word, and makes a texture of each.
 +#[test]
-+fn a_texture_without_render_target_usage_renders_through_its_word() {
++fn a_texture_without_render_target_usage_renders_as_its_render_target() {
 +    let cache = Scratch::new();
 +    let (device, watched) = watched(&cache.0);
 +    let queue = device.new_command_queue().unwrap();
 +    let profile = device.compile_device().profile();
++    let quad = Quad::new(&device);
 +    let mut worded = Vec::new();
++    let mut own = Vec::new();
 +    for (pf, texel) in WORDS {
-+        let Some(word) = WordAttachment::of(pf, profile) else {
-+            eprintln!("{pf:?}: the device renders it, or holds no texture of it: not worded");
-+            continue;
-+        };
-+        let stood = texture(&device, pf, SIDE, 1, TextureUsage::SHADER_READ).unwrap();
++        let stood = texture(&device, pf, SIDE, 1, TextureUsage::SHADER_READ)
++            .unwrap_or_else(|| panic!("{pf:?}: no texture without RenderTarget usage"));
 +        let target = texture(
 +            &device,
 +            pf,
@@ -774,137 +1223,231 @@ index 000000000..bf2b1c0f6
 +            1,
 +            TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
 +        )
-+        .unwrap();
++        .unwrap_or_else(|| panic!("{pf:?}: no render target"));
 +        let state = state(&device, pf);
-+        // Cleared and drawn: the clear's word right of the quad, the draw's left of it.
++        let word = WordAttachment::of(pf, profile).map(|w| w.word_format());
++        let what = format!("{pf:?} (word {word:?})");
++        // Cleared and drawn: the clear right of the quad, the draw left of it.
 +        for t in [&stood, &target] {
-+            draw_left_half(&device, &queue, t, &state, LoadAction::Clear);
++            draw_left_half(&queue, t, (&state, &quad), LoadAction::Clear)
++                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
 +        }
 +        let cleared = read(&device, &queue, &stood, texel);
 +        assert_eq!(
 +            cleared,
 +            read(&device, &queue, &target, texel),
-+            "{pf:?} through {:?}: cleared and drawn",
-+            word.word_format()
++            "{what}: cleared and drawn"
 +        );
 +        let first = &cleared[..texel as usize];
 +        let last = &cleared[cleared.len() - texel as usize..];
-+        assert_ne!(first, last, "{pf:?}: the draw and the clear store apart");
-+        // Loaded and drawn: every texel right of the quad keeps the bytes written before.
-+        let pattern: Vec<u8> = (0..SIDE * SIDE * texel)
-+            .map(|i| (i * 37 + 11) as u8)
-+            .collect();
++        assert_ne!(first, last, "{what}: the draw and the clear store apart");
++        // Loaded and drawn: every texel right of the quad keeps the bytes written before, and
++        // every one left of it takes what the cleared pass drew.
++        let pattern = pattern(texel);
 +        for t in [&stood, &target] {
 +            write(&device, &queue, t, texel, &pattern);
-+            draw_left_half(&device, &queue, t, &state, LoadAction::Load);
++            draw_left_half(&queue, t, (&state, &quad), LoadAction::Load)
++                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
 +        }
 +        let loaded = read(&device, &queue, &stood, texel);
 +        assert_eq!(
 +            loaded,
 +            read(&device, &queue, &target, texel),
-+            "{pf:?}: loaded and drawn"
++            "{what}: loaded and drawn"
 +        );
-+        let row = (SIDE * texel) as usize;
-+        for (at, (got, want)) in loaded.chunks(row).zip(pattern.chunks(row)).enumerate() {
-+            assert_eq!(
-+                got[row / 2..],
-+                want[row / 2..],
-+                "{pf:?}: row {at}, right of the quad"
-+            );
++        assert_halves(&loaded, texel as usize, first, Halves::Of(&pattern), &what);
++        match word {
++            Some(word) => worded.push((pf, word)),
++            None => own.push(pf),
 +        }
-+        worded.push(pf);
 +    }
-+    eprintln!("worded attachments without RenderTarget usage: {worded:?}");
++    eprintln!("through the word's format: {worded:?}; through their own: {own:?}");
++    assert!(
++        !worded.is_empty(),
++        "no format of WORDS renders through its word here: the stand-in in the word's format \
++         went unchecked"
++    );
 +    drop((queue, device));
-+    watched.layer_reported_nothing("every worded stand-in's pass was valid and nothing leaked");
++    watched.layer_reported_nothing("every stand-in's pass was valid and nothing leaked");
 +}
 +
-+/// The compressed formats checked: one of each family, and the ASTC format and extent of the
-+/// texture whose refused pass ended a QEMU vGPU host.
-+const COMPRESSED: [(PixelFormat, u32); 8] = [
-+    (PixelFormat::ASTC8x8LDR, 1024),
-+    (PixelFormat::ASTC4x4SRGB, 16),
-+    (PixelFormat::BC7RGBAUnorm, 16),
-+    (PixelFormat::BC1RGBA, 16),
-+    (PixelFormat::ETC2RGB8, 16),
-+    (PixelFormat::EACR11Unorm, 16),
-+    (PixelFormat::PVRTCRGBA4BPP, 16),
-+    (PixelFormat::BC6HRGBUfloat, 16),
-+];
-+
-+/// A color attachment of a compressed format, with `RenderTarget` usage or without, at color 0 or
-+/// beside another, is answered nil; a pass after it on the same command buffer runs, and the
-+/// command buffer completes.
++/// A texture without `RenderTarget` usage stores Metal's codes, worked out by hand ([`CODES`]):
++/// cleared and drawn, the draw's left of the quad and the clear's right of it; loaded and drawn,
++/// the draw's left of it and the bytes written before right of it. So does the format's render
++/// target, and so do both under a blend of factors one and zero, which Metal stores the same.
 +#[test]
-+fn a_compressed_color_attachment_is_answered_nil() {
++fn stand_ins_store_metal_s_codes() {
 +    let cache = Scratch::new();
 +    let (device, watched) = watched(&cache.0);
 +    let queue = device.new_command_queue().unwrap();
-+    let plain = texture(
-+        &device,
-+        PixelFormat::RGBA8Unorm,
-+        SIDE,
-+        1,
-+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
-+    )
-+    .unwrap();
-+    let mut answered = 0;
-+    for (pf, side) in COMPRESSED {
++    let quad = Quad::new(&device);
++    for (pf, cleared, drawn) in CODES {
++        let texel = cleared.len() as u32;
++        let mut blended = ColorAttachmentDescriptor::new(pf);
++        blended.blending_enabled = true;
++        let states = [
++            ("unblended", state(&device, pf)),
++            (
++                "blended one and zero",
++                state_of(&device, blended).unwrap_or_else(|e| panic!("{pf:?}: {e:?}")),
++            ),
++        ];
 +        for usage in [
 +            TextureUsage::SHADER_READ,
 +            TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
 +        ] {
-+            let Some(compressed) = texture(&device, pf, side, 1, usage) else {
++            let t = texture(&device, pf, SIDE, 1, usage).unwrap();
++            for (how, state) in &states {
++                let what = format!("{pf:?} {usage:?} {how}");
++                draw_left_half(&queue, &t, (state, &quad), LoadAction::Clear)
++                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
++                let got = read(&device, &queue, &t, texel);
++                assert_halves(&got, texel as usize, drawn, Halves::Each(cleared), &what);
++                let pattern = pattern(texel);
++                write(&device, &queue, &t, texel, &pattern);
++                draw_left_half(&queue, &t, (state, &quad), LoadAction::Load)
++                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
++                let got = read(&device, &queue, &t, texel);
++                assert_halves(&got, texel as usize, drawn, Halves::Of(&pattern), &what);
++            }
++        }
++    }
++    drop((queue, device));
++    watched.layer_reported_nothing("every pass storing Metal's codes was valid");
++}
++
++/// A pipeline blending source alpha over one minus it draws over a loaded texture without
++/// `RenderTarget` usage as over the format's render target: the same bytes, or the same refusal.
++/// A pipeline the device makes none of (a word attachment's blend it does not build) is refused
++/// as it is made, whatever it would draw into. At least one format blends.
++#[test]
++fn a_blend_over_a_stand_in_is_the_render_target_s() {
++    let cache = Scratch::new();
++    let (device, watched) = watched(&cache.0);
++    let queue = device.new_command_queue().unwrap();
++    let quad = Quad::new(&device);
++    let mut ran = Vec::new();
++    let mut unmade = Vec::new();
++    for (pf, texel) in WORDS {
++        let mut blend = ColorAttachmentDescriptor::new(pf);
++        blend.blending_enabled = true;
++        blend.source_rgb_blend_factor = BlendFactor::SourceAlpha;
++        blend.source_alpha_blend_factor = BlendFactor::SourceAlpha;
++        blend.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
++        blend.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
++        let state = match state_of(&device, blend) {
++            Ok(state) => state,
++            Err(e) => {
++                unmade.push(format!("{pf:?}: {e:?}"));
++                continue;
++            }
++        };
++        let pattern = pattern(texel);
++        let blended = |usage: TextureUsage| {
++            let t = texture(&device, pf, SIDE, 1, usage).unwrap();
++            write(&device, &queue, &t, texel, &pattern);
++            draw_left_half(&queue, &t, (&state, &quad), LoadAction::Load)
++                .map(|()| read(&device, &queue, &t, texel))
++        };
++        let stood = blended(TextureUsage::SHADER_READ);
++        let target = blended(TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET);
++        assert_eq!(
++            format!("{stood:?}"),
++            format!("{target:?}"),
++            "{pf:?}: blended over its loaded texels"
++        );
++        if let Ok(texels) = &stood {
++            // Right of the quad the loaded texels, left of it a blend of them.
++            let row = (SIDE * texel) as usize;
++            let rows = texels.chunks(row).zip(pattern.chunks(row));
++            for (at, (got, want)) in rows.enumerate() {
++                assert_eq!(got[row / 2..], want[row / 2..], "{pf:?}: row {at}, right");
++                assert_ne!(got[..row / 2], want[..row / 2], "{pf:?}: row {at}, left");
++            }
++            ran.push(pf);
++        }
++    }
++    eprintln!("blended: {ran:?}; no such pipeline: {unmade:#?}");
++    assert!(!ran.is_empty(), "no blend ran");
++    drop((queue, device));
++    watched.layer_reported_nothing("every blended stand-in's pass was valid");
++}
++
++/// The answer nil naming `index`'s color, of a compressed format.
++fn is_compressed_nil(answer: Result<crate::RenderCommandEncoder, Error>, index: u32, what: &str) {
++    match answer {
++        Err(Error::Nil(nil)) => assert_eq!(
++            nil.problem,
++            Problem::RenderPass(RenderPassProblem::CompressedColorAttachment(
++                Attachment::Color(index)
++            )),
++            "{what}"
++        ),
++        Err(other) => panic!("{what}: refused {other:?}"),
++        Ok(_) => panic!("{what}: an encoder"),
++    }
++}
++
++/// A color attachment of a compressed format, with `RenderTarget` usage or without, at color 0
++/// or beside another, loaded, cleared or neither, is answered nil; the compressed texture keeps
++/// its blocks, a pass after it on the same command buffer runs, and the command buffer completes.
++#[test]
++fn a_compressed_color_attachment_is_answered_nil_and_the_command_buffer_goes_on() {
++    let cache = Scratch::new();
++    let (device, watched) = watched(&cache.0);
++    let queue = device.new_command_queue().unwrap();
++    let rgba8 = PixelFormat::RGBA8Unorm;
++    let mut answered = 0;
++    for (pf, bytes, side) in COMPRESSED {
++        let plain = texture(
++            &device,
++            rgba8,
++            side,
++            1,
++            TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
++        )
++        .unwrap();
++        let usages = [
++            TextureUsage::SHADER_READ,
++            TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
++        ];
++        for usage in usages {
++            let shape = (TextureType::Type2D, side, 1, 1);
++            let Some(blocks_texture) = compressed(&device, pf, shape, usage) else {
 +                eprintln!("{pf:?} {usage:?}: the device makes no such texture");
 +                continue;
 +            };
++            let written = fill_blocks(&blocks_texture, bytes, 11);
 +            for index in [0usize, 1] {
-+                let mut pass = RenderPassDescriptor::new();
-+                if index == 1 {
-+                    let first = &mut pass.color_attachments[0];
-+                    first.texture = Some(plain.clone());
-+                    first.load_action = LoadAction::Clear;
-+                    first.store_action = StoreAction::Store;
++                for load in [LoadAction::Load, LoadAction::Clear, LoadAction::DontCare] {
++                    let what = format!("{pf:?} {usage:?} at {index}, {load:?}");
++                    let mut pass = RenderPassDescriptor::new();
++                    if index == 1 {
++                        color(&mut pass, 0, &plain, LoadAction::Clear);
++                    }
++                    color(&mut pass, index, &blocks_texture, load);
++                    // The command buffer goes on: a pass of the plain texture after it runs.
++                    let mut after = RenderPassDescriptor::new();
++                    color(&mut after, 0, &plain, LoadAction::Clear);
++                    after.color_attachments[0].clear_color = ClearColor::new(0.0, 1.0, 0.0, 1.0);
++                    run(&queue, &what, |command_buffer| {
++                        let answer = command_buffer.render_command_encoder(&pass);
++                        is_compressed_nil(answer, index as u32, &what);
++                        let encoder = command_buffer.render_command_encoder(&after).unwrap();
++                        encoder.end_encoding().unwrap();
++                    });
++                    let texels = read_side(&device, &queue, &plain, side, 4);
++                    assert!(
++                        texels.chunks(4).all(|t| t == [0, 255, 0, 255]),
++                        "{what}: the pass after it cleared"
++                    );
++                    assert_eq!(
++                        blocks(&blocks_texture, bytes),
++                        written,
++                        "{what}: the blocks"
++                    );
++                    answered += 1;
 +                }
-+                let color = &mut pass.color_attachments[index];
-+                color.texture = Some(compressed.clone());
-+                color.load_action = LoadAction::Load;
-+                color.store_action = StoreAction::Store;
-+                let command_buffer = queue.command_buffer().unwrap();
-+                match command_buffer.render_command_encoder(&pass) {
-+                    Err(Error::Nil(nil)) => assert_eq!(
-+                        nil.problem,
-+                        Problem::RenderPass(RenderPassProblem::CompressedColorAttachment(
-+                            crate::Attachment::Color(index as u32)
-+                        )),
-+                        "{pf:?} {usage:?} at {index}"
-+                    ),
-+                    Err(other) => panic!("{pf:?} {usage:?} at {index}: refused {other:?}"),
-+                    Ok(_) => panic!("{pf:?} {usage:?} at {index}: an encoder"),
-+                }
-+                // The command buffer goes on: a pass of the plain texture after it runs.
-+                let mut after = RenderPassDescriptor::new();
-+                let color = &mut after.color_attachments[0];
-+                color.texture = Some(plain.clone());
-+                color.load_action = LoadAction::Clear;
-+                color.store_action = StoreAction::Store;
-+                color.clear_color = ClearColor::new(0.0, 1.0, 0.0, 1.0);
-+                let encoder = command_buffer.render_command_encoder(&after).unwrap();
-+                encoder.end_encoding().unwrap();
-+                command_buffer.commit().unwrap();
-+                command_buffer.wait_until_completed_for(WAIT).unwrap();
-+                assert_eq!(
-+                    command_buffer.status(),
-+                    CommandBufferStatus::Completed,
-+                    "{pf:?} {usage:?} at {index}: {:?}",
-+                    command_buffer.error()
-+                );
-+                let cleared = read(&device, &queue, &plain, 4);
-+                assert!(
-+                    cleared.chunks(4).all(|t| t == [0, 255, 0, 255]),
-+                    "{pf:?} {usage:?} at {index}: the pass after it cleared"
-+                );
-+                answered += 1;
 +            }
 +        }
 +    }
@@ -913,17 +1456,189 @@ index 000000000..bf2b1c0f6
 +    watched.layer_reported_nothing("no image was made for a compressed attachment's pass");
 +}
 +
++/// The first of [`COMPRESSED`] the device makes a shared texture of with `shape`: its format, its
++/// bytes a block and the texture, its blocks written.
++fn first_compressed(
++    device: &Device,
++    (texture_type, levels, slices): (TextureType, u64, u64),
++) -> (PixelFormat, u64, Texture, Vec<Vec<u8>>) {
++    let side = 2 * SIDE;
++    COMPRESSED
++        .iter()
++        .filter(|(pf, ..)| *pf != PixelFormat::PVRTCRGBA4BPP)
++        .find_map(|&(pf, bytes, _)| {
++            let shape = (texture_type, side, levels, slices);
++            let t = compressed(device, pf, shape, TextureUsage::SHADER_READ)?;
++            let written = fill_blocks(&t, bytes, 23);
++            Some((pf, bytes, t, written))
++        })
++        .expect("the device makes no compressed texture")
++}
++
++/// A compressed attachment of a level and slice of an array, and of a cube's face, beside a color
++/// of the level's extent, is answered nil naming it, and keeps every level and slice's blocks;
++/// one of a level its texture lacks is refused as any attachment's is (`AttachmentSubresource`),
++/// not answered nil.
++#[test]
++fn a_compressed_level_or_slice_is_answered_nil_once_its_subresource_is_checked() {
++    let cache = Scratch::new();
++    let (device, watched) = watched(&cache.0);
++    let queue = device.new_command_queue().unwrap();
++    let plain = texture(
++        &device,
++        PixelFormat::RGBA8Unorm,
++        SIDE,
++        1,
++        TextureUsage::RENDER_TARGET,
++    )
++    .unwrap();
++    for (texture_type, slices) in [(TextureType::Type2DArray, 3), (TextureType::Cube, 1)] {
++        let (pf, bytes, t, written) = first_compressed(&device, (texture_type, 2, slices));
++        for (level, slice) in [(1, 2), (2, 2)] {
++            let what = format!("{pf:?} {texture_type:?}: level {level}, slice {slice}");
++            let mut pass = RenderPassDescriptor::new();
++            color(&mut pass, 0, &plain, LoadAction::Clear);
++            color(&mut pass, 1, &t, LoadAction::Load);
++            pass.color_attachments[1].level = level;
++            pass.color_attachments[1].slice = slice;
++            let command_buffer = queue.command_buffer().unwrap();
++            let answer = command_buffer.render_command_encoder(&pass);
++            if level < 2 {
++                is_compressed_nil(answer, 1, &what);
++            } else {
++                match answer {
++                    Err(Error::Invalid(Invalid {
++                        problem:
++                            Problem::RenderPass(RenderPassProblem::AttachmentSubresource(
++                                Attachment::Color(1),
++                            )),
++                        ..
++                    })) => {}
++                    Err(other) => panic!("{what}: {other:?}"),
++                    Ok(_) => panic!("{what}: an encoder"),
++                }
++            }
++            drop(command_buffer);
++            assert_eq!(blocks(&t, bytes), written, "{what}");
++        }
++    }
++    drop((queue, device));
++    watched.layer_reported_nothing("no image was made for a compressed level's pass");
++}
++
++/// A pass with a compressed color meets the command buffer's checks as any pass does: refused
++/// while another encoder is open (`EncoderOpen`), and after the commit (`AlreadyCommitted`), as
++/// a pass of a plain color is.
++#[test]
++fn a_pass_with_a_compressed_color_is_refused_as_any_pass_while_an_encoder_is_open_or_after_commit()
++{
++    let cache = Scratch::new();
++    let (device, watched) = watched(&cache.0);
++    let queue = device.new_command_queue().unwrap();
++    let plain = texture(
++        &device,
++        PixelFormat::RGBA8Unorm,
++        2 * SIDE,
++        1,
++        TextureUsage::RENDER_TARGET,
++    )
++    .unwrap();
++    let (pf, _, t, _) = first_compressed(&device, (TextureType::Type2D, 1, 1));
++    let mut plain_pass = RenderPassDescriptor::new();
++    color(&mut plain_pass, 0, &plain, LoadAction::Clear);
++    let mut compressed_pass = RenderPassDescriptor::new();
++    color(&mut compressed_pass, 0, &t, LoadAction::Load);
++    let refused = |error: Option<Error>, problem: Problem, what: &str| match error {
++        Some(Error::Invalid(Invalid { problem: p, .. })) if p == problem => {}
++        other => panic!("{pf:?}: {what}: {other:?}, want {problem:?}"),
++    };
++    let command_buffer = queue.command_buffer().unwrap();
++    let open = command_buffer.render_command_encoder(&plain_pass).unwrap();
++    for (pass, what) in [
++        (&compressed_pass, "the compressed pass"),
++        (&plain_pass, "the plain pass"),
++    ] {
++        let error = command_buffer.render_command_encoder(pass).err();
++        refused(
++            error,
++            Problem::EncoderOpen,
++            &format!("{what}, an encoder open"),
++        );
++    }
++    open.end_encoding().unwrap();
++    command_buffer.commit().unwrap();
++    command_buffer.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
++    for (pass, what) in [
++        (&compressed_pass, "the compressed pass"),
++        (&plain_pass, "the plain pass"),
++    ] {
++        let error = command_buffer.render_command_encoder(pass).err();
++        refused(
++            error,
++            Problem::AlreadyCommitted,
++            &format!("{what}, committed"),
++        );
++    }
++    drop(command_buffer);
++    drop((queue, device));
++    watched.layer_reported_nothing("the refused passes left nothing");
++}
++
++/// Every color of a pass is checked before any takes an image, or the pass is answered nil for a
++/// compressed one: a pass whose color 0 renders through a stand-in and whose color 1 is
++/// compressed is answered nil naming color 1; one whose color 1 names a level its texture lacks
++/// is refused naming color 1 (`AttachmentSubresource`), its color 0 a stand-in's or a compressed
++/// one's (no longer answered nil for color 0 before color 1 is checked).
++#[test]
++fn a_pass_checks_every_color_before_any_takes_an_image() {
++    let cache = Scratch::new();
++    let (device, watched) = watched(&cache.0);
++    let queue = device.new_command_queue().unwrap();
++    let rgba8 = PixelFormat::RGBA8Unorm;
++    let side = 2 * SIDE;
++    let stood = texture(&device, rgba8, side, 1, TextureUsage::SHADER_READ).unwrap();
++    let (pf, bytes, t, written) = first_compressed(&device, (TextureType::Type2D, 1, 1));
++    let what = format!("a stand-in at 0, {pf:?} at 1");
++    let mut pass = RenderPassDescriptor::new();
++    color(&mut pass, 0, &stood, LoadAction::Clear);
++    color(&mut pass, 1, &t, LoadAction::Load);
++    let command_buffer = queue.command_buffer().unwrap();
++    is_compressed_nil(command_buffer.render_command_encoder(&pass), 1, &what);
++    drop(command_buffer);
++    assert_eq!(blocks(&t, bytes), written, "{what}: the blocks");
++    let past = texture(&device, rgba8, side, 1, TextureUsage::RENDER_TARGET).unwrap();
++    for (first, what) in [(&stood, "a stand-in"), (&t, "a compressed color")] {
++        let mut pass = RenderPassDescriptor::new();
++        color(&mut pass, 0, first, LoadAction::Load);
++        color(&mut pass, 1, &past, LoadAction::Load);
++        pass.color_attachments[1].level = 3;
++        let command_buffer = queue.command_buffer().unwrap();
++        match command_buffer.render_command_encoder(&pass) {
++            Err(Error::Invalid(Invalid {
++                problem:
++                    Problem::RenderPass(RenderPassProblem::AttachmentSubresource(Attachment::Color(1))),
++                ..
++            })) => {}
++            Err(other) => panic!("{what} at 0, color 1 past its levels: {other:?}"),
++            Ok(_) => panic!("{what} at 0, color 1 past its levels: an encoder"),
++        }
++    }
++    drop((queue, device));
++    watched.layer_reported_nothing("every checked pass was valid and nothing leaked");
++}
++
 +/// No color attachment's pass is refused naming an image limit of 0, the device's answer for an
 +/// image it makes none of: every color format, at 1 and 4 samples, with and without
-+/// `RenderTarget` usage, opens, is answered nil (a compressed format alone), or is refused
-+/// naming what the device lacks.
++/// `RenderTarget` usage, opens or is refused naming what the device lacks, and every compressed
++/// texture the device makes is answered nil (`CompressedColorAttachment`), nothing else nil.
 +#[test]
 +fn no_pass_is_refused_naming_an_image_limit_of_0() {
 +    let cache = Scratch::new();
 +    let (device, watched) = watched(&cache.0);
 +    let queue = device.new_command_queue().unwrap();
 +    let mut wrong = Vec::new();
-+    let mut opened = 0;
++    let (mut opened, mut compressed_nil, mut refused) = (0, 0, 0);
 +    for &pf in PixelFormat::ALL {
 +        if is_depth_stencil(pf) {
 +            continue;
@@ -936,6 +1651,7 @@ index 000000000..bf2b1c0f6
 +                let Some(t) = texture(&device, pf, SIDE, samples, usage) else {
 +                    continue;
 +                };
++                let what = format!("{pf:?} x{samples} {usage:?}");
 +                let mut pass = RenderPassDescriptor::new();
 +                let color = &mut pass.color_attachments[0];
 +                color.texture = Some(t);
@@ -943,34 +1659,76 @@ index 000000000..bf2b1c0f6
 +                color.store_action = StoreAction::Store;
 +                let command_buffer = queue.command_buffer().unwrap();
 +                match command_buffer.render_command_encoder(&pass) {
++                    Ok(_) if block_extent(pf).is_some() => {
++                        wrong.push(format!("{what}: compressed, an encoder"));
++                    }
 +                    Ok(encoder) => {
 +                        encoder.end_encoding().unwrap();
 +                        opened += 1;
 +                    }
-+                    Err(Error::Nil(_)) if block_extent(pf).is_some() => {}
++                    Err(Error::Nil(nil))
++                        if nil.problem
++                            == Problem::RenderPass(
++                                RenderPassProblem::CompressedColorAttachment(Attachment::Color(0)),
++                            )
++                            && block_extent(pf).is_some() =>
++                    {
++                        compressed_nil += 1;
++                    }
++                    Err(error) if block_extent(pf).is_some() => {
++                        wrong.push(format!("{what}: compressed, {error:?}"));
++                    }
 +                    Err(Error::Unsupported(u))
 +                        if format!("{:?}", u.needs).contains("available: 0") =>
 +                    {
-+                        wrong.push(format!("{pf:?} x{samples} {usage:?}: {u:?}"));
++                        wrong.push(format!("{what}: {u:?}"));
 +                    }
-+                    Err(Error::Nil(nil)) => {
-+                        wrong.push(format!("{pf:?} x{samples} {usage:?}: nil {nil:?}"));
-+                    }
-+                    Err(_) => {}
++                    Err(Error::Nil(nil)) => wrong.push(format!("{what}: nil {nil:?}")),
++                    Err(_) => refused += 1,
 +                }
 +            }
 +        }
 +    }
-+    assert!(opened > 0, "no pass opened");
++    eprintln!("opened {opened}, compressed answered nil {compressed_nil}, refused {refused}");
 +    assert!(wrong.is_empty(), "{wrong:#?}");
++    assert!(opened > 0, "no pass opened");
++    assert!(compressed_nil > 0, "no compressed texture was made");
 +    drop((queue, device));
 +    watched.layer_reported_nothing("every attachment's pass was valid and nothing leaked");
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index 105e39372..a7a383170 100644
+index 105e39372..e76e52f6c 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
-@@ -2587,7 +2587,9 @@ impl Device {
+@@ -80,7 +80,8 @@ use super::heap::{Heap, HeapProblem, HeapType};
+ use super::heap_sets;
+ use super::host_bytes::HostBytes;
+ use super::image_plan::{
+-    check_image_limits, plan_image, DepthImageFacts, ImageFacts, ImagePlan, ImageRefusal,
++    check_image_limits, check_made_limits, plan_image, DepthImageFacts, ImageFacts, ImagePlan,
++    ImageRefusal,
+ };
+ use super::in_place::{self, PagesClass, Refusal, ShadowCause, Verdict};
+ use super::key_hash::KeyMap;
+@@ -1831,7 +1832,7 @@ impl Device {
+         let info =
+             sparse_create_info(plan.create_info(self.shared().sharing(), &view_formats, &mut list));
+         let limits = self.image_limits(&info, &view_formats)?;
+-        check_image_limits(&plan, texture_type, &limits).map_err(Error::Unsupported)?;
++        check_made_limits(&plan, texture_type, &limits)?;
+         // The device's first sparse image, on a driver whose first sparse resource waits for
+         // every queue's work: announced before the call that waits.
+         let first_sparse = !shared.sparse_image_made.swap(true, Ordering::Relaxed);
+@@ -1921,7 +1922,7 @@ impl Device {
+         let mut list = vk::ImageFormatListCreateInfo::default();
+         let info = plan.create_info(self.shared().sharing(), &view_formats, &mut list);
+         let limits = self.image_limits(&info, &view_formats)?;
+-        check_image_limits(&plan, shape.texture_type, &limits).map_err(Error::Unsupported)?;
++        check_made_limits(&plan, shape.texture_type, &limits)?;
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+         let raw = unsafe { crate::creation::image(raw_device, &info) }?;
+@@ -2587,7 +2588,9 @@ impl Device {
          };
          match queried {
              Ok(()) => Ok(properties.image_format_properties),
@@ -981,6 +1739,37 @@ index 105e39372..a7a383170 100644
              Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => Ok(vk::ImageFormatProperties::default()),
              Err(error) => Err(vulkan(error)),
          }
+@@ -2975,7 +2978,7 @@ impl Device {
+         let mut list = vk::ImageFormatListCreateInfo::default();
+         let info = plan.create_info(sharing, &view_formats, &mut list);
+         let limits = self.image_limits(&info, &view_formats)?;
+-        check_image_limits(plan, texture_type, &limits).map_err(Error::Unsupported)?;
++        check_made_limits(plan, texture_type, &limits)?;
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
+         // device's limits for it.
+         let raw = unsafe { crate::creation::image(raw_device, &info) }?;
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 8aba80f4d..0ea2191b8 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -219,7 +219,7 @@ use crate::degradation::Degradation;
+ use crate::device::lock;
+ use crate::error::{internal, invalid, nil, vulkan, Error, MemoryKind, Nil, Problem, RuntimeGap};
+ use crate::heap::{Heap, HeapProblem, HeapType, SizeAndAlign, WeakHeap};
+-use crate::image_plan::{check_image_limits, plan_image, ImagePlan};
++use crate::image_plan::{check_made_limits, plan_image, ImagePlan};
+ use crate::key_hash::KeyMap;
+ use crate::linear_plan::{check_linear_limits, linear_lack, LinearLack, LINEAR_ALIGNMENT};
+ use crate::memory::{Memory, MemoryClass, Placement};
+@@ -2182,7 +2182,7 @@ impl Device {
+         if tiling == vk::ImageTiling::LINEAR {
+             check_linear_limits(plan, &limits).map_err(tiling_refusal)?;
+         } else {
+-            check_image_limits(plan, texture_type, &limits).map_err(Error::Unsupported)?;
++            check_made_limits(plan, texture_type, &limits)?;
+         }
+         let raw_device = self.shared().vk();
+         // SAFETY: the device is live and `info` (with its format list) valid and within the
 diff --git a/crates/metal2vulkan/tests/api_signatures.tsv b/crates/metal2vulkan/tests/api_signatures.tsv
 index cf1ba02ca..0c187008b 100644
 --- a/crates/metal2vulkan/tests/api_signatures.tsv
@@ -994,7 +1783,7 @@ index cf1ba02ca..0c187008b 100644
  variant	metal2vulkan-runtime::RenderPassProblem::DefaultRasterSampleCount	DefaultRasterSampleCount { count: u64 }
  variant	metal2vulkan-runtime::RenderPassProblem::DepthResolvedSampleWithoutDepthResolve	DepthResolvedSampleWithoutDepthResolve
 diff --git a/docs/REFUSALS.md b/docs/REFUSALS.md
-index 6e2eae0b6..1549e4ded 100644
+index 6e2eae0b6..5405675bf 100644
 --- a/docs/REFUSALS.md
 +++ b/docs/REFUSALS.md
 @@ -35,7 +35,7 @@ Columns:
@@ -1024,7 +1813,22 @@ index 6e2eae0b6..1549e4ded 100644
  | `DivergentImplicitLod` | Divergent implicit-LOD sampling or LOD query through a multi-candidate handle | every device (not implemented) | `ours` | 1: `crates/metal2vulkan/src/lower/sampler/select.rs (select_sampling)` | `app`: implicit-LOD sampling through a dynamically chosen texture |
  | `ImplicitLodOutsideFragment` | Implicit-LOD sampling outside fragment | every device (not implemented) | `ours` | 3: `crates/metal2vulkan/src/lower/sampler/constexpr.rs (query_min_level)`, `crates/metal2vulkan/src/lower/sampler/select.rs (query_level_measured)` (+1) | `rare`: implicit-LOD sampling outside fragment functions |
  | `MinLodClamp` | `min_lod_clamp` without `shaderResourceMinLod` | devices without VkFeature::ShaderResourceMinLod; every device (not implemented) | `ours` | 2: `crates/metal2vulkan/src/lower/sampler/select.rs (min_lod)`, `crates/metal2vulkan/src/lower/sampler/select.rs (select_one)` | `rare`: min_lod_clamp on a device without shaderResourceMinLod |
-@@ -325,7 +325,7 @@ Columns:
+@@ -202,7 +202,7 @@ Columns:
+ | `AccelerationStructures` | Acceleration structures | every device (runtime piece not built) | `ours` | 1: `crates/metal2vulkan-runtime/src/binding.rs (unexpected)` | `rare`: ray tracing (out of scope by ruling) |
+ | `FeatureEnable` | A feature a created device would enable that the runtime's feature chain has no member for, or whose structure no enabled extension exposes | devices without the feature or extension it names | `ours` | 1: `crates/metal2vulkan-runtime/src/enables.rs (of)` | `none`: device creation with a feature the runtime's chain lacks |
+ | `ExtensionEnable` | An extension a created device would enable that the device lists under none of the names the runtime knows for it | devices without the feature or extension it names | `ours` | 1: `crates/metal2vulkan-runtime/src/enables.rs (of)` | `none`: device creation with an extension under an unknown name |
+-| `Render` | Render pipelines, passes and draws | every device (runtime piece not built) | `ours` | 26: `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (check_copies)`, `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (stand_in_as, 2 sites)` (+19) | `system`: render pass, resolve and attachment forms not built (20 sites: see the appendix) |
++| `Render` | Render pipelines, passes and draws | every device (runtime piece not built) | `ours` | 27: `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (check_copies)`, `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (stand_in_as, 2 sites)` (+20) | `system`: render pass, resolve and attachment forms not built (20 sites: see the appendix) |
+ | `TexelsPastBufferLength` | A texture over a buffer whose texels run past the buffer's length, which Metal makes over bytes its buffer's allocation has past the length (a 2D... | every device (runtime piece not built) | `ours` | 2: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error)`, `crates/metal2vulkan-runtime/src/texture/surface_depth.rs (surface_depth_twin)` | `rare`: a texture over a buffer past its length |
+ | `OverlappingSurfaceRows` | A texture of an IOSurface plane (`Buffer::new_texture_with_iosurface_plane`, the stand-in for `newTextureWithDescriptor:iosurface:plane:`) whose... | every device (runtime piece not built) | `ours` | 4: `crates/metal2vulkan-runtime/src/blit_plan.rs (plan_texels_rows_copy)`, `crates/metal2vulkan-runtime/src/blit_texture.rs (copy_from_buffer_to_texture)` (+2) | `rare`: an IOSurface plane whose rows overlap |
+ | `MemorylessSurfacePlane` | A texture of an IOSurface plane (`Buffer::new_texture_with_iosurface_plane`, the stand-in for `newTextureWithDescriptor:iosurface:plane:`) whose... | every device (runtime piece not built) | `ours` | 1: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error)` | `rare`: a memoryless texture over an IOSurface plane |
+@@ -320,12 +320,12 @@ Columns:
+ 
+ | Variant | What it blocks | Where | Basis | Sites | Reach |
+ |---|---|---|---|---|---|
+-| `EncoderOpen` | An encoder of this command buffer is open | every device (a public call's own check of its arguments) | `metal-measured`: an M4: plain Metal asserts "A command encoder is already encoding to this command buffer" | 2: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`, `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (queue_commit)` | `-` |
++| `EncoderOpen` | An encoder of this command buffer is open | every device (a public call's own check of its arguments) | `metal-measured`: an M4: plain Metal asserts "A command encoder is already encoding to this command buffer" | 3: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`, `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)` (+1) | `-` |
+ | `ProtectedEncoder` | A compute or render encoder made, or a blit encoder's first command (`call` names the blit encoder), under protection options 1, 3 or 7... | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max, macOS 26.7: Metal's process ends, SIGABRT, as the consumer measured | 2: `crates/metal2vulkan-runtime/src/blit.rs (refuse_aborted)`, `crates/metal2vulkan-runtime/src/command_buffer/protection.rs (refuse_protected_encoder)` | `-` |
  | `EncoderAbandoned` | An encoder of this command buffer was dropped without `end_encoding` | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "Command encoder released without endEncoding" | 1: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)` | `-` |
  | `AlreadyCommitted` | The command buffer was already committed | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "commit an already committed command buffer" | 4: `crates/metal2vulkan-runtime/src/command_buffer/checks.rs (set_submission_check)`, `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)` (+2) | `-` |
  | `ScheduledSignalAfterCompletion` | A scheduled signal encoded once the command buffer completed, or failed (status `Error`) (`CommandBuffer::encode_signal_event_scheduled`) | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max, macOS 27.0.1: a segmentation fault in 10 of 15 runs, as the consumer measured | 1: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)` | `-` |
@@ -1038,13 +1842,16 @@ index 6e2eae0b6..1549e4ded 100644
  | `Mipmap` | A `generate_mipmaps` Metal stops | every device (a public call's own check of its arguments) | `delegated`: MipmapProblem, section 9 | 1: `crates/metal2vulkan-runtime/src/blit_texture.rs (mipmaps)` | `-` |
  | `BufferTexture` | A texture over a buffer plain Metal itself refuses | every device (a public call's own check of its arguments) | `delegated`: BufferTextureProblem, section 9 | 3: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error, 2 sites)`, `crates/metal2vulkan-runtime/src/capabilities.rs (minimum_linear_texture_alignment_for_pixel_format)` | `-` |
 -| `RenderPass` | A render pass descriptor, or a render encoder's late store action, Metal stops | every device (a public call's own check of its arguments) | `delegated`: RenderPassProblem, section 9 | 15: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`, `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)` (+8) | `-` |
-+| `RenderPass` | A render pass descriptor, or a render encoder's late store action, Metal stops | every device (a public call's own check of its arguments) | `delegated`: RenderPassProblem, section 9 | 16: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`, `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)` (+9) | `-` |
++| `RenderPass` | A render pass descriptor, or a render encoder's late store action, Metal stops | every device (a public call's own check of its arguments) | `delegated`: RenderPassProblem, section 9 | 16: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`, `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)` (+10) | `-` |
  | `Draw` | A draw, or render encoder state, Metal stops | every device (a public call's own check of its arguments) | `delegated`: DrawProblem, section 9 | 3: `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (check_patches)`, `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (draw_indexed_primitives)` (+1) | `-` |
  | `PointSizeTopology` | `new_render_pipeline_state` | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max and an M4: Metal's pipeline creation answers an error, with and without API validation | 1: `crates/metal2vulkan-runtime/src/pipeline/render.rs (create_checked)` | `-` |
  | `IndirectScaledTessellation` | `new_render_pipeline_state` | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max, macOS 27.0.1: plain Metal ends its process, the API validation layer off | 1: `crates/metal2vulkan-runtime/src/pipeline/render.rs (create_reflecting)` | `-` |
-@@ -480,6 +480,7 @@ Columns:
+@@ -478,8 +478,9 @@ Columns:
+ | `RenderPassProblem::SamplePositionsSamples` | More sample positions than the pass's samples (measured | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "2 custom sample positions were programmed, but this render pass uses 4 rasterizer sample(s)", and plain Metal ends the process past them | 1: `crates/metal2vulkan-runtime/src/sample_positions.rs (refusal_error)` | `-` |
+ | `RenderPassProblem::StoreActionOptionsWithoutPositions` | The stencil descriptor's store action options include `CustomSamplePositions` without sample positions (measured | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "includes MTLStoreActionOptionCustomSamplePositions, but no custom sample positions were specified" | 1: `crates/metal2vulkan-runtime/src/sample_positions.rs (check_options)` | `-` |
  | `RenderPassProblem::StoreActionOptions` | A stencil attachment's store action options that include `CustomSamplePositions` under a store action that keeps no samples, `DontCare` or... | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "includes MTLStoreActionOptionCustomSamplePositions, which does not apply to the store action" | 1: `crates/metal2vulkan-runtime/src/sample_positions.rs (check_options)` | `-` |
- | `RenderPassProblem::CustomSampleDepthStore` | `CustomSampleDepthStore` as a color or stencil attachment's store action | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "storeAction is not a valid MTLStoreAction", with and without API validation | 3: `crates/metal2vulkan-runtime/src/render.rs (late_store)`, `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)` | `-` |
+-| `RenderPassProblem::CustomSampleDepthStore` | `CustomSampleDepthStore` as a color or stencil attachment's store action | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "storeAction is not a valid MTLStoreAction", with and without API validation | 3: `crates/metal2vulkan-runtime/src/render.rs (late_store)`, `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)` | `-` |
++| `RenderPassProblem::CustomSampleDepthStore` | `CustomSampleDepthStore` as a color or stencil attachment's store action | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "storeAction is not a valid MTLStoreAction", with and without API validation | 3: `crates/metal2vulkan-runtime/src/render.rs (late_store)`, `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)` (+1) | `-` |
  | `RenderPassProblem::DefaultRasterSampleCount` | A pass without attachments whose `defaultRasterSampleCount`'s low 8 bits are 8 to 15 or 128 to 255, or are 0 in a count of 256 or more | every device (a public call's own check of its arguments) | `metal-measured`: an Apple M3 Max, macOS 27.0.1: plain Metal ends the process, SIGABRT and no message, at `renderCommandEncoderWithDescriptor:` of 8, 15, 130 and 256, where 1, 4 and 260 — whose low 8 bits are 4 — make the encoder and run the pass, the API validation layer off | 1: `crates/metal2vulkan-runtime/src/render_pass.rs` | `-` |
 +| `RenderPassProblem::CompressedColorAttachment` | A color attachment of a block-compressed pixel format (a BC, ETC2, EAC, ASTC or PVRTC one), with `RenderTarget` usage or without | every device (a public call's own check of its arguments) | `unknown`: plain Metal's answer for a compressed color attachment is unmeasured; Metal's pixel format capabilities give a compressed format no color rendering | 1: `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)` | `-` |
  | `DrawProblem::AttachmentFormat` | `set_render_pipeline_state` | every device (a public call's own check of its arguments) | `unknown`: what stays refused is what the Metal probes did not reach: a state color covering part of a pass color or more than one, a mesh render pipeline's state, and a fragment function that fetches a color or declares an imageblock | 2: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`, `crates/metal2vulkan-runtime/src/render.rs (check_tile)` | `-` |
@@ -1055,16 +1862,31 @@ index 6e2eae0b6..1549e4ded 100644
  - `feature::Int64Arithmetic`: `crates/metal2vulkan/src/lower/arith/legal.rs (check_scalar)`; `crates/metal2vulkan/src/lower/select.rs (selector_form)`
  - `feature::Float64Arithmetic`: `crates/metal2vulkan/src/device/metal.rs (unsupported_features)`; `crates/metal2vulkan/src/lower/arith/legal.rs (check_scalar)`
 -- `feature::Format`: `crates/metal2vulkan-runtime/src/binding_view.rs (binding_view)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (check_formats, 3 sites)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (pair_unit)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (plan_levels_copy)`; `crates/metal2vulkan-runtime/src/blit_texture.rs (through_buffer)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (make_texture_over, 3 sites)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (texture_buffer_texel)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (of_attachment)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (colour_unit)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (copy_unit, 2 sites)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (scratch)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (usable_twin)`; `crates/metal2vulkan-runtime/src/families/features.rs (read_write_tier)`; `crates/metal2vulkan-runtime/src/families/formats.rs (answers, 5 sites)`; `crates/metal2vulkan-runtime/src/families/formats.rs (atomic_gap)`; `crates/metal2vulkan-runtime/src/families/formats.rs (lacking)`; `crates/metal2vulkan-runtime/src/families/formats.rs (none)`; `crates/metal2vulkan-runtime/src/families/formats.rs (sparse_missing)`; `crates/metal2vulkan-runtime/src/families/formats.rs (unsupported)`; `crates/metal2vulkan-runtime/src/image_plan.rs (plan_held, 3 sites)`; `crates/metal2vulkan-runtime/src/render.rs (viewing)`; `crates/metal2vulkan-runtime/src/render_pass.rs (attachment_format)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (color)`; `crates/metal2vulkan-runtime/src/resolve.rs (unmodelled_resolve)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (checked_twin)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (plan)`; `crates/metal2vulkan-runtime/src/sample_interleave.rs (interleave_merge)`; `crates/metal2vulkan-runtime/src/shadow.rs (unmerged, 2 sites)`; `crates/metal2vulkan-runtime/src/texture.rs (texture_as)`; `crates/metal2vulkan-runtime/src/texture.rs (two_planes_refused)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (astc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (etc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (with_decoded_twin)`; `crates/metal2vulkan-runtime/src/texture/heap.rs (planned_heap_texture)`; `crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs (refused)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (converted_storage)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (new_render_shadow)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (ycbcr_write_shadow)`; `crates/metal2vulkan-runtime/src/two_planes.rs (unmeasured)`; `crates/metal2vulkan-runtime/src/view_plan.rs (check_format, 5 sites)`; `crates/metal2vulkan-runtime/src/ycbcr.rs (refused)`; `crates/metal2vulkan/src/bind/extended_shadow.rs (extended_shadow_module)`; `crates/metal2vulkan/src/bind/plan/resources.rs (extended_sampler)`; `crates/metal2vulkan/src/bind/plan/resources.rs (plain_texture, 2 sites)`; `crates/metal2vulkan/src/bind/plan/resources.rs (require_filter_features)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (finish)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (interleave_split_module)`; `crates/metal2vulkan/src/bind/shadow_copy_in.rs (shadow_copy_in_module)`; `crates/metal2vulkan/src/bind/unused_bits.rs (unused_bits_module)`; `crates/metal2vulkan/src/lower/access/tile.rs (storage_format)`; `crates/metal2vulkan/src/lower/fragment/color.rs (select_param, 2 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (extended_range_blend, 5 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (plan)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_output, 3 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_read)`; `crates/metal2vulkan/src/lower/sampler/select.rs (select_extended)`; `crates/metal2vulkan/src/lower/sampler/select.rs (texel_in)`; `crates/metal2vulkan/src/lower/stage_io/extended_color.rs (plan)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (entry)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (zeroed_output)`; `crates/metal2vulkan/src/lower/stage_io/word_color.rs (plan)`; `crates/metal2vulkan/src/lower/texture/mod.rs (cross_class)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_image)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_read_as, 2 sites)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_write)`; `crates/metal2vulkan/src/lower/texture/slot.rs (atomic_format, 2 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (declare_slot, 3 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (storage_format, 5 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (ulong_format, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (candidates)`; `crates/metal2vulkan/src/metal/format/mod.rs (held_storage_choice, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (storage_choice)`; `crates/metal2vulkan/src/metal/format/mod.rs (vk_format, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (extended_write_mask)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (graphics_state, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (reads_alpha_to_coverage, 2 sites)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (alpha_in_red_blend)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (rotated_blend)`
-+- `feature::Format`: `crates/metal2vulkan-runtime/src/binding_view.rs (binding_view)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (check_formats, 3 sites)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (pair_unit)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (plan_levels_copy)`; `crates/metal2vulkan-runtime/src/blit_texture.rs (through_buffer)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (make_texture_over, 3 sites)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (texture_buffer_texel)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (of_attachment)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (colour_unit)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (copy_unit, 2 sites)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (scratch)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (usable_twin)`; `crates/metal2vulkan-runtime/src/families/features.rs (read_write_tier)`; `crates/metal2vulkan-runtime/src/families/formats.rs (answers, 5 sites)`; `crates/metal2vulkan-runtime/src/families/formats.rs (atomic_gap)`; `crates/metal2vulkan-runtime/src/families/formats.rs (lacking)`; `crates/metal2vulkan-runtime/src/families/formats.rs (none)`; `crates/metal2vulkan-runtime/src/families/formats.rs (sparse_missing)`; `crates/metal2vulkan-runtime/src/families/formats.rs (unsupported)`; `crates/metal2vulkan-runtime/src/image_plan.rs (plan_held, 3 sites)`; `crates/metal2vulkan-runtime/src/image_plan.rs (unmade_combination)`; `crates/metal2vulkan-runtime/src/render.rs (viewing)`; `crates/metal2vulkan-runtime/src/render_pass.rs (attachment_format)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (color)`; `crates/metal2vulkan-runtime/src/resolve.rs (unmodelled_resolve)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (checked_twin)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (plan)`; `crates/metal2vulkan-runtime/src/sample_interleave.rs (interleave_merge)`; `crates/metal2vulkan-runtime/src/shadow.rs (unmerged, 2 sites)`; `crates/metal2vulkan-runtime/src/texture.rs (texture_as)`; `crates/metal2vulkan-runtime/src/texture.rs (two_planes_refused)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (astc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (etc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (with_decoded_twin)`; `crates/metal2vulkan-runtime/src/texture/heap.rs (planned_heap_texture)`; `crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs (refused)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (converted_storage)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (new_render_shadow)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (ycbcr_write_shadow)`; `crates/metal2vulkan-runtime/src/two_planes.rs (unmeasured)`; `crates/metal2vulkan-runtime/src/view_plan.rs (check_format, 5 sites)`; `crates/metal2vulkan-runtime/src/ycbcr.rs (refused)`; `crates/metal2vulkan/src/bind/extended_shadow.rs (extended_shadow_module)`; `crates/metal2vulkan/src/bind/plan/resources.rs (extended_sampler)`; `crates/metal2vulkan/src/bind/plan/resources.rs (plain_texture, 2 sites)`; `crates/metal2vulkan/src/bind/plan/resources.rs (require_filter_features)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (finish)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (interleave_split_module)`; `crates/metal2vulkan/src/bind/shadow_copy_in.rs (shadow_copy_in_module)`; `crates/metal2vulkan/src/bind/unused_bits.rs (unused_bits_module)`; `crates/metal2vulkan/src/lower/access/tile.rs (storage_format)`; `crates/metal2vulkan/src/lower/fragment/color.rs (select_param, 2 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (extended_range_blend, 5 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (plan)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_output, 3 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_read)`; `crates/metal2vulkan/src/lower/sampler/select.rs (select_extended)`; `crates/metal2vulkan/src/lower/sampler/select.rs (texel_in)`; `crates/metal2vulkan/src/lower/stage_io/extended_color.rs (plan)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (entry)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (zeroed_output)`; `crates/metal2vulkan/src/lower/stage_io/word_color.rs (plan)`; `crates/metal2vulkan/src/lower/texture/mod.rs (cross_class)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_image)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_read_as, 2 sites)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_write)`; `crates/metal2vulkan/src/lower/texture/slot.rs (atomic_format, 2 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (declare_slot, 3 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (storage_format, 5 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (ulong_format, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (candidates)`; `crates/metal2vulkan/src/metal/format/mod.rs (held_storage_choice, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (storage_choice)`; `crates/metal2vulkan/src/metal/format/mod.rs (vk_format, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (extended_write_mask)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (graphics_state, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (reads_alpha_to_coverage, 2 sites)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (alpha_in_red_blend)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (rotated_blend)`
++- `feature::Format`: `crates/metal2vulkan-runtime/src/binding_view.rs (binding_view)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (check_formats, 3 sites)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (pair_unit)`; `crates/metal2vulkan-runtime/src/blit_plan.rs (plan_levels_copy)`; `crates/metal2vulkan-runtime/src/blit_texture.rs (through_buffer)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (make_texture_over, 3 sites)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (texture_buffer_texel)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (of_attachment)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (colour_unit)`; `crates/metal2vulkan-runtime/src/copy_plan.rs (copy_unit, 2 sites)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (scratch)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (usable_twin)`; `crates/metal2vulkan-runtime/src/families/features.rs (read_write_tier)`; `crates/metal2vulkan-runtime/src/families/formats.rs (answers, 5 sites)`; `crates/metal2vulkan-runtime/src/families/formats.rs (atomic_gap)`; `crates/metal2vulkan-runtime/src/families/formats.rs (lacking)`; `crates/metal2vulkan-runtime/src/families/formats.rs (none)`; `crates/metal2vulkan-runtime/src/families/formats.rs (sparse_missing)`; `crates/metal2vulkan-runtime/src/families/formats.rs (unsupported)`; `crates/metal2vulkan-runtime/src/image_plan.rs (plan_held, 3 sites)`; `crates/metal2vulkan-runtime/src/image_plan.rs (unmade_combination)`; `crates/metal2vulkan-runtime/src/render.rs (viewing)`; `crates/metal2vulkan-runtime/src/render_pass.rs (attachment_format)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (color)`; `crates/metal2vulkan-runtime/src/resolve.rs (unmodelled_resolve)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (checked_twin)`; `crates/metal2vulkan-runtime/src/sample_copy.rs (plan)`; `crates/metal2vulkan-runtime/src/sample_interleave.rs (interleave_merge)`; `crates/metal2vulkan-runtime/src/shadow.rs (unmerged, 2 sites)`; `crates/metal2vulkan-runtime/src/texture.rs (texture_as)`; `crates/metal2vulkan-runtime/src/texture.rs (two_planes_refused)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (astc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (etc_texels)`; `crates/metal2vulkan-runtime/src/texture/decoded_twin.rs (with_decoded_twin)`; `crates/metal2vulkan-runtime/src/texture/heap.rs (planned_heap_texture)`; `crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs (refused)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (converted_storage)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (new_render_shadow)`; `crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs (ycbcr_write_shadow)`; `crates/metal2vulkan-runtime/src/two_planes.rs (unmeasured)`; `crates/metal2vulkan-runtime/src/view_plan.rs (check_format, 5 sites)`; `crates/metal2vulkan-runtime/src/ycbcr.rs (refused)`; `crates/metal2vulkan/src/bind/extended_shadow.rs (extended_shadow_module)`; `crates/metal2vulkan/src/bind/plan/resources.rs (extended_sampler)`; `crates/metal2vulkan/src/bind/plan/resources.rs (plain_texture, 2 sites)`; `crates/metal2vulkan/src/bind/plan/resources.rs (require_filter_features)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (finish)`; `crates/metal2vulkan/src/bind/sample_interleave.rs (interleave_split_module)`; `crates/metal2vulkan/src/bind/shadow_copy_in.rs (shadow_copy_in_module)`; `crates/metal2vulkan/src/bind/unused_bits.rs (unused_bits_module)`; `crates/metal2vulkan/src/lower/access/tile.rs (storage_format)`; `crates/metal2vulkan/src/lower/fragment/color.rs (select_param, 2 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (extended_range_blend, 5 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (plan)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_output, 3 sites)`; `crates/metal2vulkan/src/lower/fragment/fetch.rs (select_read)`; `crates/metal2vulkan/src/lower/sampler/select.rs (select_extended)`; `crates/metal2vulkan/src/lower/sampler/select.rs (texel_in)`; `crates/metal2vulkan/src/lower/stage_io/extended_color.rs (plan)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (entry)`; `crates/metal2vulkan/src/lower/stage_io/plan.rs (zeroed_output)`; `crates/metal2vulkan/src/lower/stage_io/word_color.rs (plan)`; `crates/metal2vulkan/src/lower/texture/mod.rs (cross_class)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_image)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_read_as, 2 sites)`; `crates/metal2vulkan/src/lower/texture/mod.rs (select_write)`; `crates/metal2vulkan/src/lower/texture/slot.rs (atomic_format, 2 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (declare_slot, 3 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (storage_format, 5 sites)`; `crates/metal2vulkan/src/lower/texture/slot.rs (ulong_format, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (candidates)`; `crates/metal2vulkan/src/metal/format/mod.rs (held_storage_choice, 3 sites)`; `crates/metal2vulkan/src/metal/format/mod.rs (storage_choice)`; `crates/metal2vulkan/src/metal/format/mod.rs (vk_format, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (extended_write_mask)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (graphics_state, 2 sites)`; `crates/metal2vulkan/src/pipeline/link/graphics.rs (reads_alpha_to_coverage, 2 sites)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (alpha_in_red_blend)`; `crates/metal2vulkan/src/pipeline/rotated_blend.rs (rotated_blend)`
  - `feature::DivergentImplicitLod`: `crates/metal2vulkan/src/lower/sampler/select.rs (select_sampling)`
  - `feature::ImplicitLodOutsideFragment`: `crates/metal2vulkan/src/lower/sampler/constexpr.rs (query_min_level)`; `crates/metal2vulkan/src/lower/sampler/select.rs (query_level_measured)`; `crates/metal2vulkan/src/lower/sampler/select.rs (query_min_level)`
  - `feature::MinLodClamp`: `crates/metal2vulkan/src/lower/sampler/select.rs (min_lod)`; `crates/metal2vulkan/src/lower/sampler/select.rs (select_one)`
-@@ -792,7 +793,7 @@ Each refusal's sites, with the function that builds it.
+@@ -699,7 +700,7 @@ Each refusal's sites, with the function that builds it.
+ - `gap::AccelerationStructures`: `crates/metal2vulkan-runtime/src/binding.rs (unexpected)`
+ - `gap::FeatureEnable`: `crates/metal2vulkan-runtime/src/enables.rs (of)`
+ - `gap::ExtensionEnable`: `crates/metal2vulkan-runtime/src/enables.rs (of)`
+-- `gap::Render`: `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (check_copies)`; `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (stand_in_as, 2 sites)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (attachment_twin)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (of_resolve)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (plan, 2 sites)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (check_sizes)`; `crates/metal2vulkan-runtime/src/kept_bytes.rs (settle)`; `crates/metal2vulkan-runtime/src/linear_attachment.rs (settle)`; `crates/metal2vulkan-runtime/src/pipeline/render.rs (imageblock_sample_length)`; `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (draw_resident)`; `crates/metal2vulkan-runtime/src/render.rs (next_instance)`; `crates/metal2vulkan-runtime/src/render/tile_dispatch.rs (scratch)`; `crates/metal2vulkan-runtime/src/render_pass.rs (attachment_format)`; `crates/metal2vulkan-runtime/src/render_pass.rs (depth_stencil)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target, 2 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (attach)`; `crates/metal2vulkan-runtime/src/resolve.rs (color_copy)`; `crates/metal2vulkan-runtime/src/resolve.rs (destination, 3 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (keep_samples)`
++- `gap::Render`: `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (check_copies)`; `crates/metal2vulkan-runtime/src/attachment_stand_in.rs (stand_in_as, 2 sites)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (attachment_twin)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (of_resolve)`; `crates/metal2vulkan-runtime/src/color_resolve.rs (plan, 2 sites)`; `crates/metal2vulkan-runtime/src/depth_stencil_scratch.rs (check_sizes)`; `crates/metal2vulkan-runtime/src/kept_bytes.rs (settle)`; `crates/metal2vulkan-runtime/src/linear_attachment.rs (settle)`; `crates/metal2vulkan-runtime/src/pipeline/render.rs (imageblock_sample_length)`; `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (draw_resident)`; `crates/metal2vulkan-runtime/src/render.rs (next_instance)`; `crates/metal2vulkan-runtime/src/render/tile_dispatch.rs (scratch)`; `crates/metal2vulkan-runtime/src/render_pass.rs (attachment_format)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (depth_stencil)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target, 2 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (attach)`; `crates/metal2vulkan-runtime/src/resolve.rs (color_copy)`; `crates/metal2vulkan-runtime/src/resolve.rs (destination, 3 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (keep_samples)`
+ - `gap::TexelsPastBufferLength`: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error)`; `crates/metal2vulkan-runtime/src/texture/surface_depth.rs (surface_depth_twin)`
+ - `gap::OverlappingSurfaceRows`: `crates/metal2vulkan-runtime/src/blit_plan.rs (plan_texels_rows_copy)`; `crates/metal2vulkan-runtime/src/blit_texture.rs (copy_from_buffer_to_texture)`; `crates/metal2vulkan-runtime/src/blit_texture.rs (texel_copies)`; `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error)`
+ - `gap::MemorylessSurfacePlane`: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error)`
+@@ -787,12 +788,12 @@ Each refusal's sites, with the function that builds it.
+ - `ratemap::SampleOutOfRange`: `crates/metal2vulkan/src/bind/rate_map.rs (new)`
+ - `ratemap::SampleCount`: `crates/metal2vulkan/src/bind/rate_map.rs (new)`
+ - `budget::Time`: `crates/metal2vulkan-air/src/budget/mod.rs (tick)`
+-- `invalid::EncoderOpen`: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (queue_commit)`
++- `invalid::EncoderOpen`: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (queue_commit)`
+ - `invalid::ProtectedEncoder`: `crates/metal2vulkan-runtime/src/blit.rs (refuse_aborted)`; `crates/metal2vulkan-runtime/src/command_buffer/protection.rs (refuse_protected_encoder)`
  - `invalid::EncoderAbandoned`: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`
  - `invalid::AlreadyCommitted`: `crates/metal2vulkan-runtime/src/command_buffer/checks.rs (set_submission_check)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (commit_refusal)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (refusal)`
  - `invalid::ScheduledSignalAfterCompletion`: `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`
 -- `invalid::ForeignObject`: `crates/metal2vulkan-runtime/src/argument_encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/argument_encoder.rs (target)`; `crates/metal2vulkan-runtime/src/binary_archive/mod.rs (check)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (new_buffer_with_descriptor)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (shared_place)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (event_command)`; `crates/metal2vulkan-runtime/src/dynamic_library.rs (new_dynamic_library)`; `crates/metal2vulkan-runtime/src/encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/function_table.rs (function_handle)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (check_patches)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (draw_indexed_primitives)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_buffer)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_compute_pipeline_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_depth_stencil_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_render_pipeline_state)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (ignored)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function_and_reflection)`; `crates/metal2vulkan-runtime/src/rate_map.rs (copy_parameter_data_to_buffer)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (destination)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (sparse)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_fence)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_texture_mapping_indirect)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (wait_for_fence)`; `crates/metal2vulkan-runtime/src/texture/shared.rs (new_shared_texture_with_handle)`
-+- `invalid::ForeignObject`: `crates/metal2vulkan-runtime/src/argument_encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/argument_encoder.rs (target)`; `crates/metal2vulkan-runtime/src/binary_archive/mod.rs (check)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (new_buffer_with_descriptor)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (shared_place)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (event_command)`; `crates/metal2vulkan-runtime/src/dynamic_library.rs (new_dynamic_library)`; `crates/metal2vulkan-runtime/src/encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/function_table.rs (function_handle)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (check_patches)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (draw_indexed_primitives)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_buffer)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_compute_pipeline_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_depth_stencil_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_render_pipeline_state)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (ignored)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function_and_reflection)`; `crates/metal2vulkan-runtime/src/rate_map.rs (copy_parameter_data_to_buffer)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (destination)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (sparse)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_fence)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_texture_mapping_indirect)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (wait_for_fence)`; `crates/metal2vulkan-runtime/src/texture/shared.rs (new_shared_texture_with_handle)`
++- `invalid::ForeignObject`: `crates/metal2vulkan-runtime/src/argument_encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/argument_encoder.rs (target)`; `crates/metal2vulkan-runtime/src/binary_archive/mod.rs (check)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (new_buffer_with_descriptor)`; `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (shared_place)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (encode_signal_event_scheduled)`; `crates/metal2vulkan-runtime/src/command_buffer/mod.rs (event_command)`; `crates/metal2vulkan-runtime/src/dynamic_library.rs (new_dynamic_library)`; `crates/metal2vulkan-runtime/src/encoder.rs (check_device)`; `crates/metal2vulkan-runtime/src/function_table.rs (function_handle)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (check_patches)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (draw_indexed_primitives)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_buffer)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_compute_pipeline_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_depth_stencil_state)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (set_render_pipeline_state)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (ignored)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function)`; `crates/metal2vulkan-runtime/src/pipeline/mod.rs (new_compute_pipeline_state_with_function_and_reflection)`; `crates/metal2vulkan-runtime/src/rate_map.rs (copy_parameter_data_to_buffer)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`; `crates/metal2vulkan-runtime/src/render_pass.rs (target)`; `crates/metal2vulkan-runtime/src/resolve.rs (destination)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (sparse)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_fence)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (update_texture_mapping_indirect)`; `crates/metal2vulkan-runtime/src/sparse/encoder.rs (wait_for_fence)`; `crates/metal2vulkan-runtime/src/texture/shared.rs (new_shared_texture_with_handle)`
  - `invalid::DmaBuf`: `crates/metal2vulkan-runtime/src/dma_buf.rs (import_from_source)`
  - `invalid::WrappedImage`: `crates/metal2vulkan-runtime/src/texture/wrapped.rs (new_texture_with_vk_image)`
  - `invalid::NotShareable`: `crates/metal2vulkan-runtime/src/texture/shared.rs (new_shared_texture_handle)`
@@ -1073,13 +1895,16 @@ index 6e2eae0b6..1549e4ded 100644
  - `invalid::Mipmap`: `crates/metal2vulkan-runtime/src/blit_texture.rs (mipmaps)`
  - `invalid::BufferTexture`: `crates/metal2vulkan-runtime/src/buffer_texture.rs (refusal_error, 2 sites)`; `crates/metal2vulkan-runtime/src/capabilities.rs (minimum_linear_texture_alignment_for_pixel_format)`
 -- `invalid::RenderPass`: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)`; `crates/metal2vulkan-runtime/src/render.rs (store_problem)`; `crates/metal2vulkan-runtime/src/render/late_resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/render_pass.rs (2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (depth_stencil, 2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 4 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/sample_positions.rs (problem)`
-+- `invalid::RenderPass`: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)`; `crates/metal2vulkan-runtime/src/render.rs (store_problem)`; `crates/metal2vulkan-runtime/src/render/late_resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/render_pass.rs (2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`; `crates/metal2vulkan-runtime/src/render_pass.rs (depth_stencil, 2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 4 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/sample_positions.rs (problem)`
++- `invalid::RenderPass`: `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (check_descriptor)`; `crates/metal2vulkan-runtime/src/rate_mapped_pass.rs (of)`; `crates/metal2vulkan-runtime/src/render.rs (store_problem)`; `crates/metal2vulkan-runtime/src/render/late_resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/render_pass.rs (2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_target)`; `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`; `crates/metal2vulkan-runtime/src/render_pass.rs (depth_stencil, 2 sites)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 3 sites)`; `crates/metal2vulkan-runtime/src/resolve.rs (problem)`; `crates/metal2vulkan-runtime/src/sample_positions.rs (problem)`
  - `invalid::Draw`: `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (check_patches)`; `crates/metal2vulkan-runtime/src/indirect_command_buffer.rs (draw_indexed_primitives)`; `crates/metal2vulkan-runtime/src/render.rs (draw_problem)`
  - `invalid::PointSizeTopology`: `crates/metal2vulkan-runtime/src/pipeline/render.rs (create_checked)`
  - `invalid::IndirectScaledTessellation`: `crates/metal2vulkan-runtime/src/pipeline/render.rs (create_reflecting)`
-@@ -927,6 +928,7 @@ Each refusal's sites, with the function that builds it.
+@@ -925,8 +926,9 @@ Each refusal's sites, with the function that builds it.
+ - `subproblem::RenderPassProblem::SamplePositionsSamples`: `crates/metal2vulkan-runtime/src/sample_positions.rs (refusal_error)`
+ - `subproblem::RenderPassProblem::StoreActionOptionsWithoutPositions`: `crates/metal2vulkan-runtime/src/sample_positions.rs (check_options)`
  - `subproblem::RenderPassProblem::StoreActionOptions`: `crates/metal2vulkan-runtime/src/sample_positions.rs (check_options)`
- - `subproblem::RenderPassProblem::CustomSampleDepthStore`: `crates/metal2vulkan-runtime/src/render.rs (late_store)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)`
+-- `subproblem::RenderPassProblem::CustomSampleDepthStore`: `crates/metal2vulkan-runtime/src/render.rs (late_store)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)`
++- `subproblem::RenderPassProblem::CustomSampleDepthStore`: `crates/metal2vulkan-runtime/src/render.rs (late_store)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`
  - `subproblem::RenderPassProblem::DefaultRasterSampleCount`: `crates/metal2vulkan-runtime/src/render_pass.rs`
 +- `subproblem::RenderPassProblem::CompressedColorAttachment`: `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`
  - `subproblem::DrawProblem::AttachmentFormat`: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (check_tile)`
