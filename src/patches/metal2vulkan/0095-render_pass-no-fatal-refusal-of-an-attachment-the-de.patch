@@ -1,4 +1,4 @@
-From bc2a5268c604dda8a2bf4c828c8ae36aced99080 Mon Sep 17 00:00:00 2001
+From 96b1e71d1c5972285452f47c24e819d1005b1786 Mon Sep 17 00:00:00 2001
 From: Atlas agent <agent@atlas.local>
 Date: Sat, 14 Nov 2026 14:06:36 +0000
 Subject: [PATCH] render_pass: no fatal refusal of an attachment the device
@@ -36,25 +36,29 @@ Reims aborts on any refusal of that call but nil.
   NotImplemented(Render), also fatal under Reims.
 - RenderPassProblem::CompressedColorAttachment: a color attachment of a
   compressed format, which no device renders, is answered nil, naming
-  the first such color. The answer comes after the command buffer's
-  state (render.rs open_render: a pass with a compressed color is
-  refused EncoderOpen or AlreadyCommitted there, as any pass is), after
-  every color attachment's own checks (render_pass::check_colors: custom
-  sample depth store, resolve, YCbCr, foreign texture, level and slice),
-  and before any image of the pass is made. Depth and stencil
-  attachments are checked after it, as before. Reims takes a nil encoder
-  (NoEncoder), skips the pass and goes on. Each answer is said on stderr
-  (m2v-compressed-attachment: the texture and the pass's attachments;
-  the first 16, then at powers of two). Basis: unknown, plain Metal's
-  answer is unmeasured.
+  the first such color. The answer comes after every color attachment's
+  own checks (render_pass::check_colors: custom sample depth store,
+  resolve, YCbCr, foreign texture, level and slice), then the command
+  buffer's state, which render.rs open_render checks where the answer
+  comes back (refused EncoderOpen or AlreadyCommitted there, as any pass
+  is once its colors are checked), and before any image of the pass is
+  made. Its depth and stencil attachments are not checked: a bad one
+  beside a compressed color is answered nil too. Reims takes a nil
+  encoder (NoEncoder), skips the pass and goes on. Each answer is said
+  on stderr (m2v-compressed-attachment: the texture and the pass's
+  attachments; the first 16, then at powers of two). Basis: unknown,
+  plain Metal's answer is unmeasured.
 
 Not a scratch stand-in whose writes are discarded: built and tested, it
-opened the pass, but a guest pipeline with a color at that index meets
-an attachment of another format at setRenderPipelineState:, refused
-AttachmentFormat, and Reims sends that call and every draw with
+opened the pass, and a pipeline leaving that color Invalid drew. But a
+pipeline naming a color format there (another format than the
+texture's: the compressed one is refused at the pipeline's creation)
+meets an attachment of another format at setRenderPipelineState:,
+refused AttachmentFormat, and Reims sends that call and every draw with
 Policy::Dies (encode_render.rs run). Skipping those calls instead would
 be a new mode across every draw, indirect and tile entry point, with no
-Metal answer to hold it to. Nil skips the pass whole.
+Metal answer to hold it to. Nil skips the pass whole, at a cost: its
+other attachments are not loaded, cleared, drawn or stored.
 
 Not known: why the guest attached an ASTC texture there. The stderr line
 names the pass the next time it happens.
@@ -65,14 +69,18 @@ tests/unrenderable_attachments.rs (device, validation layer on) holds:
 every worded format without RenderTarget usage to a render target's
 bytes through a clear, a load and a draw; hand-computed codes for
 R8Unorm_sRGB, RG8Unorm_sRGB, RGB9E5Float and B5G6R5Unorm, unblended and
-blended One/Zero; a SourceAlpha blend to the render target's bytes;
-every compressed format, at color 0 and 1, loaded, cleared or not, to
-nil with its blocks unchanged and the command buffer going on; a
-compressed level or slice to nil once its subresource is checked; a
-pass with a compressed color to EncoderOpen and AlreadyCommitted as any
-pass; a stand-in or compressed color 0 beside a compressed or
-out-of-range color 1 to color 1's answer; and every color format to no
-refusal naming a limit of 0.
+with blending on at factors one and zero (stored the same); a
+SourceAlpha blend to the render target's bytes or its refusal (the
+packed 16-bit formats blend; the three word formats' blending pipeline
+is refused as it is made, for a render target too, so no blended byte is
+checked for them); every compressed format, at color 0 and 1, loaded,
+cleared or not, to nil with its blocks unchanged and the command buffer
+going on; a compressed level or slice to nil once its subresource is
+checked; a pass with a compressed color to EncoderOpen and
+AlreadyCommitted as any pass, and with an encoder open to its color 1's
+level refusal first, as a plain pass; a stand-in or compressed color 0
+beside a compressed or out-of-range color 1 to color 1's answer; and
+every color format to no refusal naming a limit of 0.
 At base 7 of these 8 fail on ANV and on lavapipe, the compressed ones
 with the production refusal (ASTC8x8LDR, required 1024, available 0);
 the blend one, which compares to the render target's answer, passes.
@@ -86,17 +94,17 @@ ANV.
 docs/REFUSALS.md is regenerated (its EncoderOpen row was already behind
 the code); api_signatures.tsv gains the variant's row only.
 ---
- crates/metal2vulkan-runtime/src/image_plan.rs |  96 +-
- crates/metal2vulkan-runtime/src/render.rs     |   9 +
- .../metal2vulkan-runtime/src/render_pass.rs   | 258 ++++-
- .../src/tests/image_plan.rs                   | 114 +-
- crates/metal2vulkan-runtime/src/tests/mod.rs  |   2 +
- .../src/tests/unrenderable_attachments.rs     | 988 ++++++++++++++++++
- crates/metal2vulkan-runtime/src/texture.rs    |  13 +-
- .../metal2vulkan-runtime/src/texture/heap.rs  |   4 +-
- crates/metal2vulkan/tests/api_signatures.tsv  |   1 +
- docs/REFUSALS.md                              |  30 +-
- 10 files changed, 1448 insertions(+), 67 deletions(-)
+ crates/metal2vulkan-runtime/src/image_plan.rs |   96 +-
+ crates/metal2vulkan-runtime/src/render.rs     |   14 +-
+ .../metal2vulkan-runtime/src/render_pass.rs   |  251 +++-
+ .../src/tests/image_plan.rs                   |  114 +-
+ crates/metal2vulkan-runtime/src/tests/mod.rs  |    2 +
+ .../src/tests/unrenderable_attachments.rs     | 1010 +++++++++++++++++
+ crates/metal2vulkan-runtime/src/texture.rs    |   13 +-
+ .../metal2vulkan-runtime/src/texture/heap.rs  |    4 +-
+ crates/metal2vulkan/tests/api_signatures.tsv  |    1 +
+ docs/REFUSALS.md                              |   30 +-
+ 10 files changed, 1467 insertions(+), 68 deletions(-)
  create mode 100644 crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
 
 diff --git a/crates/metal2vulkan-runtime/src/image_plan.rs b/crates/metal2vulkan-runtime/src/image_plan.rs
@@ -217,27 +225,32 @@ index 13e3c7b49..484422622 100644
 +    )
 +}
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index b933b575b..159dbb1e9 100644
+index b933b575b..7e451336b 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
-@@ -1752,6 +1752,15 @@ impl CommandBuffer {
-         let screen = screen.or_else(|| {
-             (given.rasterization_rate_map.as_ref()).map(|map| map.state().screen_size())
-         });
-+        // A pass with a compressed color, which is answered nil (`render_pass::compressed_color`),
-+        // meets the command buffer's state first: refused, as any pass is, while an encoder is
-+        // open or was abandoned and once the command buffer is committed, not answered nil there.
-+        // Every other pass meets it once laid out, below, as before.
-+        if again.is_none() && render_pass::attaches_compressed(given) {
-+            if let Some(problem) = self.state().refusal() {
-+                return Err(invalid(CALL, problem));
-+            }
-+        }
+@@ -1755,7 +1755,19 @@ impl CommandBuffer {
          rate_mapped_pass::check_descriptor(CALL, device, given)?;
          let taken = render_pass::surface_stencil_loads(given);
          let descriptor = &*taken;
+-        let full = render_pass::layout(CALL, self, descriptor)?;
++        let full = render_pass::layout(CALL, self, descriptor).map_err(|error| {
++            // A pass with a compressed color is answered nil once every color's checks pass
++            // (`render_pass::compressed_color`), before the rest of the pass is laid out; there it
++            // meets the command buffer's state, which every other pass meets once laid out (below):
++            // refused, as any pass is, while an encoder is open or was abandoned and once the
++            // command buffer is committed, not answered nil.
++            let compressed = matches!(&error, Error::Nil(nil) if matches!(nil.problem,
++                Problem::RenderPass(RenderPassProblem::CompressedColorAttachment(_))));
++            match (compressed && again.is_none()).then(|| self.state().refusal()) {
++                Some(Some(problem)) => invalid(CALL, problem),
++                _ => error,
++            }
++        })?;
+         // A pass of more colors than the device draws at once draws them in groups, the
+         // encoder's the first group's (`render/color_groups.rs`).
+         let grouping = color_groups::grouping(device, &full);
 diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
-index 4eaf142d8..5c0822e2a 100644
+index 4eaf142d8..a7308b074 100644
 --- a/crates/metal2vulkan-runtime/src/render_pass.rs
 +++ b/crates/metal2vulkan-runtime/src/render_pass.rs
 @@ -14,12 +14,16 @@
@@ -259,7 +272,7 @@ index 4eaf142d8..5c0822e2a 100644
  //!   attachment has one sample count, which the pipelines drawn must have. Metal renders into the
  //!   smallest attachment's extent, further limited by a nonzero `renderTargetWidth` and
  //!   `renderTargetHeight` (measured: an 8x8 color and a 4x4 depth attachment, or an 8x8 one under a
-@@ -695,6 +699,21 @@ pub enum RenderPassProblem {
+@@ -695,6 +699,22 @@ pub enum RenderPassProblem {
          /// The `defaultRasterSampleCount` given.
          count: u64,
      },
@@ -271,9 +284,10 @@ index 4eaf142d8..5c0822e2a 100644
 +    /// of). The encoder is answered nil, an [`Error::Nil`](crate::Error::Nil), as plain Metal
 +    /// answers a pass it makes no encoder for, and the runtime says so on its error stream
 +    /// (`m2v-compressed-attachment`): a caller that takes a nil encoder goes on past the pass,
-+    /// where a refusal of it would end the caller. Answered once the command buffer's state and
-+    /// every color attachment's checks pass (a pass refused for either is refused so), and before
-+    /// the pass takes any image, naming the first compressed color.
++    /// where a refusal of it would end the caller. Answered once every color attachment's checks
++    /// pass and then the command buffer's state (`open_render` checks it where this answer comes
++    /// back; a pass refused for either is refused so), and before the pass takes any image, naming
++    /// the first compressed color. Its depth and stencil attachments are not checked.
 +    ///
 +    /// Basis: unknown (plain Metal's answer for a compressed color attachment is unmeasured; Metal's
 +    /// pixel format capabilities give a compressed format no color rendering).
@@ -281,7 +295,7 @@ index 4eaf142d8..5c0822e2a 100644
  }
  
  /// One attachment's subresource, checked: the texture, the image level and layer it renders,
-@@ -1503,50 +1522,19 @@ pub(super) fn layout(
+@@ -1503,50 +1523,19 @@ pub(super) fn layout(
      let mut extents = [([0, 0], 0); MAX_COLOR_ATTACHMENTS + 1];
      let mut attached = 0;
      let positioned = Some(!descriptor.sample_positions.is_empty());
@@ -339,7 +353,7 @@ index 4eaf142d8..5c0822e2a 100644
          let memoryless = memoryless(texture);
          // A texture without `RenderTarget` usage renders through a stand-in that has it, copied
          // in where the pass loads it and back where it stores it (`attachment_stand_in.rs`), as
-@@ -1903,7 +1891,8 @@ fn target(
+@@ -1903,7 +1892,8 @@ fn target(
      }
      // A view of another format renders in that format (`attachment_format`); a texture without
      // `RenderTarget` usage, through its stand-in, in its own (the module docs), which for a depth
@@ -349,7 +363,7 @@ index 4eaf142d8..5c0822e2a 100644
      let holds = |format: metal2vulkan::vk::Format| match which {
          Attachment::Color(_) => true,
          Attachment::Depth => format.block().is_some_and(|b| b.depth.is_some()),
-@@ -1911,7 +1900,9 @@ fn target(
+@@ -1911,7 +1901,9 @@ fn target(
      };
      let format = match stood {
          false => attachment_format(which, plan, facts.pixel_format, device)?,
@@ -360,7 +374,7 @@ index 4eaf142d8..5c0822e2a 100644
          true => return Err(Error::NotImplemented(RuntimeGap::Render)),
      };
      Ok(Target {
-@@ -1952,6 +1943,189 @@ pub(super) fn not_2d(target: &Target) -> bool {
+@@ -1952,6 +1944,181 @@ pub(super) fn not_2d(target: &Target) -> bool {
          .is_ok_and(|plan| plan.image_type != metal2vulkan::vk::ImageType::TYPE_2D)
  }
  
@@ -453,16 +467,8 @@ index 4eaf142d8..5c0822e2a 100644
 +/// Whether `texture` is of a block-compressed pixel format (a BC, ETC2, EAC, ASTC or PVRTC one),
 +/// which no Vulkan device renders as a color attachment, and Apple's pixel format capabilities
 +/// give no color rendering either.
-+pub(super) fn compressed(texture: &Texture) -> bool {
++fn compressed(texture: &Texture) -> bool {
 +    metal2vulkan::metal::format::block_extent(texture.pixel_format()).is_some()
-+}
-+
-+/// Whether `descriptor` attaches a texture of a compressed format as a color ([`compressed`]),
-+/// which [`compressed_color`] answers nil.
-+pub(super) fn attaches_compressed(descriptor: &RenderPassDescriptor) -> bool {
-+    (descriptor.color_attachments.iter())
-+        .filter_map(|color| color.texture.as_ref())
-+        .any(compressed)
 +}
 +
 +/// Answer nil for a pass of `descriptor` with a color attachment of a block-compressed format
@@ -704,10 +710,10 @@ index 87e655e97..fcfd214f0 100644
  #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 diff --git a/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs b/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
 new file mode 100644
-index 000000000..459dc98ba
+index 000000000..37138ce98
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/tests/unrenderable_attachments.rs
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,1010 @@
 +//! Color attachments whose image the device makes no attachment of, as a pass takes them.
 +//!
 +//! - **A texture without `RenderTarget` usage** of each format with a word layout
@@ -1528,7 +1534,8 @@ index 000000000..459dc98ba
 +
 +/// A pass with a compressed color meets the command buffer's checks as any pass does: refused
 +/// while another encoder is open (`EncoderOpen`), and after the commit (`AlreadyCommitted`), as
-+/// a pass of a plain color is.
++/// a pass of a plain color is; and, as that pass, after its colors' own checks: with an encoder
++/// open, a color 1 past its texture's levels is refused naming color 1 (`AttachmentSubresource`).
 +#[test]
 +fn a_pass_with_a_compressed_color_is_refused_as_any_pass_while_an_encoder_is_open_or_after_commit()
 +{
@@ -1563,6 +1570,27 @@ index 000000000..459dc98ba
 +            error,
 +            Problem::EncoderOpen,
 +            &format!("{what}, an encoder open"),
++        );
++    }
++    let past = texture(
++        &device,
++        PixelFormat::RGBA8Unorm,
++        2 * SIDE,
++        1,
++        TextureUsage::RENDER_TARGET,
++    )
++    .unwrap();
++    for (first, what) in [(&t, "the compressed pass"), (&plain, "the plain pass")] {
++        let mut pass = RenderPassDescriptor::new();
++        color(&mut pass, 0, first, LoadAction::Load);
++        color(&mut pass, 1, &past, LoadAction::Load);
++        pass.color_attachments[1].level = 3;
++        let error = command_buffer.render_command_encoder(&pass).err();
++        let color_1 = RenderPassProblem::AttachmentSubresource(Attachment::Color(1));
++        refused(
++            error,
++            Problem::RenderPass(color_1),
++            &format!("{what}, color 1 past its levels, an encoder open"),
 +        );
 +    }
 +    open.end_encoding().unwrap();
@@ -1783,7 +1811,7 @@ index cf1ba02ca..0c187008b 100644
  variant	metal2vulkan-runtime::RenderPassProblem::DefaultRasterSampleCount	DefaultRasterSampleCount { count: u64 }
  variant	metal2vulkan-runtime::RenderPassProblem::DepthResolvedSampleWithoutDepthResolve	DepthResolvedSampleWithoutDepthResolve
 diff --git a/docs/REFUSALS.md b/docs/REFUSALS.md
-index 6e2eae0b6..5405675bf 100644
+index 6e2eae0b6..7d3dbcd18 100644
 --- a/docs/REFUSALS.md
 +++ b/docs/REFUSALS.md
 @@ -35,7 +35,7 @@ Columns:
@@ -1853,7 +1881,7 @@ index 6e2eae0b6..5405675bf 100644
 -| `RenderPassProblem::CustomSampleDepthStore` | `CustomSampleDepthStore` as a color or stencil attachment's store action | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "storeAction is not a valid MTLStoreAction", with and without API validation | 3: `crates/metal2vulkan-runtime/src/render.rs (late_store)`, `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)` | `-` |
 +| `RenderPassProblem::CustomSampleDepthStore` | `CustomSampleDepthStore` as a color or stencil attachment's store action | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "storeAction is not a valid MTLStoreAction", with and without API validation | 3: `crates/metal2vulkan-runtime/src/render.rs (late_store)`, `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)` (+1) | `-` |
  | `RenderPassProblem::DefaultRasterSampleCount` | A pass without attachments whose `defaultRasterSampleCount`'s low 8 bits are 8 to 15 or 128 to 255, or are 0 in a count of 256 or more | every device (a public call's own check of its arguments) | `metal-measured`: an Apple M3 Max, macOS 27.0.1: plain Metal ends the process, SIGABRT and no message, at `renderCommandEncoderWithDescriptor:` of 8, 15, 130 and 256, where 1, 4 and 260 — whose low 8 bits are 4 — make the encoder and run the pass, the API validation layer off | 1: `crates/metal2vulkan-runtime/src/render_pass.rs` | `-` |
-+| `RenderPassProblem::CompressedColorAttachment` | A color attachment of a block-compressed pixel format (a BC, ETC2, EAC, ASTC or PVRTC one), with `RenderTarget` usage or without | every device (a public call's own check of its arguments) | `unknown`: plain Metal's answer for a compressed color attachment is unmeasured; Metal's pixel format capabilities give a compressed format no color rendering | 1: `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)` | `-` |
++| `RenderPassProblem::CompressedColorAttachment` | A color attachment of a block-compressed pixel format (a BC, ETC2, EAC, ASTC or PVRTC one), with `RenderTarget` usage or without | every device (a public call's own check of its arguments) | `unknown`: plain Metal's answer for a compressed color attachment is unmeasured; Metal's pixel format capabilities give a compressed format no color rendering | 2: `crates/metal2vulkan-runtime/src/render.rs (open_render)`, `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)` | `-` |
  | `DrawProblem::AttachmentFormat` | `set_render_pipeline_state` | every device (a public call's own check of its arguments) | `unknown`: what stays refused is what the Metal probes did not reach: a state color covering part of a pass color or more than one, a mesh render pipeline's state, and a fragment function that fetches a color or declares an imageblock | 2: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`, `crates/metal2vulkan-runtime/src/render.rs (check_tile)` | `-` |
  | `DrawProblem::SampleCount` | `set_render_pipeline_state` | every device (a public call's own check of its arguments) | `unknown`: what stays refused is what the Metal probes did not reach: alpha to coverage, `get_num_samples()`, a mesh render pipeline's state, an imageblock, and a state of one sample in a pass of more, whose coverage rule is unmeasured | 2: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`, `crates/metal2vulkan-runtime/src/render.rs (check_tile)` | `-` |
  | `DrawProblem::ImageblockSampleLength` | `set_render_pipeline_state` | every device (a public call's own check of its arguments) | `metal-documented`: Metal asserts "the pipelineState's per sample imageBlock usage(32) is greater than the encoder's perSample imageBlock usage(4)" | 2: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`, `crates/metal2vulkan-runtime/src/render.rs (check_tile)` | `-` |
@@ -1906,7 +1934,7 @@ index 6e2eae0b6..5405675bf 100644
 -- `subproblem::RenderPassProblem::CustomSampleDepthStore`: `crates/metal2vulkan-runtime/src/render.rs (late_store)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout, 2 sites)`
 +- `subproblem::RenderPassProblem::CustomSampleDepthStore`: `crates/metal2vulkan-runtime/src/render.rs (late_store)`; `crates/metal2vulkan-runtime/src/render_pass.rs (check_colors)`; `crates/metal2vulkan-runtime/src/render_pass.rs (layout)`
  - `subproblem::RenderPassProblem::DefaultRasterSampleCount`: `crates/metal2vulkan-runtime/src/render_pass.rs`
-+- `subproblem::RenderPassProblem::CompressedColorAttachment`: `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`
++- `subproblem::RenderPassProblem::CompressedColorAttachment`: `crates/metal2vulkan-runtime/src/render.rs (open_render)`; `crates/metal2vulkan-runtime/src/render_pass.rs (compressed_color)`
  - `subproblem::DrawProblem::AttachmentFormat`: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (check_tile)`
  - `subproblem::DrawProblem::SampleCount`: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (check_tile)`
  - `subproblem::DrawProblem::ImageblockSampleLength`: `crates/metal2vulkan-runtime/src/render.rs (check_pipeline)`; `crates/metal2vulkan-runtime/src/render.rs (check_tile)`
