@@ -189,6 +189,8 @@ qemu_extra() {  # the network (passt, SSH forwarded by Docker) and the disk's op
     -set "drive.disk.cache=$MACBOX_DISK_CACHE" -set drive.disk.discard=unmap; do
     out+=("$(printf '%q' "$a")")
   done
+  # QEMU 0015: do not send unchanged keyboard reports at idle.
+  out+=(-global usb-kbd.x-ignore-idle=on)
   # Reims's VideoToolbox and M2 scaler devices, in the slots reims-ctl gives them (after the mapper)
   [ "$MACBOX_VIDEO" = on ] && out+=(-device apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8 \
     -device apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9)
