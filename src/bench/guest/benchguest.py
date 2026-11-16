@@ -440,6 +440,24 @@ def _boot_one(udid, res, i):
               "err": None if ok and rc2 == 0 else err.strip()[-120:]}
 
 
+def slim_count(udid):
+    """Services simslim keeps disabled for a simulator (what macbox-guest counts), 0 = stock."""
+    f = "/private/var/tmp/com.apple.CoreSimulator.SimDevice.%s/disabled.plist" % udid
+    if not os.path.exists(f):
+        return 0
+    return run(["plutil", "-p", f], 15)[1].count("=> true")
+
+
+def cmd_slim(a):
+    """The pool's Slim configuration on the bench's simulators: runs --cmd ({udid}) for each, then counts the
+    services left disabled. HYPOTHESIS: simslim finds devices of a custom device set; the result says."""
+    res = []
+    for u in a.udids.split(","):
+        rc, out, err, secs = run(["/bin/sh", "-c", a.cmd.replace("{udid}", u)], 900)
+        res.append({"udid": u, "rc": rc, "s": round(secs, 1), "services_off": slim_count(u), "err": (err or "").strip()[-120:] if rc else None})
+    out_json({"sims": res})
+
+
 def cmd_boot(a):
     us = a.udids.split(",")
     res = [None] * len(us)
@@ -750,6 +768,7 @@ def main(argv=None):
     add("ensure-type", cmd_ensure_type, O("--scale", default="1"), O("--allow-restart", action="store_true"))
     add("create", cmd_create, O("--n", type=int, required=True), O("--type", required=True), O("--runtime", required=True),
         O("--prefix", default="bench"), O("--start", type=int, default=0))
+    add("slim", cmd_slim, O("--udids", required=True), O("--cmd", required=True))
     add("boot", cmd_boot, O("--udids", required=True), O("--parallel", action="store_true"))
     add("prepare", cmd_prepare, O("--udids", required=True), O("--roles", required=True), O("--install", action="store_true"),
         O("--quiesce", action="store_true"))

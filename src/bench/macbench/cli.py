@@ -38,6 +38,8 @@ def add_common(p):
     p.add_argument("--lead", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--settle-step", type=float, default=3.0, help=argparse.SUPPRESS)
     p.add_argument("--settle-bg", type=float, default=40, help="the guest counts as settled below this background CPU %% (of one core)")
+    p.add_argument("--slim", action="store_true", help="make the bench simulators Slim like the pool's (simslim; a minute or two each)")
+    p.add_argument("--slim-cmd", default="$HOME/go/bin/simslim on {udid} --preserve-boot-state", help=argparse.SUPPRESS)
     p.add_argument("--quiesce", action="store_true", help="disable mediaanalysisd in each simulator (recorded; production does not)")
     p.add_argument("--fail-on-swap", action="store_true", help="a guest swap-out in a window fails the memory gate (default: reported, host swap fails)")
     p.add_argument("--golden-file", default=os.path.join(BENCH_DIR, "baselines", "golden.json"))

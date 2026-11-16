@@ -104,6 +104,12 @@ def grow(ctx, n, roles, install=True):
         r = ctx.guest.call(["create", "--n", new, "--type", ctx.type_id, "--runtime", ctx.runtime, "--start", have], 240)
         fresh = r["sims"]
         us = ",".join(s["udid"] for s in fresh)
+        if ctx.a.slim:
+            sl = ctx.guest.call(["slim", "--udids", us, "--cmd", ctx.a.slim_cmd], 900 * len(fresh))
+            bad = [x for x in sl["sims"] if x["rc"] != 0 or not x["services_off"]]
+            if bad:
+                raise Stop("--slim: simslim did not slim a bench simulator (rc %s, %s services off): %s" % (bad[0]["rc"], bad[0]["services_off"], bad[0]["err"]))
+            ctx.doc["env"]["guest"]["slim_services_off"] = sl["sims"][0]["services_off"]
         b = ctx.guest.call(["boot", "--udids", us] + (["--parallel"] if new > 1 else []), 900)
         bad = [s for s in b["sims"] if not s.get("ok")]
         if bad:

@@ -14,7 +14,7 @@ DRY=1 macbox bench scale --n 1,2,3       # the whole control flow against stubs:
 ```
 
 Requirements: Python 3.8+ on the host (standard library only; no Pillow, no numpy), the VM running, `ssh` to it.
-Unit tests, no VM needed: `cd src/bench && python3 -m unittest discover -s tests -t .` (the pure parts, 55 cases)
+Unit tests, no VM needed: `cd src/bench && python3 -m unittest discover -s tests -t .` (the pure parts and the run's safety)
 and `python3 -m unittest tests.test_dry` (the dry runs with injected faults, a couple of minutes).
 
 ## What a run does, and what it never touches
@@ -57,7 +57,7 @@ refuse the run (`--allow-foreign` to measure anyway, recorded).
 
 Common options: `--out DIR` (results, default `bench-results/`), `--secs` (window length, default 40),
 `--nominal-fps 60`, `--tag key=value` (recorded, for example `mesa=26.2.4` when Mesa is not a package),
-`--probe-method auto|openurl|appearance|cmd|none`, `--quiesce` (disables `mediaanalysisd` in each simulator, as
+`--probe-method auto|openurl|appearance|cmd|none`, `--slim` (the pool's Slim configuration through simslim on the bench's simulators: without it they are stock simulators, which cost more; it needs simslim in the guest, `macbox-guest tools`, and whether simslim finds devices of a custom device set is untested: the run stops with that message if it does not), `--quiesce` (disables `mediaanalysisd` in each simulator, as
 some old harnesses did; recorded, off by default), `--no-observer-check`, `--no-golden`, `--shots N`.
 Every run prints one PASS/FAIL/SKIP/INFO line per section and exits 0, 1 (a section failed) or 2 (the run could not
 go on). The JSON has the same lines under `sections`.
