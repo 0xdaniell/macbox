@@ -48,6 +48,28 @@ class GuestParsers(unittest.TestCase):
         self.assertAlmostEqual(m["compressed_mb"], 52949 * 16384 / 1048576.0, places=1)
         self.assertEqual(bg.parse_vm_stat(VM_STAT)["page"], 16384)
 
+    def test_available_memory_counts_cache_and_defaults_to_4k_pages(self):
+        m = bg.mem_summary(bg.parse_vm_stat(VM_STAT))
+        self.assertAlmostEqual(m["avail_mb"], (573102 + 10000 + 100000) * 16384 / 1048576.0, places=1)    # + inactive
+        self.assertGreater(m["avail_mb"], m["free_mb"])
+        nohead = bg.parse_vm_stat(VM_STAT.replace("(page size of 16384 bytes)", ""))
+        if os.uname()[4] == "x86_64":
+            # without the header (x86 guest): 573102 free pages are 2.2 GiB at 4 KiB, not 8.7 GiB
+            self.assertEqual(nohead["page"], 4096)
+            self.assertAlmostEqual(573102 * 4096 / 1073741824.0, 2.19, places=2)
+
+    def test_observer_is_nobodys_simulator_tree(self):
+        procs = bg.parse_ps(PS + "  500     1  2000    0:03.00 xcrun simctl --set /x AAAA-1 BBBB-2\n  501   500  2000    0:09.00 simfps AAAA-1\n")
+        own = bg.own_pids(procs, me=501)
+        self.assertEqual(own, {500, 501})
+        trees = bg.sim_trees(procs, ["AAAA-1", "BBBB-2"], own)
+        self.assertNotIn(500, trees["AAAA-1"] | trees["BBBB-2"])
+        self.assertNotIn(501, trees["AAAA-1"])
+        later = [dict(p, cpu_s=p["cpu_s"] + 1.0) for p in procs]
+        per, tot = bg.attribute(procs, later, ["AAAA-1", "BBBB-2"], 2.0, own)
+        self.assertAlmostEqual(tot["observer_cpu_pct"], 100.0, places=1)       # two processes x 1 s over 2 s
+        self.assertEqual(per["AAAA-1"]["procs"], 3)
+
     def test_cputime(self):
         self.assertAlmostEqual(bg.parse_cputime("0:01.50"), 1.5)
         self.assertAlmostEqual(bg.parse_cputime("2:03.25"), 123.25)

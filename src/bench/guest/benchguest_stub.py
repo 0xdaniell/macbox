@@ -93,6 +93,10 @@ def _stub_run(argv):
             u = str(uuid.uuid4()).upper()
             s["devs"][u] = {"name": cmd[1], "state": "Shutdown", "type": cmd[2]}
             out = u + "\n"
+        elif verb == "clone":
+            u = str(uuid.uuid4()).upper()
+            s["devs"][u] = {"name": cmd[2], "state": "Shutdown", "type": s["devs"][cmd[1]].get("type")}
+            out = u + "\n"
         elif verb == "boot":
             time.sleep(0.05)
             s["devs"][cmd[1]]["state"] = "Booted"
@@ -239,5 +243,8 @@ def install(mod):
         s = load()
         calls[0] += 1
         cr = fault("crash")
-        return set(s["ips"]) | ({"GlassBench-stub.ips"} if cr is not None and len(booted(s)) >= cr and calls[0] >= 2 else set())
+        if cr is not None and len(booted(s)) >= cr and calls[0] >= 2 and "GlassBench-stub.ips" not in s["ips"]:
+            s["ips"].append("GlassBench-stub.ips")          # stays on the "disk": the run-wide gate sees it later
+            save(s)
+        return set(s["ips"])
     mod.list_ips = ips

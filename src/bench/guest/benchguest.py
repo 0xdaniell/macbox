@@ -131,7 +131,7 @@ def parse_vm_stat(text):
     """vm_stat -> {"page": bytes, "free": pages, ...}. Keys lower-cased, spaces to underscores."""
     d = {}
     m = re.search(r"page size of (\d+) bytes", text)
-    d["page"] = int(m.group(1)) if m else 16384
+    d["page"] = int(m.group(1)) if m else (4096 if os.uname()[4] == "x86_64" else 16384)
     for line in text.splitlines():
         m = re.match(r"^\"?([A-Za-z ()-]+?)\"?:\s+(\d+)\.?\s*$", line)
         if m:
@@ -145,6 +145,8 @@ def mem_summary(vm):
     g = lambda k: vm.get(k, 0)
     used = (g("pages_active") + g("pages_wired_down") + g("pages_occupied_by_compressor")) * p
     return {"free_mb": round((g("pages_free") + g("pages_speculative")) * p, 1), "used_mb": round(used, 1),
+            # what the guest can hand out without swapping: free, speculative, inactive (file cache) and purgeable pages
+            "avail_mb": round((g("pages_free") + g("pages_speculative") + g("pages_inactive") + g("pages_purgeable")) * p, 1),
             "compressed_mb": round(g("pages_occupied_by_compressor") * p, 1),
             "swapins": g("swapins"), "swapouts": g("swapouts"), "pageins": g("pageins"), "pageouts": g("pageouts")}
 
@@ -176,40 +178,62 @@ def parse_ps(text):
     return out
 
 
-def sim_trees(procs, udids):
+def own_pids(procs, me=None):
+    """The helper itself, its ancestors (ssh, shells) and everything it started (simfps, simctl, ps): the observer."""
+    me = os.getpid() if me is None else me
+    by_pid = {p["pid"]: p for p in procs}
+    by_ppid = {}
+    for p in procs:
+        by_ppid.setdefault(p["ppid"], []).append(p["pid"])
+    mine, stack = {me}, [me]
+    while stack:
+        for c in by_ppid.get(stack.pop(), []):
+            if c not in mine:
+                mine.add(c)
+                stack.append(c)
+    q = me
+    while q in by_pid and by_pid[q]["ppid"] > 1:
+        q = by_pid[q]["ppid"]
+        mine.add(q)
+    return mine
+
+
+def sim_trees(procs, udids, exclude=()):
     """{udid: set of pids}: processes whose command line names the simulator's UDID (launchd_sim, SimMetalHost,
-    ...) and every descendant of them. A process that names no simulator is nobody's."""
+    ...) and every descendant of them, never the observer (`exclude`: the helper's own tree, which names every
+    UDID on its command line). A process that names no simulator is nobody's."""
     by_ppid = {}
     for p in procs:
         by_ppid.setdefault(p["ppid"], []).append(p["pid"])
     out = {}
     for u in udids:
-        roots = [p["pid"] for p in procs if u in p["cmd"]]
+        roots = [p["pid"] for p in procs if u in p["cmd"] and p["pid"] not in exclude]
         seen, stack = set(roots), list(roots)
         while stack:
             for c in by_ppid.get(stack.pop(), []):
-                if c not in seen:
+                if c not in seen and c not in exclude:
                     seen.add(c)
                     stack.append(c)
         out[u] = seen
     return out
 
 
-def attribute(before, after, udids, secs):
+def attribute(before, after, udids, secs, exclude=()):
     """Per simulator and in total: CPU % of one core over the window (from the processes' CPU time deltas) and RSS MB
     at the end. A process that started or ended inside the window counts from its first sample or not at all:
     short-lived processes are undercounted (declared in the README)."""
     b = {p["pid"]: p for p in before}
-    trees = sim_trees(after, udids)
+    trees = sim_trees(after, udids, exclude)
     per = {}
     for u in udids:
         cpu = sum(max(0.0, p["cpu_s"] - b[p["pid"]]["cpu_s"]) for p in after if p["pid"] in trees[u] and p["pid"] in b)
         rss = sum(p["rss_kb"] for p in after if p["pid"] in trees[u]) / 1024.0
         per[u] = {"cpu_pct": round(100 * cpu / secs, 1), "rss_mb": round(rss, 1), "procs": len(trees[u])}
-    tot = sum(max(0.0, p["cpu_s"] - b[p["pid"]]["cpu_s"]) for p in after if p["pid"] in b)
+    obs = sum(max(0.0, p["cpu_s"] - b[p["pid"]]["cpu_s"]) for p in after if p["pid"] in b and p["pid"] in exclude)
+    tot = sum(max(0.0, p["cpu_s"] - b[p["pid"]]["cpu_s"]) for p in after if p["pid"] in b and p["pid"] not in exclude)
     mine = set().union(*trees.values()) if trees else set()
     sims_cpu = sum(max(0.0, p["cpu_s"] - b[p["pid"]]["cpu_s"]) for p in after if p["pid"] in mine and p["pid"] in b)
-    return per, {"total_cpu_pct": round(100 * tot / secs, 1), "sims_cpu_pct": round(100 * sims_cpu / secs, 1),
+    return per, {"observer_cpu_pct": round(100 * obs / secs, 1), "total_cpu_pct": round(100 * tot / secs, 1), "sims_cpu_pct": round(100 * sims_cpu / secs, 1),
                  "other_cpu_pct": round(100 * (tot - sims_cpu) / secs, 1),
                  "sims_rss_mb": round(sum(v["rss_mb"] for v in per.values()), 1)}
 
@@ -407,10 +431,8 @@ def cmd_ensure_type(a):
     os.rename(tmp, dest)
     res.update({"type": tid, "created": True, "needs_restart": True})
     if a.allow_restart:
-        booted = [d for d in devices() if d.get("state") == "Booted"]
-        all_booted = run(["xcrun", "simctl", "list", "devices", "booted"], 30)[1]
-        if booted or re.search(r"\(Booted\)", all_booted):
-            res["restart"] = "refused: a simulator is booted"
+        if count_launchd_sim() or [d for d in devices() if d.get("state") == "Booted"]:
+            res["restart"] = "refused: a simulator is running (in any device set)"
         else:
             run(["pkill", "-f", "CoreSimulatorService"], 10)
             time.sleep(3)
@@ -485,6 +507,7 @@ def cmd_prepare(a):
         if a.quiesce:
             simctl("spawn", u, "launchctl", "disable", "system/com.apple.mediaanalysisd", timeout=30)
             simctl("spawn", u, "launchctl", "bootout", "system/com.apple.mediaanalysisd", timeout=30)
+        simctl("ui", u, "appearance", "light", timeout=30)
         simctl("terminate", u, BUNDLE_ID, timeout=30)
         args = ["-probe"] + (["-static"] if role == "static" else [])
         rc_l = 0 if role in ("agent", "idle") else simctl("launch", u, BUNDLE_ID, *args, timeout=60)[0]
@@ -499,14 +522,15 @@ def parse_name_cpu(text):
 def bg_cpu_pct(secs=3.0):
     """Everything not part of the load: CPU % of one core used by processes other than the renderers, the app and
     the observer (the settle condition: the guest has stopped doing its own housekeeping)."""
-    skip = re.compile(r"(SimMetalHost|backboardd|GlassBench|SimRenderServer|kernel_task|simfps|WindowServer|python3|/ps$|/top$)")
+    skip = re.compile(r"(^|/)(SimMetalHost|backboardd|GlassBench|SimRenderServer|kernel_task|simfps|WindowServer|python3?|Python|ps|top|ssh|sshd)( |$)")
     a = parse_ps(ps_text())
+    mine = own_pids(a)
     t0 = now()
     time.sleep(secs)
     b = parse_ps(ps_text())
     dt = now() - t0
     am = {p["pid"]: p for p in a}
-    tot = sum(max(0.0, p["cpu_s"] - am[p["pid"]]["cpu_s"]) for p in b if p["pid"] in am and not skip.search(p["cmd"].split(" ", 1)[0]))
+    tot = sum(max(0.0, p["cpu_s"] - am[p["pid"]]["cpu_s"]) for p in b if p["pid"] in am and p["pid"] not in mine and not skip.search(p["cmd"]))
     return round(100 * tot / dt, 1)
 
 
@@ -537,7 +561,7 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     inj, acts, threads = {u: [] for u in udids}, {u: [] for u in udids}, []
     lvls = []
     if mix in ("all-busy", "one-busy") and probe_method != "none":
-        targets = [u for u, r in zip(udids, roles) if mix == "all-busy" or r == "static"]
+        targets = list(udids)          # the busy simulator too: it is what a one-busy fleet's user waits on
         for k, u in enumerate(targets):
             t = threading.Thread(target=probe_loop, args=(u, probe_method, cmd_tpl, t_go + min(1.0, secs * 0.15) + k * probe_every / max(len(targets), 1),
                                                           probe_every, t_stop - probe_timeout - 0.2, inj[u], stop_evt))
@@ -565,7 +589,9 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
             h.kill()
     ps1, vm1 = parse_ps(ps_text()), parse_vm_stat(vmstat_text())
     t_end = now()
-    per, tot = attribute(ps0, ps1, udids, max(t_end - t_start, 0.001))
+    if mix != "idle" and not STUB:
+        time.sleep(6)          # GlassBench writes pace.json every 5 s: wait for the record that closes the window
+    per, tot = attribute(ps0, ps1, udids, max(t_end - t_start, 0.001), own_pids(ps1))
     st = {d["udid"]: d.get("state") for d in devices()}
     sims = []
     for i, u in enumerate(udids):
@@ -621,6 +647,7 @@ def cmd_calibrate(a):
                            "error": err}
         out_json({"methods": res})
     finally:
+        simctl("ui", a.udid, "appearance", "light", timeout=30)          # the appearance method leaves it dark
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -686,8 +713,20 @@ def cmd_cycle(a):
             frames = analysis.parse_raw(open(raw).read()) if os.path.exists(raw) else []
             first = next((x[0] for x in frames if x[0] >= t_l and x[1] >= 0 and x[1] != 65535), None)
             t["%s_first_frame_s" % phase] = None if first is None else round(first - t_l, 2)
-        t0 = now()
+        # clone of the shut-down, installed device (what a pool does for a new lease), then its boot
         simctl("shutdown", udid, timeout=120)
+        t0 = now()
+        cl = simctl("clone", udid, "%s-clone" % name, timeout=300)[1].strip().splitlines()[-1]
+        t["clone_s"] = round(now() - t0, 2)
+        try:
+            t0 = now()
+            simctl("boot", cl, timeout=300)
+            simctl("bootstatus", cl, timeout=600)
+            t["clone_boot_s"] = round(now() - t0, 2)
+        finally:
+            simctl("shutdown", cl, timeout=120)
+            simctl("delete", cl, timeout=120)
+        t0 = now()
         simctl("delete", udid, timeout=120)
         t["delete_s"] = round(now() - t0, 2)
         udid = None
@@ -708,11 +747,20 @@ def cmd_teardown(a):
     out_json({"left": len(left), "booted": len(booted), "calls": [c[1:] for c in CALLS][-3:]})
 
 
+def count_launchd_sim():
+    """Simulators running on this Mac in any device set (one launchd_sim each): the pool's, a lease's, the bench's."""
+    return len([p for p in parse_ps(ps_text()) if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])])
+
+
+def cmd_ips(a):
+    out_json({"ips": sorted(list_ips())})
+
+
 def cmd_memcheck(a):
     vm = mem_summary(parse_vm_stat(vmstat_text()))
-    default_set = run(["xcrun", "simctl", "list", "devices", "booted"], 30)[1]      # read only: the default set
-    out_json({"mem": vm, "pressure": pressure_level(), "booted": len([d for d in devices() if d.get("state") == "Booted"]),
-              "foreign_booted": len(re.findall(r"\(Booted\)", default_set)), "ips": len(list_ips())})
+    own = len([d for d in devices() if d.get("state") == "Booted"])
+    out_json({"mem": vm, "pressure": pressure_level(), "booted": own, "foreign_booted": max(0, count_launchd_sim() - own),
+              "ips": len(list_ips())})
 
 
 def cmd_build(a):
@@ -783,6 +831,7 @@ def main(argv=None):
     add("teardown", cmd_teardown)
     add("build", cmd_build, O("--xcodebuild", default=""))
     add("memcheck", cmd_memcheck)
+    add("ips", cmd_ips)
     add("calls", cmd_calls)
     a = ap.parse_args(argv)
     SET = a.set
