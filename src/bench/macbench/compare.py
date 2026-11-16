@@ -5,9 +5,9 @@ NOISE = 0.04     # run-to-run noise on this stack
 
 # (label, getter on a step, higher is better)
 STEP_ROWS = [
-    ("min distinct fps", lambda st: _min([s.get("fps") for s in st["sims"] if s.get("role") == "busy"]), True),
-    ("worst p95 ms", lambda st: _max([s.get("p95_ms") for s in st["sims"] if s.get("role") == "busy"]), False),
-    ("worst p99 ms", lambda st: _max([s.get("p99_ms") for s in st["sims"] if s.get("role") == "busy"]), False),
+    ("min distinct fps", lambda st: _min([s.get("fps") for s in st["sims"] if s.get("role") in ("busy", "agent")]), True),
+    ("worst p95 ms", lambda st: _max([s.get("p95_ms") for s in st["sims"] if s.get("role") in ("busy", "agent")]), False),
+    ("worst p99 ms", lambda st: _max([s.get("p99_ms") for s in st["sims"] if s.get("role") in ("busy", "agent")]), False),
     ("longest gap s", lambda st: _max([s.get("longest_gap_s") for s in st["sims"]]), False),
     ("input p95 ms", lambda st: _max([s.get("input_p95_ms") for s in st["sims"]]), False),
     ("Jain index", lambda st: (st.get("fairness") or {}).get("jain"), True),

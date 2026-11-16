@@ -123,7 +123,7 @@ def _stub_run(argv):
             now = time.time()
             with open(os.path.join(d, "Documents", "pace.json"), "w") as f:
                 for k in range(8):
-                    f.write(json.dumps({"at": now - 40 + 5 * k, "counter": int((now - 40 + 5 * k - T0) * 60) % 65536}) + "\n")
+                    f.write(json.dumps({"at": now - 40 + 5 * k, "counter": int((now - 40 + 5 * k - T0) * 60) % 65536, "fps": 60.0, "ticks": 300}) + "\n")
             out = d + "\n"
     elif argv[:3] == ["xcrun", "simctl", "list"]:
         out = json.dumps(RUNTIMES if argv[3] == "runtimes" else TYPES) if argv[3] in ("runtimes", "devicetypes") else ""

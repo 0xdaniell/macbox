@@ -332,8 +332,8 @@ def cmd_info(a):
     vm = parse_vm_stat(vmstat_text())
     out_json({"macos": ver.group(1) if ver else None, "xcode": xc, "runtimes": rts, "arch": run(["uname", "-m"], 5)[1].strip(),
               "cpus": sysctl("hw.ncpu"), "mem_mb": int(sysctl("hw.memsize") or 0) // 1048576, "mem": mem_summary(vm),
-              "has_simfps": os.path.exists(os.path.join(HERE, "..", "simfps")),
-              "has_app": os.path.isdir(os.path.join(HERE, "..", "GlassBench.app")), "stub": bool(STUB)})
+              "has_simfps": bool(STUB) or os.path.exists(os.path.join(HERE, "..", "simfps")),
+              "has_app": bool(STUB) or os.path.isdir(os.path.join(HERE, "..", "GlassBench.app")), "stub": bool(STUB)})
 
 
 def cmd_init_set(a):
@@ -473,9 +473,7 @@ def cmd_prepare(a):
             simctl("spawn", u, "launchctl", "bootout", "system/com.apple.mediaanalysisd", timeout=30)
         simctl("terminate", u, BUNDLE_ID, timeout=30)
         args = ["-probe"] + (["-static"] if role == "static" else [])
-        if role == "agent":
-            args = []
-        rc_l = 0 if role == "agent" else simctl("launch", u, BUNDLE_ID, *args, timeout=60)[0]
+        rc_l = 0 if role in ("agent", "idle") else simctl("launch", u, BUNDLE_ID, *args, timeout=60)[0]
         res.append({"udid": u, "role": role, "install_rc": rc_i, "launch_rc": rc_l, "s": round(now() - t0, 2)})
     out_json({"sims": res})
 
@@ -508,13 +506,13 @@ def cmd_settle(a):
     out_json({"settled": series[-1] < a.bg_pct, "bg_pct": series[-1], "waited_s": round(now() - t0, 1), "series": series[-8:]})
 
 
-def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every, cmd_tpl, strip_for_all=True):
+def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every, cmd_tpl, no_strip=False):
     """simfps on each simulator, the probe and agent threads, and the guest's samples around the window."""
     raws, handles, stop_evt = {}, {}, threading.Event()
     if mix != "idle":
         for i, u in enumerate(udids):
             raws[u] = os.path.join(tmp, "raw-%d.txt" % i)
-            handles[u] = spawn_simfps(u, secs, "bench-%d" % i, roles[i] != "static", t_go, raws[u])
+            handles[u] = spawn_simfps(u, secs, "bench-%d" % i, roles[i] != "static" and not no_strip, t_go, raws[u])
     ips0, ps0, vm0, lvl0 = list_ips(), None, None, pressure_level()
     d = t_go - now()
     if d > 0:
@@ -524,7 +522,7 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     t_stop = t_go + secs
     inj, acts, threads = {u: [] for u in udids}, {u: [] for u in udids}, []
     lvls = []
-    if mix in ("all-busy", "one-busy"):
+    if mix in ("all-busy", "one-busy") and probe_method != "none":
         targets = [u for u, r in zip(udids, roles) if mix == "all-busy" or r == "static"]
         for k, u in enumerate(targets):
             t = threading.Thread(target=probe_loop, args=(u, probe_method, cmd_tpl, t_go + 1.0 + k * probe_every / max(len(targets), 1),
@@ -574,11 +572,11 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
 
 
 def cmd_measure(a):
-    udids, roles = a.udids.split(","), a.roles.split(",")
+    udids, roles = [u for u in a.udids.split(",") if u], [r for r in a.roles.split(",") if r]
     tmp = tempfile.mkdtemp(prefix="benchwin")
     try:
         t_go = a.start_at or now() + 3 + len(udids)
-        out_json(run_window(a, udids, roles, a.mix, a.secs, t_go, tmp, a.probe_method, a.probe_every, a.probe_cmd))
+        out_json(run_window(a, udids, roles, a.mix, a.secs, t_go, tmp, a.probe_method, a.probe_every, a.probe_cmd, a.no_strip))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -590,18 +588,19 @@ def cmd_calibrate(a):
     res = {}
     try:
         for method in a.methods.split(","):
-            t_go = now() + 3
+            f = a.time_scale
+            t_go = now() + 3 * f
             raw = os.path.join(tmp, "raw.txt")
-            h = spawn_simfps(a.udid, 9, "cal", False, t_go, raw)
+            h = spawn_simfps(a.udid, 9 * f, "cal", False, t_go, raw)
             inj, state = [], {}
             for k in range(3):
-                d = t_go + 1.5 + k * 2.4 - now()
+                d = t_go + (1.5 + k * 2.4) * f - now()
                 if d > 0:
                     time.sleep(d)
                 t0 = now()
                 rc = inject(method, a.udid, state, a.probe_cmd)
                 inj.append([t0, now(), rc])
-            sj, err = h.wait(40)
+            sj, err = h.wait(40 + 9 * f)
             txt = open(raw).read() if os.path.exists(raw) else ""
             r = analysis.probe_latencies(analysis.parse_raw(txt), [(x[0], x[1]) for x in inj], 2.0)
             res[method] = {"answered": r["n"] - r["misses"], "n": r["n"], "p50_ms": r["p50_ms"], "call_p50_ms": r["call_p50_ms"],
@@ -756,10 +755,11 @@ def main(argv=None):
     add("prepare", cmd_prepare, O("--udids", required=True), O("--roles", required=True), O("--install", action="store_true"),
         O("--quiesce", action="store_true"))
     add("settle", cmd_settle, O("--max-s", type=float, default=120), O("--bg-pct", type=float, default=40), O("--step", type=float, default=3))
-    add("calibrate", cmd_calibrate, O("--udid", required=True), O("--methods", default="openurl,appearance"), O("--probe-cmd"))
+    add("calibrate", cmd_calibrate, O("--udid", required=True), O("--methods", default="openurl,appearance"), O("--probe-cmd"), O("--time-scale", type=float, default=1.0))
     add("measure", cmd_measure, O("--udids", required=True), O("--roles", required=True), O("--mix", default="all-busy"),
         O("--secs", type=float, default=40), O("--start-at", type=float, default=0), O("--probe-method", default="openurl"),
-        O("--probe-every", type=float, default=2.5), O("--probe-cmd"), O("--agent-period", type=float, default=12))
+        O("--probe-every", type=float, default=2.5), O("--probe-cmd"), O("--agent-period", type=float, default=12),
+        O("--no-strip", action="store_true"))
     add("shots", cmd_shots, O("--udids", required=True), O("--count", type=int, default=2))
     add("cycle", cmd_cycle, O("--type", required=True), O("--runtime", required=True), O("--prefix", default="bench"))
     add("teardown", cmd_teardown)

@@ -58,19 +58,19 @@ def panel(title, xs, series, ylabel, hlines=(), ymax=None):
     return "\n".join(o)
 
 
-def _per_sim(steps, key, role="busy"):
+def _per_sim(steps, key, role=("busy", "agent")):
     pts = []
     for st in steps:
         for s in st["sims"]:
-            if s.get("role") == role and s.get(key) is not None:
+            if s.get("role") in role and s.get(key) is not None:
                 pts.append((st["n"], s[key]))
     return pts
 
 
-def _agg(steps, fn, key, role="busy"):
+def _agg(steps, fn, key, role=("busy", "agent")):
     out = []
     for st in steps:
-        v = [s[key] for s in st["sims"] if s.get("role") == role and s.get(key) is not None]
+        v = [s[key] for s in st["sims"] if s.get("role") in role and s.get(key) is not None]
         out.append((st["n"], fn(v) if v else None))
     return out
 

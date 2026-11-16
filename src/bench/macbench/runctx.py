@@ -14,15 +14,17 @@ class DeadlineError(Exception):
 
 
 class Run:
-    def __init__(self, deadline_s, log=print):
+    def __init__(self, deadline_s, log=print, margin=60.0):
         self.t0 = time.monotonic()
         self.deadline = self.t0 + deadline_s
+        self.margin = margin     # the watchdog acts this long before the deadline
         self.log = log
         self.children = []       # subprocess.Popen objects this run started
         self.undo = []           # (label, fn) restoring a knob, run last-in first-out
         self.teardown = []       # (label, fn): shut down what the run started (simulators)
         self.on_deadline = None  # fn: write the partial result
         self.cleaned = False
+        self.in_cleanup = False
         self._lock = threading.Lock()
         self.expired = threading.Event()
         self.problems = []       # things cleanup found it could not restore
@@ -33,8 +35,8 @@ class Run:
 
     def need(self, secs, what):
         """Refuse a step that would run past the deadline (the cleanup keeps its own 90 s)."""
-        if self.remaining() < secs + 90:
-            raise DeadlineError("no time for %s (%d s needed, %d s left before the deadline)" % (what, secs, max(0, self.remaining() - 90)))
+        if self.remaining() < secs + self.margin + 30:
+            raise DeadlineError("no time for %s (%d s needed, %d s left before the deadline)" % (what, secs, max(0, self.remaining() - self.margin - 30)))
 
     # --- children
     def popen(self, argv, **kw):
@@ -75,9 +77,9 @@ class Run:
         t.start()
 
     def _watchdog(self):
-        while time.monotonic() < self.deadline - 60:
+        while time.monotonic() < self.deadline - self.margin:
             time.sleep(1)
-        self.log("DEADLINE: 60 s left, stopping")
+        self.log("DEADLINE: %d s left, stopping" % self.margin)
         self.expired.set()
         if self.on_deadline:
             try:
@@ -93,6 +95,7 @@ class Run:
                 return
             self.cleaned = True
         self.expired.set()
+        self.in_cleanup = True
         self.kill_children()
         for label, fn in reversed(self.teardown):
             try:

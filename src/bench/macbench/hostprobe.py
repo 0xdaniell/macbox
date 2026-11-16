@@ -219,3 +219,42 @@ def host_versions():
     except OSError:
         pass
     return {"kernel": kernel, "mesa": mesa or "unknown (pass --tag mesa=<version>)", "cpu_model": cpu, "cpus": os.cpu_count()}
+
+
+class Host:
+    """The real host side for one QEMU process. `root` is "" in production (tests point it at a fake tree)."""
+    dry = False
+
+    def __init__(self, pid, root="", live_conf=None, hz=None):
+        self.pid, self.root, self.live_conf = pid, root, live_conf
+        self.hz = hz or os.sysconf("SC_CLK_TCK")
+        self.n = 0
+
+    def qemu_pid(self):
+        return self.pid
+
+    def snap(self):
+        import time
+        return {"mono": time.monotonic(), "wall": time.time(), "pid": self.pid, "threads": thread_snapshot(self.pid, self.root),
+                "gpu": gpu_render_ns(self.pid, self.root), "mem": mem_snapshot(self.pid, self.root)}
+
+    def mem_avail_gb(self):
+        v = mem_snapshot(self.pid, self.root).get("mem_avail_kb")
+        return None if v is None else v / 1048576.0
+
+    def disk_free_gb(self, path):
+        try:
+            st = os.statvfs(path)
+            return st.f_bavail * st.f_frsize / 1073741824.0
+        except OSError:
+            return None
+
+    def kernel_gpu(self, since):
+        return kernel_gpu_lines(since)
+
+    def same_qemu(self):
+        return os.path.exists("%s/proc/%d" % (self.root, self.pid))
+
+    def env(self):
+        sw = read_live_conf(self.live_conf) if self.live_conf else {}
+        return host_versions(), sw, qemu_env_switches(self.pid, self.root)

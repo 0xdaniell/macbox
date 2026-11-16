@@ -79,7 +79,7 @@ def sim_metrics(idx, role, raw, injections, nominal_fps=60.0, timeout_s=2.0, app
 
 def fairness(sims):
     """Jain's index and min/max over the distinct fps of the simulators that were meant to animate."""
-    f = [s["fps"] for s in sims if s.get("role") == "busy" and s.get("fps") is not None]
+    f = [s["fps"] for s in sims if s.get("role") in ("busy", "agent") and s.get("fps") is not None]
     return {"jain": stats.r1(stats.jain(f), 3), "min_max": stats.r1(stats.min_max_ratio(f), 3), "n": len(f)}
 
 

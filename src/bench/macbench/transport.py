@@ -52,6 +52,8 @@ class SshGuest:
         return d
 
     def _check(self, what, timeout):
+        if self.run.in_cleanup:
+            return min(timeout, 240)
         if self.run.expired.is_set():
             raise DeadlineError("stopping: %s not started" % what)
         if self.run.remaining() < 5:
@@ -90,7 +92,7 @@ class SshGuest:
 
     def sh(self, cmd, timeout=120):
         """A plain command in the guest: (rc, stdout)."""
-        if self.run.expired.is_set():
+        if self.run.expired.is_set() and not self.run.in_cleanup:
             raise DeadlineError("stopping")
         p = subprocess.run(self.argv_plain(cmd), capture_output=True, text=True, timeout=min(timeout, max(5, int(self.run.remaining()))))
         return p.returncode, p.stdout

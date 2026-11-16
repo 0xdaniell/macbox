@@ -109,7 +109,7 @@ def strip_gate_of(sims):
     return gate("PASS", "%d simulator(s): no frame out of order" % len(judged))
 
 
-def shots_gates(shots_by_sim, golden_hash=None, golden_key=None):
+def shots_gates(shots_by_sim, golden=None):
     """Tear, strip-readable and pixel-exact gates from the guest's `shots` output.
     shots_by_sim: [{"idx", "role", "shots": [{ok, hash, tear, tear_applicable, counter}]}]"""
     res = {}
@@ -126,13 +126,15 @@ def shots_gates(shots_by_sim, golden_hash=None, golden_key=None):
         res["tears"] = gate("SKIP", "no screenshot showed the scrolling cards")
     else:
         res["tears"] = gate("FAIL" if tear_bad else "PASS", ("torn: sim %s" % sorted(set(tear_bad))) if tear_bad else "%d screenshot(s) clean" % tear_judged)
-    hashes = [sh["hash"] for s in shots_by_sim if s["role"] == "static" for sh in s["shots"] if sh.get("ok")]
+    statics = [sh for s in shots_by_sim if s["role"] == "static" for sh in s["shots"] if sh.get("ok")]
+    hashes = [sh["hash"] for sh in statics]
+    golden_hash, golden_key = golden(statics[0]["w"], statics[0]["h"]) if (golden and statics) else (None, None)
     if not hashes:
         res["pixels"] = gate("SKIP", "no static reference screen in this step")
     elif len(set(hashes)) > 1:
         res["pixels"] = gate("FAIL", "%d different pictures of the same static screen" % len(set(hashes)))
     elif golden_hash is None:
-        res["pixels"] = gate("SKIP", "screens agree with each other; no golden stored for %s (bench golden record)" % golden_key)
+        res["pixels"] = gate("SKIP", "screens agree with each other; no golden stored for %s (bench golden record)" % (golden_key or "this setup"))
     else:
         res["pixels"] = gate("PASS" if hashes[0] == golden_hash else "FAIL",
                              "static screen %s the golden %s" % ("matches" if hashes[0] == golden_hash else "DIFFERS from", golden_key))
