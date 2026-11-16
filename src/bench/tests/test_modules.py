@@ -70,6 +70,30 @@ class GuestParsers(unittest.TestCase):
         self.assertAlmostEqual(tot["observer_cpu_pct"], 100.0, places=1)       # two processes x 1 s over 2 s
         self.assertEqual(per["AAAA-1"]["procs"], 3)
 
+    def test_settle_ignores_the_load_by_whole_command(self):
+        for cmd in ("/Library/Developer/CoreSimulator/Volumes/iOS 26.5.simruntime/Contents/bin/backboardd",
+                    "/x/SimMetalHost -d AAAA-1", "simfps -set /x", "/usr/bin/ssh host", "/usr/bin/python3 benchguest.py settle"):
+            self.assertTrue(bg.SETTLE_SKIP.search(cmd), cmd)
+        for cmd in ("/usr/libexec/mds", "/System/Library/Frameworks/Foo.framework/assetsd", "/usr/sbin/cfprefsd daemon"):
+            self.assertFalse(bg.SETTLE_SKIP.search(cmd), cmd)
+
+    def test_count_launchd_sim_sees_every_device_set(self):
+        text = PS + "  600     1  20000   0:01.00 /Library/x/launchd_sim /other/set/CCCC-3/data\n"
+        saved = bg.ps_text
+        bg.ps_text = lambda: text
+        try:
+            self.assertEqual(bg.count_launchd_sim(), 2)
+        finally:
+            bg.ps_text = saved
+
+    def test_qemu_env_value_reads_the_process_environ(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "proc", "77"))
+            wr(os.path.join(root, "proc", "77", "environ"), "w", "A=1\0REIMS_VGPU_CENSUS=/run/x/coherent\0REIMS_VGPU_COHERENT=1\0")
+            self.assertEqual(hostprobe.qemu_env_value(77, "REIMS_VGPU_CENSUS", root), "/run/x/coherent")
+            self.assertIsNone(hostprobe.qemu_env_value(77, "NOPE", root))
+            self.assertIsNone(hostprobe.qemu_env_value(78, "A", root))
+
     def test_cputime(self):
         self.assertAlmostEqual(bg.parse_cputime("0:01.50"), 1.5)
         self.assertAlmostEqual(bg.parse_cputime("2:03.25"), 123.25)

@@ -65,9 +65,9 @@ def run_lifecycle(ctx):
     med = {k: _median([c[k] for c in cyc if c.get(k) is not None]) for k in keys}
     data["median_s"] = med
     ok = all(v is not None for v in med.values()) and bool(cyc)
-    ctx.section("lifecycle", "PASS" if ok else "FAIL", "LIFECYCLE %s (%d cycles, medians, s): create %s, cold boot %s, install %s, launch call %s, first app frame %s, shutdown %s, resume boot %s, first frame after resume %s, delete %s" % (
+    ctx.section("lifecycle", "PASS" if ok else "FAIL", "LIFECYCLE %s (%d cycles, medians, s): create %s, cold boot %s, install %s, launch call %s, first app frame %s, shutdown %s, resume boot %s, first frame after resume %s, clone %s, clone boot %s, delete %s" % (
         "PASS" if ok else "FAIL", len(cyc), med.get("create_s"), med.get("cold_boot_s"), med.get("install_s"), med.get("cold_launch_call_s"),
-        med.get("cold_first_frame_s"), med.get("shutdown_s"), med.get("resume_boot_s"), med.get("resume_first_frame_s"), med.get("delete_s")))
+        med.get("cold_first_frame_s"), med.get("shutdown_s"), med.get("resume_boot_s"), med.get("resume_first_frame_s"), med.get("clone_s"), med.get("clone_boot_s"), med.get("delete_s")))
     leaks = {"qemu_rss": gates.leak_gate("QEMU RSS", xs, rss, a.leak_rss_mb, "MB/cycle"),
              "guest_used": gates.leak_gate("guest used memory", xs, used, a.leak_guest_mb, "MB/cycle")}
     data["leak"] = {"qemu_rss_mb": rss, "guest_used_mb": used}

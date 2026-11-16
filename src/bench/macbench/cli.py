@@ -177,7 +177,9 @@ def build_ctx(a, kind):
         live = os.path.join(runp, "live.conf") if runp and os.path.exists(os.path.join(runp, "live.conf")) else None
         host = hostprobe.Host(pid, live_conf=live)
         from .gates import Coherent
-        census = hostprobe.qemu_env_value(pid, "REIMS_VGPU_CENSUS") or (os.path.join(runp, "coherent") if runp else None)
+        census = hostprobe.qemu_env_value(pid, "REIMS_VGPU_CENSUS")          # the path QEMU was given, if it exists here too
+        if not (census and os.path.isdir(census)):
+            census = os.path.join(runp, "coherent") if runp else None
         coh = Coherent(census, os.environ.get("BENCH_QEMU_LOG"),
                        os.path.join(os.environ.get("BENCH_HOME", ""), "home/.cache/m2v-gpu/hang") if os.environ.get("BENCH_HOME") else None)
         guest = SshGuest(run, os.environ.get("BENCH_SSH") or os.environ.get("MACBOX_SSH_HOST") or "macbox", set_name)

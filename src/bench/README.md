@@ -39,7 +39,7 @@ pressure level 2 or more, the host's available memory is under `--min-host-free-
 `--min-disk-gib` (12): the sweep stops there, it does not swap the VM to death. A sweep that ran no step at all
 (a refused guard, foreign simulators) is a FAIL with a non-zero exit. Simulators running outside the bench (a
 `launchd_sim` that is not the bench's own) refuse the run (`--allow-foreign` to measure anyway, recorded). Before each
-window the guest must settle: `settle` waits until the processes outside the simulators and the helper use less than
+window the guest must settle: `settle` waits until every process except the load and its observers (the renderers `SimMetalHost`/`backboardd`/`SimRenderServer`, GlassBench, `simfps`, WindowServer, python, ps, ssh, matched by name against the whole command, and the helper's own tree) uses less than
 `--settle-bg` % of a core, for at most `--settle-max` s; the step records `settle.settled`, `bg_pct` and `waited_s`,
 and the SCALE line names the N whose guest did not settle.
 
@@ -49,7 +49,7 @@ and the SCALE line names the N whose guest did not settle.
 |---|---|
 | `scale` | N = 1, 2, 3... simulators (`--n 1,2,3,4,6,8`, `--scale-x 1\|3`, `--mix`), per simulator numbers, the maximum sustainable N per quality target. Stops early when a floor is breached (`--floor`, default `fps>=20`), a gate fails or the system turns unstable. |
 | `idle` | The VM with no simulator: QEMU, GPU and memory standing cost against `--bar-qemu-cores` (0.15). |
-| `lifecycle` | `--cycles` times: create, boot, install, launch, first app frame, shut down, resume, first frame, delete (medians); a per-cycle leak gate; `--storm N`: N simulators booted at once. |
+| `lifecycle` | `--cycles` times: create, boot, install, launch, first app frame, shut down, resume, first frame, clone, boot the clone, delete (medians of the timings below); a per-cycle leak gate; `--storm N`: N simulators booted at once. |
 | `soak` | `--soak-n` busy simulators for `--soak-minutes`: slope of QEMU's RSS and of the guest's memory, and the frame rate at the start against the end. |
 | `build` | Build timing: the bench tools (swiftc) cold and warm; `--xcodebuild '<args>'` times your own project cold and warm (GlassBench is not an Xcode project, so the section is SKIP without it). |
 | `panel` | The Device panel's stream: pluggable (see [The panel section](#the-panel-section)); SKIP without `--panel-cmd`. |
@@ -116,8 +116,16 @@ window's start and end: the CPU time of every process in the simulator's tree ov
 was in both snapshots, so very short-lived processes are undercounted), and the RSS of the tree at the end. The
 tree is every process whose command line names the simulator's UDID (`launchd_sim`, the per-device helpers) and
 all their descendants, never the bench's own helper, its ssh and shell ancestors, or the `simfps`/`simctl`/`ps` it
-started: their CPU is `system.guest.observer_cpu_pct`. RSS counts shared pages in each process: it overstates what leaving a simulator out would
+started: their CPU is `system.guest.observer_cpu_pct` (the larger of the helper tree's CPU between the two `ps` snapshots and the CPU time of the helper's reaped children, `simfps` and the probes' `simctl`, over the window). RSS counts shared pages in each process: it overstates what leaving a simulator out would
 free. `system.guest`: `total_cpu_pct`, `sims_cpu_pct` (the trees), `other_cpu_pct` (everything else), `sims_rss_mb`.
+
+**Lifecycle timings** (`lifecycle`, seconds, medians over `--cycles`; each cycle uses a fresh device): `create_s`
+(`simctl create`); `cold_boot_s` (`boot` + `bootstatus`); `install_s`; `cold_launch_call_s` (the `launch` call);
+`cold_first_frame_s` (from the launch call to the first counter value `simfps` reads on the new surface); `shutdown_s`
+(shutting the booted device down), `resume_boot_s` and `resume_first_frame_s` (the same two again: "resume" here is
+shutdown then boot, not Simlock's parking); `clone_s` (`simctl clone` of the shut-down device that has the app
+installed), `clone_boot_s` (boot of the clone until `bootstatus` returns); `delete_s` (`simctl delete` of the source
+device only: the shutdown before the clone is not timed). The clone is deleted untimed.
 
 **Guest memory** (`system.guest`): `mem_used_mb` = active + wired + compressor pages; `mem_free_mb` = free +
 speculative; `mem_avail_mb` is what the guard uses: free + speculative + inactive + purgeable (`vm_stat` pages; 4 KiB
@@ -217,8 +225,9 @@ IPv4 addresses to `<ip>`), and `publishable` says whether anything slipped throu
 ## Limits of the measurements
 
 - The observer is not free: `simfps` polls at 2 kHz and `--strip` reads each new surface with the CPU, which also
-  touches Coherent's surfaces. `observer` measures that at the first N; the guest CPU of the simulators includes it
-  only for the helper's own tree, which is excluded from the simulators' trees and reported as `observer_cpu_pct`.
+  touches Coherent's surfaces. `observer` measures that at the first N; the simulators' guest CPU does not include it
+  (the helper's own tree is excluded from every simulator's tree and reported as `observer_cpu_pct`), but the
+  observer still takes CPU the simulators would otherwise have.
 - Probes run `simctl` in the guest every 2.5 s per simulator, a small steady load that agents also make.
 - Windows are 40 s: slow drifts need `soak`; a stall rarer than once per window is invisible.
 - GPU numbers need DRM fdinfo of QEMU's process to be readable by the user running the bench.

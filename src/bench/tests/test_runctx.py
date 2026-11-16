@@ -87,3 +87,29 @@ class RunSafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardForeign(unittest.TestCase):
+    def test_a_simulator_outside_the_bench_refuses_the_run(self):
+        from macbench import core, fakes
+
+        class A:
+            min_host_free_gib, min_disk_gib, min_guest_free_gib, allow_foreign, disk_path = 1.0, 1.0, 1.0, False, "/"
+
+        class G:
+            def __init__(self, foreign):
+                self.foreign = foreign
+
+            def call(self, args, timeout):
+                return {"mem": {"free_mb": 8000, "avail_mb": 9000}, "pressure": 1, "booted": 0, "foreign_booted": self.foreign}
+
+        class Ctx:
+            a, est_sim_mb, host = A(), 1000.0, fakes.FakeHost()
+        c = Ctx()
+        c.guest = G(1)
+        self.assertIn("outside the bench", core.guard(c, 1, "x"))
+        c.a.allow_foreign = True
+        self.assertIsNone(core.guard(c, 1, "x"))
+        c.guest = G(0)
+        c.a.allow_foreign = False
+        self.assertIsNone(core.guard(c, 1, "x"))

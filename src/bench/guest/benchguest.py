@@ -14,6 +14,7 @@ import json
 import os
 import plistlib
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -519,10 +520,14 @@ def parse_name_cpu(text):
     return text
 
 
+# the load itself and its observers, matched against the WHOLE command (a runtime path contains spaces)
+SETTLE_SKIP = re.compile(r"(^|/)(SimMetalHost|backboardd|GlassBench|SimRenderServer|kernel_task|simfps|WindowServer|python3?|Python|ps|top|ssh|sshd)( |$)")
+
+
 def bg_cpu_pct(secs=3.0):
     """Everything not part of the load: CPU % of one core used by processes other than the renderers, the app and
     the observer (the settle condition: the guest has stopped doing its own housekeeping)."""
-    skip = re.compile(r"(^|/)(SimMetalHost|backboardd|GlassBench|SimRenderServer|kernel_task|simfps|WindowServer|python3?|Python|ps|top|ssh|sshd)( |$)")
+    skip = SETTLE_SKIP
     a = parse_ps(ps_text())
     mine = own_pids(a)
     t0 = now()
@@ -557,6 +562,7 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
         time.sleep(d)
     ps0, vm0 = parse_ps(ps_text()), parse_vm_stat(vmstat_text())
     t_start = now()
+    ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     t_stop = t_go + secs
     inj, acts, threads = {u: [] for u in udids}, {u: [] for u in udids}, []
     lvls = []
@@ -587,11 +593,19 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
         [t.join(30) for t in threads]
         for h in handles.values():
             h.kill()
+        if probe_method == "appearance" and mix in ("all-busy", "one-busy"):
+            for u in udids:                       # the appearance probe leaves a simulator dark: fps and tears are judged in light
+                simctl("ui", u, "appearance", "light", timeout=30)
     ps1, vm1 = parse_ps(ps_text()), parse_vm_stat(vmstat_text())
     t_end = now()
+    ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     if mix != "idle" and not STUB:
         time.sleep(6)          # GlassBench writes pace.json every 5 s: wait for the record that closes the window
     per, tot = attribute(ps0, ps1, udids, max(t_end - t_start, 0.001), own_pids(ps1))
+    # simfps and the probes' simctl have exited (and been reaped) by now, so the two ps snapshots cannot see them: the
+    # CPU time of the helper's reaped children over the window is the observer's real cost
+    reaped = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
+    tot["observer_cpu_pct"] = round(max(tot["observer_cpu_pct"], 100 * reaped / max(t_end - t_start, 0.001)), 1)
     st = {d["udid"]: d.get("state") for d in devices()}
     sims = []
     for i, u in enumerate(udids):
