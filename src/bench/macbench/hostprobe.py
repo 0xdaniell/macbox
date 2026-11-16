@@ -209,6 +209,15 @@ def qemu_env_switches(pid, root=""):
     return out
 
 
+def qemu_env_value(pid, key, root=""):
+    """The raw value of one environment variable of the QEMU process (None when unreadable or unset)."""
+    t = _read(root, "/proc/%d/environ" % pid) or ""
+    for kv in t.split("\0"):
+        if kv.startswith(key + "="):
+            return kv.split("=", 1)[1]
+    return None
+
+
 def mesa_is_custom(pid, root=""):
     """True when QEMU maps an ANV driver from outside the system library directories (its own Mesa build)."""
     t = _read(root, "/proc/%d/maps" % pid) or ""

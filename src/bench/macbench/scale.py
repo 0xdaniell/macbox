@@ -69,12 +69,13 @@ def run_scale(ctx):
                 if a.golden_phase:
                     ctx.pixel_gate = golden_phase(ctx)
                     core.grow(ctx, n, roles)
-            core.settle(ctx)
+            st = core.settle(ctx)
             g, s0, s1, t_go = core.window(ctx, a.secs, mix)
             step = core.build_step(ctx, n, mix, g, s0, s1, t_go, boot)
+            step["settle"] = {k: st.get(k) for k in ("settled", "bg_pct", "waited_s")}
             shots, by = core.take_shots(ctx, a.shots) if a.shots and mix != "idle" else ({}, [])
-            if first and ctx.pixel_gate and "pixels" not in shots:
-                shots["pixels"] = ctx.pixel_gate
+            if first and ctx.pixel_gate:
+                shots["pixels"] = ctx.pixel_gate          # judged on the freshly launched static app, not after input probes
             core.step_gates(ctx, step, shots)
             step["window"] = {"start_offset_s": round(t_go - ctx.marks["t0"] - ctx.offset, 1)}
             data["steps"].append(step)
@@ -145,6 +146,7 @@ def _finish(ctx, stopped, partial=False):
     steps = data["steps"]
     if not steps and not stopped:
         return None
+    data["no_steps"] = not steps
     data["summary"] = analysis.summarize_scale(steps, a.targets, stopped) if steps else {"max_n": {}, "stopped": stopped, "standing_cost": {}}
     doc["data"]["summary"]["stopped"] = stopped
     doc["gates"] = _gate_rollup(steps, ctx)
@@ -168,7 +170,8 @@ def _gate_rollup(steps, ctx):
         elif all(g["status"] == "SKIP" for _, g in rows):
             roll[name] = gates.gate("SKIP", rows[-1][1]["detail"])
         else:
-            roll[name] = gates.gate("PASS", "%d step(s); %s" % (len(rows), rows[-1][1]["detail"]))
+            judged = [g for _, g in rows if g["status"] != "SKIP"]
+            roll[name] = gates.gate("PASS", "%d of %d step(s) judged; %s" % (len(judged), len(rows), judged[-1]["detail"]))
     return roll
 
 
@@ -179,10 +182,12 @@ def _sections(ctx, data, stopped):
     gate_fail = [k for k, v in ctx.doc["gates"].items() if v["status"] == "FAIL"]
     unstable = any(not s["stable"] for s in steps)
     mx = ", ".join("%s=%s" % (k, v["max_n"] if v["max_n"] is not None else "none") for k, v in sm["max_n"].items())
-    status = "FAIL" if gate_fail or unstable or data.get("stopped_kind") == "error" else "PASS"
-    ctx.section("scale", status, "SCALE %s %s %dx %s: max sustainable N: %s | steps %s%s | min Jain %s" % (
-        status, a.mix, a.scale_x, "(DRY)" if ctx.host.dry else "", mx, [s["n"] for s in steps],
-        (" | stopped: %s" % stopped) if stopped else " | all requested N done", sm.get("fairness_min_jain")))
+    status = "FAIL" if gate_fail or unstable or not steps or data.get("stopped_kind") == "error" else "PASS"
+    unsettled = [s["n"] for s in steps if (s.get("settle") or {}).get("settled") is False]
+    ctx.section("scale", status, "SCALE %s %s %dx %s: max sustainable N: %s | steps %s%s%s | min Jain %s" % (
+        status, a.mix, a.scale_x, "(DRY)" if ctx.host.dry else "", mx or "none (no step ran)", [s["n"] for s in steps],
+        (" | stopped: %s" % stopped) if stopped else " | all requested N done",
+        (" | NOT SETTLED at N=%s (guest background CPU stayed above %g%%)" % (unsettled, a.settle_bg)) if unsettled else "", sm.get("fairness_min_jain")))
     for name, v in ctx.doc["gates"].items():
         ctx.section("gate:" + name, v["status"] if v["status"] != "PASS" else "PASS", "GATE %s %s: %s" % (v["status"], name, v["detail"]))
     st = [s for s in steps]

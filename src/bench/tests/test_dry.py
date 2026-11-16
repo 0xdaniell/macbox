@@ -60,6 +60,7 @@ def sections(doc, name):
 CASES = {
     "clean": (["scale", "--n", "1,2,3"] + FAST, ""),
     "memfloor": (["scale", "--n", "1,2,3,4,5"] + FAST, "memfloor@3"),
+    "refuse": (["scale", "--n", "1,2"] + FAST, "memfloor@0"),
     "hostmem": (["scale", "--n", "1,2,3,4,5"] + FAST, "hostmem@3"),
     "crash": (["scale", "--n", "1,2,3,4"] + FAST, "crash@2"),
     "backwards": (["scale", "--n", "1,2,3"] + FAST, "backwards@2"),
@@ -116,10 +117,32 @@ class Dry(unittest.TestCase):
         r = self.r["memfloor"]
         d = r["doc"]
         self.assertEqual([s["n"] for s in d["data"]["steps"]], [1, 2, 3])        # the guard looks before booting: it refuses the 4th
-        self.assertIn("guest free memory", d["data"]["summary"]["stopped"])
+        self.assertIn("guest available memory", d["data"]["summary"]["stopped"])
         self.assertEqual(sims_booted(r["state"]), [])
         self.assertEqual(self.r["hostmem"]["doc"]["data"]["steps"][-1]["n"], 3)
         self.assertIn("host free memory", self.r["hostmem"]["doc"]["data"]["summary"]["stopped"])
+
+    def test_a_sweep_that_ran_no_step_fails(self):
+        r = self.r["refuse"]
+        self.assertEqual(r["doc"]["data"]["steps"], [])
+        self.assertNotEqual(r["rc"], 0)
+        self.assertEqual(sections(r["doc"], "scale")[0]["status"], "FAIL")
+        self.assertIn("no step ran", sections(r["doc"], "scale")[0]["line"])
+        self.assertEqual(sims_booted(r["state"]), [])
+
+    def test_steps_record_whether_the_guest_settled(self):
+        for st in self.r["clean"]["doc"]["data"]["steps"]:
+            self.assertIn("settled", st["settle"])
+            self.assertIn("waited_s", st["settle"])
+
+    def test_run_wide_gates_catch_what_a_step_gate_does_not_name(self):
+        d = self.r["crash"]["doc"]
+        self.assertEqual(d["gates"]["run_crash_reports"]["status"], "FAIL")
+        self.assertEqual(sections(d, "gate:run_crash_reports")[0]["status"], "FAIL")
+        for k in ("clean", "lifecycle", "idle"):
+            g = self.r[k]["doc"]["gates"]
+            self.assertEqual(g["run_crash_reports"]["status"], "PASS", k)
+            self.assertIn("run_kernel_gpu", g)
 
     def test_crash_report_is_instability_and_ends_the_sweep(self):
         d = self.r["crash"]["doc"]

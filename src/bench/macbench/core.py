@@ -53,10 +53,11 @@ def guard(ctx, k_new, label):
     if df is not None and df < a.min_disk_gib:
         return "free disk %.0f GiB below the %.0f GiB floor %s" % (df, a.min_disk_gib, label)
     m = ctx.guest.call(["memcheck"], 60)
-    free_gib = (m["mem"]["free_mb"] - k_new * ctx.est_sim_mb) / 1024.0
+    avail = m["mem"].get("avail_mb", m["mem"]["free_mb"])          # free + speculative + inactive + purgeable: what a boot can take
+    free_gib = (avail - k_new * ctx.est_sim_mb) / 1024.0
     if free_gib < a.min_guest_free_gib:
-        return "guest free memory would be %.1f GiB (%.1f now, %d x ~%d MB to boot), below the %.1f GiB floor %s" % (
-            free_gib, m["mem"]["free_mb"] / 1024.0, k_new, ctx.est_sim_mb, a.min_guest_free_gib, label)
+        return "guest available memory would be %.1f GiB (%.1f now, %d x ~%d MB to boot), below the %.1f GiB floor %s" % (
+            free_gib, avail / 1024.0, k_new, ctx.est_sim_mb, a.min_guest_free_gib, label)
     if (m.get("pressure") or 1) >= 2:
         return "guest memory pressure level %s %s" % (m.get("pressure"), label)
     if m.get("foreign_booted", 0) > 0 and not a.allow_foreign:
@@ -92,6 +93,7 @@ def setup_guest(ctx):
     ctx.doc["env"]["guest"]["runtime_used"] = t.get("runtime_version")
     ctx.doc["env"]["guest"]["device_type"] = "stock %s" % t["stock_name"] if a.scale_x == 3 else "macbox %dx of %s" % (a.scale_x, t["stock_name"])
     ctx.offset = ctx.guest.clock_offset()
+    ctx.run_mark = {"coh": ctx.coh.mark(), "t0": time.time(), "ips": set(ctx.guest.call(["ips"], 60)["ips"])}
     return info
 
 
@@ -166,7 +168,7 @@ def system_dict(ctx, g, s0, s1, frames_total):
         "gpu_busy_pct": None if gpu_ns is None else round(100.0 * gpu_ns / 1e9 / dt, 1),
         "gpu_ms_per_frame": None if gpu_ns is None or not frames_total else round(gpu_ns / 1e6 / frames_total, 2),
         "window_s": round(dt, 2),
-        "guest": {"mem_used_mb": gu["mem"]["used_mb"], "mem_free_mb": gu["mem"]["free_mb"], "compressed_mb": gu["mem"]["compressed_mb"],
+        "guest": {"mem_used_mb": gu["mem"]["used_mb"], "mem_free_mb": gu["mem"]["free_mb"], "mem_avail_mb": gu["mem"].get("avail_mb"), "observer_cpu_pct": gu.get("observer_cpu_pct"), "compressed_mb": gu["mem"]["compressed_mb"],
                   "swapins_d": gu["swapins_d"], "swapouts_d": gu["swapouts_d"], "pageouts_d": gu["pageouts_d"],
                   "pressure_max": gu["pressure_max"], "total_cpu_pct": gu["total_cpu_pct"], "sims_cpu_pct": gu["sims_cpu_pct"],
                   "other_cpu_pct": gu["other_cpu_pct"], "sims_rss_mb": gu["sims_rss_mb"]},
@@ -227,8 +229,10 @@ def step_gates(ctx, step, shots=None):
         gs.update(shots)
     swapped = step["system"]["guest"]["swapouts_d"] or 0
     hs = step["system"]["host"]
-    host_swap = (hs.get("cgroup_swap_delta_mb") or 0) > 50 or (hs.get("pswpout_pages") or 0) > 25600
-    gs["memory"] = gates.gate("FAIL" if swapped > 0 and ctx.a.fail_on_swap or host_swap else "PASS",
+    cg = hs.get("cgroup_swap_delta_mb")          # the VM's own cgroup: other projects' swapping on the host is not this run's
+    host_swap = cg is not None and cg > 50
+    guest_swap = swapped > 0 and ctx.a.fail_on_swap
+    gs["memory"] = gates.gate("FAIL" if guest_swap or host_swap else ("PASS" if cg is not None else "SKIP"),
                               "guest swapouts +%s, pressure max %s; host cgroup swap %s MB, pswpout %s pages" % (
                                   swapped, step["system"]["guest"]["pressure_max"], hs.get("cgroup_swap_delta_mb"), hs.get("pswpout_pages")))
     step["gates"] = gs
@@ -237,11 +241,43 @@ def step_gates(ctx, step, shots=None):
     return gs
 
 
-def take_shots(ctx, count=2):
-    """Screenshots of every simulator, through the guest, judged by the screenshot gates."""
+def run_gates(ctx):
+    """The gates that hold for a whole run, whatever the scenario: Coherent and QEMU's log since the run began, kernel
+    GPU error lines since then, and crash reports that appeared on the guest. A scenario that stopped before its setup
+    has nothing to judge. Never raises: a gate that cannot be read is SKIP."""
+    mk = getattr(ctx, "run_mark", None)
+    if not mk:
+        return
+    gs = {}
+    try:
+        for k, v in ctx.coh.check(mk["coh"]).items():
+            gs["run_" + k] = v
+    except Exception as e:
+        gs["run_coherent"] = gates.gate("SKIP", "unreadable: %s" % type(e).__name__)
+    try:
+        kern, note = ctx.host.kernel_gpu(mk["t0"])
+        gs["run_kernel_gpu"] = gates.kernel_gate(kern, note)
+    except Exception as e:
+        gs["run_kernel_gpu"] = gates.gate("SKIP", "unreadable: %s" % type(e).__name__)
+    try:
+        now = set(ctx.guest.call(["ips"], 60)["ips"])
+        new = sorted(now - mk["ips"])
+        gs["run_crash_reports"] = gates.gate("FAIL" if new else "PASS", ("%d new crash report(s): %s" % (len(new), ", ".join(new[:3]))) if new else "no new crash report on the guest")
+    except Exception as e:
+        gs["run_crash_reports"] = gates.gate("SKIP", "guest unreachable: %s" % type(e).__name__)
+    ctx.doc.setdefault("gates", {}).update(gs)
+    for name, v in gs.items():
+        ctx.section("gate:" + name, v["status"], "GATE %s %s: %s" % (v["status"], name, v["detail"]))
+
+
+def take_shots(ctx, count=2, judge_static=False):
+    """Screenshots of every simulator, through the guest, judged by the screenshot gates. Static screens are judged
+    for pixels only when `judge_static`: after a window with input probes their marker state is not the golden's
+    (the pixel gate runs on a freshly launched static app, see scale.golden_phase)."""
     udids = ",".join(s["udid"] for s in ctx.sims)
     r = ctx.guest.call(["shots", "--udids", udids, "--count", count], 60 + 30 * len(ctx.sims))
     by = []
     for s, one in zip(ctx.sims, r["sims"]):
-        by.append({"idx": s["idx"], "role": s["role"], "shots": one["shots"]})
+        role = s["role"] if (s["role"] != "static" or judge_static) else "static-unjudged"
+        by.append({"idx": s["idx"], "role": role, "shots": one["shots"]})
     return gates.shots_gates(by, ctx.golden), by
