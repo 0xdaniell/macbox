@@ -154,6 +154,8 @@ var finished = false
 let poller = Thread {
     var lastSeed = IOSurfaceGetSeed(surf0)
     var lastSurf = surf0
+    // The first line of SIMFPS_STAMPS is the screen as it stands at the start (a static screen makes no new surface).
+    if rawPath != nil { raw.append((start, readStrip ? readCounter(surf0) : -1, probe.map { readLuma(surf0, $0) } ?? -1)) }
     while true {
         let t = nowNs()
         if t >= end { break }
