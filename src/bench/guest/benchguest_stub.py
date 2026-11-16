@@ -232,9 +232,12 @@ def install(mod):
     mod.sysctl = lambda name: {"kern.memorystatus_vm_pressure_level": "1", "hw.ncpu": "8", "hw.memsize": str(16 << 30)}.get(name, "")
     mod.spawn_simfps = lambda udid, secs, label, strip, start_at, raw: StubSimfps(udid, secs, strip, start_at, raw)
 
+    calls = [0]
+
     def ips():
+        # a crash report appears during a measurement (the second look of a window), not before it
         s = load()
-        n = len(booted(s))
+        calls[0] += 1
         cr = fault("crash")
-        return set(s["ips"]) | ({"GlassBench-stub.ips"} if cr is not None and n >= cr else set())
+        return set(s["ips"]) | ({"GlassBench-stub.ips"} if cr is not None and len(booted(s)) >= cr and calls[0] >= 2 else set())
     mod.list_ips = ips

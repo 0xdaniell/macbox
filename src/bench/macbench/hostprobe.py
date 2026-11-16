@@ -107,6 +107,15 @@ def parse_kv(text):
     return d
 
 
+def parse_meminfo(text):
+    d = {}
+    for line in (text or "").splitlines():
+        p = line.replace(":", " ").split()
+        if len(p) >= 2 and p[1].isdigit():
+            d[p[0]] = int(p[1])
+    return d
+
+
 def parse_psi(text):
     """/proc/pressure/memory or memory.pressure -> {"some": {avg10,total}, "full": {...}}"""
     d = {}
@@ -127,7 +136,7 @@ def cgroup_dir(pid, root=""):
 
 def mem_snapshot(pid, root=""):
     """Host memory and swap counters, and the VM's cgroup's: every number is a counter or a level, deltas are taken by the caller."""
-    mi = parse_kv((_read(root, "/proc/meminfo") or "").replace(":", " "))
+    mi = parse_meminfo(_read(root, "/proc/meminfo"))
     vs = parse_kv(_read(root, "/proc/vmstat"))
     cg = cgroup_dir(pid, root)
     s = {"mem_total_kb": mi.get("MemTotal"), "mem_avail_kb": mi.get("MemAvailable"), "swap_total_kb": mi.get("SwapTotal"),
@@ -200,7 +209,14 @@ def qemu_env_switches(pid, root=""):
     return out
 
 
-def host_versions():
+def mesa_is_custom(pid, root=""):
+    """True when QEMU maps an ANV driver from outside the system library directories (its own Mesa build)."""
+    t = _read(root, "/proc/%d/maps" % pid) or ""
+    paths = {l.split()[-1] for l in t.splitlines() if "libvulkan_intel" in l and l.split()[-1].startswith("/")}
+    return bool(paths) and not all(p.startswith(("/usr/lib", "/lib")) for p in paths)
+
+
+def host_versions(pid=None):
     kernel = os.uname().release
     mesa = None
     for argv in (["dpkg-query", "-W", "-f=${Version}", "mesa-vulkan-drivers"], ["rpm", "-q", "--qf", "%{VERSION}", "mesa-vulkan-drivers"]):
@@ -218,7 +234,12 @@ def host_versions():
             cpu = m.group(1).strip() if m else None
     except OSError:
         pass
-    return {"kernel": kernel, "mesa": mesa or "unknown (pass --tag mesa=<version>)", "cpu_model": cpu, "cpus": os.cpu_count()}
+    note = "unknown"
+    if mesa:
+        note = mesa + " (system package)"
+    if pid and mesa_is_custom(pid):
+        note = "custom build in QEMU (system package is %s): pass --tag mesa=<version>" % (mesa or "n/a")
+    return {"kernel": kernel, "mesa": note, "cpu_model": cpu, "cpus": os.cpu_count()}
 
 
 class Host:
@@ -257,4 +278,4 @@ class Host:
 
     def env(self):
         sw = read_live_conf(self.live_conf) if self.live_conf else {}
-        return host_versions(), sw, qemu_env_switches(self.pid, self.root)
+        return host_versions(self.pid), sw, qemu_env_switches(self.pid, self.root)

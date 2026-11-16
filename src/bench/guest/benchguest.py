@@ -88,10 +88,6 @@ def now():
     return time.time()
 
 
-if STUB:
-    from guest import benchguest_stub as _stub  # noqa: E402
-    _stub.install(sys.modules[__name__])
-
 
 # --- simctl ----------------------------------------------------------------------------------------
 class GuestError(Exception):
@@ -506,7 +502,7 @@ def cmd_settle(a):
     out_json({"settled": series[-1] < a.bg_pct, "bg_pct": series[-1], "waited_s": round(now() - t0, 1), "series": series[-8:]})
 
 
-def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every, cmd_tpl, no_strip=False):
+def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every, cmd_tpl, no_strip=False, probe_timeout=2.0):
     """simfps on each simulator, the probe and agent threads, and the guest's samples around the window."""
     raws, handles, stop_evt = {}, {}, threading.Event()
     if mix != "idle":
@@ -525,8 +521,8 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     if mix in ("all-busy", "one-busy") and probe_method != "none":
         targets = [u for u, r in zip(udids, roles) if mix == "all-busy" or r == "static"]
         for k, u in enumerate(targets):
-            t = threading.Thread(target=probe_loop, args=(u, probe_method, cmd_tpl, t_go + 1.0 + k * probe_every / max(len(targets), 1),
-                                                          probe_every, t_stop - 2.2, inj[u], stop_evt))
+            t = threading.Thread(target=probe_loop, args=(u, probe_method, cmd_tpl, t_go + min(1.0, secs * 0.15) + k * probe_every / max(len(targets), 1),
+                                                          probe_every, t_stop - probe_timeout - 0.2, inj[u], stop_evt))
             threads.append(t)
     if mix == "agent":
         for i, u in enumerate(udids):
@@ -576,7 +572,7 @@ def cmd_measure(a):
     tmp = tempfile.mkdtemp(prefix="benchwin")
     try:
         t_go = a.start_at or now() + 3 + len(udids)
-        out_json(run_window(a, udids, roles, a.mix, a.secs, t_go, tmp, a.probe_method, a.probe_every, a.probe_cmd, a.no_strip))
+        out_json(run_window(a, udids, roles, a.mix, a.secs, t_go, tmp, a.probe_method, a.probe_every, a.probe_cmd, a.no_strip, a.probe_timeout))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -735,6 +731,9 @@ def cmd_calls(a):
 
 def main(argv=None):
     global SET
+    if STUB:         # after every function is defined: the stub replaces the primitives (run, ps_text, list_ips...)
+        from guest import benchguest_stub
+        benchguest_stub.install(sys.modules[__name__])
     ap = argparse.ArgumentParser(prog="benchguest")
     ap.add_argument("--set", default=os.environ.get("BENCH_SET"))
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -759,7 +758,7 @@ def main(argv=None):
     add("measure", cmd_measure, O("--udids", required=True), O("--roles", required=True), O("--mix", default="all-busy"),
         O("--secs", type=float, default=40), O("--start-at", type=float, default=0), O("--probe-method", default="openurl"),
         O("--probe-every", type=float, default=2.5), O("--probe-cmd"), O("--agent-period", type=float, default=12),
-        O("--no-strip", action="store_true"))
+        O("--no-strip", action="store_true"), O("--probe-timeout", type=float, default=2.0))
     add("shots", cmd_shots, O("--udids", required=True), O("--count", type=int, default=2))
     add("cycle", cmd_cycle, O("--type", required=True), O("--runtime", required=True), O("--prefix", default="bench"))
     add("teardown", cmd_teardown)

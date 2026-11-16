@@ -22,8 +22,8 @@ class FakeHost:
     def snap(self):
         now = time.monotonic()
         dt, self.t_last = now - self.t_last, now
-        self.cpu_ticks["vcpu"] += int(dt * 100 * (2.0 + 0.8 * self.n))
-        self.cpu_ticks["sc"] += int(dt * 100 * (0.1 + 0.05 * self.n))
+        self.cpu_ticks["vcpu"] += int(dt * 100 * (0.05 + 0.8 * self.n))
+        self.cpu_ticks["sc"] += int(dt * 100 * (0.01 + 0.05 * self.n))
         self.gpu += int(dt * 1e9 * min(0.95, 0.15 * self.n))
         v, s = self.cpu_ticks["vcpu"], self.cpu_ticks["sc"]
         thr = {"1": ("CPU 0/KVM", v - v // 5, v // 10, v // 2), "2": ("metal2vulkan-sc", s, s // 4, 0)}

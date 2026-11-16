@@ -177,6 +177,9 @@ class Targets(unittest.TestCase):
     def test_unknown_when_nothing_to_judge(self):
         t = targets.parse_target("t: input_p95<=150")
         self.assertIsNone(targets.evaluate(t, self.sims([60]))["pass"])
+        t = targets.parse_target("t: fps>=55, input_p95<=150")        # one condition has no value anywhere: unknown, not a pass
+        self.assertIsNone(targets.evaluate(t, self.sims([60]))["pass"])
+        self.assertFalse(targets.evaluate(t, self.sims([40]))["pass"])    # but a failed condition still fails it
 
     def test_max_sustainable_stops_at_first_fail(self):
         steps = [{"n": n, "sims": self.sims([f] * n), "gates_ok": True} for n, f in ((1, 60), (2, 58), (3, 50), (4, 60))]

@@ -116,6 +116,11 @@ class HostParsers(unittest.TestCase):
             self.assertEqual(a["cg_current"], 4294967296)
             self.assertEqual(a["cg_swap"], 1048576)
             self.assertEqual(a["qemu_rss_kb"], 2048)
+            self.assertEqual((a["mem_avail_kb"], a["mem_total_kb"]), (500000, 1000000))
+            put("/proc/7/maps", "7f00 r-xp 0 00:00 0 /opt/mesa/lib/libvulkan_intel.so\n")
+            self.assertTrue(hostprobe.mesa_is_custom(7, root))
+            put("/proc/7/maps", "7f00 r-xp 0 00:00 0 /usr/lib/x86_64-linux-gnu/libvulkan_intel.so\n")
+            self.assertFalse(hostprobe.mesa_is_custom(7, root))
             put("/proc/vmstat", "pswpin 15\npswpout 120\n")
             put("/sys/fs/cgroup/machine/vm.scope/memory.swap.current", "3145728\n")
             b = hostprobe.mem_snapshot(7, root)
@@ -196,7 +201,7 @@ class Schema(unittest.TestCase):
 
     def test_privacy_catches_paths_ips_hosts(self):
         doc = helpers.fake_scale_result()
-        doc["env"]["x"] = "/srv/data/something/live.conf"
+        doc["env"]["x"] = "/var/lib/something/live.conf"
         self.assertTrue(any("path" in p for p in schema.validate(doc)))
         doc["env"]["x"] = "connected to 192.168.1.20"
         self.assertTrue(any("ip" in p for p in schema.validate(doc)))
@@ -221,7 +226,7 @@ class Schema(unittest.TestCase):
 
     def test_write_keeps_data_even_when_not_publishable(self):
         doc = helpers.fake_scale_result()
-        doc["env"]["x"] = "/srv/private/path"
+        doc["env"]["x"] = "/var/private/path"
         p = os.path.join(tempfile.mkdtemp(), "r.json")
         problems = schema.write(doc, p)
         self.assertTrue(problems)

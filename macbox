@@ -662,6 +662,15 @@ cmd_coherent() {  # Coherent's crash guard (docs/performance.md)
   esac
 }
 
+cmd_bench() {  # the scaling, regression and A/B suite (src/bench/README.md)
+  case "${1:-}" in
+    compare|chart|report|tools|check|"") ;;
+    *) [ "${DRY:-0}" = 1 ] || { vm_running || die "the VM is not running: macbox up first (DRY=1 runs the suite against stubs)"; ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"; } ;;
+  esac
+  BENCH_QEMU_PID="$(qemu_pid)" BENCH_BUILD_ID="$(build_id)" BENCH_RUN="$RUN" BENCH_QEMU_LOG="$VMDIR/logs/qemu.log" \
+    BENCH_SSH="$MACBOX_SSH_HOST" BENCH_HOME="$MACBOX_HOME" exec "$REPO/src/bench/run" "$@"
+}
+
 cmd_backup() {
   local name=${1:?usage: macbox backup <name>} b="$MACBOX_HOME/backups/$1" disk
   vm_running && die "the VM is running: macbox down first"
@@ -707,6 +716,8 @@ Day to day:
   macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=auto|on|off)
   macbox video-kexts          reims-util's video kexts into OpenCore (for MACBOX_VIDEO=on)
   macbox backup <name>
+  macbox bench scale|idle|lifecycle|soak|build|panel|ab|golden|compare|chart|report|tools|check
+                              the scaling, regression and A/B suite (src/bench/README.md)
 EOF
 }
 
@@ -761,6 +772,7 @@ case "$sub" in
   coherent) cmd_coherent "$@" ;;
   video-kexts) cmd_video_kexts "$@" ;;
   backup) cmd_backup "$@" ;;
+  bench) cmd_bench "$@" ;;
   help|-h|--help) cmd_help ;;
   *) cmd_help >&2; exit 2 ;;
 esac

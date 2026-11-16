@@ -147,8 +147,8 @@ class Golden:
 def build_ctx(a, kind):
     dry = os.environ.get("DRY") == "1"
     run = Run(a.deadline, log, margin=float(os.environ.get("BENCH_DEADLINE_MARGIN", "60")))
-    names = [os.environ.get("MACBOX_SSH_HOST", ""), os.environ.get("USER", ""), os.environ.get("MACBOX_GUEST_USER", "")]
-    clean = schema.scrubber([n for n in names if n])
+    alias = os.environ.get("MACBOX_SSH_HOST", "")
+    clean = schema.scrubber([alias] if alias and alias != "macbox" else [])      # not user names or the default alias: ordinary words
     stamp = schema.stamp()
     set_name = "bench-%s" % stamp
     faults = os.environ.get("BENCH_STUB_FAULT", "")

@@ -136,7 +136,7 @@ def window(ctx, secs, mix, no_strip=False):
     t_go = time.time() + ctx.offset + lead
     ctx.run.need(secs + lead + 60, "a %d s window" % secs)
     args = ["measure", "--udids", udids, "--roles", roles, "--mix", mix, "--secs", secs, "--start-at", "%.3f" % t_go,
-            "--probe-method", ctx.probe_method or "openurl", "--probe-every", a.probe_every, "--agent-period", a.agent_period]
+            "--probe-method", ctx.probe_method or "openurl", "--probe-every", a.probe_every, "--agent-period", a.agent_period, "--probe-timeout", a.probe_timeout]
     if a.probe_cmd:
         args += ["--probe-cmd", a.probe_cmd]
     pend = ctx.guest.start(args, secs + lead + 240)

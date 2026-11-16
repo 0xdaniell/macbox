@@ -52,13 +52,13 @@ def run_scale(ctx):
                           "summary": {}, "calibration": None, "observer": None}
     ctx.marks = {"coh": ctx.coh.mark(), "t0": time.time()}
     ctx.run.on_deadline = lambda: (_finish(ctx, "deadline"), None)[1]
-    stopped, first = None, True
+    stopped, first, kind = None, True, None
     try:
         for n in a.ns:
             roles = core.roles_for(mix, n)
             reason = core.guard(ctx, n - len(ctx.sims), "before booting simulator %d" % n)
             if reason:
-                stopped = reason
+                stopped, kind = reason, "guard"
                 break
             ctx.host.n = n
             boot = core.grow(ctx, n, roles)
@@ -85,19 +85,21 @@ def run_scale(ctx):
             first = False
             if not step["gates_ok"]:
                 bad = [k for k, v in step["gates"].items() if v["status"] == "FAIL"]
-                stopped = "gate failed at N=%d: %s" % (n, ", ".join(bad))
+                stopped, kind = "gate failed at N=%d: %s" % (n, ", ".join(bad)), "gate"
                 break
             if not step["stable"]:
-                stopped = "instability at N=%d: %s" % (n, _why_unstable(step))
+                stopped, kind = "instability at N=%d: %s" % (n, _why_unstable(step)), "instability"
                 break
             fl = targets.evaluate(floor, step["sims"])
             if fl["pass"] is False:
+                kind = "floor"
                 stopped = "floor %s breached at N=%d (sim %s: %s = %s)" % (a.floor, n, fl["failing"][0]["sim"], fl["failing"][0]["cond"], fl["failing"][0]["value"])
                 break
     except Stop as e:
-        stopped = str(e)
+        stopped, kind = str(e), "error"
     except (DeadlineError, GuestError) as e:
-        stopped = "%s: %s" % (type(e).__name__, e)
+        stopped, kind = "%s: %s" % (type(e).__name__, e), "error"
+    data["stopped_kind"] = kind
     return _finish(ctx, stopped)
 
 
@@ -177,7 +179,7 @@ def _sections(ctx, data, stopped):
     gate_fail = [k for k, v in ctx.doc["gates"].items() if v["status"] == "FAIL"]
     unstable = any(not s["stable"] for s in steps)
     mx = ", ".join("%s=%s" % (k, v["max_n"] if v["max_n"] is not None else "none") for k, v in sm["max_n"].items())
-    status = "FAIL" if gate_fail or unstable else "PASS"
+    status = "FAIL" if gate_fail or unstable or data.get("stopped_kind") == "error" else "PASS"
     ctx.section("scale", status, "SCALE %s %s %dx %s: max sustainable N: %s | steps %s%s | min Jain %s" % (
         status, a.mix, a.scale_x, "(DRY)" if ctx.host.dry else "", mx, [s["n"] for s in steps],
         (" | stopped: %s" % stopped) if stopped else " | all requested N done", sm.get("fairness_min_jain")))

@@ -4,8 +4,8 @@ A target is `name: cond, cond, ...`; a cond is `<metric> <op> <number>` with op 
 Metrics (per simulator): fps (distinct app frames/s), p50, p95, p99, max (ms between distinct frames), over2x,
 stall (longest gap between distinct frames, s), input_p50, input_p95 (ms, proxy; misses count at the timeout),
 cpu (guest CPU % of one core), rss (MB). A metric a simulator has no value for (fps of an idle simulator,
-the input proxy where no probe ran) is not judged for that simulator; a target no simulator of an N has any
-value for is `None` (unknown), never a pass."""
+the input proxy where no probe ran) is not judged for that simulator; a target with a condition that NO simulator of
+an N has a value for is `None` (unknown), never a pass (unless another condition already failed it)."""
 import re
 
 METRICS = {"fps": "fps", "p50": "p50_ms", "p95": "p95_ms", "p99": "p99_ms", "max": "max_ms", "over2x": "over2x",
@@ -40,16 +40,19 @@ def parse_target(spec):
 def evaluate(target, sims):
     """target against one N's per-simulator dicts: {"pass": True|False|None, "failing": [...], "judged": int}"""
     failing, judged = [], 0
+    unjudged = set(c[0] for c in target["conds"])
     for sim in sims:
         for metric, op, val in target["conds"]:
             v = sim.get(METRICS[metric])
             if v is None:
                 continue
             judged += 1
+            unjudged.discard(metric)
             if not OPS[op](v, val):
                 failing.append({"sim": sim.get("idx"), "cond": "%s%s%g" % (metric, op, val), "value": v})
-    if judged == 0:
-        return {"pass": None, "failing": [], "judged": 0}
+    if judged == 0 or (unjudged and not failing):
+        # a condition no simulator has a value for is unknown, and so is the target (never a pass by default)
+        return {"pass": None, "failing": failing, "judged": judged, "unjudged": sorted(unjudged)}
     return {"pass": not failing, "failing": failing, "judged": judged}
 
 
