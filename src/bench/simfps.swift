@@ -6,6 +6,13 @@
 //
 //   simfps <udid> <seconds> [label] [--strip]   prints one JSON line
 //
+// Environment (all optional; used by `macbox bench`):
+//   SIMFPS_SET=<path>       a simulator device set of its own, instead of the default one
+//   SIMFPS_START_AT=<unix>  attach first, then wait for this wall-clock second to start counting, so that
+//                           several simfps (one per simulator) measure the same window
+//   SIMFPS_PROBE=<x>,<y>    a point in points (402 pt wide screen): its luma is read from every new surface
+//   SIMFPS_STAMPS=<path>    one line per new surface: "<unix seconds> <counter or -1> <probe luma or -1>"
+//
 // --strip also reads GlassBench's frame strip (a 16-bit counter the app draws every tick, see
 // GlassBench/main.swift) from each new surface: how many app frames reached the screen, how many were
 // lost on the way (gaps in the counter) and how many surface frames showed no new app frame (repeats).
@@ -39,7 +46,7 @@ for p in ["/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimu
 guard let ctxClass = NSClassFromString("SimServiceContext") as? NSObject.Type,
       let ctx = ctxClass.perform(NSSelectorFromString("sharedServiceContextForDeveloperDir:error:"), with: dev, with: nil)?
           .takeUnretainedValue() as? NSObject,
-      let set = ctx.perform(NSSelectorFromString("defaultDeviceSetWithError:"), with: nil)?.takeUnretainedValue() as? NSObject,
+      let set = (ProcessInfo.processInfo.environment["SIMFPS_SET"].map { ctx.perform(NSSelectorFromString("deviceSetWithPath:error:"), with: $0, with: nil) } ?? ctx.perform(NSSelectorFromString("defaultDeviceSetWithError:"), with: nil))?.takeUnretainedValue() as? NSObject,
       let byUDID = set.value(forKey: "devicesByUDID") as? [NSUUID: NSObject],
       let device = byUDID[NSUUID(uuidString: udid)!]
 else { die("simulator \(udid) not found") }
@@ -96,6 +103,24 @@ var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
 func nowNs() -> UInt64 { mach_absolute_time() * UInt64(tb.numer) / UInt64(tb.denom) }
 var stamps: [UInt64] = []
 var strip: [(UInt64, Int)] = []  // (time, counter or -1 when unreadable)
+let env = ProcessInfo.processInfo.environment
+let rawPath = env["SIMFPS_STAMPS"]
+let probe: (Double, Double)? = env["SIMFPS_PROBE"].flatMap { s -> (Double, Double)? in
+    let p = s.split(separator: ",").compactMap { Double($0) }
+    return p.count == 2 ? (p[0], p[1]) : nil
+}
+var raw: [(UInt64, Int, Int)] = []  // (time, counter or -1, probe luma or -1) of every new surface
+/// The luma (0-255) at a point given in points of a 402 pt wide screen, or -1.
+func readLuma(_ s: IOSurface, _ pt: (Double, Double)) -> Int {
+    let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
+    let scale = Double(w) / 402.0
+    guard IOSurfaceLock(s, .readOnly, nil) == kIOReturnSuccess else { return -1 }
+    defer { IOSurfaceUnlock(s, .readOnly, nil) }
+    let x = Int(pt.0 * scale), y = Int(pt.1 * scale)
+    guard x < w, y < h else { return -1 }
+    let p = IOSurfaceGetBaseAddress(s).assumingMemoryBound(to: UInt8.self) + y * bpr + x * 4
+    return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3
+}
 /// GlassBench's counter from a BGRA surface: 18 blocks of 20 pt from (21, 120) pt, at the surface's scale.
 func readCounter(_ s: IOSurface) -> Int {
     let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
@@ -118,6 +143,11 @@ func readCounter(_ s: IOSurface) -> Int {
 }
 stamps.reserveCapacity(Int(secs * 200))
 var polls = 0
+// SIMFPS_START_AT: attached by now; count from that wall-clock second on.
+if let at = env["SIMFPS_START_AT"].flatMap({ Double($0) }) {
+    while Date().timeIntervalSince1970 < at { usleep(1000) }
+}
+let wallStart = Date().timeIntervalSince1970
 let start = nowNs(), end = start + UInt64(secs * 1e9)
 var finished = false
 // Poll on a thread of its own; the main thread keeps its run loop going for CoreSimulator's replies.
@@ -131,7 +161,9 @@ let poller = Thread {
         let seed = IOSurfaceGetSeed(s)
         if s !== lastSurf || seed != lastSeed {
             stamps.append(t); lastSeed = seed; lastSurf = s
-            if readStrip { strip.append((t, readCounter(s))) }
+            let counter = readStrip ? readCounter(s) : -1
+            if readStrip { strip.append((t, counter)) }
+            if rawPath != nil { raw.append((t, counter, probe.map { readLuma(s, $0) } ?? -1)) }
         }
         polls += 1
         usleep(500)
@@ -186,6 +218,10 @@ if readStrip {
         "p50_ms": up(0.5), "p95_ms": up(0.95), "p99_ms": up(0.99), "max_ms": up(1.0),
         "gt20ms": uiv.filter { $0 > 20 }.count, "gt34ms": uiv.filter { $0 > 34 }.count,
     ] as [String: Any]
+}
+if let path = rawPath {
+    let lines = raw.map { String(format: "%.6f %ld %ld", wallStart + Double($0.0 - start) / 1e9, $0.1, $0.2) }.joined(separator: "\n")
+    try? (lines + "\n").write(toFile: path, atomically: true, encoding: .utf8)
 }
 let data = try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
