@@ -32,11 +32,16 @@ switch file (restored byte for byte on every way out).
 Safety, in every run: the **hard deadline** (`--deadline`, default 90 minutes) stops the run 60 s early, writes the
 result so far and runs the cleanup; **one exit trap** (normal end, error, SIGTERM/SIGINT, the deadline) kills the
 helpers it started (explicit pids, never a bare `wait`), shuts down and deletes the bench's simulators and
-restores every knob; a **guard** refuses to boot more simulators when the guest's free memory would fall under
+restores every knob; a **guard** refuses to boot more simulators when the guest's available memory (free +
+speculative + inactive + purgeable pages) would fall under
 `--min-guest-free-gib` (default 1.5, after the estimated cost of the new simulators), the guest reports memory
 pressure level 2 or more, the host's available memory is under `--min-host-free-gib` (6), or the disk under
-`--min-disk-gib` (12): the sweep stops there, it does not swap the VM to death. Simulators booted outside the bench
-refuse the run (`--allow-foreign` to measure anyway, recorded).
+`--min-disk-gib` (12): the sweep stops there, it does not swap the VM to death. A sweep that ran no step at all
+(a refused guard, foreign simulators) is a FAIL with a non-zero exit. Simulators running outside the bench (a
+`launchd_sim` that is not the bench's own) refuse the run (`--allow-foreign` to measure anyway, recorded). Before each
+window the guest must settle: `settle` waits until the processes outside the simulators and the helper use less than
+`--settle-bg` % of a core, for at most `--settle-max` s; the step records `settle.settled`, `bg_pct` and `waited_s`,
+and the SCALE line names the N whose guest did not settle.
 
 ## Commands
 
@@ -110,11 +115,13 @@ window's start and end: the CPU time of every process in the simulator's tree ov
 (CPU time has a 10 ms resolution; a process that started or ended inside the window is counted only if it
 was in both snapshots, so very short-lived processes are undercounted), and the RSS of the tree at the end. The
 tree is every process whose command line names the simulator's UDID (`launchd_sim`, the per-device helpers) and
-all their descendants. RSS counts shared pages in each process: it overstates what leaving a simulator out would
+all their descendants, never the bench's own helper, its ssh and shell ancestors, or the `simfps`/`simctl`/`ps` it
+started: their CPU is `system.guest.observer_cpu_pct`. RSS counts shared pages in each process: it overstates what leaving a simulator out would
 free. `system.guest`: `total_cpu_pct`, `sims_cpu_pct` (the trees), `other_cpu_pct` (everything else), `sims_rss_mb`.
 
 **Guest memory** (`system.guest`): `mem_used_mb` = active + wired + compressor pages; `mem_free_mb` = free +
-speculative; `compressed_mb`; `swapins_d`, `swapouts_d`, `pageouts_d` = the counters' change over the window;
+speculative; `mem_avail_mb` is what the guard uses: free + speculative + inactive + purgeable (`vm_stat` pages; 4 KiB
+when the header does not say, 16 KiB on arm64); `compressed_mb`; `swapins_d`, `swapouts_d`, `pageouts_d` = the counters' change over the window;
 `pressure_max` = the highest `kern.memorystatus_vm_pressure_level` sampled every 2 s (1 normal, 2 warning, 4
 critical).
 
@@ -157,12 +164,13 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 |---|---|
 | `strip` | no frame out of order, no counter jump, the counter advanced no more than the app's own tick log says, under 1% of samples unreadable. Lost ticks are the fps metric, not a gate failure. |
 | `tears` | no screenshot of the scrolling GlassBench shows a torn band (card spacing and gap heights, the old `tears.py` rule, standard library PNG decoding); SKIP when no screenshot shows cards |
-| `pixels` | GlassBench `-static` screenshots agree with each other and match the stored golden (`baselines/golden.json`, key: macOS, runtime, device type, size); SKIP with the pictures agreeing when no golden is stored: `macbox bench golden` records it |
+| `pixels` | GlassBench `-static` screenshots agree with each other and match the stored golden (`baselines/golden.json`, key: macOS, runtime, device type, size), judged once on a freshly launched static app before the first window (a window with input probes flips the marker, so later static screens are not judged); SKIP with the pictures agreeing when no golden is stored: `macbox bench golden` records it |
 | `coherent_census` / `coherent_process` | in the census reports written since the run began: `overwrite_risk` and `sync_errors` stayed 0, and `late_copies_in_busy`, `late_beside_unplanned`, `plan_left_planned` did not rise. Deltas, not absolute counts. Reports come once a minute, so a short step may have none: SKIP. |
 | `qemu_log` | no new `command buffer failed` line in QEMU's log (stamp waits are counted in the detail) |
 | `gpu_hang` | the hang flag did not appear |
 | `kernel_gpu` | no kernel GPU error line since the step began (SKIP when the journal is not readable) |
-| `memory` | no host swapping (cgroup swap +50 MB, or 100 MB of system swap-outs); guest swap-outs fail it with `--fail-on-swap` |
+| `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
+| `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new `.ips` on the guest since setup). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
 | `leak_*` | `lifecycle`: QEMU RSS and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute |
 | `observer` | reading the strip does not move the surface frame rate by more than 4% (a second window of the first N without the strip read); otherwise the distinct-frame numbers are lower bounds |
 
@@ -210,7 +218,7 @@ IPv4 addresses to `<ip>`), and `publishable` says whether anything slipped throu
 
 - The observer is not free: `simfps` polls at 2 kHz and `--strip` reads each new surface with the CPU, which also
   touches Coherent's surfaces. `observer` measures that at the first N; the guest CPU of the simulators includes it
-  only for the helper's own process, which is not in a simulator's tree.
+  only for the helper's own tree, which is excluded from the simulators' trees and reported as `observer_cpu_pct`.
 - Probes run `simctl` in the guest every 2.5 s per simulator, a small steady load that agents also make.
 - Windows are 40 s: slow drifts need `soak`; a stall rarer than once per window is invisible.
 - GPU numbers need DRM fdinfo of QEMU's process to be readable by the user running the bench.
