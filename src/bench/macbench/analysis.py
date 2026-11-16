@@ -126,3 +126,54 @@ def summarize_scale(steps, target_specs, stopped=None):
     return {"max_n": mx, "stopped": stopped, "standing_cost": standing_cost(steps),
             "fairness_min_jain": min([s["fairness"]["jain"] for s in steps if s["fairness"]["jain"] is not None] or [None])
             if any(s["fairness"]["jain"] is not None for s in steps) else None}
+
+
+def pace_summary(records, t_first, t_last, t_start, t_end):
+    """GlassBench's own tick log ([(at, counter, fps, ticks)] every ~5 s, from before the window to after it):
+    app_tick_fps is the mean of the records written inside the window (what the app produced, before the compositor);
+    app_ticks brackets the frames seen: the counter's distance from the last record at or before the first frame to
+    the first record at or after the last one (an upper bound for the ticks between the frames: about 5 s of slack
+    on each side). Either is None when the log does not reach."""
+    inside = [r[2] for r in records if t_start <= r[0] <= t_end + 5 and r[2] > 0]
+    before = [r for r in records if r[0] <= t_first]
+    after = [r for r in records if r[0] >= t_last]
+    ticks = (after[0][1] - before[-1][1]) % strip.WRAP if before and after else None
+    return {"app_tick_fps": stats.r1(stats.mean(inside)), "app_ticks": ticks}
+
+
+def agent_metrics(actions, raw):
+    """The agent mix's actions: launch call and launch-to-first-frame, screenshot duration (ms, p50/p95)."""
+    out = {}
+    launches = [a for a in actions if a["op"] == "launch" and a.get("rc") == 0]
+    shots = [a for a in actions if a["op"] == "screenshot" and a.get("rc") == 0]
+    ttff = []
+    for a in launches:
+        nxt = next((r[0] for r in raw if r[0] >= a["t0"] and r[1] >= 0), None)
+        if nxt is not None:
+            ttff.append((nxt - a["t0"]) * 1000.0)
+    for name, vals in (("launch_to_frame_ms", ttff), ("screenshot_ms", [(a["t1"] - a["t0"]) * 1000.0 for a in shots]),
+                       ("launch_call_ms", [(a["t1"] - a["t0"]) * 1000.0 for a in launches])):
+        out[name + "_p50"] = stats.r1(stats.percentile(vals, 0.5))
+        out[name + "_p95"] = stats.r1(stats.percentile(vals, 0.95))
+    out["actions"] = len(actions)
+    out["action_failures"] = sum(1 for a in actions if a.get("rc") not in (0, None))
+    return out
+
+
+def motion_metrics(times, nominal_fps=60.0, still_ms=250.0):
+    """frame metrics over the stretches of motion only (the agent mix idles between actions): fps = frames per
+    second inside stretches; the intervals are the ones inside stretches; the gap that ends a stretch is not one."""
+    st = stats.stretches(times, still_ms)
+    ivs, frames, span = [], 0, 0.0
+    for t0, t1, n in st:
+        span += t1 - t0
+        frames += n - 1
+    inside = [t for t in times]
+    for a, b in zip(inside, inside[1:]):
+        if (b - a) * 1000.0 <= still_ms:
+            ivs.append((b - a) * 1000.0)
+    thr = 2000.0 / nominal_fps
+    return {"stretches": len(st), "fps": stats.r1(frames / span if span > 0 else 0.0), "p50_ms": stats.r1(stats.percentile(ivs, 0.5)),
+            "p95_ms": stats.r1(stats.percentile(ivs, 0.95)), "p99_ms": stats.r1(stats.percentile(ivs, 0.99)),
+            "max_ms": stats.r1(max(ivs) if ivs else None), "over2x": sum(1 for x in ivs if x > thr),
+            "longest_gap_s": stats.r1(max(ivs) / 1000.0, 3) if ivs else None}
