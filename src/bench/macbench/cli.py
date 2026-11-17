@@ -80,16 +80,16 @@ def parser():
         if name == "idle":
             p.add_argument("--bar-qemu-cores", type=float, default=0.15, help="PASS bar for QEMU's CPU in cores")
         if name == "lifecycle":
-            p.add_argument("--cycles", type=int, default=3)
+            p.add_argument("--cycles", type=int, default=5, help="create/boot/.../delete cycles (the leak gates need at least 4)")
             p.add_argument("--storm", type=int, default=4, help="boot this many at once (0: skip)")
             p.add_argument("--storm-bar-s", type=float, default=300)
-            p.add_argument("--leak-rss-mb", type=float, default=20, help="FAIL above this QEMU RSS growth per cycle (MB)")
+            p.add_argument("--leak-rss-mb", type=float, default=20, help="FAIL above this steady growth of QEMU's memory (RSS + swap) per cycle (MB)")
             p.add_argument("--leak-guest-mb", type=float, default=30, help="FAIL above this guest memory growth per cycle (MB)")
         if name == "soak":
             p.add_argument("--soak-n", type=int, default=3)
             p.add_argument("--soak-minutes", type=float, default=15)
             p.add_argument("--soak-every", type=float, default=30)
-            p.add_argument("--soak-rss-mb-min", type=float, default=5, help="FAIL above this QEMU RSS growth (MB/min)")
+            p.add_argument("--soak-rss-mb-min", type=float, default=5, help="FAIL above this steady growth of QEMU's memory (RSS + swap) (MB/min)")
             p.add_argument("--soak-guest-mb-min", type=float, default=10, help="FAIL above this guest memory growth (MB/min)")
         if name == "build":
             p.add_argument("--xcodebuild", default="", help="arguments for xcodebuild (a project or workspace and scheme) to time cold and warm")

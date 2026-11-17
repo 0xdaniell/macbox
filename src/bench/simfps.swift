@@ -12,6 +12,7 @@
 //                           several simfps (one per simulator) measure the same window
 //   SIMFPS_PROBE=<x>,<y>    a point in points (402 pt wide screen): its luma is read from every new surface
 //   SIMFPS_STAMPS=<path>    one line per new surface: "<unix seconds> <counter or -1> <probe luma or -1>"
+//                           (counter -3: the same surface looked at again, its marker changed since the first look)
 //
 // --strip also reads GlassBench's frame strip (a 16-bit counter the app draws every tick, see
 // GlassBench/main.swift) from each new surface: how many app frames reached the screen, how many were
@@ -154,7 +155,13 @@ let poller = Thread {
     var lastSeed = IOSurfaceGetSeed(surf0)
     var lastSurf = surf0
     // The first line of SIMFPS_STAMPS is the screen as it stands at the start (a static screen makes no new surface).
-    if rawPath != nil { let r = readSurface(surf0, strip: readStrip, probe: probe); raw.append((start, r.0, r.1)) }
+    // A picture read at the moment it appears can still show the frame before it. On a moving screen the next
+    // picture corrects that; on a still one nothing follows, and a flipped marker was never seen (a "missed" probe).
+    // So the same surface is looked at again 30, 150 and 600 ms after it appeared; a marker that changed meanwhile
+    // is a line with counter -3 (a second look, not a new picture).
+    let lookAt: [UInt64] = [30_000_000, 150_000_000, 600_000_000]
+    var lastNew = start, looks = 0, lastLuma = -1
+    if rawPath != nil { let r = readSurface(surf0, strip: readStrip, probe: probe); raw.append((start, r.0, r.1)); lastLuma = r.1 }
     while true {
         let t = nowNs()
         if t >= end { break }
@@ -165,6 +172,11 @@ let poller = Thread {
             let (counter, luma) = readSurface(s, strip: readStrip, probe: rawPath != nil ? probe : nil)
             if readStrip { strip.append((t, counter)) }
             if rawPath != nil { raw.append((t, counter, luma)) }
+            lastNew = t; looks = 0; lastLuma = luma
+        } else if rawPath != nil, let p = probe, looks < lookAt.count, t - lastNew >= lookAt[looks] {
+            looks += 1
+            let l = readSurface(lastSurf, strip: false, probe: p).1
+            if l >= 0 && (l > 127) != (lastLuma > 127) { raw.append((t, -3, l)); lastLuma = l }
         }
         polls += 1
         usleep(500)

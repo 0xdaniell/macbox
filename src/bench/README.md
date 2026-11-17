@@ -20,12 +20,15 @@ Unit tests, no VM needed: `cd src/bench && python3 -m unittest discover -s tests
 and `python3 -m unittest tests.test_dry tests.test_dry_state tests.test_dry_seed tests.test_dry_closed tests.test_dry_guards` (the dry runs with injected faults: the sweeps and their faults; what a run leaves and the idle guard, including a run killed mid-seed; the seed; the fail-closed gates; the host-disk, VM and abort guards; several minutes, run one module at a time on a busy host).
 
 **What has run on a real VM so far** (2026-11-17: macOS 26.7.1 guest, iPhone 17 Pro, iOS 26.5, an Arrow Lake iGPU):
-`tools`, `check`, `seed`, `cleanup` and `scale --mix all-busy` at 3x for N = 1, 2, 3. One, two and three animating
-simulators read 57.6, 39.5 and 23.2 distinct frames/s each (p95 24, 45, 75 ms; input proxy p50 283, 312, 356 ms),
-within the noise of a hand-made measurement of the same night (60, 37-41, 22-25). Everything else (`idle`,
-`lifecycle`, `soak`, `ab`, the `one-busy` and `agent` mixes, the 1x device type, N above 3) has only run against the
-stubs (`DRY=1` and the unit tests): expect to fix things the first time you run them. Only `scale` and
-`ab --metric input_p95` inject input events; the other scenarios' windows inject nothing and leave `responsive` unknown.
+`tools`, `check`, `seed`, `cleanup`, `scale` at 3x for N = 1, 2, 3 in the `all-busy` and `one-busy` mixes, and
+`lifecycle` (5 cycles, no boot storm). All animating: 57.6, 39.5 and 23.2 distinct frames/s each (p95 24, 45, 75 ms;
+input proxy p50 283, 312, 356 ms), within the noise of a hand-made measurement of the same night (60, 37-41, 22-25).
+One animating beside still ones: it keeps 60 (59.9, 59.8, 60.0), and the still ones answer the input proxy as fast
+as it does (p95 303-311 ms, no miss). Lifecycle medians: clone 2.9 s, first boot 5.6 s, first app frame 1.0 s after a
+0.5 s launch call, shutdown 3.2 s, resume boot 5.5 s, delete 0.2 s. Everything else (`idle`, `soak`, `ab`, the `agent`
+mix, the lifecycle's boot storm, the 1x device type, N above 3) has only run against the stubs (`DRY=1` and the unit
+tests): expect to fix things the first time you run them. Only `scale` and `ab --metric input_p95` inject input
+events; the other scenarios' windows inject nothing and leave `responsive` unknown.
 
 ## What a run does, and what it never touches
 
@@ -178,7 +181,9 @@ result records it. `--probe-method openurl` (`simctl openurl glassbench://toggle
 `auto`: iOS 26 answers it with an "Open in GlassBench?" alert nobody taps, which stays over the app, through a
 relaunch too, and costs a third of its frame rate (121 against 80-83 screen frames/s, one 3x simulator). For each injection: *t0* = the wall clock just before the command is started in the guest; the answer
 is the first new surface after t0 whose marker (luma above or below 127 at a fixed point) differs from the last
-surface before t0; latency = that surface's time - t0. A probe not answered in `--probe-timeout` (2 s) is a **miss
+surface before t0; latency = that surface's time - t0. On a still screen `simfps` looks at each surface again 30, 150
+and 600 ms after it appeared (a picture read the moment it appears can still show the frame before it, and nothing
+follows to correct that); probes answered only by such a second look are counted in `input_second_looks`. A probe not answered in `--probe-timeout` (2 s) is a **miss
 and counts at the timeout** in p50/p95, never dropped. The number includes starting `simctl` (its own duration is
 `input_call_p50_ms`), CoreSimulator, the app's handling and one composite. It excludes the Device panel's stream, the
 viewer and a real finger's HID path. Read it as a trend over N and between builds, not as an absolute touch latency;
@@ -264,7 +269,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `counter` | `simfps` answered with a result for every simulator of the window and every animating simulator's surfaces gave a readable frame counter (a counter that answers nothing or an error fails the window, it is not a missing metric) |
 | `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
 | `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new crash report since setup, judged like `stability`'s). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
-| `leak_*` | `lifecycle`: QEMU RSS and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute |
+| `leak_*` | `lifecycle`: QEMU's memory (RSS + swap: RSS alone rises when the host brings swapped pages back) and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute. FAIL needs a steady growth (at least 4 samples, R2 >= 0.8); a slope above the bar without that is SKIP |
 | `observer` | what looking costs: a second window of the first N reads nothing from the screen and injects nothing. PASS within 4%; beyond it INFO (never FAIL): the distinct-frame numbers are lower bounds. One lock of each picture cost between nothing and 31% of the screen frames in seven runs here (+2, -2.5, -5.6, -12.7, -20, -23, -31%; why it varies is not known); a second lock per picture halved them, so `simfps` reads strip and marker under one |
 
 ## A/B discipline

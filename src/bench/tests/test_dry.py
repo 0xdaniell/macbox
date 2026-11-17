@@ -272,7 +272,7 @@ class Dry(unittest.TestCase):
         lc = self.r["lifecycle"]["doc"]
         self.assertTrue(sections(lc, "lifecycle"))
         self.assertTrue(sections(lc, "storm"))
-        self.assertIn("leak_qemu_rss", lc["gates"])
+        self.assertIn("leak_qemu_mem", lc["gates"])
         self.assertEqual(sims_booted(self.r["lifecycle"]["state"]), [])
         self.assertEqual(sections(self.r["build"]["doc"], "xcodebuild")[0]["status"], "SKIP")
         self.assertEqual(sections(self.r["panel_skip"]["doc"], "panel")[0]["status"], "SKIP")

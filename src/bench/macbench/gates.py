@@ -174,9 +174,16 @@ def shots_gates(shots_by_sim, golden=None):
 
 
 def leak_gate(name, xs, ys, bar_per_unit, unit):
-    """FAIL when the least-squares slope of ys over xs exceeds the bar (e.g. MB per cycle)."""
+    """FAIL when the least-squares slope of ys over xs exceeds the bar (e.g. MB per cycle) AND the growth is steady:
+    at least 4 samples on a line (R2 >= 0.8). A slope above the bar from fewer samples or a scatter is one step, not a
+    leak: SKIP, and it says to run longer."""
     from . import stats
     b, _, r2 = stats.slope(xs, ys)
     if b is None:
         return gate("SKIP", "%s: not enough samples" % name)
-    return gate("FAIL" if b > bar_per_unit else "PASS", "%s: %+.2f %s (bar %g, R2 %.2f, %d samples)" % (name, b, unit, bar_per_unit, r2, len(xs)))
+    detail = "%s: %+.2f %s (bar %g, R2 %.2f, %d samples)" % (name, b, unit, bar_per_unit, r2, len(xs))
+    if b <= bar_per_unit:
+        return gate("PASS", detail)
+    if len(xs) < 4 or r2 < 0.8:
+        return gate("SKIP", detail + ": above the bar but not a steady growth; run more cycles or longer to judge")
+    return gate("FAIL", detail)

@@ -179,6 +179,16 @@ class Latency(unittest.TestCase):
         self.assertEqual(r["max_ms"], 2000.0)
         self.assertAlmostEqual(r["call_p50_ms"], 120, delta=1)
 
+    def test_a_second_look_answers_a_probe_and_is_not_a_frame(self):
+        # a still screen: the surface that appeared at 103.07 was read too early (old marker), the second look saw the flip
+        raw = [(100.0, -1, 255), (103.07, -1, 255), (103.10, analysis.SECOND_LOOK, 0)]
+        r = analysis.probe_latencies(raw, [(103.0, 103.1)])
+        self.assertEqual((r["misses"], r["second_looks"]), (0, 1))
+        self.assertAlmostEqual(r["latencies_ms"][0], 100, delta=1)
+        busy = [(100 + i / 60, i % 65536, 255) for i in range(120)] + [(100.5001, analysis.SECOND_LOOK, 0)]
+        m = analysis.sim_metrics(0, "busy", sorted(busy), [])
+        self.assertEqual(m["strip"]["unreadable"], 0)          # the second look is not an unreadable frame
+
     def test_static_screen_uses_the_start_line(self):
         raw = [(100.0, -1, 255), (103.07, -1, 0)]          # no frames between: a static screen
         r = analysis.probe_latencies(raw, [(103.0, 103.1)])

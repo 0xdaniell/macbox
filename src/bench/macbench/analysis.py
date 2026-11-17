@@ -4,6 +4,9 @@ from . import stats, strip, targets
 LUMA_MID = 127
 
 
+SECOND_LOOK = -3          # simfps: the same surface looked at again (its marker changed since the first look), not a new picture
+
+
 def parse_raw(text):
     """simfps's SIMFPS_STAMPS file: '<unix s> <counter or -1> <probe luma or -1>' per line -> [(t, counter, luma)]."""
     out = []
@@ -27,7 +30,7 @@ def probe_latencies(raw, injections, timeout_s=2.0):
     What it includes: starting `simctl` (its own duration is `call_ms`), CoreSimulator, the app's handling and
     one frame's composite. What it leaves out: the Device panel stream, the viewer, a real finger's HID path.
     Returns {"n", "misses", "p50_ms", "p95_ms", "max_ms", "call_p50_ms", "latencies_ms": [...]}"""
-    lat, calls, misses = [], [], 0
+    lat, calls, misses, second = [], [], 0, 0
     for t0, tret in injections:
         before = None
         for t, _, luma in raw:
@@ -37,13 +40,14 @@ def probe_latencies(raw, injections, timeout_s=2.0):
                 before = luma > LUMA_MID
         hit = None
         if before is not None:
-            for t, _, luma in raw:
+            for t, c, luma in raw:
                 if t < t0 or luma < 0:
                     continue
                 if t > t0 + timeout_s:
                     break
                 if (luma > LUMA_MID) != before:
                     hit = t - t0
+                    second += c == SECOND_LOOK
                     break
         calls.append((tret - t0) * 1000.0)
         if hit is None:
@@ -51,7 +55,7 @@ def probe_latencies(raw, injections, timeout_s=2.0):
             lat.append(timeout_s * 1000.0)
         else:
             lat.append(hit * 1000.0)
-    return {"n": len(injections), "misses": misses, "p50_ms": stats.r1(stats.percentile(lat, 0.5)),
+    return {"n": len(injections), "misses": misses, "second_looks": second, "p50_ms": stats.r1(stats.percentile(lat, 0.5)),
             "p95_ms": stats.r1(stats.percentile(lat, 0.95)), "max_ms": stats.r1(max(lat)) if lat else None,
             "call_p50_ms": stats.r1(stats.percentile(calls, 0.5)), "latencies_ms": [round(x, 1) for x in lat]}
 
@@ -63,7 +67,7 @@ def sim_metrics(idx, role, raw, injections, nominal_fps=60.0, timeout_s=2.0, app
         raw = [r for r in raw if window[0] <= r[0] <= window[1]] or raw[:1]
     sim = {"idx": idx, "role": role}
     if role == "busy":
-        a = strip.analyze_counters([(t, c) for t, c, _ in raw])
+        a = strip.analyze_counters([(t, c) for t, c, _ in raw if c != SECOND_LOOK])
         fm = stats.frame_stats([t for t, _ in a["unique"]], nominal_fps)
         sim.update(fm)
         sim["strip"] = {k: a[k] for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks")}
@@ -72,7 +76,7 @@ def sim_metrics(idx, role, raw, injections, nominal_fps=60.0, timeout_s=2.0, app
         sim["app_ticks"] = app_ticks
     if injections:
         pl = probe_latencies(raw, injections, timeout_s)
-        sim.update({"input_n": pl["n"], "input_misses": pl["misses"], "input_p50_ms": pl["p50_ms"],
+        sim.update({"input_n": pl["n"], "input_misses": pl["misses"], "input_second_looks": pl["second_looks"], "input_p50_ms": pl["p50_ms"],
                     "input_p95_ms": pl["p95_ms"], "input_max_ms": pl["max_ms"], "input_call_p50_ms": pl["call_p50_ms"]})
     return sim
 

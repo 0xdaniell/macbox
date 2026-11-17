@@ -272,6 +272,9 @@ class Gates(unittest.TestCase):
         self.assertEqual(gates.leak_gate("x", [1, 2, 3, 4], [0, 50, 100, 150], 20, "MB")["status"], "FAIL")
         self.assertEqual(gates.leak_gate("x", [1, 2, 3, 4], [0, 1, 2, 3], 20, "MB")["status"], "PASS")
         self.assertEqual(gates.leak_gate("x", [1], [0], 20, "MB")["status"], "SKIP")
+        # one step up, then flat (a host bringing swapped pages back): above the bar, but not a steady growth
+        self.assertEqual(gates.leak_gate("x", [1, 2, 3], [90, 570, 520], 20, "MB")["status"], "SKIP")
+        self.assertEqual(gates.leak_gate("x", [1, 2, 3, 4, 5], [0, 480, 470, 490, 480], 20, "MB")["status"], "SKIP")
 
 
 class Schema(unittest.TestCase):
