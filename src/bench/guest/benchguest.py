@@ -10,6 +10,7 @@ and refuses a set without the bench's marker file: the pool and Simlock's device
 """
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,12 @@ SEED_PREFIX = "bench-seed-"
 OVERRIDES = "/private/var/tmp/com.apple.CoreSimulator.SimDevice"   # + "." + udid: the Slim disables of one device
 KEEP_DIR = os.path.expanduser("~/.sim-keep")                          # sim-idle-guard's keep files, one per udid
 IDLE_GUARD = os.path.expanduser("~/.local/bin/sim-idle-guard")        # `keep <udid> <minutes>` (max 240)
+# Simlock's own source devices (read only: nothing is ever written to, booted, shut down or deleted in this set; the one
+# command that names it is simlock_clone()) and the Slim tooling the fleet uses on every clone.
+SOURCE_SET = os.environ.get("BENCH_SIMLOCK_SOURCES") or os.path.expanduser("~/.simlock04/devices/ios-sources")
+SIMSLIM = os.environ.get("BENCH_SIMSLIM") or os.path.expanduser("~/go/bin/simslim")
+SLIM_PROFILE = os.environ.get("BENCH_SLIM_PROFILE") or os.path.expanduser("~/.config/simslim/atlas.json")
+MIN_SLIM_SERVICES = 100                                               # a Slim device has 168 services off today
 PROBE_POINT = "36,175"          # the input marker's centre, in points (GlassBench -probe)
 SET = None
 STUB = os.environ.get("BENCHGUEST_STUB")
@@ -531,6 +538,187 @@ def cmd_create(a):
     out_json({"sims": made})
 
 
+def simlock_clone(src_set, src_udid, name):
+    """THE one command that names Simlock's device set: `simctl --set <Simlock's set> clone <source> <name> <bench set>`.
+    It reads the source and writes into the bench set; Simlock's set is never written, booted, shut down or deleted."""
+    check_set()
+    argv = ["xcrun", "simctl", "--set", src_set, "clone", src_udid, name, SET]
+    CALLS.append(argv)
+    return run(argv, 900)
+
+
+UUID = re.compile(r"^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
+
+
+def find_source(type_id, src_set):
+    """Simlock's source device of this device type: (udid, device.plist dict), or (None, why). Reads the source folders'
+    device.plist only (never config.json); prefers a source that is shut down."""
+    try:
+        names = sorted(n for n in os.listdir(src_set) if UUID.match(n))
+    except OSError:
+        return None, "Simlock's source device set was not found at the configured path (Simlock is optional)"
+    found, types = [], set()
+    for n in names:
+        try:
+            with open(os.path.join(src_set, n, "device.plist"), "rb") as f:
+                pl = plistlib.load(f)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        types.add(str(pl.get("deviceType")).rsplit(".", 1)[-1])
+        if pl.get("deviceType") == type_id:
+            found.append((0 if pl.get("state") == 1 else 1, n, pl))
+    if not found:
+        return None, "Simlock has no source device of type %s (it has: %s)" % (type_id.rsplit(".", 1)[-1], ", ".join(sorted(types)) or "none")
+    found.sort(key=lambda x: (x[0], x[1]))
+    return found[0][1], found[0][2]
+
+
+def runtime_version(runtime_id):
+    try:
+        for r in json.loads(run(["xcrun", "simctl", "list", "runtimes", "-j"], 30)[1]).get("runtimes", []):
+            if r.get("identifier") == runtime_id:
+                return r.get("version")
+    except ValueError:
+        pass
+    return None
+
+
+def top_text(top):
+    return ", ".join("%s %g%%" % (t["cmd"], t["cpu_pct"]) for t in top[:5]) or "nothing above 0%"
+
+
+def delete_device(udid):
+    """A device of the bench's set: shut down, delete, remove what lives outside it (and from the manifest); returns problems."""
+    probs = []
+    simctl("shutdown", udid, timeout=120)
+    rc, _, err, _ = simctl("delete", udid, timeout=120)
+    if rc != 0:
+        probs.append("delete %s: %s" % (udid, err.strip()[:100]))
+    for e in (drop_keep(udid), drop_overrides(udid)):
+        if e:
+            probs.append(e)
+    man = load_manifest()
+    man["devices"].pop(udid, None)
+    if not probs:
+        man["seeds"] = {t: x for t, x in man["seeds"].items() if x["udid"] != udid}
+    save_manifest(man)
+    return probs
+
+
+def cmd_seed(a):
+    """ONE settled production seed per device type in the bench's set: a clone of Simlock's own source device of that type
+    (widgets trimmed, as production), one boot, simslim with the fleet's profile (Simlock's sources are not Slim), the bench
+    app, a real settle, shutdown. Kept (shut down) between runs and reused; every bench simulator is a clone of it. A seed
+    that was never completed is deleted again, never left to be reused."""
+    tid = a.type
+    name = SEED_PREFIX + tid.rsplit(".", 1)[-1]
+    man = load_manifest()
+    cur = man["seeds"].get(tid)
+    here = {d["udid"]: d for d in devices()}
+    stamp = app_stamp()
+    if cur and (a.rebuild or cur["udid"] not in here):
+        if cur["udid"] in here:
+            probs = delete_device(cur["udid"])
+            if probs:
+                raise GuestError("the old seed could not be deleted: %s" % "; ".join(probs))
+        man = load_manifest()
+        man["seeds"].pop(tid, None)
+        save_manifest(man)
+        cur = None
+    if cur:
+        if not cur.get("complete"):
+            raise GuestError("the seed in the bench's set was never completed: macbox bench cleanup --seeds")
+        u = cur["udid"]
+        if here[u].get("state") != "Shutdown":
+            simctl("shutdown", u, timeout=120)
+        n = slim_count(u)
+        why = ("only %d services off" % n) if n < MIN_SLIM_SERVICES else (None if os.path.isdir(icons_path(u)) else "its widgets never settled (no chronod icons)")
+        if not why and cur.get("app_stamp") != stamp:
+            why = "the bench app was rebuilt since (GlassBench differs)"
+        if why:
+            raise GuestError("the existing seed cannot be reused (%s): rebuild it with --rebuild-seed" % why)
+        return out_json(dict(cur, seed=u, reused=True, services_off=n, source_type=tid.rsplit(".", 1)[-1]))
+    src, pl = find_source(tid, os.path.expanduser(a.source_set or SOURCE_SET))
+    if src is None:
+        return out_json({"seed": None, "no_source": pl, "udid": None})
+    t0 = now()
+    rc, out, err, _ = simlock_clone(os.path.expanduser(a.source_set or SOURCE_SET), src, name)
+    if rc != 0:
+        raise GuestError("simctl clone out of Simlock's source device failed: %s" % (err or out).strip()[-200:])
+    u = out.strip().splitlines()[-1]
+    runtime = pl.get("runtime")
+    man["seeds"][tid] = {"udid": u, "name": name, "complete": False, "type": tid, "runtime": runtime}
+    man["devices"][u] = {"name": name, "kind": "seed"}
+    save_manifest(man)                # written before anything else is done to it: a crash leaves an incomplete seed, which is refused
+    try:
+        keep_or_fail(u, a.keep_min)
+        if simctl("boot", u, timeout=300)[0] != 0:
+            raise GuestError("the seed did not boot")
+        if simctl("bootstatus", u, timeout=600)[0] != 0:
+            raise GuestError("the seed never finished booting (bootstatus)")
+        sl = os.path.expanduser(a.simslim or SIMSLIM)
+        prof = os.path.expanduser(a.slim_profile or SLIM_PROFILE)
+        # Simlock's source devices are widget-trimmed but NOT Slim: simslim shuts the device down, rewrites its services and reboots it
+        rc, out, err, secs = run([sl, "--set", SET, "on", u, "--profile", prof], 900)
+        if rc != 0:
+            raise GuestError("simslim failed on the seed (rc %s): %s" % (rc, (err or out).strip()[-200:]))
+        if simctl("bootstatus", u, timeout=600)[0] != 0:
+            raise GuestError("the seed never finished booting after simslim (bootstatus)")
+        n = slim_count(u)
+        if n < MIN_SLIM_SERVICES:
+            raise GuestError("the seed is not Slim after simslim: %d services off, need >= %d" % (n, MIN_SLIM_SERVICES))
+        app = os.path.join(HERE, "..", "GlassBench.app")
+        if simctl("install", u, app, timeout=180)[0] != 0:
+            raise GuestError("installing the bench app in the seed failed")
+        if simctl("get_app_container", u, BUNDLE_ID, timeout=30)[0] != 0:
+            raise GuestError("the bench app is not installed in the seed after install")
+        st = settle_wait(a.settle_max, a.bg_pct, a.step, a.consecutive, icons_of=u)
+        if not st["settled"]:
+            raise GuestError("the seed did not settle in %g s (background %.0f%% of a core, widgets' icons %s; top: %s)" % (
+                a.settle_max, st["bg_pct"], "present" if st["icons"] else "missing", top_text(st["top"])))
+        if simctl("shutdown", u, timeout=120)[0] != 0:
+            raise GuestError("the seed did not shut down")
+    except BaseException:
+        delete_device(u)
+        man = load_manifest()
+        man["seeds"].pop(tid, None)
+        save_manifest(man)
+        raise
+    drop_keep(u)
+    res = {"seed": u, "udid": u, "name": name, "type": tid, "runtime": runtime, "runtime_version": runtime_version(runtime), "complete": True, "app_stamp": stamp,
+           "source_type": tid.rsplit(".", 1)[-1], "reused": False, "made_s": round(now() - t0, 1), "services_off": n, "settle_s": st["waited_s"],
+           "settle_bg_pct": st["bg_pct"], "slimmed_s": round(secs, 1)}
+    man = load_manifest()
+    man["seeds"][tid] = {k: res[k] for k in ("udid", "name", "type", "runtime", "runtime_version", "complete", "app_stamp", "made_s", "services_off")}
+    save_manifest(man)
+    out_json(res)
+
+
+def cmd_clone(a):
+    """Bench simulators = APFS clones of the seed (no disk cost) with the seed's Slim disables copied to each UDID's folder
+    before its first boot."""
+    here = {d["udid"]: d for d in devices()}
+    if a.seed not in here or not is_seed(here[a.seed]):
+        raise GuestError("the seed is not in the bench's set")
+    if here[a.seed].get("state") != "Shutdown":
+        simctl("shutdown", a.seed, timeout=120)          # a clone is taken of a shut-down device
+    man = load_manifest()
+    made = []
+    for i in range(a.start, a.start + a.n):
+        name = "%s-%d" % (a.prefix, i)
+        rc, out, err, secs = simctl("clone", a.seed, name, timeout=300)
+        if rc != 0:
+            raise GuestError("clone of the seed %s: %s" % (name, (err or out).strip()[:200]))
+        u = out.strip().splitlines()[-1]
+        man["devices"][u] = {"name": name, "kind": "clone"}
+        save_manifest(man)
+        t = now()
+        off = copy_overrides(a.seed, u)
+        k = keep_or_fail(u, a.keep_min)
+        made.append({"idx": i, "udid": u, "clone_s": round(secs + now() - t, 2), "services_off": off, "idle_guard": k["state"]})
+    out_json({"sims": made})
+
+
 def _boot_one(udid, res, i):
     t0 = now()
     rc, _, err, _ = simctl("boot", udid, timeout=300)
@@ -542,21 +730,49 @@ def _boot_one(udid, res, i):
 
 
 def slim_count(udid):
-    """Services simslim keeps disabled for a simulator (what macbox-guest counts), 0 = stock."""
-    f = "/private/var/tmp/com.apple.CoreSimulator.SimDevice.%s/disabled.plist" % udid
+    """Services Slim keeps disabled for a simulator: `=> true` lines of its disabled.plist (what the fleet's check counts;
+    168 today). 0 = stock or no file."""
+    f = os.path.join(overrides_dir(udid), "disabled.plist")
     if not os.path.exists(f):
         return 0
     return run(["plutil", "-p", f], 15)[1].count("=> true")
 
 
-def cmd_slim(a):
-    """The pool's Slim configuration on the bench's simulators: runs --cmd ({udid}) for each, then counts the
-    services left disabled. HYPOTHESIS: simslim finds devices of a custom device set; the result says."""
-    res = []
-    for u in a.udids.split(","):
-        rc, out, err, secs = run(["/bin/sh", "-c", a.cmd.replace("{udid}", u)], 900)
-        res.append({"udid": u, "rc": rc, "s": round(secs, 1), "services_off": slim_count(u), "err": (err or "").strip()[-120:] if rc else None})
-    out_json({"sims": res})
+def copy_overrides(seed_udid, udid, min_services=MIN_SLIM_SERVICES):
+    """The Slim disables live OUTSIDE the device, keyed by UDID: a clone boots stock unless the seed's file is in its own
+    folder (mode 0700) before its first boot. Fails when the seed has none or the copy did not take."""
+    n = slim_count(seed_udid)
+    if n < min_services:
+        raise GuestError("the seed's disabled.plist has %d services off, a production simulator needs >= %d: rebuild the seed (macbox bench seed --rebuild-seed)" % (n, min_services))
+    d = overrides_dir(udid)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    shutil.copyfile(os.path.join(overrides_dir(seed_udid), "disabled.plist"), os.path.join(d, "disabled.plist"))
+    got = slim_count(udid)
+    if got != n:
+        raise GuestError("the overrides copy for %s holds %d services off, the seed's %d: it would boot stock" % (udid, got, n))
+    return got
+
+
+def icons_path(udid):
+    return os.path.join(SET, udid, "data", "Library", "chronod", "icons")      # exists once the widgets have settled
+
+
+def app_stamp():
+    """A hash of the installed bench app (GlassBench.app of this checkout): a seed made with another build is stale."""
+    root = os.path.join(HERE, "..", "GlassBench.app")
+    h = hashlib.sha256()
+    for dp, dn, fn in os.walk(root):
+        dn.sort()
+        for f in sorted(fn):
+            p = os.path.join(dp, f)
+            h.update(os.path.relpath(p, root).encode())
+            try:
+                with open(p, "rb") as fh:
+                    h.update(fh.read())
+            except OSError:
+                pass
+    return h.hexdigest()[:16]
 
 
 def cmd_boot(a):
@@ -581,6 +797,8 @@ def cmd_prepare(a):
     for u, role in zip(us, roles):
         t0 = now()
         rc_i = simctl("install", u, app, timeout=120)[0] if a.install else 0
+        if a.check_app and simctl("get_app_container", u, BUNDLE_ID, timeout=30)[0] != 0:
+            raise GuestError("the bench app is not installed in %s: the seed is stale, rebuild it (--rebuild-seed)" % u)
         simctl("status_bar", u, "override", "--time", "9:41", "--batteryState", "charged", "--batteryLevel", "100",
                "--cellularBars", "4", "--wifiBars", "3", "--operatorName", "", timeout=30)
         if a.quiesce:
@@ -602,29 +820,46 @@ def parse_name_cpu(text):
 SETTLE_SKIP = re.compile(r"(^|/)(SimMetalHost|backboardd|GlassBench|SimRenderServer|kernel_task|simfps|WindowServer|python3?|Python|ps|top|ssh|sshd)( |$)")
 
 
-def bg_cpu_pct(secs=3.0):
-    """Everything not part of the load: CPU % of one core used by processes other than the renderers, the app and
-    the observer (the settle condition: the guest has stopped doing its own housekeeping)."""
-    skip = SETTLE_SKIP
+def bg_sample(secs=3.0):
+    """(CPU % of one core used by everything that is not the load or its observers, the top processes by CPU in the same
+    interval as [{"cmd": basename, "cpu_pct", "load": True when it is part of the load}]): the settle condition (the
+    guest has stopped doing its own housekeeping) and what to show when it never does."""
     a = parse_ps(ps_text())
     mine = own_pids(a)
     t0 = now()
     time.sleep(secs)
     b = parse_ps(ps_text())
-    dt = now() - t0
+    dt = max(now() - t0, 0.001)
     am = {p["pid"]: p for p in a}
-    tot = sum(max(0.0, p["cpu_s"] - am[p["pid"]]["cpu_s"]) for p in b if p["pid"] in am and p["pid"] not in mine and not skip.search(p["cmd"]))
-    return round(100 * tot / dt, 1)
+    rows = [(max(0.0, p["cpu_s"] - am[p["pid"]]["cpu_s"]), p["cmd"]) for p in b if p["pid"] in am and p["pid"] not in mine]
+    tot = sum(d for d, c in rows if not SETTLE_SKIP.search(c))
+    rows.sort(key=lambda r: -r[0])
+    top = [{"cmd": os.path.basename(c.split(" /")[0].strip()) or c[:30], "cpu_pct": round(100 * d / dt, 1), "load": bool(SETTLE_SKIP.search(c))}
+           for d, c in rows[:6] if d > 0]
+    return round(100 * tot / dt, 1), top
+
+
+def bg_cpu_pct(secs=3.0):
+    return bg_sample(secs)[0]
+
+
+def settle_wait(max_s, bg_pct, step, consecutive=2, icons_of=None):
+    """Waits until the background CPU is under bg_pct for `consecutive` samples IN A ROW (and, for a seed, the widgets'
+    icons exist). {"settled", "bg_pct" (last sample), "waited_s", "series", "top" (at the last sample), "icons"}. Reaching
+    max_s is settled False: the caller fails the run, it never measures on top of this."""
+    t0, series, top, icons = now(), [], [], True
+    while True:
+        v, top = bg_sample(step)
+        series.append(v)
+        icons = icons_of is None or os.path.isdir(icons_path(icons_of))
+        if len(series) >= consecutive and all(x < bg_pct for x in series[-consecutive:]) and icons:
+            return {"settled": True, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top, "icons": icons}
+        if now() - t0 > max_s:
+            return {"settled": False, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top, "icons": icons}
 
 
 def cmd_settle(a):
-    t0, series = now(), []
-    while True:
-        v = bg_cpu_pct(a.step)
-        series.append(v)
-        if v < a.bg_pct or now() - t0 > a.max_s:
-            break
-    out_json({"settled": series[-1] < a.bg_pct, "bg_pct": series[-1], "waited_s": round(now() - t0, 1), "series": series[-8:]})
+    out_json(settle_wait(a.max_s, a.bg_pct, a.step, a.consecutive))
 
 
 def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every, cmd_tpl, no_strip=False, probe_timeout=2.0):
@@ -771,17 +1006,36 @@ def cmd_shots(a):
 
 
 def cmd_cycle(a):
-    """One lifecycle of a simulator: create, boot, install, launch, first app frame, shut down, resume
-    (boot again), first frame again, delete. Timings in seconds."""
+    """One lifecycle of a simulator, timings in seconds. Production path (--seed): clone the seed (+ the Slim disables and the
+    idle-guard keep), boot (a clone's first boot), launch, first app frame, shut down, resume (boot again), first frame
+    again, delete. With --type/--runtime (the explicit stock path): create a fresh stock device instead, install the app,
+    and clone the installed device once more."""
     from macbench import analysis
     tmp = tempfile.mkdtemp(prefix="benchcycle")
     t = {}
     udid = None
+    man = load_manifest()
     try:
         name = "%s-cycle" % a.prefix
         t0 = now()
-        udid = simctl("create", name, a.type, a.runtime)[1].strip().splitlines()[-1]
-        t["create_s"] = round(now() - t0, 2)
+        if a.seed:
+            if {d["udid"]: d for d in devices()}.get(a.seed, {}).get("state") != "Shutdown":
+                simctl("shutdown", a.seed, timeout=120)
+            rc, out, err, _ = simctl("clone", a.seed, name, timeout=300)
+            if rc != 0:
+                raise GuestError("clone of the seed: %s" % (err or out).strip()[:200])
+            udid = out.strip().splitlines()[-1]
+            man["devices"][udid] = {"name": name, "kind": "clone"}
+            save_manifest(man)
+            copy_overrides(a.seed, udid)
+            keep_or_fail(udid, a.keep_min)
+            t["clone_s"] = round(now() - t0, 2)
+        else:
+            udid = simctl("create", name, a.type, a.runtime)[1].strip().splitlines()[-1]
+            man["devices"][udid] = {"name": name, "kind": "stock"}
+            save_manifest(man)
+            keep_or_fail(udid, a.keep_min)
+            t["create_s"] = round(now() - t0, 2)
         for phase in ("cold", "resume"):
             if phase == "resume":
                 t0 = now()
@@ -791,7 +1045,7 @@ def cmd_cycle(a):
             simctl("boot", udid, timeout=300)
             simctl("bootstatus", udid, timeout=600)
             t["%s_boot_s" % phase] = round(now() - t0, 2)
-            if phase == "cold":
+            if phase == "cold" and not a.seed:
                 t0 = now()
                 simctl("install", udid, os.path.join(HERE, "..", "GlassBench.app"), timeout=120)
                 t["install_s"] = round(now() - t0, 2)
@@ -805,28 +1059,35 @@ def cmd_cycle(a):
             frames = analysis.parse_raw(open(raw).read()) if os.path.exists(raw) else []
             first = next((x[0] for x in frames if x[0] >= t_l and x[1] >= 0 and x[1] != 65535), None)
             t["%s_first_frame_s" % phase] = None if first is None else round(first - t_l, 2)
-        # clone of the shut-down, installed device (what a pool does for a new lease), then its boot
-        simctl("shutdown", udid, timeout=120)
-        t0 = now()
-        cl = simctl("clone", udid, "%s-clone" % name, timeout=300)[1].strip().splitlines()[-1]
-        t["clone_s"] = round(now() - t0, 2)
-        try:
+        if not a.seed:
+            # clone of the shut-down, installed device (what a pool does for a new lease), then its boot
+            simctl("shutdown", udid, timeout=120)
             t0 = now()
-            simctl("boot", cl, timeout=300)
-            simctl("bootstatus", cl, timeout=600)
-            t["clone_boot_s"] = round(now() - t0, 2)
-        finally:
-            simctl("shutdown", cl, timeout=120)
-            simctl("delete", cl, timeout=120)
+            cl = simctl("clone", udid, "%s-clone" % name, timeout=300)[1].strip().splitlines()[-1]
+            t["clone_s"] = round(now() - t0, 2)
+            man = load_manifest()
+            man["devices"][cl] = {"name": "%s-clone" % name, "kind": "stock"}
+            save_manifest(man)
+            try:
+                t0 = now()
+                simctl("boot", cl, timeout=300)
+                simctl("bootstatus", cl, timeout=600)
+                t["clone_boot_s"] = round(now() - t0, 2)
+            finally:
+                simctl("shutdown", cl, timeout=120)
+                simctl("delete", cl, timeout=120)
+        else:
+            simctl("shutdown", udid, timeout=120)
         t0 = now()
-        simctl("delete", udid, timeout=120)
+        problems = delete_device(udid)
         t["delete_s"] = round(now() - t0, 2)
         udid = None
+        if problems:
+            raise GuestError("; ".join(problems))
         out_json({"timings": t})
     finally:
         if udid:
-            simctl("shutdown", udid, timeout=60)
-            simctl("delete", udid, timeout=60)
+            delete_device(udid)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -984,18 +1245,22 @@ def main(argv=None):
     add("ensure-type", cmd_ensure_type, O("--scale", default="1"), O("--allow-restart", action="store_true"))
     add("create", cmd_create, O("--n", type=int, required=True), O("--type", required=True), O("--runtime", required=True),
         O("--prefix", default="bench"), O("--start", type=int, default=0), O("--keep-min", type=float, default=60))
-    add("slim", cmd_slim, O("--udids", required=True), O("--cmd", required=True))
+    add("seed", cmd_seed, O("--type", required=True), O("--source-set"), O("--simslim"), O("--slim-profile"), O("--keep-min", type=float, default=60),
+        O("--rebuild", action="store_true"), O("--settle-max", type=float, default=600), O("--bg-pct", type=float, default=40),
+        O("--step", type=float, default=10), O("--consecutive", type=int, default=2))
+    add("clone", cmd_clone, O("--seed", required=True), O("--n", type=int, required=True), O("--prefix", default="bench"), O("--start", type=int, default=0),
+        O("--keep-min", type=float, default=60))
     add("boot", cmd_boot, O("--udids", required=True), O("--parallel", action="store_true"))
     add("prepare", cmd_prepare, O("--udids", required=True), O("--roles", required=True), O("--install", action="store_true"),
-        O("--quiesce", action="store_true"))
-    add("settle", cmd_settle, O("--max-s", type=float, default=120), O("--bg-pct", type=float, default=40), O("--step", type=float, default=3))
+        O("--check-app", action="store_true"), O("--quiesce", action="store_true"))
+    add("settle", cmd_settle, O("--max-s", type=float, default=120), O("--bg-pct", type=float, default=40), O("--step", type=float, default=3), O("--consecutive", type=int, default=2))
     add("calibrate", cmd_calibrate, O("--udid", required=True), O("--methods", default="openurl,appearance"), O("--probe-cmd"), O("--time-scale", type=float, default=1.0))
     add("measure", cmd_measure, O("--udids", required=True), O("--roles", required=True), O("--mix", default="all-busy"),
         O("--secs", type=float, default=40), O("--start-at", type=float, default=0), O("--probe-method", default="openurl"),
         O("--probe-every", type=float, default=2.5), O("--probe-cmd"), O("--agent-period", type=float, default=12),
         O("--no-strip", action="store_true"), O("--probe-timeout", type=float, default=2.0))
     add("shots", cmd_shots, O("--udids", required=True), O("--count", type=int, default=2))
-    add("cycle", cmd_cycle, O("--type", required=True), O("--runtime", required=True), O("--prefix", default="bench"))
+    add("cycle", cmd_cycle, O("--seed"), O("--type"), O("--runtime"), O("--prefix", default="bench"), O("--keep-min", type=float, default=60))
     add("acquire", cmd_acquire, O("--run", default="?"))
     add("teardown", cmd_teardown, O("--seeds", action="store_true", help="delete the seeds too"))
     add("build", cmd_build, O("--xcodebuild", default=""))

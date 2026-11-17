@@ -61,7 +61,7 @@ class IdleGuard(unittest.TestCase):
         r = run_case(ONE, "", state=state)
         self.assertEqual(r["rc"], 0, r["out"][-600:])
         made = {c[2] for c in keep_calls(state)}
-        self.assertEqual(len(made), 2)
+        self.assertEqual(len(made), 3)                            # the seed (made in this run) and the two clones
         for c in keep_calls(state):
             self.assertEqual(c[1], "keep")
             self.assertEqual(c[3], str(95))                      # --deadline 5400 s = 90 min + 5

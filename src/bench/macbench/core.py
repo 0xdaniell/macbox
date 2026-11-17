@@ -23,6 +23,9 @@ class Ctx:
         self.marks = {}
         self.golden = None          # fn(w, h) -> (hash or None, key)
         self.pixel_gate = None
+        self.stock = False          # --stock-devices: fresh stock devices instead of clones of the seed
+        self.seed = None            # the guest's answer to `seed`
+        self.prefix = "bench"
         self.taken = False          # the bench's set is owned by this run (lock taken, cleanup registered)
         self.idle_guard = set()     # what sim-idle-guard keep answered for the bench's simulators: kept / absent
 
@@ -117,10 +120,47 @@ def setup_guest(ctx, sims=True):
         raise Stop("device type %s was just created and CoreSimulatorService must restart to load it, which would shut "
                    "down every booted simulator: stop them, then run again with --allow-restart (or `macbox pool create`)" % t["type"])
     ctx.type_id, ctx.runtime = t["type"], t["runtime"]
-    ctx.doc["env"]["guest"]["runtime_used"] = t.get("runtime_version")
-    ctx.doc["env"]["guest"]["device_type"] = "stock %s" % t["stock_name"] if a.scale_x == 3 else "macbox %dx of %s" % (a.scale_x, t["stock_name"])
+    base = "stock %s" % t["stock_name"] if a.scale_x == 3 else "macbox %dx of %s" % (a.scale_x, t["stock_name"])
+    g = ctx.doc["env"]["guest"]
+    g["runtime_used"] = t.get("runtime_version")
+    g["device_type"] = base + (" (fresh stock devices)" if a.stock_devices else " (production seed)")
+    g["device_source"] = "stock devices" if a.stock_devices else "clones of a seed made from a Simlock source device"
+    ctx.stock = bool(a.stock_devices)
+    ctx.prefix = "bench-%s" % ctx.doc["id"]
     _run_mark(ctx)
+    if not ctx.stock:
+        make_seed(ctx)
     return info
+
+
+def make_seed(ctx):
+    """The production seed: a settled Slim clone of Simlock's own source device of this type, kept in the bench's set
+    (reused when it is there). Every bench simulator is a clone of it. Fails closed: no source, no Slim, no settle, no run."""
+    a = ctx.a
+    reason = guard(ctx, 1, "before the seed")
+    if reason:
+        raise Stop(reason)
+    args = ["seed", "--type", ctx.type_id, "--keep-min", keep_minutes(ctx), "--settle-max", a.seed_settle_max, "--step", a.settle_step]
+    for flag, val in (("--source-set", a.source_set), ("--simslim", a.simslim), ("--slim-profile", a.slim_profile)):
+        if val:
+            args += [flag, val]
+    if a.rebuild_seed:
+        args.append("--rebuild")
+    r = ctx.guest.call(args, a.seed_settle_max + 2400)
+    if not r.get("seed"):
+        raise Stop("%s. A bench simulator must be a production simulator (a clone of a Simlock source device with the Slim disables), "
+                   "so there is nothing to run on. For a device type Simlock has no source for, or a scenario that needs a stock device, "
+                   "use --stock-devices: it creates fresh stock devices (about 1.8 GB of guest disk each, the host-disk guard checks "
+                   "before each) and the result says so" % r.get("no_source", "no seed"))
+    ctx.seed = r
+    ctx.runtime = r.get("runtime") or ctx.runtime
+    g = ctx.doc["env"]["guest"]
+    g["runtime_used"] = r.get("runtime_version") or g.get("runtime_used")
+    g["seed"] = {k: r.get(k) for k in ("source_type", "reused", "made_s", "services_off", "settle_s", "settle_bg_pct")}
+    ctx.section("seed", "INFO", "SEED %s: %s services off (Slim), %s" % (
+        "reused" if r.get("reused") else "made from a Simlock source device in %s s (simslim %s s, settled in %s s at %s%% background)" % (
+            r.get("made_s"), r.get("slimmed_s"), r.get("settle_s"), r.get("settle_bg_pct")),
+        r.get("services_off"), "kept shut down between runs" if not r.get("reused") else "settled when it was made"))
 
 
 def _run_mark(ctx):
@@ -128,34 +168,51 @@ def _run_mark(ctx):
     ctx.run_mark = {"coh": ctx.coh.mark(), "t0": time.time(), "ips": set(ctx.guest.call(["ips"], 60)["ips"])}
 
 
-def grow(ctx, n, roles, install=True):
-    """Make and boot simulators up to n (the ones already running stay), launch each with its role. Returns boot timings."""
+def grow(ctx, n, roles, install=True, parallel=False):
+    """Make and boot simulators up to n (the ones already running stay), launch each with its role. Returns boot timings.
+    Production path: clones of the seed (no disk cost, the seed's Slim disables copied to each). --stock-devices: fresh
+    stock devices, one at a time with the guard (host disk, guest memory) in front of each. parallel=True boots all the
+    new ones at once (the lifecycle's boot storm); otherwise they boot one after the other with the guard between."""
     have = len(ctx.sims)
     new = n - have
     boot = {}
     if new > 0:
-        r = ctx.guest.call(["create", "--n", new, "--type", ctx.type_id, "--runtime", ctx.runtime, "--start", have, "--keep-min", keep_minutes(ctx)], 240)
-        fresh = r["sims"]
-        ctx.idle_guard.update(x.get("idle_guard") for x in fresh)
-        us = ",".join(s["udid"] for s in fresh)
-        if ctx.a.slim:
-            sl = ctx.guest.call(["slim", "--udids", us, "--cmd", ctx.a.slim_cmd], 900 * len(fresh))
-            bad = [x for x in sl["sims"] if x["rc"] != 0 or not x["services_off"]]
+        keep = keep_minutes(ctx)
+        done, usable = [], []
+        t0 = time.time()
+        if parallel and not ctx.stock:
+            r = ctx.guest.call(["clone", "--seed", ctx.seed["seed"], "--n", new, "--start", have, "--prefix", ctx.prefix, "--keep-min", keep], 240 + 60 * new)
+            fresh = r["sims"]
+            b = ctx.guest.call(["boot", "--udids", ",".join(x["udid"] for x in fresh)] + ["--parallel"], 900)
+            groups = [(fresh, b)]
+        else:
+            groups = []
+            for k in range(new):
+                if k:
+                    reason = guard(ctx, 1, "before booting simulator %d" % (have + k + 1))
+                    if reason:
+                        raise Stop(reason)
+                if ctx.stock:
+                    r = ctx.guest.call(["create", "--n", 1, "--type", ctx.type_id, "--runtime", ctx.runtime, "--start", have + k, "--keep-min", keep], 240)
+                else:
+                    r = ctx.guest.call(["clone", "--seed", ctx.seed["seed"], "--n", 1, "--start", have + k, "--prefix", ctx.prefix, "--keep-min", keep], 240)
+                groups.append((r["sims"], ctx.guest.call(["boot", "--udids", r["sims"][0]["udid"]], 900)))
+        for fresh, b in groups:
+            ctx.idle_guard.update(x.get("idle_guard") for x in fresh)
+            bad = [s for s in b["sims"] if not s.get("ok")]
             if bad:
-                raise Stop("--slim: simslim did not slim a bench simulator (rc %s, %s services off): %s" % (bad[0]["rc"], bad[0]["services_off"], bad[0]["err"]))
-            ctx.doc["env"]["guest"]["slim_services_off"] = sl["sims"][0]["services_off"]
-        b = ctx.guest.call(["boot", "--udids", us] + (["--parallel"] if new > 1 else []), 900)
-        bad = [s for s in b["sims"] if not s.get("ok")]
-        if bad:
-            raise Stop("a simulator did not boot: %s" % bad[0].get("err"))
-        for s, bs in zip(fresh, b["sims"]):
-            ctx.sims.append({"idx": s["idx"], "udid": s["udid"]})
-        boot = {"new": new, "all_usable_s": b["all_s"], "each_usable_s": [s["usable_s"] for s in b["sims"]]}
+                for s_, bs in zip(fresh, b["sims"]):
+                    ctx.sims.append({"idx": s_["idx"], "udid": s_["udid"]})          # known to the cleanup and the count even when it failed
+                raise Stop("a simulator did not boot: %s" % bad[0].get("err"))
+            for s_, bs in zip(fresh, b["sims"]):
+                ctx.sims.append({"idx": s_["idx"], "udid": s_["udid"]})
+                usable.append(bs["usable_s"])
+        boot = {"new": new, "all_usable_s": round(time.time() - t0, 2) if not parallel else groups[0][1]["all_s"], "each_usable_s": usable}
     # roles may change with N (one-busy: only the first animates); (re)launch every simulator whose role changed or is new
     for i, s in enumerate(ctx.sims):
         want = roles[i]
         if s.get("role") != want:
-            ctx.guest.call(["prepare", "--udids", s["udid"], "--roles", want] + (["--install"] if not s.get("installed") else []) +
+            ctx.guest.call(["prepare", "--udids", s["udid"], "--roles", want] + (["--install"] if ctx.stock and not s.get("installed") else ["--check-app"]) +
                            (["--quiesce"] if ctx.a.quiesce else []), 300)
             s["role"], s["installed"] = want, True
     return boot

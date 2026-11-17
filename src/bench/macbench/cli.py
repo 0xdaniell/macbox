@@ -39,8 +39,12 @@ def add_common(p):
     p.add_argument("--lead", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--settle-step", type=float, default=3.0, help=argparse.SUPPRESS)
     p.add_argument("--settle-bg", type=float, default=40, help="the guest counts as settled below this background CPU %% (of one core)")
-    p.add_argument("--slim", action="store_true", help="make the bench simulators Slim like the pool's (simslim; a minute or two each)")
-    p.add_argument("--slim-cmd", default="$HOME/go/bin/simslim on {udid} --preserve-boot-state", help=argparse.SUPPRESS)
+    p.add_argument("--stock-devices", action="store_true", help="create FRESH STOCK devices instead of cloning the production seed: about 1.8 GB of guest disk each, not what an agent gets; for a device type Simlock has no source for or a scenario that needs a stock device (recorded in the result)")
+    p.add_argument("--rebuild-seed", action="store_true", help="delete the bench's seed and make a new one (after `macbox bench tools` rebuilt the app, or when it cannot be reused)")
+    p.add_argument("--source-set", default=os.environ.get("BENCH_SIMLOCK_SOURCES"), help="Simlock's source device set in the guest, read only (default ~/.simlock04/devices/ios-sources)")
+    p.add_argument("--simslim", default=os.environ.get("BENCH_SIMSLIM"), help="simslim in the guest (default ~/go/bin/simslim)")
+    p.add_argument("--slim-profile", default=os.environ.get("BENCH_SLIM_PROFILE"), help="simslim profile in the guest (default ~/.config/simslim/atlas.json)")
+    p.add_argument("--seed-settle-max", type=float, default=600, help="the seed must settle within this many seconds or it is deleted and the run fails")
     p.add_argument("--quiesce", action="store_true", help="disable mediaanalysisd in each simulator (recorded; production does not)")
     p.add_argument("--fail-on-swap", action="store_true", help="a guest swap-out in a window fails the memory gate (default: reported, host swap fails)")
     p.add_argument("--golden-file", default=os.path.join(BENCH_DIR, "baselines", "golden.json"))
@@ -58,7 +62,7 @@ def parser():
     s.add_argument("--shots", type=int, default=2, help="screenshots per simulator per step for the tear gate (0: none)")
     s.add_argument("--no-observer-check", dest="observer_check", action="store_false", help="skip the strip-read cost window at the first N")
     s.add_argument("--no-golden", dest="golden_phase", action="store_false", help="skip the static reference screen at the first N")
-    for name, hlp in (("idle", "the VM with no simulators: the standing cost"), ("lifecycle", "create, boot, install, launch, shut down, resume, delete; leak per cycle; boot storm"),
+    for name, hlp in (("seed", "make the production seed (or report the one that is there)"), ("idle", "the VM with no simulators: the standing cost"), ("lifecycle", "create, boot, install, launch, shut down, resume, delete; leak per cycle; boot storm"),
                       ("soak", "N busy simulators for minutes: memory growth, frame rate drift"), ("build", "build timing: the bench tools, optionally an xcodebuild"),
                       ("panel", "the Device panel's stream (optional, needs Simlock/T3 Code)"), ("golden", "record the static screen's pixel hash for this setup"),
                       ("ab", "A/B one knob, A B B A inside one window, ADOPT or CLOSE")):
@@ -275,7 +279,7 @@ def main(argv=None):
         for t in a.targets + ["floor: " + a.floor]:
             targets.parse_target(t)
         return execute(a, "scale", scale.run_scale)
-    body = {"idle": others.run_idle, "lifecycle": others.run_lifecycle, "soak": others.run_soak, "build": others.run_build,
+    body = {"seed": others.run_seed, "idle": others.run_idle, "lifecycle": others.run_lifecycle, "soak": others.run_soak, "build": others.run_build,
             "panel": others.run_panel, "golden": others.run_golden, "ab": ab.run_ab}[c]
     for k, v in (("ns", [1]), ("mix", "all-busy"), ("targets", targets.DEFAULT_TARGETS), ("floor", "fps>=20"), ("shots", 2),
                  ("observer_check", False), ("golden_phase", False)):

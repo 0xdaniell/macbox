@@ -13,6 +13,15 @@ def _fmt(x, unit=""):
     return "n/a" if x is None else "%g%s" % (x, unit)
 
 
+def run_seed(ctx):
+    """macbox bench seed [--rebuild-seed]: make (or check and report) the production seed and nothing else."""
+    info = core.setup_guest(ctx)
+    core.capture_env(ctx, info)
+    ctx.doc["data"] = {"seed": ctx.doc["env"]["guest"].get("seed")}
+    ctx.section("seed_ready", "PASS", "SEED READY: %s" % [s for s in ctx.doc["sections"] if s["name"] == "seed"][-1]["line"] if not ctx.stock else "SEED SKIP: --stock-devices makes no seed")
+    ctx.save()
+
+
 def run_idle(ctx):
     a = ctx.a
     info = core.setup_guest(ctx, sims=False)
@@ -52,7 +61,7 @@ def run_lifecycle(ctx):
     mem0 = ctx.guest.call(["memcheck"], 60)["mem"]
     data = ctx.doc["data"] = {"cycles": cyc, "storm": None}
     for i in range(a.cycles):
-        r = ctx.guest.call(["cycle", "--type", ctx.type_id, "--runtime", ctx.runtime], 900)
+        r = ctx.guest.call(["cycle", "--keep-min", core.keep_minutes(ctx)] + (["--type", ctx.type_id, "--runtime", ctx.runtime] if ctx.stock else ["--seed", ctx.seed["seed"]]), 900)
         cyc.append(r["timings"])
         m = ctx.guest.call(["memcheck"], 60)
         xs.append(i + 1)
@@ -65,9 +74,11 @@ def run_lifecycle(ctx):
     med = {k: _median([c[k] for c in cyc if c.get(k) is not None]) for k in keys}
     data["median_s"] = med
     ok = all(v is not None for v in med.values()) and bool(cyc)
-    ctx.section("lifecycle", "PASS" if ok else "FAIL", "LIFECYCLE %s (%d cycles, medians, s): create %s, cold boot %s, install %s, launch call %s, first app frame %s, shutdown %s, resume boot %s, first frame after resume %s, clone %s, clone boot %s, delete %s" % (
-        "PASS" if ok else "FAIL", len(cyc), med.get("create_s"), med.get("cold_boot_s"), med.get("install_s"), med.get("cold_launch_call_s"),
-        med.get("cold_first_frame_s"), med.get("shutdown_s"), med.get("resume_boot_s"), med.get("resume_first_frame_s"), med.get("clone_s"), med.get("clone_boot_s"), med.get("delete_s")))
+    names = (("create_s", "create"), ("clone_s", "clone of the seed" if not ctx.stock else "clone"), ("cold_boot_s", "cold boot"), ("install_s", "install"),
+             ("cold_launch_call_s", "launch call"), ("cold_first_frame_s", "first app frame"), ("shutdown_s", "shutdown"), ("resume_boot_s", "resume boot"),
+             ("resume_first_frame_s", "first frame after resume"), ("clone_boot_s", "clone boot"), ("delete_s", "delete"))
+    ctx.section("lifecycle", "PASS" if ok else "FAIL", "LIFECYCLE %s (%d cycles, medians, s; %s): %s" % (
+        "PASS" if ok else "FAIL", len(cyc), "fresh stock devices" if ctx.stock else "clones of the seed", ", ".join("%s %s" % (label, med[k]) for k, label in names if k in med)))
     leaks = {"qemu_rss": gates.leak_gate("QEMU RSS", xs, rss, a.leak_rss_mb, "MB/cycle"),
              "guest_used": gates.leak_gate("guest used memory", xs, used, a.leak_guest_mb, "MB/cycle")}
     data["leak"] = {"qemu_rss_mb": rss, "guest_used_mb": used}
@@ -81,7 +92,7 @@ def run_lifecycle(ctx):
             ctx.section("storm", "SKIP", "BOOT STORM SKIP: " + reason)
         else:
             t0 = time.time()
-            boot = core.grow(ctx, n, ["busy"] * n)
+            boot = core.grow(ctx, n, ["busy"] * n, parallel=True)
             usable = time.time() - t0
             data["storm"] = {"n": n, "boot_all_s": boot.get("all_usable_s"), "each_s": boot.get("each_usable_s"), "boot_and_launch_s": round(usable, 1)}
             ok = usable <= a.storm_bar_s

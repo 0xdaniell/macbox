@@ -6,7 +6,7 @@ import re
 import socket
 
 SCHEMA = 1
-KINDS = ("scale", "ab", "idle", "lifecycle", "build", "soak", "panel", "gates")
+KINDS = ("scale", "ab", "idle", "lifecycle", "build", "soak", "panel", "gates", "seed")
 SECTION_STATUS = ("PASS", "FAIL", "SKIP", "INFO")
 
 _PATH = re.compile(r"(?:^|[\s\"'=:(,])(/(?:srv|home|Users|var|tmp|private|etc|opt|mnt|root|usr|run|Volumes|proc|sys)/[^\s\"',)]*)")

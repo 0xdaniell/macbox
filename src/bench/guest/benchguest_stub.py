@@ -4,7 +4,9 @@ Faults ($BENCH_STUB_FAULT, comma separated): memfloor@N (guest free memory below
 simulators), crash@N (a new crash report at N booted), backwards@N (a frame shown out of order at N), slow@N
 (frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips),
 cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-idle-guard on the Mac), keepfail
-(sim-idle-guard keep fails).
+(sim-idle-guard keep fails), nosource (Simlock has no source device of the type), nosourceset (no Simlock set at all),
+slimfail (simslim fails), slimfew (simslim leaves too few services off), noicons (the widgets never settle: no chronod icons),
+noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators).
 The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
 $BENCHGUEST_STATE too, so the bench's real file code runs against them."""
 import json
@@ -80,6 +82,35 @@ def stub_run(argv, timeout=120, env=None):
         return _stub_run(argv)
 
 
+SRC_UDIDS = ["5A5A5A5A-0000-4000-8000-00000000000%d" % i for i in range(4)]
+SRC_TYPES = ["com.apple.CoreSimulator.SimDeviceType.iPhone-17", "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+             "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro", "dev.macbox.CoreSimulator.SimDeviceType.iPhone-17-Pro-1x"]
+
+
+def make_source_set(path):
+    """Simlock's source set as the bench sees it: one folder per device with a device.plist (an iPhone 17 Pro shut down and one booted, its 1x type, another type)."""
+    import plistlib
+    os.makedirs(path, exist_ok=True)
+    for i, (typ, state) in enumerate(zip(SRC_TYPES, (1, 1, 3, 1))):
+        d = os.path.join(path, SRC_UDIDS[i])
+        if os.path.exists(d):
+            continue                       # made once: a run must find it exactly as it was
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "device.plist"), "wb") as f:
+            plistlib.dump({"UDID": SRC_UDIDS[i], "deviceType": typ, "runtime": "stub.runtime.iOS-26-5", "name": "src%d" % i, "state": state}, f)
+
+
+def _stub_source(argv, s):
+    """`xcrun simctl --set <Simlock's set> ...`: ONLY clone into another set is allowed; anything else is recorded as a violation."""
+    cmd = argv[4:]
+    if cmd[0] != "clone" or len(cmd) != 4 or cmd[1] not in SRC_UDIDS:
+        s.setdefault("source_violations", []).append(cmd)
+        return 1, "", "stub: Simlock's set may only be cloned from"
+    u = str(uuid.uuid4()).upper()
+    s["devs"][u] = {"name": cmd[2], "state": "Shutdown", "type": SRC_TYPES[SRC_UDIDS.index(cmd[1])], "apps": []}
+    return 0, u + "\n", ""
+
+
 def _stub_run(argv):
     _log(argv)
     s = load()
@@ -94,7 +125,30 @@ def _stub_run(argv):
         with open(os.path.join(_MOD.KEEP_DIR, argv[2]), "w") as f:
             f.write("%s\n" % argv[3])
         return 0, "", "", 0.01
-    if argv[:3] == ["xcrun", "simctl", "--set"]:
+    if argv[:3] == ["xcrun", "simctl", "--set"] and argv[3] == _MOD.SOURCE_SET:
+        rc, out, err = _stub_source(argv, s)
+    elif argv and argv[0] == _MOD.SIMSLIM:
+        # simslim --set <set> on <udid> --profile <file>: shuts the device down, rewrites its services, reboots it
+        u = argv[4]
+        if fault("slimfail") is not None:
+            rc, err = 1, "simslim: injected failure"
+        elif s["devs"].get(u, {}).get("state") != "Booted":
+            rc, err = 1, "simslim: device is not booted"
+        else:
+            import plistlib
+            os.makedirs(_MOD.overrides_dir(u), exist_ok=True)
+            n = 20 if fault("slimfew") is not None else 168
+            with open(os.path.join(_MOD.overrides_dir(u), "disabled.plist"), "wb") as f:
+                plistlib.dump({"com.apple.stub.service%d" % i: True for i in range(n)}, f)
+    elif argv and argv[0] == "plutil":
+        import plistlib
+        try:
+            with open(argv[2], "rb") as f:
+                d = plistlib.load(f)
+            out = "{\n" + "".join('  "%s" => %s\n' % (k, "true" if v is True else "false") for k, v in d.items()) + "}\n"
+        except (OSError, ValueError):
+            rc, err = 1, "plutil: no such file"
+    elif argv[:3] == ["xcrun", "simctl", "--set"]:
         cmd = argv[4:]
         verb = cmd[0]
         if verb == "list":
@@ -105,15 +159,27 @@ def _stub_run(argv):
                 out = json.dumps(RUNTIMES if cmd[1] == "runtimes" else TYPES)
         elif verb == "create":
             u = str(uuid.uuid4()).upper()
-            s["devs"][u] = {"name": cmd[1], "state": "Shutdown", "type": cmd[2]}
+            s["devs"][u] = {"name": cmd[1], "state": "Shutdown", "type": cmd[2], "apps": []}
             out = u + "\n"
         elif verb == "clone":
-            u = str(uuid.uuid4()).upper()
-            s["devs"][u] = {"name": cmd[2], "state": "Shutdown", "type": s["devs"][cmd[1]].get("type")}
-            out = u + "\n"
+            src = s["devs"][cmd[1]]
+            if src["state"] != "Shutdown":
+                rc, err = 1, "Unable to clone a device in state: %s" % src["state"]          # HYPOTHESIS about real simctl
+            else:
+                u = str(uuid.uuid4()).upper()
+                s["devs"][u] = {"name": cmd[2], "state": "Shutdown", "type": src.get("type"), "apps": list(src.get("apps", []))}
+                if os.path.isdir(os.path.join(argv[3], cmd[1], "data")):
+                    import shutil
+                    shutil.copytree(os.path.join(argv[3], cmd[1], "data"), os.path.join(argv[3], u, "data"))      # the clone has the seed's data
+                out = u + "\n"
         elif verb == "boot":
             time.sleep(0.05)
             s["devs"][cmd[1]]["state"] = "Booted"
+            if fault("noicons") is None:
+                os.makedirs(os.path.join(argv[3], cmd[1], "data", "Library", "chronod", "icons"), exist_ok=True)
+        elif verb == "install":
+            if fault("noinstall") is None:
+                s["devs"][cmd[1]].setdefault("apps", []).append("dev.macbox.glassbench")
         elif verb == "shutdown":
             for u in (list(s["devs"]) if cmd[1] == "all" else [cmd[1]]):
                 if u in s["devs"]:
@@ -122,8 +188,10 @@ def _stub_run(argv):
             if fault("cantdelete") is not None:
                 err, rc = "Unable to delete (injected)", 1
             else:
+                import shutil
                 for u in (list(s["devs"]) if cmd[1] == "all" else [cmd[1]]):
                     s["devs"].pop(u, None)
+                    shutil.rmtree(os.path.join(argv[3], u), ignore_errors=True)
         elif verb == "launch":
             s["mode"][cmd[1]] = "static" if "-static" in cmd else "busy"
         elif verb == "terminate":
@@ -138,6 +206,9 @@ def _stub_run(argv):
             with open(p, "wb") as f:
                 f.write(png.write_png(rows, 402, 874, 3))
         elif verb == "get_app_container":
+            if "dev.macbox.glassbench" not in s["devs"].get(cmd[1], {}).get("apps", []):
+                save(s)
+                return 1, "", "No such app", 0.01
             d = _p("container")
             os.makedirs(os.path.join(d, "Documents"), exist_ok=True)
             u = cmd[1]
@@ -260,6 +331,18 @@ def install(mod):
         with open(mod.IDLE_GUARD, "w") as f:
             f.write("#!/bin/sh\n")
         os.chmod(mod.IDLE_GUARD, 0o755)
+    mod.SOURCE_SET = _p("simlock-sources")
+    if fault("nosourceset") is None:
+        make_source_set(mod.SOURCE_SET)
+        if fault("nosource") is not None:
+            import shutil
+            for u in SRC_UDIDS[1:]:
+                shutil.rmtree(os.path.join(mod.SOURCE_SET, u))
+    mod.SIMSLIM = _p("bin/simslim")
+    os.makedirs(_p("bin"), exist_ok=True)
+    with open(mod.SIMSLIM, "w") as f:
+        f.write("#!/bin/sh\n")
+    os.chmod(mod.SIMSLIM, 0o755)
     mod.run = stub_run
     mod.ps_text = stub_ps
     mod.vmstat_text = stub_vmstat

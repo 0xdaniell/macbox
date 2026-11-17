@@ -108,14 +108,27 @@ class Dry(unittest.TestCase):
                 self.assertIn("guest_rss_mb", sim)
 
     def test_every_simctl_call_names_the_bench_set(self):
+        """Every simctl call names the bench's own set; the one exception is the clone OUT of Simlock's source set (a read of
+        the source, written into the bench's set), and nothing else may name Simlock's set."""
         for k in ("clean", "onebusy", "lifecycle", "agent"):
-            calls = simctl_calls(self.r[k]["state"])
+            state = self.r[k]["state"]
+            bench, src = os.path.join(state, "guest", "set"), os.path.join(state, "guest", "simlock-sources")
+            calls = simctl_calls(state)
             self.assertTrue(calls, k)
+            clones_from_source = 0
             for c in calls:
                 if c[2:4] == ["list", "devicetypes"] or c[2:4] == ["list", "runtimes"] or c[2:5] == ["list", "devices", "booted"]:
                     continue                                   # global, read only
                 self.assertEqual(c[2], "--set", (k, c))
-        
+                if c[3] == src:
+                    self.assertEqual((c[4], len(c), c[-1]), ("clone", 8, bench), (k, c))          # clone <source> <name> <bench set>, nothing else
+                    clones_from_source += 1
+                else:
+                    self.assertEqual(c[3], bench, (k, c))
+            self.assertEqual(clones_from_source, 1, k)           # ONE seed for the device type, whatever N is
+            with open(os.path.join(state, "guest", "state.json")) as f:
+                self.assertEqual(json.load(f).get("source_violations", []), [], k)
+
     def test_memory_floor_stops_the_sweep_and_keeps_the_data(self):
         r = self.r["memfloor"]
         d = r["doc"]
@@ -126,11 +139,12 @@ class Dry(unittest.TestCase):
         self.assertIn("host free memory", self.r["hostmem"]["doc"]["data"]["summary"]["stopped"])
 
     def test_a_sweep_that_ran_no_step_fails(self):
-        r = self.r["refuse"]
+        r = self.r["refuse"]                      # the guard refuses before the seed is even made: nothing ran
         self.assertEqual(r["doc"]["data"]["steps"], [])
         self.assertNotEqual(r["rc"], 0)
-        self.assertEqual(sections(r["doc"], "scale")[0]["status"], "FAIL")
-        self.assertIn("no step ran", sections(r["doc"], "scale")[0]["line"])
+        st = sections(r["doc"], "stopped")[0]
+        self.assertEqual(st["status"], "FAIL")
+        self.assertIn("guest available memory", st["line"])
         self.assertEqual(sims_booted(r["state"]), [])
 
     def test_steps_record_whether_the_guest_settled(self):
