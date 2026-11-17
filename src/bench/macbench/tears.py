@@ -24,7 +24,9 @@ def detect_tears(img):
     w, h = img.w, img.h
     s = w / 1206.0
     x0, x1 = int(1125 * s), max(int(1125 * s) + 1, int(1150 * s))
-    y0, y1 = int(400 * s), min(int(1700 * s), h - 1)
+    # The band starts below the navigation bar's glass, which ends at 420 px (3x): a gap that scrolls under the glass
+    # is cut there and looked like a short gap at a wrong distance (a "tear" in every third screenshot).
+    y0, y1 = int(440 * s), min(int(1700 * s), h - 1)
     rows = _row_means(img, x0, x1, y0, y1)
     gap = [min(c) > 225 for c in rows]            # the white background between cards
     margin = int(75 * s)

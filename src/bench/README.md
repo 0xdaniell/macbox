@@ -19,6 +19,14 @@ Requirements: Python 3.8+ on the host (standard library only; no Pillow, no nump
 Unit tests, no VM needed: `cd src/bench && python3 -m unittest discover -s tests -t .` (the pure parts and the run's safety)
 and `python3 -m unittest tests.test_dry tests.test_dry_state tests.test_dry_seed tests.test_dry_closed tests.test_dry_guards` (the dry runs with injected faults: the sweeps and their faults; what a run leaves and the idle guard, including a run killed mid-seed; the seed; the fail-closed gates; the host-disk, VM and abort guards; several minutes, run one module at a time on a busy host).
 
+**What has run on a real VM so far** (2026-11-17: macOS 26.7.1 guest, iPhone 17 Pro, iOS 26.5, an Arrow Lake iGPU):
+`tools`, `check`, `seed`, `cleanup` and `scale --mix all-busy` at 3x for N = 1, 2, 3. One, two and three animating
+simulators read 57.6, 39.5 and 23.2 distinct frames/s each (p95 24, 45, 75 ms; input proxy p50 283, 312, 356 ms),
+within the noise of a hand-made measurement of the same night (60, 37-41, 22-25). Everything else (`idle`,
+`lifecycle`, `soak`, `ab`, the `one-busy` and `agent` mixes, the 1x device type, N above 3) has only run against the
+stubs (`DRY=1` and the unit tests): expect to fix things the first time you run them. Only `scale` and
+`ab --metric input_p95` inject input events; the other scenarios' windows inject nothing and leave `responsive` unknown.
+
 ## What a run does, and what it never touches
 
 The bench has a **device set of its own** (`simctl --set`, a directory with a marker file, the same one for every run so
@@ -58,7 +66,8 @@ it finds) the run stops and says so. Two explicit ways out: `--scale-x 3` (the s
 which Simlock usually has a source for), or **`--stock-devices`**: fresh stock devices, created one at a time with the
 host-disk guard in front of each, for a device type Simlock has no source for or a scenario that needs a stock device.
 The result records `env.guest.device_source` (`stock devices` or clones of a seed) and `compare` warns when two results
-were made differently. Defaults of the Mac's paths: `~/.simlock04/devices/ios-sources` (`--source-set`),
+were made differently. Defaults of the Mac's paths: `~/.simlock/devices/ios-sources` (`--source-set` or `BENCH_SIMLOCK_SOURCES`: the
+`devices/ios-sources` folder of your Simlock's state directory, whatever that install calls it),
 `~/go/bin/simslim` (`--simslim`), the only `.json` in `~/.config/simslim/` (`--slim-profile`; several or none: the run stops and asks for the flag), `~/.local/bin/sim-idle-guard`.
 
 ### Safety, in every run that boots simulators
@@ -124,7 +133,7 @@ started (explicit pids, never a bare `wait`), shuts down and deletes the bench's
 
 Common options: `--out DIR` (results, default `bench-results/`), `--secs` (window length, default 40),
 `--nominal-fps 60`, `--tag key=value` (recorded, for example `mesa=26.2.4` when Mesa is not a package),
-`--probe-method auto|openurl|appearance|cmd|none`, `--stock-devices`, `--rebuild-seed`, `--source-set`, `--simslim`, `--slim-profile`, `--seed-settle-max` (see above), `--disk-path`, `--disk-start-gib`, `--disk-boot-gib`, `--disk-abort-gib`, `--max-compressor-mb`, `--set-name` (the bench's device set, default `bench`), `--quiesce` (disables `mediaanalysisd` in each simulator, as
+`--probe-method auto|notify|appearance|openurl|cmd|none`, `--stock-devices`, `--rebuild-seed`, `--source-set`, `--simslim`, `--slim-profile`, `--seed-settle-max` (see above), `--disk-path`, `--disk-start-gib`, `--disk-boot-gib`, `--disk-abort-gib`, `--max-compressor-mb`, `--set-name` (the bench's device set, default `bench`), `--quiesce` (disables `mediaanalysisd` in each simulator, as
 some old harnesses did; recorded, off by default), `--no-observer-check`, `--no-golden`, `--shots N`.
 Every run prints one PASS/FAIL/SKIP/INFO line per section and exits 0, 1 (a section failed), 2 (the run could not
 go on), 20 (the cleanup could not delete everything) or, when a monitor aborted it, 7, 8, 9 or 10 (above). The JSON has the same lines under `sections`.
@@ -160,16 +169,22 @@ simulator's framebuffer surface at about 2 kHz and reads the counter from every 
 
 **Input latency proxy** (`input_p50_ms`, `input_p95_ms`, `input_max_ms`, `input_misses`, `input_call_p50_ms`).
 It is a proxy and says so. Without Simlock or agent-device, the guest injects an event with `simctl`: by default
-`simctl openurl glassbench://toggle`, which flips a 30 pt marker (white/black) in GlassBench `-probe`; the fallback is
-`simctl ui appearance dark|light`, which flips the same marker; `--probe-cmd` may run any command that flips it (a
-real tap through your own tool). The first N calibrates which method is answered (3 tries each) and the result
-records it. For each injection: *t0* = the wall clock just before the command is started in the guest; the answer
+`simctl spawn <udid> notifyutil -p dev.macbox.glassbench.toggle`, a Darwin notification that flips a 30 pt marker
+(white/black) in GlassBench `-probe` and puts nothing else on the screen; the fallback is `simctl ui appearance
+dark|light`, which flips the same marker but redraws the whole screen (about 0.5 s to answer, and a window that uses
+it lost a quarter of its distinct frames: 43 against 59 a second, one 3x simulator); `--probe-cmd` may run any command
+that flips it (a real tap through your own tool). The first N checks which method is answered (3 tries) and the
+result records it. `--probe-method openurl` (`simctl openurl glassbench://toggle`) is not tried by
+`auto`: iOS 26 answers it with an "Open in GlassBench?" alert nobody taps, which stays over the app, through a
+relaunch too, and costs a third of its frame rate (121 against 80-83 screen frames/s, one 3x simulator). For each injection: *t0* = the wall clock just before the command is started in the guest; the answer
 is the first new surface after t0 whose marker (luma above or below 127 at a fixed point) differs from the last
 surface before t0; latency = that surface's time - t0. A probe not answered in `--probe-timeout` (2 s) is a **miss
 and counts at the timeout** in p50/p95, never dropped. The number includes starting `simctl` (its own duration is
 `input_call_p50_ms`), CoreSimulator, the app's handling and one composite. It excludes the Device panel's stream, the
 viewer and a real finger's HID path. Read it as a trend over N and between builds, not as an absolute touch latency;
-the default `responsive` bar (150 ms) wants one calibration at N=1 on your hardware before you trust it. p95 over
+the default `responsive` bar (500 ms) sits about 200 ms above the proxy's floor measured here (the notification is
+answered 280 ms after `simctl spawn` is started, one 3x simulator alone; the command itself takes 355 ms): check that
+floor at N=1 on your hardware before you trust the bar. p95 over
 few probes is coarse: a 40 s window gives 16 probes per simulator.
 
 **Guest CPU and memory of a simulator** (`guest_cpu_pct`, `guest_rss_mb`). From `ps` snapshots in the guest at the
@@ -227,7 +242,7 @@ simulator metrics (`fps p50 p95 p99 max over2x stall input_p50 input_p95 cpu rss
 that has a value for each condition meets it, with its gates ok and the system stable. The maximum is the largest N
 such that it and **every smaller measured N** passed: the first failure ends it (a pass above a failure is luck, not
 sustainability). A condition no simulator has a value for makes the target unknown (`null`), never a pass.
-Defaults: `smooth60: fps>=55, p95<=25`, `smooth30: fps>=30, p95<=50`, `responsive: input_p95<=150, stall<0.3`.
+Defaults: `smooth60: fps>=55, p95<=25`, `smooth30: fps>=30, p95<=50`, `responsive: input_p95<=500, stall<0.3`.
 
 **Standing cost per simulator** (`summary.standing_cost`): the least-squares slope of each system number over N, with
 its intercept and R². Use `--mix idle` for the pure cost of a booted simulator.
@@ -240,7 +255,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | gate | PASS when |
 |---|---|
 | `strip` | no frame out of order, no counter jump, the counter advanced no more than the app's own tick log says, under 1% of samples unreadable. Lost ticks are the fps metric, not a gate failure. |
-| `tears` | no screenshot of the scrolling GlassBench shows a torn band (card spacing and gap heights, the old `tears.py` rule, standard library PNG decoding); SKIP when no screenshot shows cards |
+| `tears` | no screenshot of the scrolling GlassBench shows a torn band (card spacing and gap heights, the old `tears.py` rule, standard library PNG decoding); SKIP when no screenshot shows cards. A torn picture fails the step and the run, and that N does not count as sustained, but the sweep goes on to the next N (the stack tears now and then: 3 flagged of 50 judged pictures in one night here) |
 | `pixels` | GlassBench `-static` screenshots agree with each other and match the stored golden (`baselines/golden.json`, key: macOS, runtime, device type, size), judged once on a freshly launched static app before the first window (a window with input probes flips the marker, so later static screens are not judged); SKIP with the pictures agreeing when no golden is stored: `macbox bench golden` records it |
 | `coherent_census` / `coherent_process` | in the census reports written since the run began: `overwrite_risk` and `sync_errors` stayed 0, and `late_copies_in_busy`, `late_beside_unplanned`, `plan_left_planned` did not rise. Deltas, not absolute counts. Reports come once a minute, so a short step may have none: SKIP. |
 | `qemu_log` | no new `command buffer failed` line in QEMU's log (stamp waits are counted in the detail) |
@@ -250,7 +265,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
 | `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new crash report since setup, judged like `stability`'s). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
 | `leak_*` | `lifecycle`: QEMU RSS and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute |
-| `observer` | reading the strip does not move the surface frame rate by more than 4% (a second window of the first N without the strip read); otherwise the distinct-frame numbers are lower bounds |
+| `observer` | what looking costs: a second window of the first N reads nothing from the screen and injects nothing. PASS within 4%; beyond it INFO (never FAIL): the distinct-frame numbers are lower bounds. One lock of each picture cost between nothing and 31% of the screen frames in seven runs here (+2, -2.5, -5.6, -12.7, -20, -23, -31%; why it varies is not known); a second lock per picture halved them, so `simfps` reads strip and marker under one |
 
 ## A/B discipline
 

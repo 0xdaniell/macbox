@@ -99,7 +99,7 @@ def scale_chart(doc):
               "ms", hlines=[(25, "25 ms")]),
         panel("input proxy p95 (ms)", xs, [("each sim", [(st["n"], s["input_p95_ms"]) for st in steps for s in st["sims"] if s.get("input_p95_ms") is not None], "dots"),
               ("worst", [(st["n"], max([s["input_p95_ms"] for s in st["sims"] if s.get("input_p95_ms") is not None] or [None])) for st in steps], "line")],
-              "ms", hlines=[(150, "150 ms")]),
+              "ms", hlines=[(500, "500 ms")]),
         panel("QEMU CPU (cores) and GPU busy (%)", xs, [("QEMU cores", _sys(steps, "qemu_cpu_cores"), "line"),
               ("GPU busy %", [(x, None if y is None else y / 10.0) for x, y in _sys(steps, "gpu_busy_pct")], "line")],
               "cores | % / 10"),

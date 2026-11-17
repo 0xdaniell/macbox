@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,7 @@ def add_common(p):
     p.add_argument("--scale-x", dest="scale_x", type=int, choices=(1, 2, 3), default=1, help="device pixel scale: 1 = the macbox 1x type, 3 = the stock iPhone (default 1)")
     p.add_argument("--secs", type=float, default=40, help="length of a measurement window, seconds")
     p.add_argument("--nominal-fps", type=float, default=60.0)
-    p.add_argument("--probe-method", default="auto", choices=("auto", "openurl", "appearance", "cmd", "none"), help="input injection (auto: calibrated at the first N)")
+    p.add_argument("--probe-method", default="auto", choices=("auto", "notify", "appearance", "openurl", "cmd", "none"), help="input injection (auto: notify, else appearance, checked at the first N; openurl raises an alert on iOS 26 that stays over the app)")
     p.add_argument("--probe-cmd", default=None, help="for --probe-method cmd: a shell command with {udid}; it must flip GlassBench's marker (a tap)")
     p.add_argument("--probe-every", type=float, default=2.5, help="seconds between input probes of one simulator")
     p.add_argument("--probe-timeout", type=float, default=2.0, help="an input probe not answered in this time is a miss (counted at this value)")
@@ -47,7 +48,7 @@ def add_common(p):
     p.add_argument("--settle-bg", type=float, default=40, help="the guest counts as settled below this background CPU %% (of one core)")
     p.add_argument("--stock-devices", action="store_true", help="create FRESH STOCK devices instead of cloning the production seed: about 1.8 GB of guest disk each, not what an agent gets; for a device type Simlock has no source for or a scenario that needs a stock device (recorded in the result)")
     p.add_argument("--rebuild-seed", action="store_true", help="delete the bench's seed and make a new one (after `macbox bench tools` rebuilt the app, or when it cannot be reused)")
-    p.add_argument("--source-set", default=os.environ.get("BENCH_SIMLOCK_SOURCES"), help="Simlock's source device set in the guest, read only (default ~/.simlock04/devices/ios-sources)")
+    p.add_argument("--source-set", default=os.environ.get("BENCH_SIMLOCK_SOURCES"), help="Simlock's source device set in the guest, read only (default ~/.simlock/devices/ios-sources)")
     p.add_argument("--simslim", default=os.environ.get("BENCH_SIMSLIM"), help="simslim in the guest (default ~/go/bin/simslim)")
     p.add_argument("--slim-profile", default=os.environ.get("BENCH_SLIM_PROFILE"), help="simslim profile in the guest (default: the only .json in ~/.config/simslim)")
     p.add_argument("--seed-settle-max", type=float, default=600, help="the seed must settle within this many seconds or it is deleted and the run fails")
@@ -383,7 +384,9 @@ def check(a):
         line(hp.mem_avail_gb() is not None, "host available memory readable")
     ssh = os.environ.get("BENCH_SSH") or os.environ.get("MACBOX_SSH_HOST") or "macbox"
     try:
-        out = subprocess.run(["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", ssh, "cd ~/.macbox/bench && xcrun python3 guest/benchguest.py info"],
+        src = os.environ.get("BENCH_SIMLOCK_SOURCES")
+        out = subprocess.run(["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", ssh, "cd ~/.macbox/bench && %sxcrun python3 guest/benchguest.py info" % (
+                              "BENCH_SIMLOCK_SOURCES=%s " % shlex.quote(src) if src else "")],
                              capture_output=True, text=True, timeout=60).stdout
         d = json.loads(out.strip().splitlines()[-1])
         line(True, "guest answers: macOS %s, %s" % (d.get("macos"), d.get("xcode")))

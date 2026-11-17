@@ -344,7 +344,7 @@ def window(ctx, secs, mix, no_strip=False):
     t_go = time.time() + ctx.offset + lead
     ctx.run.need(secs + lead + 60, "a %d s window" % secs)
     args = ["measure", "--udids", udids, "--roles", roles, "--mix", mix, "--secs", secs, "--start-at", "%.3f" % t_go,
-            "--probe-method", ctx.probe_method or "openurl", "--probe-every", a.probe_every, "--agent-period", a.agent_period, "--probe-timeout", a.probe_timeout]
+            "--probe-method", ctx.probe_method or "none", "--probe-every", a.probe_every, "--agent-period", a.agent_period, "--probe-timeout", a.probe_timeout]
     if a.probe_cmd:
         args += ["--probe-cmd", a.probe_cmd]
     if no_strip:          # the unviewed screen: no strip, no marker, no injection, so simfps locks no surface

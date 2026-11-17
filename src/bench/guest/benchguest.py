@@ -38,7 +38,8 @@ KEEP_DIR = os.path.expanduser("~/.sim-keep")                          # sim-idle
 IDLE_GUARD = os.path.expanduser("~/.local/bin/sim-idle-guard")        # `keep <udid> <minutes>` (max 240)
 # Simlock's own source devices (read only: nothing is ever written to, booted, shut down or deleted in this set; the one
 # command that names it is simlock_clone()) and the Slim tooling the fleet uses on every clone.
-SOURCE_SET = os.environ.get("BENCH_SIMLOCK_SOURCES") or os.path.expanduser("~/.simlock04/devices/ios-sources")
+# Simlock's state directory is named by its install: give yours with --source-set or BENCH_SIMLOCK_SOURCES.
+SOURCE_SET = os.path.expanduser(os.environ.get("BENCH_SIMLOCK_SOURCES") or "~/.simlock/devices/ios-sources")
 SIMSLIM = os.environ.get("BENCH_SIMSLIM") or os.path.expanduser("~/go/bin/simslim")
 SLIM_PROFILE = os.environ.get("BENCH_SLIM_PROFILE")                   # else the one profile in SLIM_DIR
 SLIM_DIR = os.path.expanduser("~/.config/simslim")
@@ -365,6 +366,8 @@ def list_ips():
 # --- injection -------------------------------------------------------------------------------------
 def inject(method, udid, state, cmd_tpl=None):
     """One input event; returns the command's rc. state: a per-simulator dict for alternating methods."""
+    if method == "notify":
+        return simctl("spawn", udid, "notifyutil", "-p", "dev.macbox.glassbench.toggle", timeout=20)[0]
     if method == "openurl":
         return simctl("openurl", udid, "glassbench://toggle", timeout=20)[0]
     if method == "appearance":
@@ -569,7 +572,8 @@ def find_source(type_id, src_set):
     try:
         names = sorted(n for n in os.listdir(src_set) if UUID.match(n))
     except OSError:
-        return None, "Simlock's source device set was not found at the configured path (Simlock is optional)"
+        return None, ("Simlock's source device set was not found at the configured path (Simlock is optional): give the "
+                      "devices/ios-sources folder of its state directory with --source-set or BENCH_SIMLOCK_SOURCES")
     found, types = [], set()
     for n in names:
         try:
@@ -1331,7 +1335,7 @@ def main(argv=None):
     add("prepare", cmd_prepare, O("--udids", required=True), O("--roles", required=True), O("--install", action="store_true"),
         O("--check-app", action="store_true"), O("--quiesce", action="store_true"))
     add("settle", cmd_settle, O("--max-s", type=float, default=120), O("--bg-pct", type=float, default=40), O("--step", type=float, default=3), O("--consecutive", type=int, default=2))
-    add("calibrate", cmd_calibrate, O("--udid", required=True), O("--methods", default="openurl,appearance"), O("--probe-cmd"), O("--time-scale", type=float, default=1.0))
+    add("calibrate", cmd_calibrate, O("--udid", required=True), O("--methods", default="notify,appearance"), O("--probe-cmd"), O("--time-scale", type=float, default=1.0))
     add("measure", cmd_measure, O("--udids", required=True), O("--roles", required=True), O("--mix", default="all-busy"),
         O("--secs", type=float, default=40), O("--start-at", type=float, default=0), O("--probe-method", default="openurl"),
         O("--probe-every", type=float, default=2.5), O("--probe-cmd"), O("--agent-period", type=float, default=12),

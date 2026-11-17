@@ -142,6 +142,15 @@ class Tears(unittest.TestCase):
         r = tears.detect_tears(helpers.card_image(603, tear_at=700))
         self.assertTrue(r["tear"], r)
 
+    def test_a_gap_sliding_under_the_navigation_bar_is_not_a_tear(self):
+        # the bar's glass ends at 420 px (3x): a gap half under it showed as a short gap at a wrong distance
+        for scrolled in (190, 200, 216, 230, 245):
+            r = tears.detect_tears(helpers.card_image(603, scrolled=scrolled, bar=True))
+            self.assertTrue(r["applicable"], scrolled)
+            self.assertFalse(r["tear"], (scrolled, r))
+        r = tears.detect_tears(helpers.card_image(603, scrolled=216, bar=True, tear_at=700))
+        self.assertTrue(r["tear"])
+
     def test_no_cards_is_not_applicable(self):
         r = tears.detect_tears(helpers.card_image(603, with_cards=False))
         self.assertFalse(r["applicable"])

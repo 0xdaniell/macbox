@@ -10,17 +10,30 @@ from .transport import GuestError
 STEP_GATES = ("counter", "strip", "kernel_gpu", "coherent_census", "coherent_process", "qemu_log", "gpu_hang", "tears", "pixels", "memory")
 
 
+# A torn screenshot fails the step and the run (exit code, the gate's line), but the sweep goes on: the pictures of the
+# next N are not made worse by it, and a sweep that ends at the first torn picture measures nothing above it.
+SWEEP_GOES_ON = ("tears",)
+
+
 def calibrate(ctx, sim):
     """Pick the input injection that is answered (or 'none'): 3 tries of each method on one simulator."""
     a = ctx.a
     if a.probe_method != "auto":
         ctx.probe_method = a.probe_method
         return {"chosen": a.probe_method, "calibrated": False}
-    methods = "openurl,appearance"
-    r = ctx.guest.call(["calibrate", "--udid", sim["udid"], "--methods", methods, "--time-scale", 0.3 if ctx.host.dry else 1.0] + (["--probe-cmd", a.probe_cmd] if a.probe_cmd else []), 200)
-    chosen = next((m for m in methods.split(",") if r["methods"].get(m, {}).get("answered", 0) >= 2), "none")
+    # notify first: a Darwin notification puts nothing on the screen but the marker's flip. appearance redraws the whole
+    # screen (0.5 s to answer, a quarter of the distinct frames lost in a window that uses it): the fallback only.
+    # Never openurl: iOS 26 answers `simctl openurl` with an "Open in GlassBench?" alert that nobody taps. It stays over
+    # the app, through a relaunch too, and its glass cost a third of the frame rate (121 -> 80-83 screen frames/s).
+    seen, chosen = {}, "none"
+    for m in ("notify", "appearance"):
+        r = ctx.guest.call(["calibrate", "--udid", sim["udid"], "--methods", m, "--time-scale", 0.3 if ctx.host.dry else 1.0] + (["--probe-cmd", a.probe_cmd] if a.probe_cmd else []), 200)
+        seen.update(r["methods"])
+        if r["methods"].get(m, {}).get("answered", 0) >= 2:
+            chosen = m
+            break
     ctx.probe_method = chosen
-    return {"chosen": chosen, "calibrated": True, "methods": r["methods"]}
+    return {"chosen": chosen, "calibrated": True, "methods": seen}
 
 
 def golden_phase(ctx, record=False):
@@ -84,8 +97,8 @@ def run_scale(ctx):
             _est(ctx, data["steps"])
             _finish(ctx, None, partial=True)
             first = False
-            if not step["gates_ok"]:
-                bad = [k for k, v in step["gates"].items() if v["status"] == "FAIL"]
+            bad = [k for k, v in step["gates"].items() if v["status"] == "FAIL"]
+            if [k for k in bad if k not in SWEEP_GOES_ON]:
                 stopped, kind = "gate failed at N=%d: %s" % (n, ", ".join(bad)), "gate"
                 break
             if not step["stable"]:
@@ -131,7 +144,8 @@ def _est(ctx, steps):
 
 def observer_check(ctx, step, mix):
     """Decision: if reading the strip moves the surface frame rate by more than the noise (4%), every distinct-frame
-    number in this result carries that observer cost. A second window of the same N reads no strip."""
+    number in this result carries that observer cost. A second window of the same N reads nothing from the screen
+    and injects nothing."""
     g, s0, s1, t_go = core.window(ctx, ctx.a.secs, mix, no_strip=True)
     with_strip = [s["surface_fps"] for s in step["sims"] if s.get("role") in ("busy", "agent") and s.get("surface_fps")]
     without = [s["simfps"]["fps"] for s in g["sims"] if s["role"] in ("busy", "agent") and s.get("simfps")]
@@ -201,9 +215,14 @@ def _sections(ctx, data, stopped):
         ctx.section("input", "INFO", "INPUT PROXY method %s %s" % (cal["chosen"], "(calibrated: %s)" % {k: "%d/%d" % (v["answered"], v["n"]) for k, v in cal.get("methods", {}).items()} if cal.get("calibrated") else "(given)"))
     ob = data.get("observer")
     if ob:
-        ctx.section("observer", "PASS" if ob["ok"] else "FAIL", "OBSERVER %s: surface fps %s with the strip read, %s without (%s): %s" % (
-            "PASS" if ob["ok"] else "FAIL", ob["surface_fps_with_strip"], ob["surface_fps_without_strip"],
-            "n/a" if ob["delta"] is None else "%+.1f%%" % (ob["delta"] * 100), "within the noise" if ob["ok"] else "reading the strip changes the system: distinct-fps numbers are lower bounds"))
+        # a cost of looking is a property of the measurement, not a failure of the system: INFO, never FAIL. A window
+        # whose counter did not answer (delta None) is the failure.
+        status = "FAIL" if ob["delta"] is None else "PASS" if ob["ok"] else "INFO"
+        ctx.section("observer", status, "OBSERVER %s: surface fps %s measured (strip and marker read, events injected), %s on an unviewed screen (%s): %s" % (
+            status, ob["surface_fps_with_strip"], ob["surface_fps_without_strip"],
+            "n/a" if ob["delta"] is None else "%+.1f%%" % (ob["delta"] * 100),
+            "the unviewed window's counter did not answer" if ob["delta"] is None else "within the noise" if ob["ok"]
+            else "looking at the screen costs frames (a lock of every picture, the injected events): the distinct-fps numbers are lower bounds"))
     sc = sm.get("standing_cost") or {}
     if sc:
         parts = ["%s %+.2f/sim" % (k, v["per_sim"]) for k, v in sc.items() if k in ("qemu_cpu_cores", "gpu_busy_pct", "guest_mem_used_mb", "guest_sims_cpu_pct", "guest_sims_rss_mb")]

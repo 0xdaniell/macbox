@@ -16,7 +16,9 @@ OPS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a
 DEFAULT_TARGETS = [
     "smooth60: fps>=55, p95<=25",
     "smooth30: fps>=30, p95<=50",
-    "responsive: input_p95<=150, stall<0.3",
+    # the proxy's floor is the injecting command itself: `simctl spawn notifyutil` answered in 280 ms (p50, one 3x
+    # simulator alone, the command took 355 ms). 500 ms leaves about 200 ms for the simulator to be late.
+    "responsive: input_p95<=500, stall<0.3",
 ]
 _COND = re.compile(r"^\s*([a-z0-9_]+)\s*(>=|<=|>|<)\s*([0-9.]+)\s*$")
 

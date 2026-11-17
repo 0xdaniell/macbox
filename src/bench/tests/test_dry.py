@@ -74,6 +74,8 @@ CASES = {
     "slow": (["scale", "--n", "1,2,3,4"] + FAST, "slow@3"),
     "hang": (["scale", "--n", "1,2,3"] + FAST, "hang_simfps"),
     "nomarker": (["scale", "--n", "1,2"] + FAST, "nomarker"),
+    "nonotify": (["scale", "--n", "1"] + FAST, "nonotify"),
+    "tear": (["scale", "--n", "1,2,3"] + FAST, "tear@2"),
     "onebusy": (["scale", "--n", "1,2,3", "--mix", "one-busy"] + FAST, ""),
     "agent": (["scale", "--n", "1,2", "--mix", "agent", "--agent-period", "2"] + FAST, ""),
     "idlemix": (["scale", "--n", "1,2", "--mix", "idle"] + FAST, ""),
@@ -216,6 +218,29 @@ class Dry(unittest.TestCase):
         d = self.r["hang"]["doc"]
         self.assertTrue(d["data"]["steps"][0]["stability"]["observer_errors"])
         self.assertEqual(sims_booted(self.r["hang"]["state"]), [])
+
+    def test_a_torn_screenshot_fails_the_run_but_the_sweep_goes_on(self):
+        r = self.r["tear"]
+        d = r["doc"]
+        self.assertEqual([st["n"] for st in d["data"]["steps"]], [1, 2, 3])          # N=3 is still measured
+        self.assertEqual([st["gates"]["tears"]["status"] for st in d["data"]["steps"]], ["PASS", "FAIL", "PASS"])
+        self.assertNotEqual(r["rc"], 0)
+        self.assertIsNone(d["data"]["summary"]["stopped"])
+        for name, m in d["data"]["summary"]["max_n"].items():                        # the torn step is not sustained
+            self.assertNotIn(m["max_n"], (2, 3), name)
+        self.assertEqual(sims_booted(r["state"]), [])
+
+    def test_auto_never_sends_openurl(self):
+        # iOS 26 answers `simctl openurl` with an alert that stays over the app and slows it for the whole run
+        r = self.r["clean"]
+        self.assertEqual(list(r["doc"]["data"]["calibration"]["methods"]), ["notify"])        # answered: appearance is not tried
+        self.assertEqual(r["doc"]["data"]["calibration"]["chosen"], "notify")
+        self.assertFalse([c for c in simctl_calls(r["state"]) if "openurl" in c])
+
+    def test_appearance_is_the_fallback_when_the_notification_is_not_answered(self):
+        cal = self.r["nonotify"]["doc"]["data"]["calibration"]
+        self.assertEqual(cal["chosen"], "appearance")
+        self.assertEqual(cal["methods"]["notify"]["answered"], 0)
 
     def test_unanswered_input_probe_is_not_dropped(self):
         d = self.r["nomarker"]["doc"]

@@ -7,7 +7,8 @@
 // -probe (an input marker, see below).
 //
 // The input marker (-probe): a 30 pt square at (21, 160) pt that flips between white and black on every
-// tap and on every glassbench://toggle URL (`simctl openurl`). The bench times from the injection to the
+// tap, on the Darwin notification dev.macbox.glassbench.toggle (`simctl spawn <udid> notifyutil -p ...`) and
+// on every glassbench://toggle URL (`simctl openurl`). The bench times from the injection to the
 // first surface whose marker flipped (bench/README.md, "input proxy").
 //
 // The frame strip: every display-link tick draws a 16-bit counter as blocks at the top left, so a
@@ -279,7 +280,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if noGlass { tabs.tabBar.isHidden = true }
         let w = BenchWindow(windowScene: ws); w.rootViewController = tabs; w.makeKeyAndVisible()
         if showStrip { let f = FrameStrip(); w.addSubview(f); frameStrip = f }
-        if showProbe { let m = ProbeMarker(); w.addSubview(m); probeMarker = m }
+        if showProbe {
+            let m = ProbeMarker(); w.addSubview(m); probeMarker = m
+            // `simctl spawn <udid> notifyutil -p dev.macbox.glassbench.toggle`: an event from outside that puts
+            // nothing on the screen but the marker's flip (an openurl raises an alert, an appearance switch redraws all).
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, { _, _, _, _, _ in
+                DispatchQueue.main.async { probeMarker?.toggle() }
+            }, "dev.macbox.glassbench.toggle" as CFString, nil, .deliverImmediately)
+        }
         window = w
     }
 

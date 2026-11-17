@@ -2,18 +2,19 @@
 from macbench import png
 
 
-def card_image(width=603, tear_at=None, with_cards=True):
+def card_image(width=603, tear_at=None, with_cards=True, scrolled=0, bar=False):
     """A screenshot like GlassBench's at scale s = width/1206: white background, cards 336*s apart whose right edge
     strip (x 1125..1150 * s) is a vertical gradient (1 level per row at 3x), gaps 58*s tall. tear_at=y shifts every
-    row below y by 40*s rows (a band from another frame)."""
+    row below y by 40*s rows (a band from another frame). scrolled=N moves the content up by N*s rows; bar=True
+    draws the navigation bar's glass over everything above 420*s (grey, as the real one tints what is under it)."""
     s = width / 1206.0
     h = int(2622 * s)
     pitch, gap = 336 * s, 58 * s
     rows = []
     for y in range(h):
-        yy = y
+        yy = y + int(scrolled * s)
         if tear_at is not None and y >= tear_at:
-            yy = y + int(40 * s)
+            yy += int(40 * s)
         k = (yy - int(300 * s)) % pitch if yy >= 300 * s else None
         row = bytearray([255] * (width * 3))
         if with_cards and k is not None and gap / 2 <= k < pitch - gap / 2 and 300 * s < yy < 2300 * s:
@@ -23,6 +24,8 @@ def card_image(width=603, tear_at=None, with_cards=True):
                     row[x * 3:x * 3 + 3] = bytes([level, level // 2, 200 - level // 2])
                 else:
                     row[x * 3:x * 3 + 3] = bytes([60, 60, 200])
+        if bar and y < 420 * s:
+            row = bytearray([200] * (width * 3))
         rows.append(bytes(row))
     return png.Image(width, h, 3, rows)
 

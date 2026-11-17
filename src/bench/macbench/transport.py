@@ -38,8 +38,10 @@ class SshGuest:
         self.fault_ssh_timeout = None      # DRY: fail the k-th call (tests)
 
     def argv(self, args):
-        remote = "cd %s && BENCH_SET=\"$HOME/.macbox/bench/sets/%s\" xcrun python3 guest/benchguest.py %s" % (
-            GUEST_DIR, self.set_path, " ".join(shlex.quote(str(a)) for a in args))
+        src = os.environ.get("BENCH_SIMLOCK_SOURCES")          # the guest expands a leading ~ itself
+        remote = "cd %s && BENCH_SET=\"$HOME/.macbox/bench/sets/%s\" %sxcrun python3 guest/benchguest.py %s" % (
+            GUEST_DIR, self.set_path, "BENCH_SIMLOCK_SOURCES=%s " % shlex.quote(src) if src else "",
+            " ".join(shlex.quote(str(a)) for a in args))
         return ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", self.ssh_host, remote]
 
     def parse(self, what, rc, out, err):

@@ -2,7 +2,7 @@
 directory ($BENCHGUEST_STATE) between calls, so `benchguest.py` runs its real control flow with no macOS.
 Faults ($BENCH_STUB_FAULT, comma separated): memfloor@N (guest free memory below any floor from N booted
 simulators), crash@N (a new crash report at N booted), backwards@N (a frame shown out of order at N), slow@N
-(frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips),
+(frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips), nonotify (it does not flip on the notification), tear@N (the screenshots at N booted are torn),
 cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-idle-guard on the Mac), keepfail
 (sim-idle-guard keep fails), nosource (Simlock has no source device of the type), nosourceset (no Simlock set at all),
 slimfail (simslim fails), slowslim (simslim takes 2 minutes: a run killed while the seed is half made), slimfew (simslim leaves too few services off), noicons (no chronod icons folder: recorded as icons=false, never a failure),
@@ -205,8 +205,8 @@ def _stub_run(argv):
             s["mode"][cmd[1]] = "static" if "-static" in cmd else "busy"
         elif verb == "terminate":
             s["mode"].pop(cmd[1], None)
-        elif verb in ("openurl", "ui"):
-            if fault("nomarker") is None:
+        elif verb in ("openurl", "ui") or (verb == "spawn" and "notifyutil" in cmd):
+            if fault("nomarker") is None and not (verb == "spawn" and fault("nonotify") is not None):
                 s["inj"].append([time.time(), cmd[1]])
         elif verb == "io":
             p = cmd[-1]
@@ -380,6 +380,15 @@ def install(mod):
     mod.ps_text = stub_ps
     mod.vmstat_text = stub_vmstat
     mod.sysctl = lambda name: {"kern.memorystatus_vm_pressure_level": "1", "hw.ncpu": "8", "hw.memsize": str(16 << 30)}.get(name, "")
+    tr = fault("tear")
+    if tr is not None:          # every screenshot taken while exactly `tr` simulators are booted is torn
+        from macbench import tears as _tears
+
+        def torn(img):
+            return {"tear": len(booted(load())) == tr, "applicable": True, "odd": [1] if len(booted(load())) == tr else [],
+                    "steps": [], "gaps": [58, 58]}
+        _tears.detect_tears = torn
+
     def spawn(udid, secs, label, strip, start_at, raw, probe=True):
         _log(["simfps", udid, "strip" if strip else "nostrip", "probe" if probe else "noprobe"])
         return StubSimfps(udid, secs, strip, start_at, raw)
