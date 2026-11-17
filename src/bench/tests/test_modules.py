@@ -108,6 +108,18 @@ class GuestParsers(unittest.TestCase):
         finally:
             bg.ps_text = saved
 
+    def test_foreign_counts_a_bench_device_that_is_not_booted_as_the_benchs_own(self):
+        text = PS + "  600     1  20000   0:01.00 /Library/x/launchd_sim /bench/set/CCCC-3/data\n"       # CCCC-3 is booting: state Shutdown
+        devs = [{"udid": "CCCC-3", "state": "Shutdown"}, {"udid": "AAAA-1", "state": "Booted"}, {"udid": "BBBB-2", "state": "Booted"}]
+        saved = bg.ps_text
+        bg.ps_text = lambda: text
+        try:
+            self.assertEqual(bg.count_launchd_sim(), 2)
+            self.assertEqual(bg.foreign_count(devs), 0)
+            self.assertEqual(bg.foreign_count(devs[1:2]), 1)                # the same process with no device of the set behind it: foreign
+        finally:
+            bg.ps_text = saved
+
     def test_qemu_env_value_reads_the_process_environ(self):
         with tempfile.TemporaryDirectory() as root:
             os.makedirs(os.path.join(root, "proc", "77"))

@@ -65,7 +65,7 @@ def run_scale(ctx):
             if first:
                 if mix in ("all-busy", "one-busy"):
                     data["calibration"] = calibrate(ctx, ctx.sims[0])
-                    core.settle(ctx, "before the input calibration", max_s=60, bg=90)
+                    core.settle(ctx, "before the input calibration", bg=90)
                 if a.golden_phase:
                     ctx.pixel_gate = golden_phase(ctx)
                     core.grow(ctx, n, roles)

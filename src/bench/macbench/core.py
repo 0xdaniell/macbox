@@ -113,7 +113,7 @@ def monitor_check(ctx):
     """While the run waits (a boot, a settle, a window): the host's disk, QEMU and, outside measurement windows (their
     own calls would be observer load), the Mac. Any breach aborts the run NOW: the monitor thread writes the partial
     result, runs the one cleanup and exits (8 disk, 9 VM, 7 someone else's simulator, 10 guest memory)."""
-    a, st = ctx.a, {"dead": 0, "last_guest": 0.0}
+    a, st = ctx.a, {"dead": 0, "foreign": 0, "last_guest": 0.0}
 
     def check():
         why = disk_reason(ctx, a.disk_abort_gib, "go on", "")
@@ -133,7 +133,11 @@ def monitor_check(ctx):
         st["dead"] = 0
         m = ctx.guest.quick(["memcheck"], 60)
         if m.get("foreign_booted", 0) > 0 and not a.allow_foreign:
-            return "a simulator that is not the bench's is booted (someone needs the Mac): yielding", 7
+            st["foreign"] += 1              # the bench's own boots and shutdowns race the count: two polls in a row
+            if st["foreign"] >= 2:
+                return "a simulator that is not the bench's is booted (someone needs the Mac): yielding", 7
+        else:
+            st["foreign"] = 0
         why = guest_memory_reason(ctx, m["mem"])
         if why:
             return why, 10
@@ -229,7 +233,7 @@ def make_seed(ctx):
     ctx.runtime = r.get("runtime") or ctx.runtime
     g = ctx.doc["env"]["guest"]
     g["runtime_used"] = r.get("runtime_version") or g.get("runtime_used")
-    g["seed"] = {k: r.get(k) for k in ("source_type", "reused", "made_s", "services_off", "settle_s", "settle_bg_pct")}
+    g["seed"] = {k: r.get(k) for k in ("source_type", "reused", "made_s", "services_off", "settle_s", "settle_bg_pct", "icons")}
     ctx.section("seed", "INFO", "SEED %s: %s services off (Slim), %s" % (
         "reused" if r.get("reused") else "made from a Simlock source device in %s s (simslim %s s, settled in %s s at %s%% background)" % (
             r.get("made_s"), r.get("slimmed_s"), r.get("settle_s"), r.get("settle_bg_pct")),

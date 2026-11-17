@@ -657,12 +657,12 @@ def cmd_seed(a):
         if here[u].get("state") != "Shutdown":
             simctl("shutdown", u, timeout=120)
         n = slim_count(u)
-        why = ("only %d services off" % n) if n < MIN_SLIM_SERVICES else (None if os.path.isdir(icons_path(u)) else "its widgets never settled (no chronod icons)")
+        why = ("only %d services off" % n) if n < MIN_SLIM_SERVICES else None
         if not why and cur.get("app_stamp") != stamp:
             why = "the bench app was rebuilt since (GlassBench differs)"
         if why:
             raise GuestError("the existing seed cannot be reused (%s): rebuild it with --rebuild-seed" % why)
-        return out_json(dict(cur, seed=u, reused=True, services_off=n, source_type=tid.rsplit(".", 1)[-1]))
+        return out_json(dict(cur, seed=u, reused=True, services_off=n, source_type=tid.rsplit(".", 1)[-1], icons=os.path.isdir(icons_path(u))))
     src, pl = find_source(tid, os.path.expanduser(a.source_set or SOURCE_SET))
     if src is None:
         return out_json({"seed": None, "no_source": pl, "udid": None})
@@ -697,10 +697,11 @@ def cmd_seed(a):
             raise GuestError("installing the bench app in the seed failed")
         if simctl("get_app_container", u, BUNDLE_ID, timeout=30)[0] != 0:
             raise GuestError("the bench app is not installed in the seed after install")
-        st = settle_wait(a.settle_max, a.bg_pct, a.step, a.consecutive, icons_of=u)
+        st = settle_wait(a.settle_max, a.bg_pct, a.step, a.consecutive)
+        icons = os.path.isdir(icons_path(u))          # recorded, never a gate: whether a widget-trimmed seed grows this folder is unverified
         if not st["settled"]:
-            raise GuestError("the seed did not settle in %g s (background %.0f%% of a core, widgets' icons %s; top: %s)" % (
-                a.settle_max, st["bg_pct"], "present" if st["icons"] else "missing", top_text(st["top"])))
+            raise GuestError("the seed did not settle in %g s (background %.0f%% of a core; top: %s)" % (
+                a.settle_max, st["bg_pct"], top_text(st["top"])))
         if simctl("shutdown", u, timeout=120)[0] != 0:
             raise GuestError("the seed did not shut down")
     except BaseException:
@@ -711,7 +712,7 @@ def cmd_seed(a):
         raise
     drop_keep(u)
     res = {"seed": u, "udid": u, "name": name, "type": tid, "runtime": runtime, "runtime_version": runtime_version(runtime), "complete": True, "app_stamp": stamp,
-           "source_type": tid.rsplit(".", 1)[-1], "reused": False, "made_s": round(now() - t0, 1), "services_off": n, "settle_s": st["waited_s"],
+           "source_type": tid.rsplit(".", 1)[-1], "reused": False, "made_s": round(now() - t0, 1), "services_off": n, "settle_s": st["waited_s"], "icons": icons,
            "settle_bg_pct": st["bg_pct"], "slimmed_s": round(secs, 1)}
     man = load_manifest()
     man["seeds"][tid] = {k: res[k] for k in ("udid", "name", "type", "runtime", "runtime_version", "complete", "app_stamp", "made_s", "services_off")}
@@ -884,19 +885,18 @@ def bg_cpu_pct(secs=3.0):
     return bg_sample(secs)[0]
 
 
-def settle_wait(max_s, bg_pct, step, consecutive=2, icons_of=None):
-    """Waits until the background CPU is under bg_pct for `consecutive` samples IN A ROW (and, for a seed, the widgets'
-    icons exist). {"settled", "bg_pct" (last sample), "waited_s", "series", "top" (at the last sample), "icons"}. Reaching
-    max_s is settled False: the caller fails the run, it never measures on top of this."""
-    t0, series, top, icons = now(), [], [], True
+def settle_wait(max_s, bg_pct, step, consecutive=2):
+    """Waits until the background CPU is under bg_pct for `consecutive` samples IN A ROW. {"settled", "bg_pct" (last
+    sample), "waited_s", "series", "top" (at the last sample)}. Reaching max_s is settled False: the caller fails the run,
+    it never measures on top of this."""
+    t0, series, top = now(), [], []
     while True:
         v, top = bg_sample(step)
         series.append(v)
-        icons = icons_of is None or os.path.isdir(icons_path(icons_of))
-        if len(series) >= consecutive and all(x < bg_pct for x in series[-consecutive:]) and icons:
-            return {"settled": True, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top, "icons": icons}
+        if len(series) >= consecutive and all(x < bg_pct for x in series[-consecutive:]):
+            return {"settled": True, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top}
         if now() - t0 > max_s:
-            return {"settled": False, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top, "icons": icons}
+            return {"settled": False, "bg_pct": v, "waited_s": round(now() - t0, 1), "series": series[-8:], "top": top}
 
 
 def cmd_settle(a):
@@ -960,10 +960,10 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     # CPU time of the helper's reaped children over the window is the observer's real cost
     reaped = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
     tot["observer_cpu_pct"] = round(max(tot["observer_cpu_pct"], 100 * reaped / max(t_end - t_start, 0.001)), 1)
-    st = {d["udid"]: d.get("state") for d in devices()}
-    own_up = len([1 for v in st.values() if v == "Booted"])
-    foreign = {"before": max(0, len([p for p in ps0 if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])]) - len(udids)),
-               "after": max(0, len([p for p in ps1 if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])]) - own_up)}
+    dev_list = devices()
+    st = {d["udid"]: d.get("state") for d in dev_list}
+    foreign = {"before": foreign_count([dict(d, state="Booted") if d["udid"] in udids else d for d in dev_list], ps0),
+               "after": foreign_count(dev_list, ps1)}
     sims = []
     for i, u in enumerate(udids):
         sj, err = res.get(u, (None, None))
@@ -1135,9 +1135,9 @@ def cmd_cycle(a):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def leftovers():
+def leftovers(ignore_lock=False):
     """What an earlier run left in the bench's set: [text]. Empty = the set is clean (settled seeds, shut down, are not
-    leftovers: they are kept on purpose)."""
+    leftovers: they are kept on purpose). The one definition: `acquire` refuses on it and `teardown` verifies against it."""
     out, man, devs = [], load_manifest(), devices()
     complete = {s["udid"] for s in man["seeds"].values() if s.get("complete")}
     for d in devs:
@@ -1153,7 +1153,7 @@ def leftovers():
         if u not in here and (os.path.exists(overrides_dir(u)) or os.path.exists(os.path.join(KEEP_DIR, u))):
             out.append("overrides or keep file of the deleted device %s" % u)
     lock = os.path.join(SET, LOCK)
-    if os.path.exists(lock):
+    if os.path.exists(lock) and not ignore_lock:
         try:
             with open(lock) as f:
                 out.append("the run lock of an earlier run (%s)" % f.read().strip()[:80])
@@ -1178,22 +1178,23 @@ def cmd_acquire(a):
 
 
 def cmd_teardown(a):
-    """Shuts down every device of the bench's set and deletes every one that is not a seed (all of them with --seeds),
-    then removes what lives outside the device: its overrides folder and its ~/.sim-keep file. It looks again at the end
-    and reports what is still there in `failed`/`left`/`booted`; the run lock is released only when nothing is."""
+    """Shuts down every device of the bench's set and deletes every one that is not a COMPLETE seed (every seed with --seeds;
+    a seed that was never completed is a leftover like any other device), then removes what lives outside the device: its
+    overrides folder and its ~/.sim-keep file. It looks again at the end with the same definition of 'leftover' that
+    `acquire` uses and reports what is still there in `failed`/`left`/`booted`; the run lock goes only when nothing is."""
     failed = []
     man = load_manifest()
+    complete = {s["udid"] for s in man["seeds"].values() if s.get("complete")}
     simctl("shutdown", "all", timeout=300)          # a failure shows in the second look below
     for d in devices():
-        if is_seed(d) and not a.seeds:
+        if d["udid"] in complete and not a.seeds:
             continue
         rc, _, err, _ = simctl("delete", d["udid"], timeout=120)
         if rc != 0:
             failed.append("delete %s %s: %s" % (d["name"], d["udid"], (err or "failed").strip()[:100]))
     after = devices()
     present = {d["udid"] for d in after}
-    seeds_now = {d["udid"] for d in after if is_seed(d)}
-    for u in sorted(set(man["devices"]) | {s["udid"] for s in man["seeds"].values()} | {d["udid"] for d in after}):
+    for u in sorted(set(man["devices"]) | {s["udid"] for s in man["seeds"].values()} | present):
         e = drop_keep(u)
         if e:
             failed.append(e)
@@ -1203,26 +1204,39 @@ def cmd_teardown(a):
                 failed.append(e)
             else:
                 man["devices"].pop(u, None)
-    man["seeds"] = {t: s for t, s in man["seeds"].items() if s["udid"] in seeds_now}
+    man["seeds"] = {t: s for t, s in man["seeds"].items() if s["udid"] in present and s["udid"] in complete}
     save_manifest(man)
-    left = [d for d in after if not is_seed(d) or a.seeds]
-    booted = [d for d in after if d.get("state") == "Booted"]
     keep_left = [u for u in present | set(man["devices"]) if os.path.exists(os.path.join(KEEP_DIR, u))]
     if keep_left:
         failed.append("%d keep file(s) still in the idle guard's folder" % len(keep_left))
-    if not (failed or left or booted):
+    remaining = leftovers(ignore_lock=True)
+    failed += ["still there: %s" % x for x in remaining]
+    booted = [d for d in after if d.get("state") == "Booted"]
+    if not (failed or remaining or booted):
         try:
             os.remove(os.path.join(SET, LOCK))
         except FileNotFoundError:
             pass
         except OSError as e:
             failed.append("run lock: %s" % e)
-    out_json({"left": len(left), "booted": len(booted), "failed": failed, "seeds": len(seeds_now), "calls": [c[1:] for c in CALLS][-3:]})
+    out_json({"left": len(remaining), "booted": len(booted), "failed": failed, "seeds": len([d for d in after if is_seed(d)]), "calls": [c[1:] for c in CALLS][-3:]})
 
 
 def count_launchd_sim():
     """Simulators running on this Mac in any device set (one launchd_sim each): the pool's, a lease's, the bench's."""
     return len([p for p in parse_ps(ps_text()) if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])])
+
+
+def foreign_count(devs=None, procs=None):
+    """Simulators that are not the bench's: the `launchd_sim` processes minus the bench's own. A device of the bench's set
+    in ANY state counts as its own when the process's command line names its UDID (a device that is booting, shutting
+    down or being rebooted by simslim has a launchd_sim and is not Booted yet or any more); where the command line names
+    no device (HYPOTHESIS: it does carry the device's path), the number of Booted devices is the fallback."""
+    devs = devices() if devs is None else devs
+    udids = [d["udid"] for d in devs]
+    procs = [p for p in (parse_ps(ps_text()) if procs is None else procs) if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])]
+    named = len([p for p in procs if any(u in p["cmd"] for u in udids)])
+    return max(0, len(procs) - max(named, len([d for d in devs if d.get("state") == "Booted"])))
 
 
 def cmd_precheck(a):
@@ -1237,7 +1251,7 @@ def cmd_precheck(a):
             k = keep_or_fail(u, a.keep_min)
             kept[k["state"]] = kept.get(k["state"], 0) + 1
     out_json({"booted": len(booted), "booted_udids": booted, "missing": [u for u in expect if u not in booted],
-              "extra": [u for u in booted if u not in expect], "foreign_booted": max(0, count_launchd_sim() - len(booted)), "keep": kept})
+              "extra": [u for u in booted if u not in expect], "foreign_booted": foreign_count(), "keep": kept})
 
 
 def cmd_ips(a):
@@ -1247,7 +1261,7 @@ def cmd_ips(a):
 def cmd_memcheck(a):
     vm = mem_summary(parse_vm_stat(vmstat_text()))
     own = len([d for d in devices() if d.get("state") == "Booted"])
-    out_json({"mem": vm, "pressure": pressure_level(), "booted": own, "foreign_booted": max(0, count_launchd_sim() - own),
+    out_json({"mem": vm, "pressure": pressure_level(), "booted": own, "foreign_booted": foreign_count(),
               "ips": len(list_ips())})
 
 

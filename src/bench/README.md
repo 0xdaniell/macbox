@@ -17,7 +17,7 @@ DRY=1 macbox bench scale --n 1,2,3       # the whole control flow against stubs:
 
 Requirements: Python 3.8+ on the host (standard library only; no Pillow, no numpy), the VM running, `ssh` to it.
 Unit tests, no VM needed: `cd src/bench && python3 -m unittest discover -s tests -t .` (the pure parts and the run's safety)
-and `python3 -m unittest tests.test_dry` (the dry runs with injected faults, a couple of minutes).
+and `python3 -m unittest tests.test_dry tests.test_dry_state tests.test_dry_seed tests.test_dry_closed tests.test_dry_guards` (the dry runs with injected faults: the sweeps and their faults; what a run leaves and the idle guard, including a run killed mid-seed; the seed; the fail-closed gates; the host-disk, VM and abort guards; several minutes, run one module at a time on a busy host).
 
 ## What a run does, and what it never touches
 
@@ -44,7 +44,7 @@ stopped the VM) and keeps the Home Screen widgets, one of which retries a servic
    set is only ever cloned from, never written, booted, shut down or deleted, and its config is not read), registered with
    `sim-idle-guard`, one boot, `simslim --set <bench set> on <seed> --profile <profile>` (it reboots the device),
    a check that its `disabled.plist` has at least 100 services off (168 today), the bench app installed, a real settle
-   (the guest quiet for two samples in a row and the widgets' `chronod/icons` present, `--seed-settle-max` 600 s) and a
+   (the guest quiet for two samples in a row, `--seed-settle-max` 600 s; whether the widgets' `chronod/icons` folder exists is recorded as `icons`, not required) and a
    shutdown. A seed that fails any step is deleted again, never left to be reused.
 2. **Every bench simulator is `simctl clone <seed>`** (an APFS clone: no disk cost) with the seed's `disabled.plist` copied
    into its own `/private/var/tmp/com.apple.CoreSimulator.SimDevice.<udid>` folder (mode 0700) before its first boot, and

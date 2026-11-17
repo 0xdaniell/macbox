@@ -2,10 +2,14 @@
 Each case is a real `run` process (stub guest, fake host); nothing real is touched."""
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
-from tests.test_dry import FAST, run_case, sections, simctl_calls
+from tests.test_dry import FAST, RUN, run_case, sections, simctl_calls
 
 ONE = ["scale", "--n", "1,2"] + FAST
 
@@ -91,3 +95,46 @@ class IdleGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def devices_of(state):
+    with open(os.path.join(state, "guest", "state.json")) as f:
+        return json.load(f)["devs"]
+
+
+def kill_mid_seed(state):
+    """A run killed outright (no signal handler, no exit trap, the guest helper gone with it) while its seed is half made:
+    what an ssh drop or a SIGKILL leaves behind."""
+    d = tempfile.mkdtemp(prefix="dry-kill-")
+    env = dict(os.environ, DRY="1", BENCH_STUB_FAULT="slowslim", BENCH_DRY_KEEP=state, BENCH_DEADLINE_MARGIN="3")
+    p = subprocess.Popen([sys.executable, RUN] + ONE + ["--out", os.path.join(d, "out")], env=env, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    t0 = time.time()
+    try:
+        while time.time() - t0 < 60 and not any(c[0].endswith("simslim") for c in (calls(state) if os.path.exists(os.path.join(state, "guest", "calls.log")) else [])):
+            time.sleep(0.2)
+    finally:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+    return any(c[0].endswith("simslim") for c in calls(state))
+
+
+class HalfMadeSeed(unittest.TestCase):
+    def test_a_killed_seed_is_refused_then_cleanup_removes_it_and_the_next_run_works(self):
+        state = tempfile.mkdtemp(prefix="dry-half-")
+        self.assertTrue(kill_mid_seed(state), "the run never reached simslim")
+        left = devices_of(state)
+        self.assertEqual(len(left), 1)                                           # the half-made seed
+        self.assertEqual(files(state, "sim-keep"), list(left))
+        r = run_case(ONE, "", state=state)                                       # the next run refuses to start on it
+        self.assertNotEqual(r["rc"], 0)
+        self.assertIn("never completed", r["out"])
+        self.assertIn("macbox bench cleanup", r["out"])
+        c = run_case(["cleanup"], "", state=state)                               # a plain cleanup (no --seeds) removes it
+        self.assertEqual(c["rc"], 0, c["out"][-600:])
+        self.assertIn("CLEANUP PASS", c["out"])
+        self.assertEqual(devices_of(state), {})
+        self.assertEqual(files(state, "sim-keep"), [])
+        self.assertFalse(os.path.exists(os.path.join(state, "guest", "set", ".bench-run.lock")))
+        ok = run_case(ONE, "", state=state)
+        self.assertEqual(ok["rc"], 0, ok["out"][-600:])

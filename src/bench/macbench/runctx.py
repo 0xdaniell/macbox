@@ -91,6 +91,11 @@ class Run:
             except Exception as e:      # the partial result is best effort
                 self.log("partial result failed: %s" % e)
         self.cleanup()
+        if self.final:                  # the cleanup's verdict goes into the result of a run that ran out of time too
+            try:
+                self.final()
+            except Exception as e:
+                self.log("closing the result failed: %s" % e)
         os._exit(124)
 
     # --- monitors: what must stop the run while a long call is waiting

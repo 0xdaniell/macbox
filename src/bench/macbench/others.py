@@ -61,6 +61,10 @@ def run_lifecycle(ctx):
     mem0 = ctx.guest.call(["memcheck"], 60)["mem"]
     data = ctx.doc["data"] = {"cycles": cyc, "storm": None}
     for i in range(a.cycles):
+        why = core.guard(ctx, 1, "before lifecycle cycle %d" % (i + 1))
+        if why:
+            ctx.section("stopped", "FAIL", "STOPPED: %s" % why)
+            break
         r = ctx.guest.call(["cycle", "--keep-min", core.keep_minutes(ctx)] + (["--type", ctx.type_id, "--runtime", ctx.runtime] if ctx.stock else ["--seed", ctx.seed["seed"]]), 900)
         cyc.append(r["timings"])
         m = ctx.guest.call(["memcheck"], 60)

@@ -229,15 +229,19 @@ def execute(a, kind, body):
         try:
             body(ctx)
         finally:
-            core.run_gates(ctx)          # every scenario: Coherent, kernel GPU lines and crash reports since the run began
+            if not run.aborted:          # a monitor that ended the run owns the result: no one else writes into it
+                core.run_gates(ctx)      # every scenario: Coherent, kernel GPU lines and crash reports since the run began
     except core.Stop as e:
-        ctx.section("stopped", "FAIL", "STOPPED: %s" % e)
+        if not run.aborted:
+            ctx.section("stopped", "FAIL", "STOPPED: %s" % e)
         rc = 2
     except (GuestError, DeadlineError) as e:
-        ctx.section("error", "FAIL", "ERROR: %s: %s" % (type(e).__name__, e))
+        if not run.aborted:
+            ctx.section("error", "FAIL", "ERROR: %s: %s" % (type(e).__name__, e))
         rc = 2
     finally:
-        run.cleanup()
+        if not run.aborted:
+            run.cleanup()
         run.join_abort()                 # when a monitor aborted the run it writes the result and owns the exit code
         rc = max(rc, finalize(ctx))
     fails = [s for s in ctx.doc["sections"] if s["status"] == "FAIL"]

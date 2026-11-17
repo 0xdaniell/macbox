@@ -124,9 +124,24 @@ class Monitor(unittest.TestCase):
         c.guest.up = False
         self.assertIsNone(check())
 
-    def test_someone_elses_simulator_makes_the_run_yield_with_7(self):
-        self.assertEqual(monitor_result(Ctx(guest=FakeGuest(foreign=1)))[1], 7)
+    def test_someone_elses_simulator_makes_the_run_yield_with_7_when_two_polls_in_a_row_see_it(self):
+        c = Ctx(guest=FakeGuest(foreign=1))
+        c.a.watch_guest_every = 0.0
+        check = core.monitor_check(c)
+        self.assertIsNone(check())                  # the bench's own boots and shutdowns race the count: one sighting is not a verdict
+        self.assertEqual(check()[1], 7)
         self.assertIsNone(monitor_result(Ctx(guest=FakeGuest(foreign=1), allow_foreign=True)))
+
+    def test_a_sighting_that_goes_away_resets_the_count(self):
+        c = Ctx(guest=FakeGuest(foreign=1))
+        c.a.watch_guest_every = 0.0
+        check = core.monitor_check(c)
+        self.assertIsNone(check())
+        c.guest.foreign = 0
+        self.assertIsNone(check())
+        c.guest.foreign = 1
+        self.assertIsNone(check())
+        self.assertEqual(check()[1], 7)
 
     def test_swap_growth_and_the_compressor_end_the_run_with_10(self):
         self.assertEqual(monitor_result(Ctx(guest=FakeGuest(mem={"swapouts": 9, "compressed_mb": 1})))[1], 10)
@@ -139,6 +154,31 @@ class Monitor(unittest.TestCase):
         self.assertEqual(c.guest.calls, [])         # no observer load: the guest was not asked
         c.host.disk = 5
         self.assertEqual(monitor_result(c)[1], 8)   # but the host-side checks go on
+
+
+class LifecycleGuard(unittest.TestCase):
+    def test_every_lifecycle_cycle_boots_behind_the_guard(self):
+        from macbench import others
+        stopped, cycles, seen = [], [], []
+        c = Ctx(guest=FakeGuest())
+        c.a = cli.parser().parse_args(["lifecycle", "--cycles", "3", "--storm", "0"])
+        c.sims, c.seed, c.type_id, c.runtime, c.stock = [], {"seed": "S"}, "t", "r", False
+        c.marks, c.doc = {}, {"data": {}, "gates": {}, "sections": []}
+        c.coh = type("Coh", (), {"mark": lambda self: 0, "check": lambda self, m: {}})()
+        c.host.snap = lambda: {"mem": {}}
+        c.section = lambda name, status, line, extra=None: stopped.append((name, status, line))
+        c.save = lambda: None
+        orig = (core.setup_guest, core.capture_env, core.guard, core.keep_minutes)
+        core.setup_guest, core.capture_env, core.keep_minutes = (lambda ctx: {}), (lambda ctx, info: None), (lambda ctx: 30)
+        core.guard = lambda ctx, k, label: (seen.append(label), "disk is low" if len(seen) == 2 else None)[1]
+        c.guest.call = lambda args, timeout=60, counted=True: (cycles.append(args[0]) or {"timings": {"clone_s": 1.0}, "mem": {"used_mb": 1, "compressed_mb": 1}})
+        try:
+            others.run_lifecycle(c)
+        finally:
+            core.setup_guest, core.capture_env, core.guard, core.keep_minutes = orig
+        self.assertEqual(seen[:2], ["before lifecycle cycle 1", "before lifecycle cycle 2"])
+        self.assertEqual(cycles.count("cycle"), 1)         # the second was refused
+        self.assertIn(("stopped", "FAIL", "STOPPED: disk is low"), stopped)
 
 
 class QemuIdentity(unittest.TestCase):

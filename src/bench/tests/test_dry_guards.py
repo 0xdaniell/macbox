@@ -16,7 +16,7 @@ def results():
     if not _R:
         cases = {"diskstart": (SWEEP, "diskstart"), "disklow": (SWEEP, "disklow@2"), "diskabort": (SWEEP, "diskabort@2"),
                  "diskunreadable": (SWEEP, "diskunreadable"), "qemugone": (SWEEP, "qemugone@2"),
-                 "stockdisk": (["scale", "--n", "2", "--stock-devices"] + FAST[:], "disklow@2"), "clean": (SWEEP, "")}
+                 "transition": (SWEEP, "transition@1"), "stockdisk": (["scale", "--n", "2", "--stock-devices"] + FAST[:], "disklow@2"), "clean": (SWEEP, "")}
         with concurrent.futures.ThreadPoolExecutor(8) as ex:
             futs = {k: ex.submit(run_case, a, f) for k, (a, f) in cases.items()}
             _R.update({k: f.result() for k, f in futs.items()})
@@ -65,6 +65,27 @@ class HostDisk(unittest.TestCase):
         self.assertEqual(r["rc"], 9, r["out"][-800:])
         self.assertIn("QEMU", sections(r["doc"], "abort")[0]["line"])
         self.assertEqual(sims_booted(r["state"]), [])
+
+    def test_a_bench_device_in_transition_is_not_a_foreign_simulator(self):
+        r = results()["transition"]                          # a launchd_sim that names a bench-set device in any state is the bench's own
+        self.assertEqual(r["rc"], 0, r["out"][-800:])
+        self.assertEqual(sections(r["doc"], "abort") + sections(r["doc"], "foreign"), [])
+        self.assertEqual([s["n"] for s in r["doc"]["data"]["steps"]], [1, 2, 3])
+        for s in r["doc"]["data"]["steps"]:
+            self.assertEqual(s["stability"]["foreign_booted"], 0)
+
+    def test_an_abort_is_not_a_race_with_the_main_thread(self):
+        """The monitor thread writes the result while the main thread, whose calls it killed, unwinds: the result must always be
+        whole, the cleanup verified and the exit code the monitor's, every time."""
+        cases = [(SWEEP, "diskabort@2", 8), (SWEEP, "qemugone@2", 9)] * 6
+        with concurrent.futures.ThreadPoolExecutor(8) as ex:
+            rs = list(ex.map(lambda c: (run_case(c[0], c[1]), c[2]), cases))
+        for r, code in rs:
+            self.assertEqual(r["rc"], code, r["out"][-600:])
+            self.assertIsNotNone(r["doc"], r["out"][-600:])
+            self.assertEqual(sections(r["doc"], "cleanup")[0]["status"], "PASS")
+            self.assertEqual([s["name"] for s in r["doc"]["sections"]].count("abort"), 1)
+            self.assertEqual([s["name"] for s in r["doc"]["sections"] if s["name"] in ("stopped", "error")], [])
 
     def test_a_clean_run_is_not_aborted(self):
         r = results()["clean"]

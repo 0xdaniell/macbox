@@ -5,10 +5,10 @@ simulators), crash@N (a new crash report at N booted), backwards@N (a frame show
 (frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips),
 cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-idle-guard on the Mac), keepfail
 (sim-idle-guard keep fails), nosource (Simlock has no source device of the type), nosourceset (no Simlock set at all),
-slimfail (simslim fails), slimfew (simslim leaves too few services off), noicons (the widgets never settle: no chronod icons),
+slimfail (simslim fails), slowslim (simslim takes 2 minutes: a run killed while the seed is half made), slimfew (simslim leaves too few services off), noicons (no chronod icons folder: recorded as icons=false, never a failure),
 noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators),
 lostsim@N (the Mac's idle guard shuts the newest simulator down once N are booted), counterfail@N (the frame counter
-of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted), swapgrow@N (the guest's swap-outs
+of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted), transition@N (a bench device that is not Booted still has its launchd_sim: it must not read as foreign), swapgrow@N (the guest's swap-outs
 grow from N booted), compressor@N (the compressor holds 3 GB from N booted).
 The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
 $BENCHGUEST_STATE too, so the bench's real file code runs against them."""
@@ -133,6 +133,8 @@ def _stub_run(argv):
     elif argv and argv[0] == _MOD.SIMSLIM:
         # simslim --set <set> on <udid> --profile <file>: shuts the device down, rewrites its services, reboots it
         u = argv[4]
+        if fault("slowslim") is not None:
+            time.sleep(120)                          # a run that is killed while its seed is half made
         if fault("slimfail") is not None:
             rc, err = 1, "simslim: injected failure"
         elif s["devs"].get(u, {}).get("state") != "Booted":
@@ -255,6 +257,12 @@ def stub_ps():
     us = fault("unsettled")
     if us is not None and n >= us:                  # the Maps widget's retry loop: a process that never quiets down
         lines.append("%5d     1  40000 %s /usr/libexec/diagnosticd" % (900, _cpu(now - T0, 1.7)))
+    tr = fault("transition")
+    if tr is not None and n >= tr:                  # a bench device (the seed) that is shut down, its launchd_sim still alive: not foreign
+        for u, d in sorted(s["devs"].items()):
+            if d["state"] != "Booted":
+                lines.append("%5d     1  20000 %s launchd_sim /stub/set/%s/data" % (960, _cpu(now - T0, 0.003), u))
+                break
     fo = fault("foreign")
     if fo is not None and n >= fo:                  # someone else's simulator on the Mac, in another device set
         lines.append("%5d     1  20000 %s launchd_sim /stub/other-set/FOREIGN/data" % (950, _cpu(now - T0, 0.01)))

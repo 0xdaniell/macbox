@@ -95,7 +95,7 @@ JOBS = {
     "nosourceset": job_fail("nosourceset"),
     "slimfail": job_fail_then_ok("slimfail"),
     "slimfew": job_fail_then_ok("slimfew"),
-    "noicons": job_fail_then_ok("noicons", ONE + ["--seed-settle-max", "2"]),
+    "noicons": lambda: (lambda st: {"state": st, "r": run_case(ONE, "noicons", state=st)})(new_state()),
     "noinstall": job_fail_then_ok("noinstall"),
     "stale": job_stale,
     "seedcmd": job_seedcmd,
@@ -211,8 +211,10 @@ class SeedFailures(unittest.TestCase):
     def test_a_seed_that_is_not_slim_enough_fails(self):
         self.failing("slimfew", "not Slim after simslim: 20 services off")
 
-    def test_a_seed_whose_widgets_never_settle_fails(self):
-        self.failing("noicons", "the seed did not settle")
+    def test_a_seed_without_the_widgets_icons_folder_is_recorded_not_refused(self):
+        r = parallel(JOBS)["noicons"]["r"]                 # the folder is not in the verified recipe: an unknown, never a gate
+        self.assertEqual(r["rc"], 0, r["out"][-500:])
+        self.assertIs(r["doc"]["env"]["guest"]["seed"]["icons"], False)
 
     def test_the_app_must_be_in_the_seed(self):
         self.failing("noinstall", "not installed in the seed")
