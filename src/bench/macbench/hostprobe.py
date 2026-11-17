@@ -155,8 +155,9 @@ def mem_snapshot(pid, root=""):
     s["qemu_rss_kb"] = int(m.group(1)) if m else None
     sw = re.search(r"VmSwap:\s+(\d+)", st)
     s["qemu_swap_kb"] = int(sw.group(1)) if sw else None
-    # what QEMU holds, wherever the host keeps it: RSS alone rises when the host brings swapped pages back, which is
-    # not a leak (a VM with 8 GB in swap gained 480 MB of RSS in one create/boot/delete cycle)
+    # what QEMU holds, wherever the host keeps it: RSS alone also rises when the host brings swapped pages back, which
+    # is not a leak (a VM with 8 GB in swap gained 480 MB of RSS in one create/boot/delete cycle and then stayed flat;
+    # swap-in is the likely cause, it was not counted in that run)
     s["qemu_mem_kb"] = None if not m else int(m.group(1)) + (int(sw.group(1)) if sw else 0)
     return s
 

@@ -57,6 +57,10 @@ stopped the VM) and keeps the Home Screen widgets, one of which retries a servic
    a check that its `disabled.plist` has at least 100 services off (168 today), the bench app installed, a real settle
    (the guest quiet for two samples in a row, `--seed-settle-max` 600 s; whether the widgets' `chronod/icons` folder exists is recorded as `icons`, not required) and a
    shutdown. A seed that fails any step is deleted again, never left to be reused.
+One difference from a Simlock lease remains: Simlock deletes a clone's LaunchServices database before its first boot and
+the bench does not, so a bench clone's first boot (5.6 s here) is not a lease's (17-22 s here); everything after the
+boot has settled is the same.
+
 2. **Every bench simulator is `simctl clone <seed>`** (an APFS clone: no disk cost) with the seed's `disabled.plist` copied
    into its own `/private/var/tmp/com.apple.CoreSimulator.SimDevice.<udid>` folder (mode 0700) before its first boot, and
    checked there; the app is already in it.
@@ -181,9 +185,12 @@ result records it. `--probe-method openurl` (`simctl openurl glassbench://toggle
 `auto`: iOS 26 answers it with an "Open in GlassBench?" alert nobody taps, which stays over the app, through a
 relaunch too, and costs a third of its frame rate (121 against 80-83 screen frames/s, one 3x simulator). For each injection: *t0* = the wall clock just before the command is started in the guest; the answer
 is the first new surface after t0 whose marker (luma above or below 127 at a fixed point) differs from the last
-surface before t0; latency = that surface's time - t0. On a still screen `simfps` looks at each surface again 30, 150
-and 600 ms after it appeared (a picture read the moment it appears can still show the frame before it, and nothing
-follows to correct that); probes answered only by such a second look are counted in `input_second_looks`. A probe not answered in `--probe-timeout` (2 s) is a **miss
+surface before t0; latency = that surface's time - t0. A picture read the moment it appears can still show the frame
+before it (14-15 of 15 single changes on a still screen here). On a still screen nothing follows to correct that, so
+there `simfps` looks at each surface again 30, 150 and 600 ms after it appeared; probes answered only by such a second
+look are counted in `input_second_looks`, and their latency is up to 30 ms long. On a moving screen there is no second
+look (it would be a second lock of most pictures); if the first look is a picture behind there too (not measured), the
+proxy carries one picture's interval, which grows with N (about 10, 21 and 33 ms at 1, 2 and 3 animating simulators). A probe not answered in `--probe-timeout` (2 s) is a **miss
 and counts at the timeout** in p50/p95, never dropped. The number includes starting `simctl` (its own duration is
 `input_call_p50_ms`), CoreSimulator, the app's handling and one composite. It excludes the Device panel's stream, the
 viewer and a real finger's HID path. Read it as a trend over N and between builds, not as an absolute touch latency;
@@ -269,7 +276,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `counter` | `simfps` answered with a result for every simulator of the window and every animating simulator's surfaces gave a readable frame counter (a counter that answers nothing or an error fails the window, it is not a missing metric) |
 | `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
 | `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new crash report since setup, judged like `stability`'s). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
-| `leak_*` | `lifecycle`: QEMU's memory (RSS + swap: RSS alone rises when the host brings swapped pages back) and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute. FAIL needs a steady growth (at least 4 samples, R2 >= 0.8); a slope above the bar without that is SKIP |
+| `leak_*` | `lifecycle`: QEMU's memory (RSS + swap: RSS alone also rises when the host brings swapped pages back) and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute. FAIL needs a steady growth (at least 4 samples, R2 >= 0.8); a slope above the bar without that is SKIP |
 | `observer` | what looking costs: a second window of the first N reads nothing from the screen and injects nothing. PASS within 4%; beyond it INFO (never FAIL): the distinct-frame numbers are lower bounds. One lock of each picture cost between nothing and 31% of the screen frames in seven runs here (+2, -2.5, -5.6, -12.7, -20, -23, -31%; why it varies is not known); a second lock per picture halved them, so `simfps` reads strip and marker under one |
 
 ## A/B discipline

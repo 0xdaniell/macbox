@@ -113,8 +113,8 @@ let probe: (Double, Double)? = env["SIMFPS_PROBE"].flatMap { s -> (Double, Doubl
 var raw: [(UInt64, Int, Int)] = []  // (time, counter or -1, probe luma or -1) of every new surface
 /// One look at a BGRA surface under ONE lock: GlassBench's counter (18 blocks of 20 pt from (21, 120) pt, at the
 /// surface's scale; -1 when unreadable or not asked for) and the luma (0-255) at the probe point (-1 without one).
-/// A lock of a surface the simulator just drew makes it wait for the pixels: two locks per surface halved the
-/// simulator's frame rate (55 against 102 screen frames/s, one 3x simulator), one lock costs a few percent.
+/// Locks are not free for the simulator: two per surface halved its frame rate (55 against 102 screen frames/s, one
+/// 3x simulator); one cost between nothing and 31% over seven runs (why it varies is not known).
 func readSurface(_ s: IOSurface, strip: Bool, probe: (Double, Double)?) -> (Int, Int) {
     guard strip || probe != nil else { return (-1, -1) }
     let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
@@ -157,8 +157,9 @@ let poller = Thread {
     // The first line of SIMFPS_STAMPS is the screen as it stands at the start (a static screen makes no new surface).
     // A picture read at the moment it appears can still show the frame before it. On a moving screen the next
     // picture corrects that; on a still one nothing follows, and a flipped marker was never seen (a "missed" probe).
-    // So the same surface is looked at again 30, 150 and 600 ms after it appeared; a marker that changed meanwhile
-    // is a line with counter -3 (a second look, not a new picture).
+    // So a reader that does not read the strip (a still screen) looks at the same surface again 30, 150 and 600 ms
+    // after it appeared; a marker that changed meanwhile is a line with counter -3 (a second look, not a new picture).
+    // Never with --strip: at 30 pictures a second the first second look would be a second lock of most pictures.
     let lookAt: [UInt64] = [30_000_000, 150_000_000, 600_000_000]
     var lastNew = start, looks = 0, lastLuma = -1
     if rawPath != nil { let r = readSurface(surf0, strip: readStrip, probe: probe); raw.append((start, r.0, r.1)); lastLuma = r.1 }
@@ -173,7 +174,7 @@ let poller = Thread {
             if readStrip { strip.append((t, counter)) }
             if rawPath != nil { raw.append((t, counter, luma)) }
             lastNew = t; looks = 0; lastLuma = luma
-        } else if rawPath != nil, let p = probe, looks < lookAt.count, t - lastNew >= lookAt[looks] {
+        } else if rawPath != nil, !readStrip, let p = probe, looks < lookAt.count, t - lastNew >= lookAt[looks] {
             looks += 1
             let l = readSurface(lastSurf, strip: false, probe: p).1
             if l >= 0 && (l > 127) != (lastLuma > 127) { raw.append((t, -3, l)); lastLuma = l }
