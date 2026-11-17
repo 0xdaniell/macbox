@@ -716,7 +716,7 @@ Day to day:
   macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=auto|on|off)
   macbox video-kexts          reims-util's video kexts into OpenCore (for MACBOX_VIDEO=on)
   macbox backup <name>
-  macbox bench scale|idle|lifecycle|soak|build|panel|ab|golden|compare|chart|report|tools|check
+  macbox bench scale|idle|lifecycle|soak|build|panel|ab|golden|seed|cleanup|compare|chart|report|tools|check
                               the scaling, regression and A/B suite (src/bench/README.md)
 EOF
 }
