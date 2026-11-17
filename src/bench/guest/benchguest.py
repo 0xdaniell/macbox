@@ -62,10 +62,13 @@ def run(argv, timeout=120, env=None):
         return 127, "", str(e), time.time() - t0
 
 
-def spawn_simfps(udid, secs, label, strip, start_at, raw_path):
-    """Starts simfps; returns an object whose .wait(timeout) -> (json dict or None, error or None)."""
-    env = dict(os.environ, SIMFPS_SET=SET, SIMFPS_START_AT="%.3f" % start_at, SIMFPS_STAMPS=raw_path,
-               SIMFPS_PROBE=PROBE_POINT)
+def spawn_simfps(udid, secs, label, strip, start_at, raw_path, probe=True):
+    """Starts simfps; returns an object whose .wait(timeout) -> (json dict or None, error or None).
+    strip and probe are what it reads from every surface; with neither it locks no surface (an unviewed screen)."""
+    env = dict(os.environ, SIMFPS_SET=SET, SIMFPS_START_AT="%.3f" % start_at, SIMFPS_STAMPS=raw_path)
+    env.pop("SIMFPS_PROBE", None)
+    if probe:
+        env["SIMFPS_PROBE"] = PROBE_POINT
     argv = [os.path.join(HERE, "..", "simfps"), udid, str(secs), label] + (["--strip"] if strip else [])
     p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
 
@@ -909,7 +912,8 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     if mix != "idle":
         for i, u in enumerate(udids):
             raws[u] = os.path.join(tmp, "raw-%d.txt" % i)
-            handles[u] = spawn_simfps(u, secs, "bench-%d" % i, roles[i] != "static" and not no_strip, t_go, raws[u])
+            handles[u] = spawn_simfps(u, secs, "bench-%d" % i, roles[i] != "static" and not no_strip, t_go, raws[u],
+                                      probe_method != "none" and not no_strip)
     ips0, ps0, vm0, lvl0 = list_ips(), None, None, pressure_level()
     d = t_go - now()
     if d > 0:

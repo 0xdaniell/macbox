@@ -110,36 +110,35 @@ let probe: (Double, Double)? = env["SIMFPS_PROBE"].flatMap { s -> (Double, Doubl
     return p.count == 2 ? (p[0], p[1]) : nil
 }
 var raw: [(UInt64, Int, Int)] = []  // (time, counter or -1, probe luma or -1) of every new surface
-/// The luma (0-255) at a point given in points of a 402 pt wide screen, or -1.
-func readLuma(_ s: IOSurface, _ pt: (Double, Double)) -> Int {
+/// One look at a BGRA surface under ONE lock: GlassBench's counter (18 blocks of 20 pt from (21, 120) pt, at the
+/// surface's scale; -1 when unreadable or not asked for) and the luma (0-255) at the probe point (-1 without one).
+/// A lock of a surface the simulator just drew makes it wait for the pixels: two locks per surface halved the
+/// simulator's frame rate (55 against 102 screen frames/s, one 3x simulator), one lock costs a few percent.
+func readSurface(_ s: IOSurface, strip: Bool, probe: (Double, Double)?) -> (Int, Int) {
+    guard strip || probe != nil else { return (-1, -1) }
     let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
     let scale = Double(w) / 402.0
-    guard IOSurfaceLock(s, .readOnly, nil) == kIOReturnSuccess else { return -1 }
-    defer { IOSurfaceUnlock(s, .readOnly, nil) }
-    let x = Int(pt.0 * scale), y = Int(pt.1 * scale)
-    guard x < w, y < h else { return -1 }
-    let p = IOSurfaceGetBaseAddress(s).assumingMemoryBound(to: UInt8.self) + y * bpr + x * 4
-    return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3
-}
-/// GlassBench's counter from a BGRA surface: 18 blocks of 20 pt from (21, 120) pt, at the surface's scale.
-func readCounter(_ s: IOSurface) -> Int {
-    let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
-    let scale = Double(w) / 402.0
-    guard IOSurfaceLock(s, .readOnly, nil) == kIOReturnSuccess else { return -1 }
+    guard IOSurfaceLock(s, .readOnly, nil) == kIOReturnSuccess else { return (-1, -1) }
     defer { IOSurfaceUnlock(s, .readOnly, nil) }
     let base = IOSurfaceGetBaseAddress(s).assumingMemoryBound(to: UInt8.self)
-    func luma(_ i: Int) -> Int {
-        let x = Int((21 + 20 * Double(i) + 10) * scale), y = Int(130 * scale)
-        guard x < w, y < h else { return 0 }
+    func lumaAt(_ px: Double, _ py: Double) -> Int? {
+        let x = Int(px * scale), y = Int(py * scale)
+        guard x < w, y < h else { return nil }
         let p = base + y * bpr + x * 4
         return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3
     }
-    let white = luma(0), black = luma(1)
-    guard white - black > 100 else { return -1 }
-    let mid = (white + black) / 2
-    var n = 0
-    for b in 0..<16 where luma(b + 2) > mid { n |= 1 << b }
-    return n
+    var counter = -1
+    if strip {
+        func block(_ i: Int) -> Int { lumaAt(21 + 20 * Double(i) + 10, 130) ?? 0 }
+        let white = block(0), black = block(1)
+        if white - black > 100 {
+            let mid = (white + black) / 2
+            var n = 0
+            for b in 0..<16 where block(b + 2) > mid { n |= 1 << b }
+            counter = n
+        }
+    }
+    return (counter, probe.flatMap { lumaAt($0.0, $0.1) } ?? -1)
 }
 stamps.reserveCapacity(Int(secs * 200))
 var polls = 0
@@ -155,7 +154,7 @@ let poller = Thread {
     var lastSeed = IOSurfaceGetSeed(surf0)
     var lastSurf = surf0
     // The first line of SIMFPS_STAMPS is the screen as it stands at the start (a static screen makes no new surface).
-    if rawPath != nil { raw.append((start, readStrip ? readCounter(surf0) : -1, probe.map { readLuma(surf0, $0) } ?? -1)) }
+    if rawPath != nil { let r = readSurface(surf0, strip: readStrip, probe: probe); raw.append((start, r.0, r.1)) }
     while true {
         let t = nowNs()
         if t >= end { break }
@@ -163,9 +162,9 @@ let poller = Thread {
         let seed = IOSurfaceGetSeed(s)
         if s !== lastSurf || seed != lastSeed {
             stamps.append(t); lastSeed = seed; lastSurf = s
-            let counter = readStrip ? readCounter(s) : -1
+            let (counter, luma) = readSurface(s, strip: readStrip, probe: rawPath != nil ? probe : nil)
             if readStrip { strip.append((t, counter)) }
-            if rawPath != nil { raw.append((t, counter, probe.map { readLuma(s, $0) } ?? -1)) }
+            if rawPath != nil { raw.append((t, counter, luma)) }
         }
         polls += 1
         usleep(500)

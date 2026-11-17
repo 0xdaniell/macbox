@@ -67,6 +67,7 @@ CASES = {
     "hostmem": (["scale", "--n", "1,2,3,4,5"] + FAST, "hostmem@3"),
     "crash": (["scale", "--n", "1,2,3,4"] + FAST, "crash@2"),
     "daemoncrash": (["scale", "--n", "1,2"] + FAST, "daemoncrash@2"),
+    "observer": (["scale", "--n", "1"] + [x for x in FAST if x != "--no-observer-check"], ""),
     "backwards": (["scale", "--n", "1,2,3"] + FAST, "backwards@2"),
     "kernelgpu": (["scale", "--n", "1,2,3"] + FAST, "kernelgpu@2"),
     "coherent": (["scale", "--n", "1,2,3"] + FAST, "coherent@2"),
@@ -161,6 +162,14 @@ class Dry(unittest.TestCase):
             g = self.r[k]["doc"]["gates"]
             self.assertEqual(g["run_crash_reports"]["status"], "PASS", k)
             self.assertIn("run_kernel_gpu", g)
+
+    def test_observer_check_window_reads_nothing_from_the_screen(self):
+        r = self.r["observer"]
+        self.assertIsNotNone(r["doc"]["data"].get("observer"), r["out"][-600:])
+        with open(os.path.join(r["state"], "guest", "calls.log")) as f:
+            fps = [c[2:] for c in map(json.loads, f) if c[0] == "simfps"]
+        self.assertIn(["strip", "probe"], fps)                    # the measured window: strip and marker, one look
+        self.assertEqual(fps[-1], ["nostrip", "noprobe"])         # the observer check's window: an unviewed screen
 
     def test_another_daemons_crash_report_is_listed_not_judged(self):
         r = self.r["daemoncrash"]

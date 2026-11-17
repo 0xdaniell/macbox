@@ -380,7 +380,10 @@ def install(mod):
     mod.ps_text = stub_ps
     mod.vmstat_text = stub_vmstat
     mod.sysctl = lambda name: {"kern.memorystatus_vm_pressure_level": "1", "hw.ncpu": "8", "hw.memsize": str(16 << 30)}.get(name, "")
-    mod.spawn_simfps = lambda udid, secs, label, strip, start_at, raw: StubSimfps(udid, secs, strip, start_at, raw)
+    def spawn(udid, secs, label, strip, start_at, raw, probe=True):
+        _log(["simfps", udid, "strip" if strip else "nostrip", "probe" if probe else "noprobe"])
+        return StubSimfps(udid, secs, strip, start_at, raw)
+    mod.spawn_simfps = spawn
 
     calls = [0]
 

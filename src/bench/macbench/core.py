@@ -347,6 +347,9 @@ def window(ctx, secs, mix, no_strip=False):
             "--probe-method", ctx.probe_method or "openurl", "--probe-every", a.probe_every, "--agent-period", a.agent_period, "--probe-timeout", a.probe_timeout]
     if a.probe_cmd:
         args += ["--probe-cmd", a.probe_cmd]
+    if no_strip:          # the unviewed screen: no strip, no marker, no injection, so simfps locks no surface
+        args[args.index("--probe-method") + 1] = "none"
+        args.append("--no-strip")
     ctx.in_window = True
     try:
         pend = ctx.guest.start(args, secs + lead + 240)
