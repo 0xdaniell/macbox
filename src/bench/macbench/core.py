@@ -422,7 +422,8 @@ def build_step(ctx, n, mix, g, s0, s1, t_go, boot=None):
     died = [s["idx"] for s in sims if g["sims"][s["idx"]].get("state_after") != "Booted"]
     kern, knote = ctx.host.kernel_gpu(s0["wall"])
     foreign = max((g.get("foreign_booted") or {}).values() or [0])
-    stab = {"new_ips": len(g["new_ips"]), "ips": g["new_ips"][:5], "sims_died": died, "kernel_gpu_lines": kern, "kernel_note": knote,
+    judged, listed = gates.crash_split(g["new_ips"], crash_names(a), getattr(a, "strict_crashes", False))
+    stab = {"new_ips": len(judged), "ips": judged[:5], "other_ips": listed[:10], "sims_died": died, "kernel_gpu_lines": kern, "kernel_note": knote,
             "qemu_same": ctx.host.same_qemu(), "observer_errors": [s["idx"] for s in sims if s.get("observer_error")],
             "foreign_booted": foreign}
     stab["ok"] = not (stab["new_ips"] or died or kern or not stab["qemu_same"] or (foreign and not a.allow_foreign))
@@ -469,6 +470,11 @@ def step_gates(ctx, step, shots=None):
     return gs
 
 
+def crash_names(a):
+    """Extra process names whose crash report fails a run (--crash-names a,b)."""
+    return [n for n in (getattr(a, "crash_names", None) or "").split(",") if n.strip()]
+
+
 def run_gates(ctx):
     """The gates that hold for a whole run, whatever the scenario: Coherent and QEMU's log since the run began, kernel
     GPU error lines since then, and crash reports that appeared on the guest. A scenario that stopped before its setup
@@ -489,8 +495,7 @@ def run_gates(ctx):
         gs["run_kernel_gpu"] = gates.gate("SKIP", "unreadable: %s" % type(e).__name__)
     try:
         now = set(ctx.guest.call(["ips"], 60)["ips"])
-        new = sorted(now - mk["ips"])
-        gs["run_crash_reports"] = gates.gate("FAIL" if new else "PASS", ("%d new crash report(s): %s" % (len(new), ", ".join(new[:3]))) if new else "no new crash report on the guest")
+        gs["run_crash_reports"] = gates.crash_gate(now - mk["ips"], crash_names(ctx.a), getattr(ctx.a, "strict_crashes", False))
     except Exception as e:
         gs["run_crash_reports"] = gates.gate("SKIP", "guest unreachable: %s" % type(e).__name__)
     ctx.doc.setdefault("gates", {}).update(gs)

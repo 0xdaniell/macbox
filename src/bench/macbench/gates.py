@@ -12,6 +12,38 @@ def gate(status, detail=""):
     return {"status": status, "detail": detail}
 
 
+# Crash reports that fail a run: the bench's own programs and the processes the measured frames pass through.
+# macOS files reports for other daemons of a simulator all day (widget extensions, searchd, containermanagerd ...);
+# those are listed with the gate, not judged, unless --strict-crashes says so.
+CRASH_NAMES = ("GlassBench", "GenieBench", "simfps", "SpringBoard", "backboardd", "SimRenderServer", "SimMetalHost",
+               "WindowServer", "com.apple.CoreSimulator.CoreSimulatorService", "CoreSimulatorBridge", "launchd_sim",
+               "Simulator", "simctl", "Kernel", "JetsamEvent")
+_CRASH_STAMP = re.compile(r"[-_.]\d{4}-\d{2}-\d{2}[-_]\d{6}.*$")
+
+
+def crash_proc(report):
+    """The process a crash report's file name names: 'searchd-2026-01-02-030405.ips' -> 'searchd'."""
+    n = _CRASH_STAMP.sub("", report)
+    return re.sub(r"\.(ips|crash)$", "", n)
+
+
+def crash_split(reports, extra=(), strict=False):
+    """(judged, listed): new crash reports that fail a gate, and those that are only shown."""
+    names = {n.lower() for n in CRASH_NAMES} | {n.strip().lower() for n in extra if n.strip()}
+    judged, listed = [], []
+    for r in sorted(reports):
+        (judged if strict or crash_proc(r).lower() in names else listed).append(r)
+    return judged, listed
+
+
+def crash_gate(reports, extra=(), strict=False):
+    judged, listed = crash_split(reports, extra, strict)
+    also = ("; not judged: %d other report(s): %s" % (len(listed), ", ".join(listed[:5]))) if listed else ""
+    if judged:
+        return gate("FAIL", "%d new crash report(s): %s%s" % (len(judged), ", ".join(judged[:3]), also))
+    return gate("PASS", "no new crash report of the bench or the simulator's graphics path" + also)
+
+
 def worst(gates):
     """FAIL if any FAIL; else SKIP-only/mixed is still ok: a run PASSes when nothing FAILed (SKIPs stay visible)."""
     return not any(g["status"] == "FAIL" for g in gates.values())

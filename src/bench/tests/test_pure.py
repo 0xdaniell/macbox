@@ -3,8 +3,39 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from macbench import abrule, analysis, png, stats, strip, targets, tears  # noqa: E402
+from macbench import abrule, analysis, gates, png, stats, strip, targets, tears  # noqa: E402
 from tests import helpers  # noqa: E402
+
+
+class CrashReports(unittest.TestCase):
+    NEW = ["searchd-2026-11-17-065234.ips", "SpringBoard-2026-11-17-065301.ips", "GlassBench_2026-11-17-065302_Mac.crash",
+           "PassbookWidgetsExtension-iPhone-2026-11-17-065303.ips", "com.apple.CoreSimulator.CoreSimulatorService-2026-11-17-070000.ips"]
+
+    def test_process_name_of_a_report(self):
+        self.assertEqual(gates.crash_proc("searchd-2026-11-17-065234.ips"), "searchd")
+        self.assertEqual(gates.crash_proc("PassbookWidgetsExtension-iPhone-2026-11-17-065303.ips"), "PassbookWidgetsExtension-iPhone")
+        self.assertEqual(gates.crash_proc("GlassBench_2026-11-17-065302_Mac.crash"), "GlassBench")
+        self.assertEqual(gates.crash_proc("odd.ips"), "odd")
+
+    def test_only_the_bench_and_the_graphics_path_are_judged(self):
+        judged, listed = gates.crash_split(self.NEW)
+        self.assertEqual([gates.crash_proc(r) for r in judged], ["GlassBench", "SpringBoard", "com.apple.CoreSimulator.CoreSimulatorService"])
+        self.assertEqual([gates.crash_proc(r) for r in listed], ["PassbookWidgetsExtension-iPhone", "searchd"])
+
+    def test_more_names_and_strict(self):
+        judged, listed = gates.crash_split(self.NEW, extra=["SearchD", " "])
+        self.assertIn("searchd-2026-11-17-065234.ips", judged)
+        judged, listed = gates.crash_split(self.NEW, strict=True)
+        self.assertEqual((len(judged), listed), (5, []))
+
+    def test_gate_names_what_it_did_not_judge(self):
+        g = gates.crash_gate(["searchd-2026-11-17-065234.ips"])
+        self.assertEqual(g["status"], "PASS")
+        self.assertIn("not judged: 1 other report(s): searchd-2026-11-17-065234.ips", g["detail"])
+        g = gates.crash_gate(self.NEW)
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn("3 new crash report(s)", g["detail"])
+        self.assertEqual(gates.crash_gate([])["status"], "PASS")
 
 
 class Stats(unittest.TestCase):

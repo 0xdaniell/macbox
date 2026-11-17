@@ -210,7 +210,12 @@ animating simulators in the window. i915 only (xe states cycles, not ns: the fie
 change over the window, `cgroup_events` (high/max/oom_kill deltas), `pswpin_pages`/`pswpout_pages` (system wide),
 `psi_mem_some_pct` (system) and `cgroup_psi_some_pct` (the VM's cgroup).
 
-**Stability** (`stability`): new `.ips`/`.crash` files in the guest's DiagnosticReports during the window,
+**Stability** (`stability`): new crash reports (`.ips`/`.crash` in the guest's DiagnosticReports) during the window
+of the bench's own programs or of the simulator's graphics path (`CRASH_NAMES` in `macbench/gates.py`: GlassBench,
+simfps, SpringBoard, backboardd, SimRenderServer, SimMetalHost, CoreSimulatorService, the kernel, jetsam events ...).
+A Mac that runs simulators files reports for other daemons all day (widget extensions, searchd, containermanagerd);
+those are recorded in `other_ips` and in the gate's text, and fail nothing unless `--strict-crashes` is given.
+`--crash-names a,b` (or `BENCH_CRASH_NAMES`) adds names to judge. Also:
 simulators no longer Booted at its end, kernel GPU error lines (`journalctl -k`: GPU hang, fence expired, context
 reset, xe job timeouts and faults), QEMU still the same process. Any one makes the step unstable and ends the sweep.
 
@@ -243,7 +248,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `kernel_gpu` | no kernel GPU error line since the step began (SKIP when the journal is not readable) |
 | `counter` | `simfps` answered with a result for every simulator of the window and every animating simulator's surfaces gave a readable frame counter (a counter that answers nothing or an error fails the window, it is not a missing metric) |
 | `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
-| `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new `.ips` on the guest since setup). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
+| `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new crash report since setup, judged like `stability`'s). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
 | `leak_*` | `lifecycle`: QEMU RSS and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute |
 | `observer` | reading the strip does not move the surface frame rate by more than 4% (a second window of the first N without the strip read); otherwise the distinct-frame numbers are lower bounds |
 

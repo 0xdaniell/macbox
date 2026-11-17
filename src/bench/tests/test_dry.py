@@ -66,6 +66,7 @@ CASES = {
     "refuse": (["scale", "--n", "1,2"] + FAST, "memfloor@0"),
     "hostmem": (["scale", "--n", "1,2,3,4,5"] + FAST, "hostmem@3"),
     "crash": (["scale", "--n", "1,2,3,4"] + FAST, "crash@2"),
+    "daemoncrash": (["scale", "--n", "1,2"] + FAST, "daemoncrash@2"),
     "backwards": (["scale", "--n", "1,2,3"] + FAST, "backwards@2"),
     "kernelgpu": (["scale", "--n", "1,2,3"] + FAST, "kernelgpu@2"),
     "coherent": (["scale", "--n", "1,2,3"] + FAST, "coherent@2"),
@@ -160,6 +161,17 @@ class Dry(unittest.TestCase):
             g = self.r[k]["doc"]["gates"]
             self.assertEqual(g["run_crash_reports"]["status"], "PASS", k)
             self.assertIn("run_kernel_gpu", g)
+
+    def test_another_daemons_crash_report_is_listed_not_judged(self):
+        r = self.r["daemoncrash"]
+        d = r["doc"]
+        self.assertEqual(r["rc"], 0, r["out"][-600:])
+        self.assertEqual([st["n"] for st in d["data"]["steps"]], [1, 2])
+        self.assertTrue(all(st["stable"] for st in d["data"]["steps"]))
+        self.assertEqual(d["data"]["steps"][-1]["stability"]["other_ips"], ["searchd-2026-01-02-030405.ips"])
+        g = d["gates"]["run_crash_reports"]
+        self.assertEqual(g["status"], "PASS")
+        self.assertIn("not judged: 1 other report(s): searchd-", g["detail"])
 
     def test_crash_report_is_instability_and_ends_the_sweep(self):
         d = self.r["crash"]["doc"]

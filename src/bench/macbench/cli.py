@@ -52,6 +52,8 @@ def add_common(p):
     p.add_argument("--slim-profile", default=os.environ.get("BENCH_SLIM_PROFILE"), help="simslim profile in the guest (default: the only .json in ~/.config/simslim)")
     p.add_argument("--seed-settle-max", type=float, default=600, help="the seed must settle within this many seconds or it is deleted and the run fails")
     p.add_argument("--quiesce", action="store_true", help="disable mediaanalysisd in each simulator (recorded; production does not)")
+    p.add_argument("--strict-crashes", action="store_true", help="any new crash report on the Mac fails the run (default: only reports of the bench's programs and the simulator's graphics path; the others are listed)")
+    p.add_argument("--crash-names", default=os.environ.get("BENCH_CRASH_NAMES", ""), help="more process names whose crash report fails the run, comma-separated")
     p.add_argument("--fail-on-swap", action="store_true", help="a guest swap-out in a window fails the memory gate (default: reported, host swap fails)")
     p.add_argument("--golden-file", default=os.path.join(BENCH_DIR, "baselines", "golden.json"))
 

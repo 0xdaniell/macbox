@@ -389,8 +389,9 @@ def install(mod):
         s = load()
         calls[0] += 1
         cr = fault("crash")
-        if cr is not None and len(booted(s)) >= cr and calls[0] >= 2 and "GlassBench-stub.ips" not in s["ips"]:
-            s["ips"].append("GlassBench-stub.ips")          # stays on the "disk": the run-wide gate sees it later
-            save(s)
+        for cr, name in ((cr, "GlassBench-2026-01-02-030405.ips"), (fault("daemoncrash"), "searchd-2026-01-02-030405.ips")):
+            if cr is not None and len(booted(s)) >= cr and calls[0] >= 2 and name not in s["ips"]:
+                s["ips"].append(name)                       # stays on the "disk": the run-wide gate sees it later
+                save(s)
         return set(s["ips"])
     mod.list_ips = ips
