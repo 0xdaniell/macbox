@@ -24,6 +24,7 @@ def add_common(p):
     p.add_argument("--min-host-free-gib", type=float, default=6.0, help="refuse to boot more simulators below this host available memory")
     p.add_argument("--min-disk-gib", type=float, default=12.0, help="refuse below this free disk space (the VM's disk, host side)")
     p.add_argument("--disk-path", default=os.environ.get("BENCH_HOME"), help=argparse.SUPPRESS)
+    p.add_argument("--set-name", default=os.environ.get("BENCH_SET_NAME", "bench"), help="the bench's own device set in the guest (kept between runs: the seed lives in it)")
     p.add_argument("--allow-foreign", action="store_true", help="go on although simulators outside the bench are booted (recorded)")
     p.add_argument("--allow-restart", action="store_true", help="let a NEW device type restart CoreSimulatorService (only when nothing is booted)")
     p.add_argument("--scale-x", dest="scale_x", type=int, choices=(1, 2, 3), default=1, help="device pixel scale: 1 = the macbox 1x type, 3 = the stock iPhone (default 1)")
@@ -106,6 +107,9 @@ def parser():
     t = sp.add_parser("tools", help="copy the bench to the Mac and build simfps and GlassBench there")
     t.add_argument("--no-build", action="store_true")
     sp.add_parser("check", help="what this host and the VM offer the bench")
+    cl = sp.add_parser("cleanup", help="shut down and delete what an earlier run left in the bench's device set (seeds stay unless --seeds)")
+    cl.add_argument("--seeds", action="store_true", help="delete the seeds too (the next run makes a new one)")
+    cl.add_argument("--set-name", default=os.environ.get("BENCH_SET_NAME", "bench"))
     return ap
 
 
@@ -152,7 +156,7 @@ def build_ctx(a, kind):
     alias = os.environ.get("MACBOX_SSH_HOST", "")
     clean = schema.scrubber([alias] if alias and alias != "macbox" else [])      # not user names or the default alias: ordinary words
     stamp = schema.stamp()
-    set_name = "bench-%s" % stamp
+    set_name = a.set_name                # ONE set for every run: the seed made in it is kept and reused
     faults = os.environ.get("BENCH_STUB_FAULT", "")
     if dry:
         tmp = os.environ.get("BENCH_DRY_KEEP") or tempfile.mkdtemp(prefix="macbench-dry-")
@@ -221,18 +225,36 @@ def execute(a, kind, body):
         rc = 2
     finally:
         run.cleanup()
-        info = ctx.cleanup_info
-        if info or any(l for l in run.teardown):
-            left_ok = (not info) or (info.get("booted", 0) == 0 and info.get("left", 0) == 0)
-            sec = "PASS" if left_ok and not run.problems else "FAIL"
-            ctx.section("cleanup", sec, "CLEANUP %s: bench simulators left booted %s, devices left %s, knobs restored %s%s" % (
-                sec, info.get("booted", "n/a"), info.get("left", "n/a"), "yes" if not run.problems else "NO",
-                ("; " + "; ".join(run.problems)) if run.problems else ""))
-        problems = ctx.save()
+        rc = max(rc, finalize(ctx))
     fails = [s for s in ctx.doc["sections"] if s["status"] == "FAIL"]
-    print("result: %s%s" % (os.path.basename(ctx.out_path), "" if not problems else "  (NOT publishable as is: %s)" % "; ".join(problems[:3])))
     if fails:
         return max(rc, 1)
+    return rc
+
+
+CLEANUP_FAILED_RC = 20
+
+
+def finalize(ctx):
+    """After the cleanup: its section (PASS only when verified), the idle guard's, the result file. Also what the abort
+    path of the run's monitor calls. Returns CLEANUP_FAILED_RC when the cleanup could not delete everything."""
+    run, info = ctx.run, ctx.cleanup_info
+    rc = 0
+    if ctx.taken or info or run.problems:
+        left_ok = bool(info) and not info.get("failed") and info.get("booted", 0) == 0 and info.get("left", 0) == 0
+        sec = "PASS" if left_ok and not run.problems else "FAIL"
+        if sec == "FAIL":
+            rc = CLEANUP_FAILED_RC
+        ctx.section("cleanup", sec, "CLEANUP %s: bench simulators left booted %s, devices left %s, knobs restored %s%s" % (
+            sec, info.get("booted", "n/a"), info.get("left", "n/a"), "yes" if not run.problems else "NO",
+            ("; " + "; ".join(run.problems)) if run.problems else ""))
+    if ctx.idle_guard:
+        absent = "absent" in ctx.idle_guard
+        ctx.doc["env"].setdefault("guest", {})["idle_guard"] = "absent" if absent else "kept"
+        ctx.section("idle_guard", "INFO", ("IDLE GUARD ABSENT: sim-idle-guard is not installed on the Mac, nothing keeps the simulators from an idle shutdown; "
+                                           "the run counts its booted simulators before every window") if absent else "IDLE GUARD kept every bench simulator for the run")
+    problems = ctx.save()
+    print("result: %s%s" % (os.path.basename(ctx.out_path), "" if not problems else "  (NOT publishable as is: %s)" % "; ".join(problems[:3])))
     return rc
 
 
@@ -245,6 +267,8 @@ def main(argv=None):
         return tools(a)
     if c == "check":
         return check(a)
+    if c == "cleanup":
+        return cleanup(a)
     if c == "scale":
         a.ns = [int(x) for x in a.ns.split(",")]
         a.targets = a.targets or targets.DEFAULT_TARGETS
@@ -258,6 +282,29 @@ def main(argv=None):
         if not hasattr(a, k):
             setattr(a, k, v)
     return execute(a, {"golden": "gates"}.get(c, c), body)
+
+
+def cleanup(a):
+    """macbox bench cleanup: shut down and delete what an earlier run left in the bench's set; exit 0 only when verified."""
+    run = Run(900, log)
+    faults = os.environ.get("BENCH_STUB_FAULT", "")
+    if os.environ.get("DRY") == "1":
+        keep = os.environ.get("BENCH_DRY_KEEP")
+        if not keep:
+            raise SystemExit("DRY cleanup needs BENCH_DRY_KEEP (the stub guest's state directory)")
+        guest = LocalGuest(run, a.set_name, os.path.join(keep, "guest"), BENCH_DIR, faults)
+    else:
+        guest = SshGuest(run, os.environ.get("BENCH_SSH") or os.environ.get("MACBOX_SSH_HOST") or "macbox", a.set_name)
+    try:
+        guest.call(["init-set"], 60)
+        info = guest.call(["teardown"] + (["--seeds"] if a.seeds else []), 300)
+    except (GuestError, DeadlineError) as e:
+        print("CLEANUP FAIL: the guest could not be reached or refused: %s" % e)
+        return CLEANUP_FAILED_RC
+    ok = not (info.get("failed") or info.get("left") or info.get("booted"))
+    print("CLEANUP %s: devices left %s, booted %s, seeds kept %s%s" % ("PASS" if ok else "FAIL", info.get("left"), info.get("booted"), info.get("seeds"),
+                                                                       ("; could not: " + "; ".join(info["failed"])) if info.get("failed") else ""))
+    return 0 if ok else CLEANUP_FAILED_RC
 
 
 def offline(a):

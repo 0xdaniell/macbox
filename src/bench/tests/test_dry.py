@@ -15,13 +15,16 @@ RUN = os.path.join(HERE, "..", "run")
 FAST = ["--secs", "3", "--probe-every", "0.7", "--probe-timeout", "1", "--settle-max", "2", "--no-observer-check"]
 
 
-def run_case(args, faults="", extra_env=None, kill_after=None, keep=True, timeout=240):
+def run_case(args, faults="", extra_env=None, kill_after=None, keep=True, timeout=240, state=None):
+    """One real `run` process in DRY mode. `state` = a directory shared by several cases in a row (the stub guest, its
+    device set, the seed): the run after another one sees what the first left."""
     d = tempfile.mkdtemp(prefix="dry-case-")
-    env = dict(os.environ, DRY="1", BENCH_STUB_FAULT=faults, BENCH_DRY_KEEP=os.path.join(d, "state") if keep else "",
+    env = dict(os.environ, DRY="1", BENCH_STUB_FAULT=faults, BENCH_DRY_KEEP=state or os.path.join(d, "state") if keep else "",
                BENCH_DEADLINE_MARGIN="3", **(extra_env or {}))
     if not keep:
         env.pop("BENCH_DRY_KEEP")
-    p = subprocess.Popen([sys.executable, RUN] + args + ["--out", os.path.join(d, "out")], env=env, stdout=subprocess.PIPE,
+    out_arg = [] if args[0] == "cleanup" else ["--out", os.path.join(d, "out")]
+    p = subprocess.Popen([sys.executable, RUN] + args + out_arg, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True)
     if kill_after:
         time.sleep(kill_after)
@@ -34,7 +37,7 @@ def run_case(args, faults="", extra_env=None, kill_after=None, keep=True, timeou
             if f.endswith(".json"):
                 with open(os.path.join(od, f)) as fh:
                     res = json.load(fh)
-    return {"rc": p.returncode, "out": out, "doc": res, "state": os.path.join(d, "state")}
+    return {"rc": p.returncode, "out": out, "doc": res, "state": state or os.path.join(d, "state")}
 
 
 def sims_booted(state):

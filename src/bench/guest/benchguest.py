@@ -11,6 +11,7 @@ and refuses a set without the bench's marker file: the pool and Simlock's device
 import argparse
 import base64
 import json
+import math
 import os
 import plistlib
 import re
@@ -26,6 +27,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 BUNDLE_ID = "dev.macbox.glassbench"
 MARKER = ".macbox-bench-set"
+MANIFEST = ".bench-manifest.json"     # what the bench made in its set: seeds (complete or not) and the devices it must clean up
+LOCK = ".bench-run.lock"              # present while a run owns the set; a leftover lock = a run that did not clean up
+SEED_PREFIX = "bench-seed-"
+# Things outside the device set that a bench simulator leaves behind or depends on. Module variables so the DRY stub
+# can point them under its own state directory (nothing here is touched on the host).
+OVERRIDES = "/private/var/tmp/com.apple.CoreSimulator.SimDevice"   # + "." + udid: the Slim disables of one device
+KEEP_DIR = os.path.expanduser("~/.sim-keep")                          # sim-idle-guard's keep files, one per udid
+IDLE_GUARD = os.path.expanduser("~/.local/bin/sim-idle-guard")        # `keep <udid> <minutes>` (max 240)
 PROBE_POINT = "36,175"          # the input marker's centre, in points (GlassBench -probe)
 SET = None
 STUB = os.environ.get("BENCHGUEST_STUB")
@@ -125,6 +134,69 @@ def devices():
             d["runtime"] = rt
             out.append(d)
     return out
+
+
+def is_seed(d):
+    return d.get("name", "").startswith(SEED_PREFIX)
+
+
+def overrides_dir(udid):
+    return "%s.%s" % (OVERRIDES, udid)
+
+
+def load_manifest():
+    try:
+        with open(os.path.join(SET, MANIFEST)) as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        m = {}
+    m.setdefault("seeds", {})
+    m.setdefault("devices", {})
+    return m
+
+
+def save_manifest(m):
+    p = os.path.join(SET, MANIFEST)
+    with open(p + ".tmp", "w") as f:
+        json.dump(m, f, indent=1, sort_keys=True)
+    os.replace(p + ".tmp", p)
+
+
+def idle_guard_keep(udid, minutes):
+    """Registers a simulator with the Mac's sim-idle-guard (it shuts down any simulator nobody used for 15 minutes, in
+    every device set). {"state": "kept"|"absent"|"failed", "minutes", "err"}. 'absent' is recorded by the caller and the
+    run goes on; 'failed' (the tool is there and refused) is an error: the simulator would be shut down under the run."""
+    minutes = max(1, min(int(math.ceil(minutes)), 240))
+    if not (os.path.isfile(IDLE_GUARD) and os.access(IDLE_GUARD, os.X_OK)):
+        return {"state": "absent", "minutes": 0, "err": None}
+    rc, out, err, _ = run([IDLE_GUARD, "keep", udid, str(minutes)], 30)
+    if rc != 0:
+        return {"state": "failed", "minutes": minutes, "err": (err or out).strip()[-120:]}
+    return {"state": "kept", "minutes": minutes, "err": None}
+
+
+def keep_or_fail(udid, minutes):
+    k = idle_guard_keep(udid, minutes)
+    if k["state"] == "failed":
+        raise GuestError("sim-idle-guard keep %s failed: %s (the Mac would shut the simulator down under the run)" % (udid, k["err"]))
+    return k
+
+
+def drop_keep(udid):
+    """Removes ~/.sim-keep/<udid>; returns None or what went wrong (a missing file is fine)."""
+    try:
+        os.remove(os.path.join(KEEP_DIR, udid))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return "keep file of %s: %s" % (udid, e)
+    return None
+
+
+def drop_overrides(udid):
+    d = overrides_dir(udid)
+    shutil.rmtree(d, ignore_errors=True)
+    return "overrides folder of %s still there" % udid if os.path.exists(d) else None
 
 
 # --- parsers (unit-tested) -------------------------------------------------------------------------
@@ -443,13 +515,19 @@ def cmd_ensure_type(a):
 
 
 def cmd_create(a):
+    """A fresh STOCK device (about 1.8 GB of guest disk each): only behind --stock-devices on the host."""
     made = []
+    man = load_manifest()
     for i in range(a.start, a.start + a.n):
         name = "%s-%d" % (a.prefix, i)
         rc, out, err, secs = simctl("create", name, a.type, a.runtime)
         if rc != 0:
             raise GuestError("create %s: %s" % (name, err.strip()[:200]))
-        made.append({"idx": i, "udid": out.strip().splitlines()[-1], "create_s": round(secs, 2)})
+        udid = out.strip().splitlines()[-1]
+        man["devices"][udid] = {"name": name, "kind": "stock"}
+        save_manifest(man)
+        k = keep_or_fail(udid, a.keep_min)
+        made.append({"idx": i, "udid": udid, "create_s": round(secs, 2), "idle_guard": k["state"]})
     out_json({"sims": made})
 
 
@@ -752,13 +830,89 @@ def cmd_cycle(a):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def leftovers():
+    """What an earlier run left in the bench's set: [text]. Empty = the set is clean (settled seeds, shut down, are not
+    leftovers: they are kept on purpose)."""
+    out, man, devs = [], load_manifest(), devices()
+    complete = {s["udid"] for s in man["seeds"].values() if s.get("complete")}
+    for d in devs:
+        if is_seed(d):
+            if d["udid"] not in complete:
+                out.append("a seed that was never completed (%s %s)" % (d["name"], d["udid"]))
+            elif d.get("state") != "Shutdown":
+                out.append("the seed %s is %s" % (d["name"], d.get("state")))
+        else:
+            out.append("device %s %s (%s)" % (d["name"], d["udid"], d.get("state")))
+    here = {d["udid"] for d in devs}
+    for u in man["devices"]:
+        if u not in here and (os.path.exists(overrides_dir(u)) or os.path.exists(os.path.join(KEEP_DIR, u))):
+            out.append("overrides or keep file of the deleted device %s" % u)
+    lock = os.path.join(SET, LOCK)
+    if os.path.exists(lock):
+        try:
+            with open(lock) as f:
+                out.append("the run lock of an earlier run (%s)" % f.read().strip()[:80])
+        except OSError:
+            out.append("the run lock of an earlier run")
+    return out
+
+
+def cmd_acquire(a):
+    """Takes the set for one run: refuses (ok false, with the list) while an earlier run left anything, then writes the
+    run lock (exclusive create: two runs cannot share the set)."""
+    left = leftovers()
+    if left:
+        return out_json({"ok": False, "leftovers": left})
+    try:
+        fd = os.open(os.path.join(SET, LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return out_json({"ok": False, "leftovers": ["the run lock was taken just now by another run"]})
+    with os.fdopen(fd, "w") as f:
+        f.write("run %s pid %d at %d\n" % (a.run, os.getpid(), int(now())))
+    out_json({"ok": True, "leftovers": []})
+
+
 def cmd_teardown(a):
-    """Shut down and delete EVERY device in the bench set (it is the bench's own, marker file checked)."""
-    simctl("shutdown", "all", timeout=300)
-    simctl("delete", "all", timeout=300)
-    left = [d["udid"] for d in devices()]
-    booted = [d["udid"] for d in devices() if d.get("state") == "Booted"]
-    out_json({"left": len(left), "booted": len(booted), "calls": [c[1:] for c in CALLS][-3:]})
+    """Shuts down every device of the bench's set and deletes every one that is not a seed (all of them with --seeds),
+    then removes what lives outside the device: its overrides folder and its ~/.sim-keep file. It looks again at the end
+    and reports what is still there in `failed`/`left`/`booted`; the run lock is released only when nothing is."""
+    failed = []
+    man = load_manifest()
+    simctl("shutdown", "all", timeout=300)          # a failure shows in the second look below
+    for d in devices():
+        if is_seed(d) and not a.seeds:
+            continue
+        rc, _, err, _ = simctl("delete", d["udid"], timeout=120)
+        if rc != 0:
+            failed.append("delete %s %s: %s" % (d["name"], d["udid"], (err or "failed").strip()[:100]))
+    after = devices()
+    present = {d["udid"] for d in after}
+    seeds_now = {d["udid"] for d in after if is_seed(d)}
+    for u in sorted(set(man["devices"]) | {s["udid"] for s in man["seeds"].values()} | {d["udid"] for d in after}):
+        e = drop_keep(u)
+        if e:
+            failed.append(e)
+        if u not in present:
+            e = drop_overrides(u)
+            if e:
+                failed.append(e)
+            else:
+                man["devices"].pop(u, None)
+    man["seeds"] = {t: s for t, s in man["seeds"].items() if s["udid"] in seeds_now}
+    save_manifest(man)
+    left = [d for d in after if not is_seed(d) or a.seeds]
+    booted = [d for d in after if d.get("state") == "Booted"]
+    keep_left = [u for u in present | set(man["devices"]) if os.path.exists(os.path.join(KEEP_DIR, u))]
+    if keep_left:
+        failed.append("%d keep file(s) still in the idle guard's folder" % len(keep_left))
+    if not (failed or left or booted):
+        try:
+            os.remove(os.path.join(SET, LOCK))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            failed.append("run lock: %s" % e)
+    out_json({"left": len(left), "booted": len(booted), "failed": failed, "seeds": len(seeds_now), "calls": [c[1:] for c in CALLS][-3:]})
 
 
 def count_launchd_sim():
@@ -829,7 +983,7 @@ def main(argv=None):
     add("init-set", cmd_init_set)
     add("ensure-type", cmd_ensure_type, O("--scale", default="1"), O("--allow-restart", action="store_true"))
     add("create", cmd_create, O("--n", type=int, required=True), O("--type", required=True), O("--runtime", required=True),
-        O("--prefix", default="bench"), O("--start", type=int, default=0))
+        O("--prefix", default="bench"), O("--start", type=int, default=0), O("--keep-min", type=float, default=60))
     add("slim", cmd_slim, O("--udids", required=True), O("--cmd", required=True))
     add("boot", cmd_boot, O("--udids", required=True), O("--parallel", action="store_true"))
     add("prepare", cmd_prepare, O("--udids", required=True), O("--roles", required=True), O("--install", action="store_true"),
@@ -842,7 +996,8 @@ def main(argv=None):
         O("--no-strip", action="store_true"), O("--probe-timeout", type=float, default=2.0))
     add("shots", cmd_shots, O("--udids", required=True), O("--count", type=int, default=2))
     add("cycle", cmd_cycle, O("--type", required=True), O("--runtime", required=True), O("--prefix", default="bench"))
-    add("teardown", cmd_teardown)
+    add("acquire", cmd_acquire, O("--run", default="?"))
+    add("teardown", cmd_teardown, O("--seeds", action="store_true", help="delete the seeds too"))
     add("build", cmd_build, O("--xcodebuild", default=""))
     add("memcheck", cmd_memcheck)
     add("ips", cmd_ips)

@@ -15,7 +15,7 @@ def _fmt(x, unit=""):
 
 def run_idle(ctx):
     a = ctx.a
-    info = core.setup_guest(ctx)
+    info = core.setup_guest(ctx, sims=False)
     core.capture_env(ctx, info)
     ctx.marks = {"coh": ctx.coh.mark(), "t0": time.time()}
     m = ctx.guest.call(["memcheck"], 60)
@@ -135,7 +135,7 @@ def run_soak(ctx):
 
 def run_build(ctx):
     a = ctx.a
-    info = core.setup_guest(ctx)
+    info = core.setup_guest(ctx, sims=False)
     core.capture_env(ctx, info)
     r = ctx.guest.call(["build"] + (["--xcodebuild", a.xcodebuild] if a.xcodebuild else []), 3900)
     ctx.doc["data"] = r

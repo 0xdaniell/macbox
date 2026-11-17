@@ -23,6 +23,8 @@ class Ctx:
         self.marks = {}
         self.golden = None          # fn(w, h) -> (hash or None, key)
         self.pixel_gate = None
+        self.taken = False          # the bench's set is owned by this run (lock taken, cleanup registered)
+        self.idle_guard = set()     # what sim-idle-guard keep answered for the bench's simulators: kept / absent
 
     def save(self):
         return schema.write(self.doc, self.out_path, self.clean)
@@ -37,7 +39,8 @@ def capture_env(ctx, info):
     g = {k: info.get(k) for k in ("macos", "xcode", "arch", "cpus", "mem_mb")}
     rts = info.get("runtimes") or []
     g["runtimes"] = ["%s %s" % (r.get("name"), r.get("build")) for r in rts]
-    ctx.doc["env"].update({"build_id": ctx.a.build_id or "unknown", "host": host, "guest": g,
+    ctx.doc["env"].setdefault("guest", {}).update(g)          # keeps what setup_guest recorded (runtime, device type, seed)
+    ctx.doc["env"].update({"build_id": ctx.a.build_id or "unknown", "host": host,
                            "switches": sw, "qemu_env": qenv, "tags": dict(kv.split("=", 1) for kv in (ctx.a.tag or []) if "=" in kv),
                            "dry": bool(ctx.host.dry)})
 
@@ -77,14 +80,38 @@ def roles_for(mix, n):
     raise ValueError("unknown mix %r" % mix)
 
 
-def setup_guest(ctx):
-    """Device set, device type, tools check. Returns the guest info."""
+def teardown(ctx):
+    """The cleanup of the bench's simulators. Raises, naming what is left, when anything could not be deleted: the
+    cleanup section must never say 'done' on a cleanup that was not verified."""
+    info = ctx.guest.call(["teardown"], 300)
+    ctx.cleanup_info.update(info)
+    if info.get("failed") or info.get("left") or info.get("booted"):
+        raise RuntimeError("could not clean up the bench's device set: %s; %d device(s) left, %d booted: run `macbox bench cleanup` "
+                           "(the next run refuses to start until it is clean)" % ("; ".join(info.get("failed") or ["nothing reported"])[:300], info.get("left", 0), info.get("booted", 0)))
+
+
+def keep_minutes(ctx):
+    """How long the Mac's idle guard must leave the bench's simulators alone: the run's deadline plus 5 minutes, at most 240."""
+    return max(5, min(240, int(ctx.a.deadline / 60.0) + 5))
+
+
+def setup_guest(ctx, sims=True):
+    """Device set, device type, tools check. Returns the guest info. With sims=False the run boots no simulator of its
+    own (idle, build): the set is not taken and nothing is registered for cleanup."""
     a = ctx.a
     info = ctx.guest.call(["info"], 120)
     if not info.get("has_simfps") or not info.get("has_app"):
         raise Stop("the bench tools are not built in the guest: macbox bench tools")
     ctx.guest.call(["init-set"], 60)
-    ctx.run.teardown.append(("bench simulators", lambda: ctx.cleanup_info.update(ctx.guest.call(["teardown"], 240))))
+    if not sims:
+        _run_mark(ctx)
+        return info
+    acq = ctx.guest.call(["acquire", "--run", ctx.doc["id"]], 60)
+    if not acq.get("ok"):
+        # refuse BEFORE the cleanup is registered: the leftovers are not this run's to delete (macbox bench cleanup does)
+        raise Stop("an earlier run left the bench's device set unclean (%s): run `macbox bench cleanup`, then start again" % "; ".join(acq.get("leftovers", [])[:4]))
+    ctx.run.teardown.append(("bench simulators", lambda: teardown(ctx)))
+    ctx.taken = True
     t = ctx.guest.call(["ensure-type", "--scale", str(a.scale_x)] + (["--allow-restart"] if a.allow_restart else []), 180)
     if t.get("needs_restart"):
         raise Stop("device type %s was just created and CoreSimulatorService must restart to load it, which would shut "
@@ -92,9 +119,13 @@ def setup_guest(ctx):
     ctx.type_id, ctx.runtime = t["type"], t["runtime"]
     ctx.doc["env"]["guest"]["runtime_used"] = t.get("runtime_version")
     ctx.doc["env"]["guest"]["device_type"] = "stock %s" % t["stock_name"] if a.scale_x == 3 else "macbox %dx of %s" % (a.scale_x, t["stock_name"])
+    _run_mark(ctx)
+    return info
+
+
+def _run_mark(ctx):
     ctx.offset = ctx.guest.clock_offset()
     ctx.run_mark = {"coh": ctx.coh.mark(), "t0": time.time(), "ips": set(ctx.guest.call(["ips"], 60)["ips"])}
-    return info
 
 
 def grow(ctx, n, roles, install=True):
@@ -103,8 +134,9 @@ def grow(ctx, n, roles, install=True):
     new = n - have
     boot = {}
     if new > 0:
-        r = ctx.guest.call(["create", "--n", new, "--type", ctx.type_id, "--runtime", ctx.runtime, "--start", have], 240)
+        r = ctx.guest.call(["create", "--n", new, "--type", ctx.type_id, "--runtime", ctx.runtime, "--start", have, "--keep-min", keep_minutes(ctx)], 240)
         fresh = r["sims"]
+        ctx.idle_guard.update(x.get("idle_guard") for x in fresh)
         us = ",".join(s["udid"] for s in fresh)
         if ctx.a.slim:
             sl = ctx.guest.call(["slim", "--udids", us, "--cmd", ctx.a.slim_cmd], 900 * len(fresh))

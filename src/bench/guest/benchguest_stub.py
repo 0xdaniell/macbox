@@ -2,7 +2,11 @@
 directory ($BENCHGUEST_STATE) between calls, so `benchguest.py` runs its real control flow with no macOS.
 Faults ($BENCH_STUB_FAULT, comma separated): memfloor@N (guest free memory below any floor from N booted
 simulators), crash@N (a new crash report at N booted), backwards@N (a frame shown out of order at N), slow@N
-(frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips)."""
+(frame rate collapses from N), hang_simfps (simfps never answers), nomarker (the input marker never flips),
+cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-idle-guard on the Mac), keepfail
+(sim-idle-guard keep fails).
+The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
+$BENCHGUEST_STATE too, so the bench's real file code runs against them."""
 import json
 import os
 import random
@@ -79,7 +83,17 @@ def stub_run(argv, timeout=120, env=None):
 def _stub_run(argv):
     _log(argv)
     s = load()
-    out, rc = "", 0
+    out, err, rc = "", "", 0
+    if argv and argv[0] == _MOD.IDLE_GUARD:
+        # the Mac's idle guard: `keep <udid> <minutes>` (max 240) writes ~/.sim-keep/<udid>
+        if fault("keepfail") is not None:
+            return 1, "", "keep: refused (injected)", 0.01
+        if argv[1] != "keep" or len(argv) != 4 or not argv[3].isdigit() or not 1 <= int(argv[3]) <= 240:
+            return 2, "", "usage: sim-idle-guard keep <udid> <minutes 1..240>", 0.01
+        os.makedirs(_MOD.KEEP_DIR, exist_ok=True)
+        with open(os.path.join(_MOD.KEEP_DIR, argv[2]), "w") as f:
+            f.write("%s\n" % argv[3])
+        return 0, "", "", 0.01
     if argv[:3] == ["xcrun", "simctl", "--set"]:
         cmd = argv[4:]
         verb = cmd[0]
@@ -105,8 +119,11 @@ def _stub_run(argv):
                 if u in s["devs"]:
                     s["devs"][u]["state"] = "Shutdown"
         elif verb == "delete":
-            for u in (list(s["devs"]) if cmd[1] == "all" else [cmd[1]]):
-                s["devs"].pop(u, None)
+            if fault("cantdelete") is not None:
+                err, rc = "Unable to delete (injected)", 1
+            else:
+                for u in (list(s["devs"]) if cmd[1] == "all" else [cmd[1]]):
+                    s["devs"].pop(u, None)
         elif verb == "launch":
             s["mode"][cmd[1]] = "static" if "-static" in cmd else "busy"
         elif verb == "terminate":
@@ -140,7 +157,7 @@ def _stub_run(argv):
     else:
         out = ""
     save(s)
-    return rc, out, "", 0.01
+    return rc, out, err, 0.01
 
 
 def stub_ps():
@@ -229,7 +246,20 @@ class StubSimfps:
         pass
 
 
+_MOD = None
+
+
 def install(mod):
+    global _MOD
+    _MOD = mod
+    mod.OVERRIDES = _p("overrides/SimDevice")
+    mod.KEEP_DIR = _p("sim-keep")
+    mod.IDLE_GUARD = _p("bin/sim-idle-guard")
+    if fault("noguard") is None:
+        os.makedirs(_p("bin"), exist_ok=True)
+        with open(mod.IDLE_GUARD, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(mod.IDLE_GUARD, 0o755)
     mod.run = stub_run
     mod.ps_text = stub_ps
     mod.vmstat_text = stub_vmstat
