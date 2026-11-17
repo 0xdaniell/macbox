@@ -40,7 +40,8 @@ IDLE_GUARD = os.path.expanduser("~/.local/bin/sim-idle-guard")        # `keep <u
 # command that names it is simlock_clone()) and the Slim tooling the fleet uses on every clone.
 SOURCE_SET = os.environ.get("BENCH_SIMLOCK_SOURCES") or os.path.expanduser("~/.simlock04/devices/ios-sources")
 SIMSLIM = os.environ.get("BENCH_SIMSLIM") or os.path.expanduser("~/go/bin/simslim")
-SLIM_PROFILE = os.environ.get("BENCH_SLIM_PROFILE") or os.path.expanduser("~/.config/simslim/atlas.json")
+SLIM_PROFILE = os.environ.get("BENCH_SLIM_PROFILE")                   # else the one profile in SLIM_DIR
+SLIM_DIR = os.path.expanduser("~/.config/simslim")
 MIN_SLIM_SERVICES = 100                                               # a Slim device has 168 services off today
 PROBE_POINT = "36,175"          # the input marker's centre, in points (GlassBench -probe)
 SET = None
@@ -418,6 +419,13 @@ def out_json(obj):
     sys.stdout.flush()
 
 
+def _has_profile():
+    try:
+        return os.path.isfile(resolve_profile())
+    except GuestError:
+        return False
+
+
 def cmd_info(a):
     sw = run(["sw_vers"], 10)[1]
     ver = re.search(r"ProductVersion:\s*(\S+)", sw)
@@ -432,6 +440,8 @@ def cmd_info(a):
     vm = parse_vm_stat(vmstat_text())
     out_json({"macos": ver.group(1) if ver else None, "xcode": xc, "runtimes": rts, "arch": run(["uname", "-m"], 5)[1].strip(),
               "cpus": sysctl("hw.ncpu"), "mem_mb": int(sysctl("hw.memsize") or 0) // 1048576, "mem": mem_summary(vm),
+              "simlock_types": source_types(SOURCE_SET), "has_simslim": os.path.isfile(SIMSLIM) and os.access(SIMSLIM, os.X_OK),
+              "has_slim_profile": _has_profile(), "has_idle_guard": os.path.isfile(IDLE_GUARD) and os.access(IDLE_GUARD, os.X_OK),
               "has_simfps": bool(STUB) or os.path.exists(os.path.join(HERE, "..", "simfps")),
               "has_app": bool(STUB) or os.path.isdir(os.path.join(HERE, "..", "GlassBench.app")), "stub": bool(STUB)})
 
@@ -573,6 +583,21 @@ def find_source(type_id, src_set):
     return found[0][1], found[0][2]
 
 
+def source_types(src_set):
+    """The device types Simlock has a source device for (names only), [] when Simlock's set is not there."""
+    out = set()
+    try:
+        for n in os.listdir(src_set):
+            try:
+                with open(os.path.join(src_set, n, "device.plist"), "rb") as f:
+                    out.add(str(plistlib.load(f).get("deviceType")).rsplit(".", 1)[-1])
+            except (OSError, ValueError, plistlib.InvalidFileException):
+                pass
+    except OSError:
+        pass
+    return sorted(out)
+
+
 def runtime_version(runtime_id):
     try:
         for r in json.loads(run(["xcrun", "simctl", "list", "runtimes", "-j"], 30)[1]).get("runtimes", []):
@@ -657,7 +682,7 @@ def cmd_seed(a):
         if simctl("bootstatus", u, timeout=600)[0] != 0:
             raise GuestError("the seed never finished booting (bootstatus)")
         sl = os.path.expanduser(a.simslim or SIMSLIM)
-        prof = os.path.expanduser(a.slim_profile or SLIM_PROFILE)
+        prof = resolve_profile(a.slim_profile)
         # Simlock's source devices are widget-trimmed but NOT Slim: simslim shuts the device down, rewrites its services and reboots it
         rc, out, err, secs = run([sl, "--set", SET, "on", u, "--profile", prof], 900)
         if rc != 0:
@@ -736,6 +761,22 @@ def slim_count(udid):
     if not os.path.exists(f):
         return 0
     return run(["plutil", "-p", f], 15)[1].count("=> true")
+
+
+def resolve_profile(arg=None):
+    """simslim's profile: --slim-profile, else $BENCH_SLIM_PROFILE, else the only *.json in ~/.config/simslim (ambiguous or
+    none: an error that says to pass --slim-profile)."""
+    chosen = arg or SLIM_PROFILE
+    if chosen:
+        return os.path.expanduser(chosen)
+    try:
+        found = sorted(n for n in os.listdir(SLIM_DIR) if n.endswith(".json"))
+    except OSError:
+        found = []
+    if len(found) != 1:
+        raise GuestError("no simslim profile: %s; pass --slim-profile <file> (or set BENCH_SLIM_PROFILE)" % (
+            "%d profiles in the simslim config folder" % len(found) if found else "none in the simslim config folder"))
+    return os.path.join(SLIM_DIR, found[0])
 
 
 def copy_overrides(seed_udid, udid, min_services=MIN_SLIM_SERVICES):

@@ -7,7 +7,9 @@ single-purpose tools it builds on (`simfps`, GlassBench, GenieBench) are describ
 ```sh
 macbox bench tools                       # once: copy the bench to the Mac, build simfps and GlassBench there
 macbox bench check                       # what this host and the VM offer
+macbox bench seed                        # once: the production seed every bench simulator is cloned from (kept between runs)
 macbox bench scale --n 1,2,3,4,5,6       # the scaling sweep (the centrepiece)
+macbox bench cleanup                     # after a run that could not clean up (the next run refuses to start until then)
 macbox bench compare baseline.json new.json
 macbox bench chart new.json              # an HTML/SVG chart next to it
 DRY=1 macbox bench scale --n 1,2,3       # the whole control flow against stubs: no VM, no simulator, no GPU
@@ -19,34 +21,94 @@ and `python3 -m unittest tests.test_dry` (the dry runs with injected faults, a c
 
 ## What a run does, and what it never touches
 
-The bench has a **device set of its own** (`simctl --set`, a directory with a marker file), so it never sees the
-pool's simulators or anyone's lease; every `simctl` the guest helper starts goes through one function that adds
-`--set` and refuses a set without the marker. It creates its own devices, and at the end shuts down and deletes
-all of them. The 3x device is the stock iPhone Pro; the **1x type** is the macbox 1x device type `macbox pool`
-makes (same identifier, reused when it exists; made by the bench when it does not, and then CoreSimulatorService
-must restart to load it, which closes every booted simulator: the bench refuses that unless nothing is booted
-and `--allow-restart` is given). It starts no tracer. It reads `/proc`, `/sys`, the kernel journal and the VM's
+The bench has a **device set of its own** (`simctl --set`, a directory with a marker file, the same one for every run so
+its seed is kept), so it never sees the pool's simulators or anyone's lease; every `simctl` the guest helper starts goes
+through one function that adds `--set` and refuses a set without the marker. The one exception is the clone out of
+Simlock's source set (below), which is read-only for Simlock. At the end of a run the bench shuts down and deletes every
+device it made except the seed. The 3x device is the stock iPhone Pro; the **1x type** is the macbox 1x device type
+`macbox pool` makes (same identifier, reused when it exists; made by the bench when it does not, and then
+CoreSimulatorService must restart to load it, which closes every booted simulator: the bench refuses that unless nothing
+is booted and `--allow-restart` is given). It starts no tracer. It reads `/proc`, `/sys`, the kernel journal and the VM's
 census and log; it writes only its result file, and, with `ab --knob live:KEY=VALUE`, the one line in the VM's live
 switch file (restored byte for byte on every way out).
 
-Safety, in every run: the **hard deadline** (`--deadline`, default 90 minutes) stops the run 60 s early, writes the
-result so far and runs the cleanup; **one exit trap** (normal end, error, SIGTERM/SIGINT, the deadline) kills the
-helpers it started (explicit pids, never a bare `wait`), shuts down and deletes the bench's simulators and
-restores every knob; a **guard** refuses to boot more simulators when the guest's available memory (free +
-speculative + inactive + purgeable pages) would fall under
-`--min-guest-free-gib` (default 1.5, after the estimated cost of the new simulators), the guest reports memory
-pressure level 2 or more, the host's available memory is under `--min-host-free-gib` (6), or the disk under
-`--min-disk-gib` (12): the sweep stops there, it does not swap the VM to death. A sweep that ran no step at all
-(a refused guard, foreign simulators) is a FAIL with a non-zero exit. Simulators running outside the bench (a
-`launchd_sim` that is not the bench's own) refuse the run (`--allow-foreign` to measure anyway, recorded). Before each
-window the guest must settle: `settle` waits until every process except the load and its observers (the renderers `SimMetalHost`/`backboardd`/`SimRenderServer`, GlassBench, `simfps`, WindowServer, python, ps, ssh, matched by name against the whole command, and the helper's own tree) uses less than
-`--settle-bg` % of a core, for at most `--settle-max` s; the step records `settle.settled`, `bg_pct` and `waited_s`,
-and the SCALE line names the N whose guest did not settle.
+### Bench simulators are production simulators
+
+A fresh stock device is not what an agent gets: it runs stock services (a first boot keeps the vCPUs busy for minutes),
+costs about 1.8 GB of guest disk (five of them took the guest's disk, then the host's, to the storage guard's limit and
+stopped the VM) and keeps the Home Screen widgets, one of which retries a service Slim turns off in a tight loop
+(~3 cores per "idle" simulator, for ever). So the bench makes simulators the way Simlock does:
+
+1. **One seed per device type**, kept shut down in the bench's set between runs: `simctl --set <Simlock's source set>
+   clone <source> <seed> <bench set>` (the source is Simlock's own device of that type: widgets trimmed, not Slim; Simlock's
+   set is only ever cloned from, never written, booted, shut down or deleted, and its config is not read), registered with
+   `sim-idle-guard`, one boot, `simslim --set <bench set> on <seed> --profile <profile>` (it reboots the device),
+   a check that its `disabled.plist` has at least 100 services off (168 today), the bench app installed, a real settle
+   (the guest quiet for two samples in a row and the widgets' `chronod/icons` present, `--seed-settle-max` 600 s) and a
+   shutdown. A seed that fails any step is deleted again, never left to be reused.
+2. **Every bench simulator is `simctl clone <seed>`** (an APFS clone: no disk cost) with the seed's `disabled.plist` copied
+   into its own `/private/var/tmp/com.apple.CoreSimulator.SimDevice.<udid>` folder (mode 0700) before its first boot, and
+   checked there; the app is already in it.
+3. The seed is **reused** by later runs (its Slim services, its widgets and the app's build are checked: a seed made for
+   another build of the bench app is refused, not silently reinstalled). `macbox bench seed --rebuild-seed` (or
+   `--rebuild-seed` on any run) makes a new one, which you need after `macbox bench tools` rebuilt the app.
+
+Simlock is an **optional** integration. Without a source device of the wanted type (`macbox bench check` lists the types
+it finds) the run stops and says so. Two explicit ways out: `--scale-x 3` (the stock iPhone Pro type,
+which Simlock usually has a source for), or **`--stock-devices`**: fresh stock devices, created one at a time with the
+host-disk guard in front of each, for a device type Simlock has no source for or a scenario that needs a stock device.
+The result records `env.guest.device_source` (`stock devices` or clones of a seed) and `compare` warns when two results
+were made differently. Defaults of the Mac's paths: `~/.simlock04/devices/ios-sources` (`--source-set`),
+`~/go/bin/simslim` (`--simslim`), the only `.json` in `~/.config/simslim/` (`--slim-profile`; several or none: the run stops and asks for the flag), `~/.local/bin/sim-idle-guard`.
+
+### Safety, in every run that boots simulators
+
+The **hard deadline** (`--deadline`, default 90 minutes) stops the run 60 s early, writes the result so far and runs
+the cleanup; **one exit trap** (normal end, error, SIGTERM/SIGINT, the deadline, a monitor's abort) kills the helpers it
+started (explicit pids, never a bare `wait`), shuts down and deletes the bench's simulators and restores every knob.
+
+- **Idle guard.** The Mac's `sim-idle-guard` shuts down every simulator nobody used for 15 minutes, in any device set.
+  Every bench simulator (and the seed while it is booted) is registered with `sim-idle-guard keep <udid> <minutes>` for the
+  run's length (the deadline plus 5 minutes, at most 240; renewed before every window) and `~/.sim-keep/<udid>` is removed
+  by the cleanup. A guard that is not installed is recorded in the result (`idle_guard`, a section) and the run goes on; a
+  guard that refuses `keep` stops it.
+- **Disk.** `--disk-path` (a path on the filesystem that holds the VM's storage and that your storage guard watches) must
+  have `--disk-start-gib` 18 free to start, `--disk-boot-gib` 14 to boot another simulator (checked before **every** boot:
+  simulators boot one after the other, the lifecycle's boot storm is the one exception), and under `--disk-abort-gib` 11 the
+  run is aborted and cleaned up even while it waits. A disk reading that fails refuses.
+- **Guest memory.** Before every boot: the guest's available memory (free + speculative + inactive + purgeable pages) after
+  the estimated cost of the new simulators stays over `--min-guest-free-gib` (1.5), no memory pressure level 2 or more,
+  **swap-outs have not grown** since the run began, the **compressor** holds at most `--max-compressor-mb` (2048), the
+  host's available memory is over `--min-host-free-gib` (6). The sweep stops there; it does not swap the VM to death.
+- **A monitor** runs on its own thread while the run waits in a long call (a boot, a settle, a window): the host disk, the
+  VM's QEMU process (the same pid **and** start time) always; the Mac (answers over ssh twice in a row, no simulator that is
+  not the bench's, swap-outs, compressor) outside measurement windows, whose own load it must not add to. A breach aborts
+  the run from that thread: the partial result is written, the cleanup runs, the cleanup's verdict is added and the process
+  exits with 8 (disk), 9 (VM), 7 (someone else's simulator: **yield**, `--allow-foreign` to measure anyway) or 10 (guest
+  memory).
+- **Settle fails closed.** Before a window the guest must settle: every process except the load and its observers (the
+  renderers `SimMetalHost`/`backboardd`/`SimRenderServer`, GlassBench, `simfps`, WindowServer, python, ps, ssh, matched by
+  name against the whole command, and the helper's own tree) uses less than `--settle-bg` % of a core for two samples in a
+  row. A settle that reaches `--settle-max` (300 s) **fails the run** (a `settle` FAIL section with the top processes by CPU
+  at that moment); nothing is measured on top of an unsettled guest.
+- **The count of booted simulators.** Before every window (scale steps, A/B arms, soak, the observer window, idle) the guest
+  counts the Booted devices of the bench's own set and the run fails on any mismatch with the expected number (a
+  simulator the idle guard or someone shut down would otherwise be measured as if it ran). A step's `booted` is that
+  measured count, `expected_booted` the expected one.
+- **The frame counter fails the window.** A simulator for which `simfps` returned nothing or an error, or an animating one
+  from whose surfaces no counter could be read, fails the `counter` gate (and so the step, the run and the exit code).
+- **Leftovers.** A run takes the set with a lock and **refuses to start** while an earlier run left a device other than the
+  seed, a booted or never-completed seed, a lock, or overrides/keep files of a deleted device; `macbox bench cleanup` removes
+  them (`--seeds` also deletes the seeds). The cleanup looks again after deleting and says what it could not remove
+  (`CLEANUP FAIL`, exit code **20**, the lock stays); "cleanup done" is only printed for a verified one.
+- A sweep that ran no step at all (a refused guard, foreign simulators) is a FAIL with a non-zero exit.
 
 ## Commands
 
 | | |
 |---|---|
+| `seed` | Make the production seed for the device type (or check and report the one that is there); `--rebuild-seed` makes a new one. |
+| `cleanup` | Shut down and delete what an earlier run left in the bench's set (verified; exit 20 when something stays); `--seeds` deletes the seeds too. |
 | `scale` | N = 1, 2, 3... simulators (`--n 1,2,3,4,6,8`, `--scale-x 1\|3`, `--mix`), per simulator numbers, the maximum sustainable N per quality target. Stops early when a floor is breached (`--floor`, default `fps>=20`), a gate fails or the system turns unstable. |
 | `idle` | The VM with no simulator: QEMU, GPU and memory standing cost against `--bar-qemu-cores` (0.15). |
 | `lifecycle` | `--cycles` times: create, boot, install, launch, first app frame, shut down, resume, first frame, clone, boot the clone, delete (medians of the timings below); a per-cycle leak gate; `--storm N`: N simulators booted at once. |
@@ -62,10 +124,10 @@ and the SCALE line names the N whose guest did not settle.
 
 Common options: `--out DIR` (results, default `bench-results/`), `--secs` (window length, default 40),
 `--nominal-fps 60`, `--tag key=value` (recorded, for example `mesa=26.2.4` when Mesa is not a package),
-`--probe-method auto|openurl|appearance|cmd|none`, `--slim` (the pool's Slim configuration through simslim on the bench's simulators: without it they are stock simulators, which cost more; it needs simslim in the guest, `macbox-guest tools`, and whether simslim finds devices of a custom device set is untested: the run stops with that message if it does not), `--quiesce` (disables `mediaanalysisd` in each simulator, as
+`--probe-method auto|openurl|appearance|cmd|none`, `--stock-devices`, `--rebuild-seed`, `--source-set`, `--simslim`, `--slim-profile`, `--seed-settle-max` (see above), `--disk-path`, `--disk-start-gib`, `--disk-boot-gib`, `--disk-abort-gib`, `--max-compressor-mb`, `--set-name` (the bench's device set, default `bench`), `--quiesce` (disables `mediaanalysisd` in each simulator, as
 some old harnesses did; recorded, off by default), `--no-observer-check`, `--no-golden`, `--shots N`.
-Every run prints one PASS/FAIL/SKIP/INFO line per section and exits 0, 1 (a section failed) or 2 (the run could not
-go on). The JSON has the same lines under `sections`.
+Every run prints one PASS/FAIL/SKIP/INFO line per section and exits 0, 1 (a section failed), 2 (the run could not
+go on), 20 (the cleanup could not delete everything) or, when a monitor aborted it, 7, 8, 9 or 10 (above). The JSON has the same lines under `sections`.
 
 ### Workload mixes (`scale --mix`)
 
@@ -119,13 +181,15 @@ all their descendants, never the bench's own helper, its ssh and shell ancestors
 started: their CPU is `system.guest.observer_cpu_pct` (the larger of the helper tree's CPU between the two `ps` snapshots and the CPU time of the helper's reaped children, `simfps` and the probes' `simctl`, over the window). RSS counts shared pages in each process: it overstates what leaving a simulator out would
 free. `system.guest`: `total_cpu_pct`, `sims_cpu_pct` (the trees), `other_cpu_pct` (everything else), `sims_rss_mb`.
 
-**Lifecycle timings** (`lifecycle`, seconds, medians over `--cycles`; each cycle uses a fresh device): `create_s`
-(`simctl create`); `cold_boot_s` (`boot` + `bootstatus`); `install_s`; `cold_launch_call_s` (the `launch` call);
+**Lifecycle timings** (`lifecycle`, seconds, medians over `--cycles`; each cycle makes its own device the way a lease does:
+a clone of the seed; with `--stock-devices` a fresh stock device, and then `create_s`, `install_s` and one more clone of the
+installed device are timed too): `clone_s` (`simctl clone` of the seed + the Slim disables copied + the idle-guard keep);
+`cold_boot_s` (the clone's first `boot` + `bootstatus`); `cold_launch_call_s` (the `launch` call);
 `cold_first_frame_s` (from the launch call to the first counter value `simfps` reads on the new surface); `shutdown_s`
 (shutting the booted device down), `resume_boot_s` and `resume_first_frame_s` (the same two again: "resume" here is
-shutdown then boot, not Simlock's parking); `clone_s` (`simctl clone` of the shut-down device that has the app
-installed), `clone_boot_s` (boot of the clone until `bootstatus` returns); `delete_s` (`simctl delete` of the source
-device only: the shutdown before the clone is not timed). The clone is deleted untimed.
+shutdown then boot, not Simlock's parking); `delete_s` (`simctl delete` of the device and its overrides folder; stock
+path only: `clone_boot_s`, the boot of a clone of the installed device, deleted untimed). The boot storm
+(`--storm N`) clones N simulators and boots them at once.
 
 **Guest memory** (`system.guest`): `mem_used_mb` = active + wired + compressor pages; `mem_free_mb` = free +
 speculative; `mem_avail_mb` is what the guard uses: free + speculative + inactive + purgeable (`vm_stat` pages; 4 KiB
@@ -177,6 +241,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `qemu_log` | no new `command buffer failed` line in QEMU's log (stamp waits are counted in the detail) |
 | `gpu_hang` | the hang flag did not appear |
 | `kernel_gpu` | no kernel GPU error line since the step began (SKIP when the journal is not readable) |
+| `counter` | `simfps` answered with a result for every simulator of the window and every animating simulator's surfaces gave a readable frame counter (a counter that answers nothing or an error fails the window, it is not a missing metric) |
 | `memory` | the VM's own cgroup swapped no more than 50 MB (SKIP when the cgroup is unreadable: other projects' swapping on the host is not this run's); guest swap-outs fail it with `--fail-on-swap` |
 | `run_*` | every scenario, after its body: `run_coherent_census`, `run_coherent_process`, `run_qemu_log`, `run_gpu_hang` and `run_kernel_gpu` since the run began, and `run_crash_reports` (a new `.ips` on the guest since setup). They fail the exit code of `idle`, `lifecycle`, `soak`, `ab` too. |
 | `leak_*` | `lifecycle`: QEMU RSS and guest memory grow less than `--leak-rss-mb` / `--leak-guest-mb` per create/boot/delete cycle (least-squares slope); `soak`: less than `--soak-rss-mb-min` / `--soak-guest-mb-min` per minute |
@@ -249,7 +314,8 @@ ssh macbox 'cd ~/.macbox/bench && ./build.sh'
 | `GenieBench.app` | the desktop load: a window that minimizes and restores, for counting the Genie animation's frames |
 | `scroll-local.html` | a page for Safari that scrolls itself under a blurred floating bar, with no network |
 
-A run on the iOS Simulator, from the host:
+A by-hand run on the iOS Simulator (a **fresh stock device**: about 1.8 GB of guest disk and a minutes-long first boot, not what an
+agent's simulator is; `macbox bench scale` makes production simulators and is what to use for numbers):
 
 ```sh
 # a simulator of its own for the bench, so the pool is left alone (1x: the macbox 1x device type)

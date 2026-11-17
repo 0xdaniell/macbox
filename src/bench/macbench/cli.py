@@ -49,7 +49,7 @@ def add_common(p):
     p.add_argument("--rebuild-seed", action="store_true", help="delete the bench's seed and make a new one (after `macbox bench tools` rebuilt the app, or when it cannot be reused)")
     p.add_argument("--source-set", default=os.environ.get("BENCH_SIMLOCK_SOURCES"), help="Simlock's source device set in the guest, read only (default ~/.simlock04/devices/ios-sources)")
     p.add_argument("--simslim", default=os.environ.get("BENCH_SIMSLIM"), help="simslim in the guest (default ~/go/bin/simslim)")
-    p.add_argument("--slim-profile", default=os.environ.get("BENCH_SLIM_PROFILE"), help="simslim profile in the guest (default ~/.config/simslim/atlas.json)")
+    p.add_argument("--slim-profile", default=os.environ.get("BENCH_SLIM_PROFILE"), help="simslim profile in the guest (default: the only .json in ~/.config/simslim)")
     p.add_argument("--seed-settle-max", type=float, default=600, help="the seed must settle within this many seconds or it is deleted and the run fails")
     p.add_argument("--quiesce", action="store_true", help="disable mediaanalysisd in each simulator (recorded; production does not)")
     p.add_argument("--fail-on-swap", action="store_true", help="a guest swap-out in a window fails the memory gate (default: reported, host swap fails)")
@@ -383,6 +383,11 @@ def check(a):
         line(True, "guest answers: macOS %s, %s" % (d.get("macos"), d.get("xcode")))
         line(d.get("has_simfps"), "simfps built in the guest (macbox bench tools)")
         line(d.get("has_app"), "GlassBench.app built in the guest (macbox bench tools)")
+        types = d.get("simlock_types") or []
+        line(bool(types), "Simlock's source devices found (production simulators: %s)%s" % (", ".join(types) or "none",
+                                                                                            "" if types else "; without them only --stock-devices works"))
+        line(d.get("has_simslim") and d.get("has_slim_profile"), "simslim and its profile in the guest (the seed is made Slim with them)")
+        line(d.get("has_idle_guard"), "sim-idle-guard in the guest (keeps the bench's simulators from its 15-minute shutdown)")
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         line(False, "the guest's bench helper (macbox bench tools)")
     return 0 if ok else 1

@@ -359,6 +359,10 @@ def install(mod):
             import shutil
             for u in SRC_UDIDS[1:]:
                 shutil.rmtree(os.path.join(mod.SOURCE_SET, u))
+    mod.SLIM_DIR = _p("simslim-config")
+    os.makedirs(mod.SLIM_DIR, exist_ok=True)
+    with open(os.path.join(mod.SLIM_DIR, "profile.json"), "w") as f:
+        f.write("{}")
     mod.SIMSLIM = _p("bin/simslim")
     os.makedirs(_p("bin"), exist_ok=True)
     with open(mod.SIMSLIM, "w") as f:

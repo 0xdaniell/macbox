@@ -40,6 +40,28 @@ def wr(path, mode, text):
         f.write(text)
 
 
+class SlimProfile(unittest.TestCase):
+    def test_explicit_env_then_the_only_file_else_an_error_that_says_what_to_pass(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        old = (bg.SLIM_DIR, bg.SLIM_PROFILE)
+        try:
+            bg.SLIM_DIR, bg.SLIM_PROFILE = d, None
+            with self.assertRaises(bg.GuestError) as e:
+                bg.resolve_profile()
+            self.assertIn("--slim-profile", str(e.exception))
+            wr(os.path.join(d, "a.json"), "w", "{}")
+            self.assertEqual(bg.resolve_profile(), os.path.join(d, "a.json"))
+            wr(os.path.join(d, "b.json"), "w", "{}")
+            with self.assertRaises(bg.GuestError):
+                bg.resolve_profile()                                  # two: no guessing
+            self.assertEqual(bg.resolve_profile("/x/p.json"), "/x/p.json")
+            bg.SLIM_PROFILE = "/env/p.json"
+            self.assertEqual(bg.resolve_profile(), "/env/p.json")
+        finally:
+            bg.SLIM_DIR, bg.SLIM_PROFILE = old
+
+
 class GuestParsers(unittest.TestCase):
     def test_vm_stat(self):
         m = bg.mem_summary(bg.parse_vm_stat(VM_STAT))

@@ -120,8 +120,9 @@ class ResultFilesAreNeverFoundByPattern(unittest.TestCase):
     def test_no_module_selects_files_by_pattern(self):
         for name, text in self.sources():
             self.assertNotRegex(text, r"\bimport glob\b|\bfrom glob\b|\bfnmatch\b|\.glob\(|\brglob\b", name)
-        # the only directory listings: sets' devices (a UUID pattern), crash reports (exact suffix), /proc, and the source set
-        allowed = {"benchguest.py": 2, "hostprobe.py": 2}
+        # the only directory listings: crash reports (exact suffix), Simlock's source set (twice: a UUID pattern, device.plist read by exact
+        # path), the simslim config folder (one profile), /proc and /sys in hostprobe. A new listing has to be argued for here.
+        allowed = {"benchguest.py": 4, "hostprobe.py": 2}
         for name, text in self.sources():
             n = len(re.findall(r"os\.listdir\(|os\.scandir\(", text))
             self.assertLessEqual(n, allowed.get(name, 0), name)

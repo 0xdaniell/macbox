@@ -50,6 +50,9 @@ def compare_scale(a, b, noise=NOISE):
         a["id"], b["id"], da.get("mix"), db.get("mix"), da.get("scale_x"), db.get("scale_x"), noise * 100))
     if (da.get("mix"), da.get("scale_x")) != (db.get("mix"), db.get("scale_x")):
         lines.append("  warning: different mix or scale: the numbers are not comparable")
+    src = [(r.get("env", {}).get("guest") or {}).get("device_source") for r in (a, b)]
+    if src[0] != src[1]:
+        lines.append("  warning: the simulators were not made the same way (A: %s, B: %s): the numbers are not comparable" % tuple(src))
     for name in sorted(set(da["summary"]["max_n"]) | set(db["summary"]["max_n"])):
         ma = (da["summary"]["max_n"].get(name) or {}).get("max_n")
         mb = (db["summary"]["max_n"].get(name) or {}).get("max_n")
