@@ -218,8 +218,40 @@ def grow(ctx, n, roles, install=True, parallel=False):
     return boot
 
 
-def settle(ctx):
-    r = ctx.guest.call(["settle", "--max-s", ctx.a.settle_max, "--bg-pct", ctx.a.settle_bg, "--step", ctx.a.settle_step], ctx.a.settle_max + 120)
+def settle(ctx, at="before the window", max_s=None, bg=None):
+    """Waits until the guest is quiet (background CPU under --settle-bg for two samples in a row, up to --settle-max).
+    A settle that reaches its cap FAILS the run: a window now would measure whatever keeps the guest busy, not the
+    simulators. The top processes by CPU at that moment are recorded in the failure."""
+    a = ctx.a
+    max_s = a.settle_max if max_s is None else max_s
+    bg = a.settle_bg if bg is None else bg
+    r = ctx.guest.call(["settle", "--max-s", max_s, "--bg-pct", bg, "--step", a.settle_step, "--consecutive", 2], max_s + 120 + 4 * a.settle_step)
+    if not r.get("settled"):
+        top = ", ".join("%s %g%%" % (t["cmd"], t["cpu_pct"]) for t in r.get("top", [])[:6]) or "nothing"
+        line = "NOT SETTLED %s: the guest's background CPU stayed at %.0f%% of a core (bar %g%%) for %g s; top processes by CPU: %s" % (
+            at, r.get("bg_pct", -1), bg, max_s, top)
+        ctx.section("settle", "FAIL", line, {"at": at, "series": r.get("series"), "top": r.get("top")})
+        raise Stop(line)
+    return r
+
+
+def precheck(ctx, what):
+    """Before a measurement window: count the bench's OWN booted simulators and refuse any mismatch with the expected
+    number (a simulator the Mac's idle guard or someone shut down would be measured as if it ran); yield when a simulator
+    that is not the bench's is booted. The measured count is what the result records."""
+    a = ctx.a
+    udids = [s["udid"] for s in ctx.sims]
+    r = ctx.guest.call(["precheck", "--udids", ",".join(udids), "--keep-min", keep_minutes(ctx)], 90)
+    ctx.idle_guard.update(r.get("keep", {}))
+    if r.get("foreign_booted") and not a.allow_foreign:
+        line = "YIELDING %s: %d simulator(s) outside the bench are booted (someone needs the Mac); --allow-foreign measures anyway" % (what, r["foreign_booted"])
+        ctx.section("foreign", "FAIL", line)
+        raise Stop(line)
+    if r["booted"] != len(udids) or r.get("missing") or r.get("extra"):
+        line = "ABORT %s: %d of the bench's simulators are booted, expected %d (%d expected one(s) not booted, %d unexpected): one was shut down under the run (the Mac's idle guard?)" % (
+            what, r["booted"], len(udids), len(r.get("missing", [])), len(r.get("extra", [])))
+        ctx.section("booted_check", "FAIL", line, {"booted": r["booted"], "expected": len(udids)})
+        raise Stop(line)
     return r
 
 
@@ -227,6 +259,7 @@ def window(ctx, secs, mix, no_strip=False):
     """One measurement window over every simulator of ctx.sims: the guest measures, the host samples the same window.
     Returns (guest result, host system dict, window start/end in guest time)."""
     a = ctx.a
+    pre = precheck(ctx, "before the %g s window" % secs)
     udids = ",".join(s["udid"] for s in ctx.sims)
     roles = ",".join(s["role"] for s in ctx.sims)
     lead = a.lead if a.lead is not None else 8 + 2 * len(ctx.sims)
@@ -243,6 +276,7 @@ def window(ctx, secs, mix, no_strip=False):
     time.sleep(max(0, secs - (time.time() - host_go)))
     s1 = ctx.host.snap()
     g = pend.wait()
+    g["precheck"] = pre
     return g, s0, s1, t_go
 
 
@@ -305,14 +339,37 @@ def build_step(ctx, n, mix, g, s0, s1, t_go, boot=None):
     system = system_dict(ctx, g, s0, s1, frames_total)
     died = [s["idx"] for s in sims if g["sims"][s["idx"]].get("state_after") != "Booted"]
     kern, knote = ctx.host.kernel_gpu(s0["wall"])
+    foreign = max((g.get("foreign_booted") or {}).values() or [0])
     stab = {"new_ips": len(g["new_ips"]), "ips": g["new_ips"][:5], "sims_died": died, "kernel_gpu_lines": kern, "kernel_note": knote,
-            "qemu_same": ctx.host.same_qemu(), "observer_errors": [s["idx"] for s in sims if s.get("observer_error")]}
-    stab["ok"] = not (stab["new_ips"] or died or kern or not stab["qemu_same"])
-    return {"n": n, "mix": mix, "sims": sims, "system": system, "stability": stab, "boot": boot or {}}
+            "qemu_same": ctx.host.same_qemu(), "observer_errors": [s["idx"] for s in sims if s.get("observer_error")],
+            "foreign_booted": foreign}
+    stab["ok"] = not (stab["new_ips"] or died or kern or not stab["qemu_same"] or (foreign and not a.allow_foreign))
+    pre = g.get("precheck") or {}
+    # "booted" is what the guest counted in the bench's set right before the window, never the expected number
+    return {"n": n, "mix": mix, "booted": pre.get("booted"), "expected_booted": len(ctx.sims), "sims": sims, "system": system,
+            "stability": stab, "boot": boot or {}, "counter": counter_gate(g["sims"], mix)}
+
+
+def counter_gate(gsims, mix):
+    """A frame counter that returns nothing or an error for a simulator fails the window: every simulator of a window with
+    a counter must have an answer from simfps, and an animating one must have read counters from its surfaces."""
+    if mix == "idle":
+        return gates.gate("SKIP", "no counter in the idle mix")
+    bad = []
+    for i, s in enumerate(gsims):
+        if s.get("simfps_error") or not s.get("simfps"):
+            bad.append("sim %d: %s" % (i, s.get("simfps_error") or "simfps returned nothing"))
+        elif s.get("role") in ("busy", "agent"):
+            rd = [r for r in analysis.parse_raw(s.get("raw") or "") if 0 <= r[1] < 65535]
+            if len(rd) < 2:
+                bad.append("sim %d: no frame counter read from its surfaces (%d reads)" % (i, len(rd)))
+    if bad:
+        return gates.gate("FAIL", "; ".join(bad[:4]))
+    return gates.gate("PASS", "simfps answered for %d simulator(s), counters read" % len(gsims))
 
 
 def step_gates(ctx, step, shots=None):
-    gs = {"strip": gates.strip_gate_of(step["sims"]), "kernel_gpu": gates.kernel_gate(step["stability"]["kernel_gpu_lines"], step["stability"]["kernel_note"])}
+    gs = {"counter": step["counter"], "strip": gates.strip_gate_of(step["sims"]), "kernel_gpu": gates.kernel_gate(step["stability"]["kernel_gpu_lines"], step["stability"]["kernel_note"])}
     gs.update(ctx.coh.check(ctx.marks["coh"]))
     if shots:
         gs.update(shots)

@@ -49,7 +49,7 @@ def run_ab(ctx):
     ctx.host.n = n
     core.grow(ctx, n, core.roles_for(mix, n))
     ctx.probe_method = scale.calibrate(ctx, ctx.sims[0])["chosen"] if mix in ("all-busy", "one-busy") and metric == "input_p95" else "none"
-    core.settle(ctx)
+    core.settle(ctx, "before the A/B")
     ctx.doc["data"] = {"knob": knob.describe(), "metric": metric, "arms": [], "n": n, "mix": mix}
     vals = {"A": [], "B": []}
     steps = {"A": [], "B": []}

@@ -87,7 +87,7 @@ class Dry(unittest.TestCase):
     def setUpClass(cls):
         with concurrent.futures.ThreadPoolExecutor(8) as ex:
             futs = {k: ex.submit(run_case, a, f) for k, (a, f) in CASES.items()}
-            futs["ssh"] = ex.submit(run_case, ["scale", "--n", "1,2,3"] + FAST, "", {"BENCH_STUB_SSH_TIMEOUT": "20"})
+            futs["ssh"] = ex.submit(run_case, ["scale", "--n", "1,2,3"] + FAST, "", {"BENCH_STUB_SSH_TIMEOUT": "30"})
             futs["term"] = ex.submit(run_case, ["scale", "--n", "1,2,3,4,5,6"] + FAST, "", None, 35)
             futs["deadline"] = ex.submit(run_case, ["scale", "--n", "1,2,3,4,5,6", "--deadline", "40"] + FAST, "")
             cls.r = {k: f.result() for k, f in futs.items()}

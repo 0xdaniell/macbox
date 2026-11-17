@@ -920,6 +920,9 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
     reaped = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
     tot["observer_cpu_pct"] = round(max(tot["observer_cpu_pct"], 100 * reaped / max(t_end - t_start, 0.001)), 1)
     st = {d["udid"]: d.get("state") for d in devices()}
+    own_up = len([1 for v in st.values() if v == "Booted"])
+    foreign = {"before": max(0, len([p for p in ps0 if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])]) - len(udids)),
+               "after": max(0, len([p for p in ps1 if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])]) - own_up)}
     sims = []
     for i, u in enumerate(udids):
         sj, err = res.get(u, (None, None))
@@ -935,7 +938,7 @@ def run_window(a, udids, roles, mix, secs, t_go, tmp, probe_method, probe_every,
             "guest": dict(tot, mem=m1, mem_before=m0, swapins_d=m1["swapins"] - m0["swapins"], swapouts_d=m1["swapouts"] - m0["swapouts"],
                           pageouts_d=m1["pageouts"] - m0["pageouts"], pressure_before=lvl0,
                           pressure_max=max([x for x in lvls + [pressure_level()] if x] or [None]) if any(lvls) else pressure_level()),
-            "new_ips": sorted(list_ips() - ips0), "procs_total": len(ps1)}
+            "new_ips": sorted(list_ips() - ips0), "procs_total": len(ps1), "foreign_booted": foreign}
 
 
 def cmd_measure(a):
@@ -1181,6 +1184,21 @@ def count_launchd_sim():
     return len([p for p in parse_ps(ps_text()) if re.search(r"(^|/)launchd_sim( |$)", p["cmd"])])
 
 
+def cmd_precheck(a):
+    """Before a measurement window: how many simulators of the bench's own set are Booted (counted from the set's own
+    device list, the seed included), which of the expected ones are not, and how many simulators outside the bench run on
+    this Mac (a `launchd_sim` that is not the bench's). Renews the idle-guard keep of the expected simulators."""
+    expect = [u for u in a.udids.split(",") if u]
+    booted = sorted(d["udid"] for d in devices() if d.get("state") == "Booted")
+    kept = {}
+    for u in expect:
+        if a.keep_min:
+            k = keep_or_fail(u, a.keep_min)
+            kept[k["state"]] = kept.get(k["state"], 0) + 1
+    out_json({"booted": len(booted), "booted_udids": booted, "missing": [u for u in expect if u not in booted],
+              "extra": [u for u in booted if u not in expect], "foreign_booted": max(0, count_launchd_sim() - len(booted)), "keep": kept})
+
+
 def cmd_ips(a):
     out_json({"ips": sorted(list_ips())})
 
@@ -1265,6 +1283,7 @@ def main(argv=None):
     add("teardown", cmd_teardown, O("--seeds", action="store_true", help="delete the seeds too"))
     add("build", cmd_build, O("--xcodebuild", default=""))
     add("memcheck", cmd_memcheck)
+    add("precheck", cmd_precheck, O("--udids", default=""), O("--keep-min", type=float, default=0))
     add("ips", cmd_ips)
     add("calls", cmd_calls)
     a = ap.parse_args(argv)

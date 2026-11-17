@@ -30,7 +30,7 @@ def run_idle(ctx):
     m = ctx.guest.call(["memcheck"], 60)
     if (m["booted"] or m.get("foreign_booted")) and not a.allow_foreign:
         raise Stop("simulators are booted (%d of the bench, %d outside it): an idle VM has none; --allow-foreign to measure anyway" % (m["booted"], m.get("foreign_booted", 0)))
-    core.settle(ctx)
+    core.settle(ctx, "before the idle window")
     g, s0, s1, t_go = core.window(ctx, a.secs, "idle")
     sysd = core.system_dict(ctx, g, s0, s1, 0)
     kern, note = ctx.host.kernel_gpu(s0["wall"])
@@ -113,7 +113,7 @@ def run_soak(ctx):
         raise Stop(reason)
     ctx.host.n = n
     core.grow(ctx, n, ["busy"] * n)
-    core.settle(ctx)
+    core.settle(ctx, "before the soak")
     res = {}
     for label in ("start", "end"):
         if label == "end":
@@ -141,6 +141,11 @@ def run_soak(ctx):
     ctx.section("soak_fps", "PASS" if ok else "FAIL", "SOAK %s: slowest simulator %.1f fps at the start, %.1f after %g min (bar: not below 95%%)" % ("PASS" if ok else "FAIL", f0, f1, a.soak_minutes))
     ctx.doc["gates"].update(ctx.coh.check(ctx.marks["coh"]))
     ctx.doc["gates"]["strip"] = gates.strip_gate_of(res["end"]["sims"])
+    cg = [res[k]["counter"] for k in ("start", "end")]
+    ctx.doc["gates"]["counter"] = next((g for g in cg if g["status"] == "FAIL"), cg[-1])
+    for name in ("counter", "strip"):          # a failed gate is a FAIL section: it sets the exit code
+        g = ctx.doc["gates"][name]
+        ctx.section("gate:" + name, g["status"], "GATE %s %s: %s" % (g["status"], name, g["detail"]))
     ctx.save()
 
 
@@ -205,7 +210,7 @@ def run_golden(ctx):
     info = core.setup_guest(ctx)
     core.capture_env(ctx, info)
     core.grow(ctx, 1, ["static"])
-    core.settle(ctx)
+    core.settle(ctx, "before the golden screen")
     scale.golden_phase(ctx)
     seen = getattr(ctx, "golden_seen", None)
     if not seen:

@@ -6,7 +6,9 @@ simulators), crash@N (a new crash report at N booted), backwards@N (a frame show
 cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-idle-guard on the Mac), keepfail
 (sim-idle-guard keep fails), nosource (Simlock has no source device of the type), nosourceset (no Simlock set at all),
 slimfail (simslim fails), slimfew (simslim leaves too few services off), noicons (the widgets never settle: no chronod icons),
-noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators).
+noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators),
+lostsim@N (the Mac's idle guard shuts the newest simulator down once N are booted), counterfail@N (the frame counter
+of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted).
 The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
 $BENCHGUEST_STATE too, so the bench's real file code runs against them."""
 import json
@@ -153,6 +155,10 @@ def _stub_run(argv):
         verb = cmd[0]
         if verb == "list":
             if cmd[1] == "devices":
+                ls = fault("lostsim")
+                if ls is not None and len(booted(s)) >= ls and not s.get("lost") and "-j" in cmd:
+                    s["devs"][booted(s)[-1]]["state"] = "Shutdown"           # the idle guard took it
+                    s["lost"] = 1
                 devs = [{"udid": u, "name": d["name"], "state": d["state"], "isAvailable": True} for u, d in s["devs"].items()]
                 out = json.dumps({"devices": {"stub.runtime.iOS-26-5": devs}})
             else:
@@ -234,16 +240,23 @@ def _stub_run(argv):
 def stub_ps():
     s = load()
     now = time.time()
-    lines = ["    1     0  4000 %s /sbin/launchd" % _cpu(now - T0, 0.05), "  100     1  60000 %s /usr/sbin/WindowServer" % _cpu(now - T0, 0.2)]
+    lines = ["    1     0  4000 %s /sbin/launchd" % _cpu(now - T0, 0.01), "  100     1  60000 %s /usr/sbin/WindowServer" % _cpu(now - T0, 0.2)]
     pid = 200
     for i, u in enumerate(sorted(booted(s))):
         busy = s["mode"].get(u) == "busy"
         base = "/stub/set/%s/data" % u
-        lines.append("%5d     1  20000 %s launchd_sim %s" % (pid, _cpu(now - T0, 0.05), base))
-        lines.append("%5d %5d 150000 %s SpringBoard" % (pid + 1, pid, _cpu(now - T0, 0.15 if busy else 0.03)))
+        lines.append("%5d     1  20000 %s launchd_sim %s" % (pid, _cpu(now - T0, 0.003), base))
+        lines.append("%5d %5d 150000 %s SpringBoard" % (pid + 1, pid, _cpu(now - T0, 0.03 if busy else 0.01)))
         lines.append("%5d %5d 300000 %s GlassBench" % (pid + 2, pid, _cpu(now - T0, 0.5 if busy else 0.01)))
         lines.append("%5d     1  90000 %s SimMetalHost -d %s" % (pid + 3, _cpu(now - T0, 0.3 if busy else 0.02), u))
         pid += 10
+    n = len(booted(s))
+    us = fault("unsettled")
+    if us is not None and n >= us:                  # the Maps widget's retry loop: a process that never quiets down
+        lines.append("%5d     1  40000 %s /usr/libexec/diagnosticd" % (900, _cpu(now - T0, 1.7)))
+    fo = fault("foreign")
+    if fo is not None and n >= fo:                  # someone else's simulator on the Mac, in another device set
+        lines.append("%5d     1  20000 %s launchd_sim /stub/other-set/FOREIGN/data" % (950, _cpu(now - T0, 0.01)))
     return "\n".join(lines) + "\n"
 
 
@@ -272,6 +285,9 @@ class StubSimfps:
         self.udid, self.secs, self.strip, self.start_at, self.raw = udid, secs, strip, start_at, raw_path
 
     def wait(self, timeout):
+        cf = fault("counterfail")
+        if cf is not None and len(booted(load())) >= cf and self.udid == sorted(booted(load()))[-1]:
+            return None, "simfps: no surface for the simulator (injected)"
         if fault("hang_simfps") is not None:
             return None, "simfps hung (killed after %ds)" % int(timeout)
         d = self.start_at + self.secs - time.time()

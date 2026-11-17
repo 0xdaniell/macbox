@@ -7,7 +7,7 @@ from .core import Stop
 from .runctx import DeadlineError
 from .transport import GuestError
 
-STEP_GATES = ("strip", "kernel_gpu", "coherent_census", "coherent_process", "qemu_log", "gpu_hang", "tears", "pixels", "memory")
+STEP_GATES = ("counter", "strip", "kernel_gpu", "coherent_census", "coherent_process", "qemu_log", "gpu_hang", "tears", "pixels", "memory")
 
 
 def calibrate(ctx, sim):
@@ -65,11 +65,11 @@ def run_scale(ctx):
             if first:
                 if mix in ("all-busy", "one-busy"):
                     data["calibration"] = calibrate(ctx, ctx.sims[0])
-                    ctx.guest.call(["settle", "--max-s", 20, "--bg-pct", 90, "--step", ctx.a.settle_step], 60)
+                    core.settle(ctx, "before the input calibration", max_s=60, bg=90)
                 if a.golden_phase:
                     ctx.pixel_gate = golden_phase(ctx)
                     core.grow(ctx, n, roles)
-            st = core.settle(ctx)
+            st = core.settle(ctx, "at N=%d" % n)
             g, s0, s1, t_go = core.window(ctx, a.secs, mix)
             step = core.build_step(ctx, n, mix, g, s0, s1, t_go, boot)
             step["settle"] = {k: st.get(k) for k in ("settled", "bg_pct", "waited_s")}
@@ -111,6 +111,8 @@ def _why_unstable(step):
         out.append("%d new crash report(s)" % s["new_ips"])
     if s["sims_died"]:
         out.append("simulator(s) %s no longer booted" % s["sims_died"])
+    if s.get("foreign_booted") and s["foreign_booted"]:
+        out.append("%d simulator(s) outside the bench were booted during the window" % s["foreign_booted"])
     if s["kernel_gpu_lines"]:
         out.append("%d kernel GPU error line(s)" % s["kernel_gpu_lines"])
     if not s["qemu_same"]:
@@ -133,10 +135,11 @@ def observer_check(ctx, step, mix):
     g, s0, s1, t_go = core.window(ctx, ctx.a.secs, mix, no_strip=True)
     with_strip = [s["surface_fps"] for s in step["sims"] if s.get("role") in ("busy", "agent") and s.get("surface_fps")]
     without = [s["simfps"]["fps"] for s in g["sims"] if s["role"] in ("busy", "agent") and s.get("simfps")]
+    missing = len([s for s in g["sims"] if s["role"] in ("busy", "agent")]) - len(without)          # a counter that answered nothing is not a measurement
     ws, wo = stats.mean(with_strip), stats.mean(without)
-    d = stats.rel_diff(wo, ws)
+    d = None if missing else stats.rel_diff(wo, ws)
     return {"n": step["n"], "surface_fps_with_strip": stats.r1(ws), "surface_fps_without_strip": stats.r1(wo),
-            "delta": None if d is None else round(d, 4), "ok": d is not None and abs(d) <= 0.04}
+            "delta": None if d is None else round(d, 4), "missing": missing, "ok": d is not None and abs(d) <= 0.04}
 
 
 def _finish(ctx, stopped, partial=False):
