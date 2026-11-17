@@ -74,7 +74,8 @@ class BootedCount(unittest.TestCase):
     def test_a_simulator_outside_the_bench_makes_the_run_yield(self):
         r = results()["foreign"]
         self.assertNotEqual(r["rc"], 0, r["out"][-600:])
-        self.assertIn("YIELDING", sections(r["doc"], "foreign")[0]["line"])
+        said = " | ".join(x["line"] for x in r["doc"]["sections"] if x["status"] == "FAIL")          # the precheck, the guard or the monitor: whoever sees it first
+        self.assertRegex(said, r"YIELDING|someone needs the Mac|outside the bench are booted")
         self.assertEqual([st["n"] for st in r["doc"]["data"]["steps"]], [1])
         self.assertEqual(sims_booted(r["state"]), [])
 

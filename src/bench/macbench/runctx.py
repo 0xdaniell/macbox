@@ -28,6 +28,10 @@ class Run:
         self._lock = threading.Lock()
         self.expired = threading.Event()
         self.problems = []       # things cleanup found it could not restore
+        self.aborted = None      # (reason, exit code) once a monitor ended the run
+        self.on_abort = None     # fn(reason): records the abort in the result
+        self.final = None        # fn(): after the cleanup, writes the result's closing sections (the cleanup's verdict)
+        self._done = threading.Event()
 
     # --- time
     def remaining(self):
@@ -89,11 +93,62 @@ class Run:
         self.cleanup()
         os._exit(124)
 
+    # --- monitors: what must stop the run while a long call is waiting
+    def watch(self, name, fn, every):
+        """Calls fn() every `every` seconds on a thread until the run is over; fn returns None (all well) or
+        (reason, exit code): the run is then aborted: partial result, cleanup, exit."""
+        def loop():
+            while not self.expired.wait(every):
+                try:
+                    r = fn()
+                except Exception as e:           # a check that cannot run is not a verdict
+                    self.log("monitor %s: %s: %s" % (name, type(e).__name__, e))
+                    continue
+                if r:
+                    self.abort(*r)
+                    return
+        t = threading.Thread(target=loop, daemon=True, name="watch-" + name)
+        t.start()
+        return t
+
+    def abort(self, reason, code):
+        """End the run NOW from a monitor thread: record why, write the partial result, run the one cleanup, write the
+        closing sections, exit with `code`. The main thread, which may be blocked in a call, is killed with its children."""
+        with self._lock:
+            if self.aborted or self.cleaned:
+                return
+            self.aborted = (reason, code)
+        self.log("ABORT: %s" % reason)
+        self.expired.set()
+        for hook, arg in ((self.on_abort, (reason,)), (self.on_deadline, (reason,))):
+            if hook:
+                try:
+                    hook(*arg)
+                except Exception as e:
+                    self.log("abort hook failed: %s" % e)
+        self.cleanup()
+        if self.final:
+            try:
+                self.final()
+            except Exception as e:
+                self.log("closing the result failed: %s" % e)
+        os._exit(code)
+
+    def join_abort(self):
+        """Called by the main thread after its own cleanup: when a monitor aborted the run, it owns the exit."""
+        if self.aborted:
+            time.sleep(600)
+
     def cleanup(self):
         with self._lock:
             if self.cleaned:
-                return
-            self.cleaned = True
+                already = True
+            else:
+                already = False
+                self.cleaned = True
+        if already:
+            self._done.wait(900)            # another thread is cleaning up: do not exit before it is done
+            return
         self.expired.set()
         self.in_cleanup = True
         self.kill_children()
@@ -111,6 +166,7 @@ class Run:
             except Exception as e:
                 self.problems.append("%s: %s" % (label, e))
                 self.log("restore FAILED: %s: %s" % (label, e))
+        self._done.set()
 
 
 class LiveKnob:

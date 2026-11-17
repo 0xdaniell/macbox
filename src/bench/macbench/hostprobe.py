@@ -259,6 +259,7 @@ class Host:
         self.pid, self.root, self.live_conf = pid, root, live_conf
         self.hz = hz or os.sysconf("SC_CLK_TCK")
         self.n = 0
+        self.born = self._starttime()          # the QEMU process as this run first saw it: a restart is a different process
 
     def qemu_pid(self):
         return self.pid
@@ -282,8 +283,17 @@ class Host:
     def kernel_gpu(self, since):
         return kernel_gpu_lines(since)
 
+    def _starttime(self):
+        t = _read(self.root, "/proc/%d/stat" % self.pid)
+        try:
+            return t[t.rindex(")") + 2:].split()[19] if t else None          # field 22: start time in ticks since boot
+        except (ValueError, IndexError):
+            return None
+
     def same_qemu(self):
-        return os.path.exists("%s/proc/%d" % (self.root, self.pid))
+        """The QEMU process is still the one the run started with (same pid AND same start time: a restarted VM may reuse the pid)."""
+        now = self._starttime()
+        return now is not None and now == self.born
 
     def env(self):
         sw = read_live_conf(self.live_conf) if self.live_conf else {}

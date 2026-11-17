@@ -51,26 +51,27 @@ class SshGuest:
             raise GuestError("%s: %s" % (what, d["error"]))
         return d
 
-    def _check(self, what, timeout):
+    def _check(self, what, timeout, counted=True):
         if self.run.in_cleanup:
             return min(timeout, 240)
         if self.run.expired.is_set():
             raise DeadlineError("stopping: %s not started" % what)
         if self.run.remaining() < 5:
             raise DeadlineError("deadline: %s not started" % what)
-        self.calls += 1
-        if self.fault_ssh_timeout and self.calls == self.fault_ssh_timeout:
-            raise GuestError("%s: ssh timed out (injected)" % what)
+        if counted:
+            self.calls += 1
+            if self.fault_ssh_timeout and self.calls == self.fault_ssh_timeout:
+                raise GuestError("%s: ssh timed out (injected)" % what)
         return min(timeout, max(5, int(self.run.remaining())))
 
-    def start(self, args, timeout=300):
+    def start(self, args, timeout=300, counted=True):
         what = args[0]
-        timeout = self._check(what, timeout)
+        timeout = self._check(what, timeout, counted)
         p = self.run.popen(self.argv(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return Pending(self, p, what, timeout)
 
-    def call(self, args, timeout=300):
-        return self.start(args, timeout).wait()
+    def call(self, args, timeout=300, counted=True):
+        return self.start(args, timeout, counted).wait()
 
     def clock_offset(self):
         """Guest clock minus host clock in seconds, from the quickest of 5 round trips."""
@@ -89,6 +90,25 @@ class SshGuest:
 
     def argv_plain(self, cmd):
         return ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", self.ssh_host, cmd]
+
+    def alive(self):
+        """The Mac answers over ssh (a monitor's question: it does not count as one of the run's calls)."""
+        try:
+            return subprocess.run(self.argv_plain("true"), capture_output=True, timeout=20).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _env(self):
+        return None
+
+    def quick(self, args, timeout=60):
+        """A helper call for the monitors: not counted, never injected with the DRY faults of the run's own calls, and a
+        timeout kills only itself (a hung monitor must not take the run's own call down with it)."""
+        try:
+            p = subprocess.run(self.argv(args), capture_output=True, text=True, timeout=timeout, env=self._env(), cwd=getattr(self, "bench_dir", None))
+        except subprocess.TimeoutExpired:
+            raise GuestError("%s: no answer in %ds" % (args[0], timeout))
+        return self.parse(args[0], p.returncode, p.stdout, p.stderr)
 
     def sh(self, cmd, timeout=120):
         """A plain command in the guest: (rc, stdout)."""
@@ -109,16 +129,21 @@ class LocalGuest(SshGuest):
     def argv(self, args):
         return [sys.executable, os.path.join(self.bench_dir, "guest", "benchguest.py"), "--set", self.set_dir] + [str(a) for a in args]
 
-    def start(self, args, timeout=300):
+    def start(self, args, timeout=300, counted=True):
         what = args[0]
-        timeout = self._check(what, timeout)
-        env = dict(os.environ, BENCHGUEST_STUB="1", BENCHGUEST_STATE=self.state_dir, BENCH_STUB_FAULT=self.faults,
-                   BENCHGUEST_CALLS=os.path.join(self.state_dir, "calls.log"), PYTHONPATH=self.bench_dir)
-        p = self.run.popen(self.argv(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=self.bench_dir)
+        timeout = self._check(what, timeout, counted)
+        p = self.run.popen(self.argv(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self._env(), cwd=self.bench_dir)
         return Pending(self, p, what, timeout)
+
+    def _env(self):
+        return dict(os.environ, BENCHGUEST_STUB="1", BENCHGUEST_STATE=self.state_dir, BENCH_STUB_FAULT=self.faults,
+                    BENCHGUEST_CALLS=os.path.join(self.state_dir, "calls.log"), PYTHONPATH=self.bench_dir)
 
     def clock_offset(self):
         return 0.0
+
+    def alive(self):
+        return True
 
     def sh(self, cmd, timeout=120):
         return 0, ""

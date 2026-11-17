@@ -94,17 +94,18 @@ class GuardForeign(unittest.TestCase):
         from macbench import core, fakes
 
         class A:
-            min_host_free_gib, min_disk_gib, min_guest_free_gib, allow_foreign, disk_path = 1.0, 1.0, 1.0, False, "/"
+            min_host_free_gib, disk_boot_gib, min_guest_free_gib, allow_foreign, disk_path = 1.0, 1.0, 1.0, False, "/"
+            max_compressor_mb = 2048.0
 
         class G:
             def __init__(self, foreign):
                 self.foreign = foreign
 
             def call(self, args, timeout):
-                return {"mem": {"free_mb": 8000, "avail_mb": 9000}, "pressure": 1, "booted": 0, "foreign_booted": self.foreign}
+                return {"mem": {"free_mb": 8000, "avail_mb": 9000, "swapouts": 0, "compressed_mb": 0}, "pressure": 1, "booted": 0, "foreign_booted": self.foreign}
 
         class Ctx:
-            a, est_sim_mb, host = A(), 1000.0, fakes.FakeHost()
+            a, est_sim_mb, host, swap0 = A(), 1000.0, fakes.FakeHost(), None
         c = Ctx()
         c.guest = G(1)
         self.assertIn("outside the bench", core.guard(c, 1, "x"))

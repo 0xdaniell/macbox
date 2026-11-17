@@ -54,7 +54,7 @@ def run_ab(ctx):
     vals = {"A": [], "B": []}
     steps = {"A": [], "B": []}
     bad = None
-    ctx.run.on_deadline = lambda: (_save(ctx), None)[1]
+    ctx.run.on_deadline = lambda reason=None: (_save(ctx), None)[1]
     for arm in abrule.abba_order():
         (knob.set if arm == "B" else knob.unset)()
         time.sleep(a.arm_settle)

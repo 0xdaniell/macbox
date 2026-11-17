@@ -38,7 +38,23 @@ class FakeHost:
             return 0.5
         return v
 
+    def _fault_n(self, name):
+        for f in self.faults:
+            if f == name or f.startswith(name + "@"):
+                return int(f.split("@")[1]) if "@" in f else 0
+        return None
+
     def disk_free_gb(self, path):
+        """Faults: diskstart (16 GiB from the start: under the 18 to start), disklow@N (12.5 from N simulators: under the 14 to
+        boot another), diskabort@N (9: under the 11 to go on), diskunreadable."""
+        if self._fault_n("diskunreadable") is not None:
+            return None
+        for name, val in (("diskabort", 9.0), ("disklow", 12.5)):
+            k = self._fault_n(name)
+            if k is not None and self.n >= k:
+                return val
+        if self._fault_n("diskstart") is not None:
+            return 16.0
         return 500.0
 
     def kernel_gpu(self, since):
@@ -47,7 +63,8 @@ class FakeHost:
         return 0, ""
 
     def same_qemu(self):
-        return True
+        k = self._fault_n("qemugone")           # the VM restarted: another QEMU process
+        return not (k is not None and self.n >= k)
 
     def env(self):
         return {"kernel": "fake", "mesa": "fake", "cpu_model": "fake", "cpus": 20}, {"surface_coherent": "1"}, {"REIMS_VGPU_COHERENT": "1"}

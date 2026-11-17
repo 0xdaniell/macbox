@@ -51,7 +51,7 @@ def run_scale(ctx):
                           "nominal_fps": a.nominal_fps, "window_s": a.secs, "targets": tg_specs, "floor": a.floor, "steps": [],
                           "summary": {}, "calibration": None, "observer": None}
     ctx.marks = {"coh": ctx.coh.mark(), "t0": time.time()}
-    ctx.run.on_deadline = lambda: (_finish(ctx, "deadline"), None)[1]
+    ctx.run.on_deadline = lambda reason="deadline": (_finish(ctx, reason), None)[1]
     stopped, first, kind = None, True, None
     try:
         for n in a.ns:

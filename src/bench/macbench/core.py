@@ -26,6 +26,8 @@ class Ctx:
         self.stock = False          # --stock-devices: fresh stock devices instead of clones of the seed
         self.seed = None            # the guest's answer to `seed`
         self.prefix = "bench"
+        self.swap0 = None           # the guest's swap-out counter when the run began
+        self.in_window = False      # a measurement window is running: the monitors keep off the guest
         self.taken = False          # the bench's set is owned by this run (lock taken, cleanup registered)
         self.idle_guard = set()     # what sim-idle-guard keep answered for the bench's simulators: kept / absent
 
@@ -48,16 +50,30 @@ def capture_env(ctx, info):
                            "dry": bool(ctx.host.dry)})
 
 
+def disk_reason(ctx, floor_gib, what, label=""):
+    """None when the filesystem that holds the VM's storage has `floor_gib` free; else why not. A reading that fails refuses
+    (a guard that cannot see the disk is not a guard): that is what let the 2026-11-16 outage through."""
+    df = ctx.host.disk_free_gb(ctx.a.disk_path or "/")
+    if df is None:
+        return "free disk space of the VM's storage (--disk-path) cannot be read: refusing to %s %s" % (what, label)
+    if df < floor_gib:
+        return "free disk %.1f GiB is under the %g GiB floor to %s %s" % (df, floor_gib, what, label)
+    return None
+
+
 def guard(ctx, k_new, label):
-    """Refuses to boot k_new more simulators when the guest or the host would run short: returns a reason or None.
-    The sweep stops there; it never swaps the VM to death."""
+    """Refuses to boot k_new more simulators when the host or the guest would run short: returns a reason or None. Checked
+    before every boot (and by the monitor while waiting). The sweep stops there; it never swaps the VM to death.
+    Host: free disk (>= --disk-boot-gib to boot another), available memory. Guest: available memory after the new
+    simulators, memory pressure, swap-outs since the run began (must not grow), the compressor's size, simulators that
+    are not the bench's."""
     a = ctx.a
     hm = ctx.host.mem_avail_gb()
     if hm is not None and hm - k_new * 0.5 < a.min_host_free_gib:
         return "host free memory %.1f GiB below the %.1f GiB floor %s" % (hm, a.min_host_free_gib, label)
-    df = ctx.host.disk_free_gb(a.disk_path or "/")
-    if df is not None and df < a.min_disk_gib:
-        return "free disk %.0f GiB below the %.0f GiB floor %s" % (df, a.min_disk_gib, label)
+    why = disk_reason(ctx, a.disk_boot_gib, "boot another simulator", label)
+    if why:
+        return why
     m = ctx.guest.call(["memcheck"], 60)
     avail = m["mem"].get("avail_mb", m["mem"]["free_mb"])          # free + speculative + inactive + purgeable: what a boot can take
     free_gib = (avail - k_new * ctx.est_sim_mb) / 1024.0
@@ -66,9 +82,63 @@ def guard(ctx, k_new, label):
             free_gib, avail / 1024.0, k_new, ctx.est_sim_mb, a.min_guest_free_gib, label)
     if (m.get("pressure") or 1) >= 2:
         return "guest memory pressure level %s %s" % (m.get("pressure"), label)
+    mem_why = guest_memory_reason(ctx, m["mem"])
+    if mem_why:
+        return "%s %s" % (mem_why, label)
     if m.get("foreign_booted", 0) > 0 and not a.allow_foreign:
         return "%d simulator(s) outside the bench are booted (the pool or someone's lease): not a clean measurement; --allow-foreign to go on" % m["foreign_booted"]
     return None
+
+
+def guest_memory_reason(ctx, mem):
+    """Swap-outs since the run began (the guest started paging memory out: the simulators no longer fit) and the compressor's size."""
+    base = ctx.swap0
+    if base is not None and mem.get("swapouts", 0) > base:
+        return "guest swap-outs grew from %d to %d since the run began" % (base, mem["swapouts"])
+    if mem.get("compressed_mb", 0) > ctx.a.max_compressor_mb:
+        return "guest compressor holds %.0f MB (limit %g MB)" % (mem["compressed_mb"], ctx.a.max_compressor_mb)
+    return None
+
+
+def start_reason(ctx):
+    """Before the first simulator of a run: the host disk has --disk-start-gib free."""
+    return disk_reason(ctx, ctx.a.disk_start_gib, "start a run that boots simulators", "")
+
+
+def monitor(ctx):
+    ctx.run.watch("guards", monitor_check(ctx), ctx.a.watch_every)
+
+
+def monitor_check(ctx):
+    """While the run waits (a boot, a settle, a window): the host's disk, QEMU and, outside measurement windows (their
+    own calls would be observer load), the Mac. Any breach aborts the run NOW: the monitor thread writes the partial
+    result, runs the one cleanup and exits (8 disk, 9 VM, 7 someone else's simulator, 10 guest memory)."""
+    a, st = ctx.a, {"dead": 0, "last_guest": 0.0}
+
+    def check():
+        why = disk_reason(ctx, a.disk_abort_gib, "go on", "")
+        if why:
+            return "%s; deleting the bench's simulators" % why, 8
+        if not ctx.host.same_qemu():
+            return "the VM's QEMU process is gone or was restarted", 9
+        now = time.monotonic()
+        if ctx.in_window or not ctx.taken or now - st["last_guest"] < a.watch_guest_every:
+            return None
+        st["last_guest"] = now
+        if not ctx.guest.alive():
+            st["dead"] += 1
+            if st["dead"] >= 2:
+                return "the VM stopped answering over ssh (two checks in a row)", 9
+            return None
+        st["dead"] = 0
+        m = ctx.guest.quick(["memcheck"], 60)
+        if m.get("foreign_booted", 0) > 0 and not a.allow_foreign:
+            return "a simulator that is not the bench's is booted (someone needs the Mac): yielding", 7
+        why = guest_memory_reason(ctx, m["mem"])
+        if why:
+            return why, 10
+        return None
+    return check
 
 
 def roles_for(mix, n):
@@ -109,6 +179,9 @@ def setup_guest(ctx, sims=True):
     if not sims:
         _run_mark(ctx)
         return info
+    why = start_reason(ctx)
+    if why:
+        raise Stop(why)
     acq = ctx.guest.call(["acquire", "--run", ctx.doc["id"]], 60)
     if not acq.get("ok"):
         # refuse BEFORE the cleanup is registered: the leftovers are not this run's to delete (macbox bench cleanup does)
@@ -164,6 +237,7 @@ def make_seed(ctx):
 
 
 def _run_mark(ctx):
+    ctx.swap0 = ctx.guest.call(["memcheck"], 60)["mem"].get("swapouts", 0)           # swap-outs may not grow from here on
     ctx.offset = ctx.guest.clock_offset()
     ctx.run_mark = {"coh": ctx.coh.mark(), "t0": time.time(), "ips": set(ctx.guest.call(["ips"], 60)["ips"])}
 
@@ -269,13 +343,17 @@ def window(ctx, secs, mix, no_strip=False):
             "--probe-method", ctx.probe_method or "openurl", "--probe-every", a.probe_every, "--agent-period", a.agent_period, "--probe-timeout", a.probe_timeout]
     if a.probe_cmd:
         args += ["--probe-cmd", a.probe_cmd]
-    pend = ctx.guest.start(args, secs + lead + 240)
-    host_go = t_go - ctx.offset
-    time.sleep(max(0, host_go - time.time()))
-    s0 = ctx.host.snap()
-    time.sleep(max(0, secs - (time.time() - host_go)))
-    s1 = ctx.host.snap()
-    g = pend.wait()
+    ctx.in_window = True
+    try:
+        pend = ctx.guest.start(args, secs + lead + 240)
+        host_go = t_go - ctx.offset
+        time.sleep(max(0, host_go - time.time()))
+        s0 = ctx.host.snap()
+        time.sleep(max(0, secs - (time.time() - host_go)))
+        s1 = ctx.host.snap()
+        g = pend.wait()
+    finally:
+        ctx.in_window = False
     g["precheck"] = pre
     return g, s0, s1, t_go
 

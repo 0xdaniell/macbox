@@ -8,7 +8,8 @@ cantdelete (simctl delete fails: a cleanup that cannot finish), noguard (no sim-
 slimfail (simslim fails), slimfew (simslim leaves too few services off), noicons (the widgets never settle: no chronod icons),
 noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators),
 lostsim@N (the Mac's idle guard shuts the newest simulator down once N are booted), counterfail@N (the frame counter
-of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted).
+of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted), swapgrow@N (the guest's swap-outs
+grow from N booted), compressor@N (the compressor holds 3 GB from N booted).
 The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
 $BENCHGUEST_STATE too, so the bench's real file code runs against them."""
 import json
@@ -272,12 +273,16 @@ def stub_vmstat():
     total_pages = 16 * 1024 * 1024 * 1024 // page
     used = (3000 + 1100 * n) * 1048576 // page
     free = max(0, total_pages - used)
+    sw = fault("swapgrow")
+    swapouts = 500 if sw is not None and n >= sw else 0
+    cp = fault("compressor")
+    comp = 200000 if cp is not None and n >= cp else 5000 + 300 * n
     mf = fault("memfloor")
     if mf is not None and n >= mf:
         free = 20 * 1048576 // page
     return ("Mach Virtual Memory Statistics: (page size of %d bytes)\nPages free:  %d.\nPages active:  %d.\nPages inactive:  1000.\n"
             "Pages speculative:  500.\nPages wired down:  %d.\nPages occupied by compressor:  %d.\nPageins:  1000.\nPageouts:  0.\n"
-            "Swapins:  0.\nSwapouts:  0.\n" % (page, free, used // 2, used // 4, 5000 + 300 * n))
+            "Swapins:  0.\nSwapouts:  %d.\n" % (page, free, used // 2, used // 4, comp, swapouts))
 
 
 class StubSimfps:

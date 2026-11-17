@@ -22,8 +22,14 @@ def add_common(p):
     p.add_argument("--build-id", default=os.environ.get("BENCH_BUILD_ID"), help="the VM's build id (macbox bench fills it in)")
     p.add_argument("--min-guest-free-gib", type=float, default=1.5, help="refuse to boot more simulators below this guest free memory")
     p.add_argument("--min-host-free-gib", type=float, default=6.0, help="refuse to boot more simulators below this host available memory")
-    p.add_argument("--min-disk-gib", type=float, default=12.0, help="refuse below this free disk space (the VM's disk, host side)")
-    p.add_argument("--disk-path", default=os.environ.get("BENCH_HOME"), help=argparse.SUPPRESS)
+    p.add_argument("--disk-path", default=os.environ.get("BENCH_DISK_PATH") or os.environ.get("BENCH_HOME"),
+                   help="a path on the filesystem that holds the VM's storage and that your storage guard watches (default $BENCH_DISK_PATH, else the macbox home); a reading that fails refuses to run")
+    p.add_argument("--disk-start-gib", type=float, default=18.0, help="start a run only with this much free disk (GiB)")
+    p.add_argument("--disk-boot-gib", type=float, default=14.0, help="boot another simulator only with this much free disk (GiB)")
+    p.add_argument("--disk-abort-gib", type=float, default=11.0, help="below this the run is aborted and cleaned up while it waits (GiB)")
+    p.add_argument("--max-compressor-mb", type=float, default=2048.0, help="refuse to boot (abort while waiting) when the guest's compressor holds more than this")
+    p.add_argument("--watch-every", type=float, default=10.0, help=argparse.SUPPRESS)
+    p.add_argument("--watch-guest-every", type=float, default=30.0, help=argparse.SUPPRESS)
     p.add_argument("--set-name", default=os.environ.get("BENCH_SET_NAME", "bench"), help="the bench's own device set in the guest (kept between runs: the seed lives in it)")
     p.add_argument("--allow-foreign", action="store_true", help="go on although simulators outside the bench are booted (recorded)")
     p.add_argument("--allow-restart", action="store_true", help="let a NEW device type restart CoreSimulatorService (only when nothing is booted)")
@@ -167,7 +173,7 @@ def build_ctx(a, kind):
         os.makedirs(tmp, exist_ok=True)
         if not os.environ.get("BENCH_DRY_KEEP"):
             run.teardown.insert(0, ("dry state directory", lambda: shutil.rmtree(tmp, ignore_errors=True)))
-        a.lead, a.settle_step = 1.0, 0.3
+        a.lead, a.settle_step, a.watch_every, a.watch_guest_every = 1.0, 0.3, 0.5, 1.0
         host = fakes.FakeHost(faults)
         coh = fakes.FakeCoherent(host, faults)
         guest = LocalGuest(run, set_name, os.path.join(tmp, "guest"), BENCH_DIR, faults)
@@ -213,6 +219,9 @@ def execute(a, kind, body):
     ctx = build_ctx(a, kind)
     run = ctx.run
     run.install()
+    run.on_abort = lambda reason: ctx.section("abort", "FAIL", "ABORT: %s" % reason)
+    run.final = lambda: finalize(ctx)
+    core.monitor(ctx)
     if ctx.host.dry:
         log("DRY=1: stub guest, fake host; nothing real is touched")
     rc = 0
@@ -229,6 +238,7 @@ def execute(a, kind, body):
         rc = 2
     finally:
         run.cleanup()
+        run.join_abort()                 # when a monitor aborted the run it writes the result and owns the exit code
         rc = max(rc, finalize(ctx))
     fails = [s for s in ctx.doc["sections"] if s["status"] == "FAIL"]
     if fails:
