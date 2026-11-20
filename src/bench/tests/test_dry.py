@@ -167,7 +167,10 @@ class Dry(unittest.TestCase):
 
     def test_observer_check_window_reads_nothing_from_the_screen(self):
         r = self.r["observer"]
-        self.assertIsNotNone(r["doc"]["data"].get("observer"), r["out"][-600:])
+        ob = r["doc"]["data"].get("observer")
+        self.assertIsNotNone(ob, r["out"][-600:])
+        for k in ("gpu_busy_with_strip", "gpu_busy_without_strip", "gpu_ms_per_screen_frame_with_strip", "gpu_ms_per_screen_frame_without_strip"):
+            self.assertIn(k, ob)                                  # the GPU's side of the two windows
         with open(os.path.join(r["state"], "guest", "calls.log")) as f:
             fps = [c[2:] for c in map(json.loads, f) if c[0] == "simfps"]
         self.assertIn(["strip", "probe"], fps)                    # the measured window: strip and marker, one look

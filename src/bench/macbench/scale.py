@@ -152,8 +152,15 @@ def observer_check(ctx, step, mix):
     missing = len([s for s in g["sims"] if s["role"] in ("busy", "agent")]) - len(without)          # a counter that answered nothing is not a measurement
     ws, wo = stats.mean(with_strip), stats.mean(without)
     d = None if missing else stats.rel_diff(wo, ws)
+    # the GPU's side of the same two windows: busy and GPU ms per screen frame (what one lock per picture costs the GPU)
+    sys0 = core.system_dict(ctx, g, s0, s1, 0)
+    def per_screen(busy, fps):
+        return round(busy * 10.0 / fps, 2) if busy is not None and fps else None
+    gw, go = step["system"].get("gpu_busy_pct"), sys0.get("gpu_busy_pct")
     return {"n": step["n"], "surface_fps_with_strip": stats.r1(ws), "surface_fps_without_strip": stats.r1(wo),
-            "delta": None if d is None else round(d, 4), "missing": missing, "ok": d is not None and abs(d) <= 0.04}
+            "delta": None if d is None else round(d, 4), "missing": missing, "ok": d is not None and abs(d) <= 0.04,
+            "gpu_busy_with_strip": gw, "gpu_busy_without_strip": go,
+            "gpu_ms_per_screen_frame_with_strip": per_screen(gw, sum(with_strip)), "gpu_ms_per_screen_frame_without_strip": per_screen(go, sum(without))}
 
 
 def _finish(ctx, stopped, partial=False):
