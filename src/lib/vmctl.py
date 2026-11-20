@@ -10,8 +10,14 @@ VM_QMP is the QMP socket; VM_RESOLUTION_FILE holds the screen size clicks are sc
   vmctl.py type TEXT               type text (US layout)
   vmctl.py wait SECONDS [OUT.png]  wait until the screen changes (>1%), then shot
   vmctl.py key COMBO...            e.g. ret, tab, esc, meta-space, meta-q, ctrl-c
+  vmctl.py find TEXT               OCR the screen: "X Y TEXT" for every place TEXT shows (exit 1: none)
+  vmctl.py click-text TEXT [--nth N] [--right|--double]   click the Nth place TEXT shows (1: topmost)
+  vmctl.py wait-text SECONDS TEXT  wait until TEXT shows, then print where
+
+find/click-text/wait-text need tesseract in the image (macbox build). TEXT is one or more whole words,
+matched case-insensitively, in order, on one line of the screen; X Y are guest pixels, like click's.
 """
-import json, os, socket, sys, time
+import json, os, re, socket, struct, subprocess, sys, time
 
 SOCK = os.environ["VM_QMP"]
 SHOTS = os.environ.get("VM_SHOTS", "/tmp")
@@ -68,18 +74,80 @@ def press(q, names):
     q.ev([{"type": "key", "data": {"down": True, "key": k}} for k in ks]); time.sleep(0.03)
     q.ev([{"type": "key", "data": {"down": False, "key": k}} for k in reversed(ks)]); time.sleep(0.03)
 
+def ocr_words(q):
+    """The screen's words as (left, top, width, height, text, line key), read by tesseract."""
+    png = os.path.join(SHOTS, ".ocr.png")
+    q.cmd("screendump", filename=png, format="png")
+    pw, ph = struct.unpack(">II", open(png, "rb").read(24)[16:24])
+    try:
+        tsv = subprocess.run(["tesseract", png, "-", "--psm", "11", "tsv"], capture_output=True, text=True,
+                             check=True).stdout
+    except FileNotFoundError:
+        raise SystemExit("tesseract is missing from the image: macbox build, then macbox down && macbox up")
+    words = []
+    for row in tsv.splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or not f[11].strip() or float(f[10]) < 30: continue
+        l, t, w, h = (int(v) for v in f[6:10])
+        # Guest pixels: the screendump may be larger than the screen clicks are scaled to (HiDPI).
+        words.append((l * W / pw, t * H / ph, w * W / pw, h * H / ph, f[11], tuple(f[1:5])))
+    return words
+
+def _norm(t):
+    return re.sub(r"^\W+|\W+$", "", t.lower())
+
+def find_text(q, text):
+    """Where TEXT shows, topmost first: [(x, y, matched text)]."""
+    want = [_norm(t) for t in text.split() if _norm(t)]
+    if not want: raise SystemExit("find: no text to look for")
+    words, hits = ocr_words(q), []
+    for i in range(len(words)):
+        run = words[i:i + len(want)]
+        if len(run) < len(want) or any(r[5] != run[0][5] for r in run): continue
+        if [_norm(r[4]) for r in run] != want: continue
+        l = min(r[0] for r in run); t = min(r[1] for r in run)
+        r_ = max(r[0] + r[2] for r in run); b = max(r[1] + r[3] for r in run)
+        hits.append((round((l + r_) / 2), round((t + b) / 2), " ".join(r[4] for r in run)))
+    return sorted(hits, key=lambda h: (h[1], h[0]))
+
+def click(q, x, y, opts):
+    q.ev(absm(x, y)); time.sleep(0.05)
+    b = "right" if "right" in opts else "left"
+    for _ in range(2 if "double" in opts else 1):
+        q.ev(btn(b, True)); time.sleep(0.06); q.ev(btn(b, False)); time.sleep(0.06)
+
 def main():
     a = sys.argv[1:]
     if not a: print(__doc__); return
     q = QMP(); c = a[0]
     if c == "shot":
         q.cmd("screendump", filename=os.path.abspath(a[1]), format="png")
-    elif c in ("click", "move"):
-        x, y = float(a[1]), float(a[2]); q.ev(absm(x, y)); time.sleep(0.05)
-        if c == "click":
-            b = "right" if "right" in a[3:] else "left"
-            for _ in range(2 if "double" in a[3:] else 1):
-                q.ev(btn(b, True)); time.sleep(0.06); q.ev(btn(b, False)); time.sleep(0.06)
+    elif c == "click":
+        click(q, float(a[1]), float(a[2]), a[3:])
+    elif c == "move":
+        q.ev(absm(float(a[1]), float(a[2])))
+    elif c == "find":
+        hits = find_text(q, " ".join(a[1:]))
+        for h in hits: print(*h)
+        if not hits: sys.exit(1)
+    elif c == "click-text":
+        nth, opts, words = 1, [], []
+        it = iter(a[1:])
+        for w in it:
+            if w == "--nth": nth = int(next(it))
+            elif w in ("--right", "--double"): opts.append(w[2:])
+            else: words.append(w)
+        hits = find_text(q, " ".join(words))
+        if len(hits) < nth: raise SystemExit(f"click-text: {' '.join(words)!r} shows {len(hits)} time(s) on the screen")
+        x, y, t = hits[nth - 1]; click(q, x, y, opts); print(x, y, t)
+    elif c == "wait-text":
+        end = time.time() + float(a[1])
+        while True:
+            hits = find_text(q, " ".join(a[2:]))
+            if hits or time.time() >= end: break
+            time.sleep(3)
+        for h in hits: print(*h)
+        if not hits: print("timeout"); sys.exit(1)
     elif c == "scroll":
         q.ev(absm(float(a[1]), float(a[2])))
         n = int(a[3]); b = "wheel-up" if n < 0 else "wheel-down"

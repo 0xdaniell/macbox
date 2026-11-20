@@ -43,6 +43,9 @@ pixels at the current resolution (`./macbox status`).
 ./macbox key ret                         # ret, tab, esc, space, up, down, meta-space, meta-q, ctrl-c ...
 ./macbox scroll 960 540 5                # 5 notches down (negative: up)
 ./macbox wait 120 /tmp/s.png             # wait up to 120 s for the screen to change, then a screenshot
+./macbox find 'Reinstall macOS'          # OCR: where that text is on the screen ("X Y text")
+./macbox click-text 'Continue'           # click it; --nth 2 for the second, top to bottom
+./macbox wait-text 600 'Select Country'  # wait until that text shows
 ```
 
 Take a screenshot after every action and check that it did what you meant before the next one.
@@ -54,13 +57,13 @@ The sequence:
    quit → Reinstall macOS → the disk → agree → wait (30 to 60 min, several restarts; leave OpenCore's
    menu to its default).
 3. When Setup Assistant or a broken desktop shows: `./macbox down && ./macbox up`, stop OpenCore's
-   countdown with an arrow key, choose Recovery, Utilities → Terminal, then `./macbox recovery-fix`.
-   It reboots; choose macOS.
+   countdown with an arrow key, choose Recovery, Utilities → Terminal, then `./macbox recovery-fix --ssh`
+   (about four minutes of typing). It reboots; choose macOS.
 4. Setup Assistant: country, keyboard, skip the Apple Account, an administrator named `dev`. The
    user picks the password and types it, or gives it to you as above. Turn off Location Services,
    analytics, Screen Time and Siri.
-5. Open Terminal (`./macbox key meta-space`, type `Terminal`, `ret`), then `./macbox ssh-bootstrap`;
-   the password again, then `ssh macbox true`.
+5. `ssh macbox true`. Only if it fails (or step 3 ran without `--ssh`): open Terminal
+   (`./macbox key meta-space`, type `Terminal`, `ret`), then `./macbox ssh-bootstrap`; the password again.
 6. Optional, in System Settings > General > Sharing: the (i) next to Remote Login, "Allow full
    disk access for remote users" on.
 
@@ -93,7 +96,7 @@ config stay; only macbox's checkout, its build and its links change.
 3. `./macbox agents install`: tools, skills and user units are links into the checkout, and files
    can move between versions (they moved to `src/` in November 2026).
 4. `./macbox doctor`. Anything it reports about the host: show the user the commands and ask.
-5. If `git diff --stat ORIG_HEAD -- src/versions.env src/patches` shows anything, run
+5. If `git diff --stat ORIG_HEAD -- src/versions.env src/patches src/docker` shows anything, run
    `./macbox build` in the background (20 to 60 minutes) and report progress. The running VM keeps
    its QEMU until it restarts.
 6. Config: compare `~/.config/macbox/macbox.env` with the defaults in docs/setup.md ("2. Config
