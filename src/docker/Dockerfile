@@ -20,3 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     passt sway wayvnc novnc websockify libva-drm2 vainfo intel-media-va-driver mesa-va-drivers \
  && rm -rf /var/lib/apt/lists/*
 COPY sway.conf /etc/macbox/sway.conf
+# OCR of the VM's screen (macbox find, click-text, wait-text).
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
+ && rm -rf /var/lib/apt/lists/*
