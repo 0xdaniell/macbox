@@ -312,6 +312,8 @@ class KnobsAndAB(unittest.TestCase):
         self.assertEqual(r["rc"], 0, r["out"][-800:])
         self.assertIn(d["data"]["decision"]["decision"], ("ADOPT", "CLOSE"))
         self.assertEqual([a["arm"] for a in d["data"]["arms"]], ["A", "B", "B", "A"])
+        self.assertEqual([s["arm"] for s in d["data"]["steps"]], ["A", "B", "B", "A"])          # each arm's whole step is kept
+        self.assertTrue(all(s["sims"] and "system" in s for s in d["data"]["steps"]))
         self.assertIn("AB live:group_x=1:", d["data"]["line"])
         self.assertIn("bar 4.0%", d["data"]["line"])
         self.assertIn("rule", d["params"])

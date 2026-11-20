@@ -65,6 +65,7 @@ def run_ab(ctx):
         step = core.build_step(ctx, n, mix, g, s0, s1, t_go)
         core.step_gates(ctx, step)
         steps[arm].append(step)
+        ctx.doc["data"].setdefault("steps", []).append(dict(step, arm=arm))          # the whole step: per simulator, gates
         v = {k: f(step) for k, (f, _) in METRICS.items()}
         vals[arm].append(v)
         ctx.doc["data"]["arms"].append({"arm": arm, "values": v, "gates_ok": step["gates_ok"], "stable": step["stable"]})
