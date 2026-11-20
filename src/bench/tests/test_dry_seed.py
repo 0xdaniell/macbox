@@ -10,7 +10,7 @@ from guest import benchguest_stub as stub
 from tests.test_dry import FAST, run_case, sections
 from tests.test_dry_state import calls, files
 
-ONE = ["scale", "--n", "1,2"] + FAST
+ONE = ["scale", "--n", "1,2", "--scale-x", "1"] + FAST          # the 1x type's seed path (3x is the default)
 _CACHE = {}
 
 
@@ -83,7 +83,7 @@ def job_stale():
 
 def job_seedcmd():
     st = new_state()
-    out = {"state": st, "seed": run_case(["seed", "--secs", "3"], "", state=st)}
+    out = {"state": st, "seed": run_case(["seed", "--secs", "3", "--scale-x", "1"], "", state=st)}
     out["ndevs"] = len(devs(st))
     out["cleanup"] = run_case(["cleanup", "--seeds"], "", state=st)
     return out
@@ -100,7 +100,7 @@ JOBS = {
     "stale": job_stale,
     "seedcmd": job_seedcmd,
     "stock": lambda: (lambda st: {"state": st, "r": run_case(ONE + ["--stock-devices"], "nosourceset", state=st)})(new_state()),
-    "lifecycle": lambda: (lambda st: {"state": st, "r": run_case(["lifecycle", "--cycles", "2", "--storm", "2", "--secs", "3"], "", state=st)})(new_state()),
+    "lifecycle": lambda: (lambda st: {"state": st, "r": run_case(["lifecycle", "--cycles", "2", "--storm", "2", "--secs", "3", "--scale-x", "1"], "", state=st)})(new_state()),
 }
 
 

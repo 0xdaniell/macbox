@@ -34,7 +34,7 @@ def add_common(p):
     p.add_argument("--set-name", default=os.environ.get("BENCH_SET_NAME", "bench"), help="the bench's own device set in the guest (kept between runs: the seed lives in it)")
     p.add_argument("--allow-foreign", action="store_true", help="go on although simulators outside the bench are booted (recorded)")
     p.add_argument("--allow-restart", action="store_true", help="let a NEW device type restart CoreSimulatorService (only when nothing is booted)")
-    p.add_argument("--scale-x", dest="scale_x", type=int, choices=(1, 2, 3), default=1, help="device pixel scale: 1 = the macbox 1x type, 3 = the stock iPhone (default 1)")
+    p.add_argument("--scale-x", dest="scale_x", type=int, choices=(1, 2, 3), default=3, help="device pixel scale: 3 = the stock iPhone (default; macbox performance work is 3x only), 1 = the macbox 1x type")
     p.add_argument("--secs", type=float, default=40, help="length of a measurement window, seconds")
     p.add_argument("--nominal-fps", type=float, default=60.0)
     p.add_argument("--probe-method", default="auto", choices=("auto", "notify", "appearance", "openurl", "cmd", "none"), help="input injection (auto: notify, else appearance, checked at the first N; openurl raises an alert on iOS 26 that stays over the app)")
