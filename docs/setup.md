@@ -273,4 +273,4 @@ git diff --stat ORIG_HEAD -- src/versions.env src/patches   # anything here: reb
 ./macbox build && ./macbox down && ./macbox up    # a newer build
 ```
 
-The VM configuration enables QEMU's `usb-kbd.x-ignore-idle` property to avoid unchanged keyboard reports at idle. Before rolling back to a QEMU build without patch 0015, remove `-global usb-kbd.x-ignore-idle=on` from the VM configuration (`vm.toml`) and from the scripts that regenerate it; older builds cannot start with that flag.
+The VM configuration enables QEMU's `usb-kbd.x-ignore-idle` property to avoid unchanged keyboard reports at idle, when the current QEMU build has it (patch 0015). `macbox up` checks the build each time it starts a stopped VM, so a rollback to an older build or `macbox build --upstream` starts without the flag.

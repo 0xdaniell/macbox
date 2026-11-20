@@ -100,6 +100,9 @@ view_move() {
 }
 resolution() { cat "$RUN/resolution" 2>/dev/null || echo "$MACBOX_RESOLUTION"; }
 build_id() { readlink "$DATA/qemu/current" 2>/dev/null || true; }
+qemu_has() {  # does the current QEMU build know this property (device.property)? its name is in the binary
+  grep -aqF -- "${1#*.}" "$DATA/qemu/current/bin/qemu-system-x86_64" 2>/dev/null
+}
 ssh_ok() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$MACBOX_SSH_HOST" true >/dev/null 2>&1; }
 guest() { ssh -o ConnectTimeout=10 "$MACBOX_SSH_HOST" "$@"; }
 
@@ -189,8 +192,9 @@ qemu_extra() {  # the network (passt, SSH forwarded by Docker) and the disk's op
     -set "drive.disk.cache=$MACBOX_DISK_CACHE" -set drive.disk.discard=unmap; do
     out+=("$(printf '%q' "$a")")
   done
-  # QEMU 0015: do not send unchanged keyboard reports at idle.
-  out+=(-global usb-kbd.x-ignore-idle=on)
+  # QEMU 0015: do not send unchanged keyboard reports at idle. Only a build with the patch has the
+  # property, and QEMU refuses to start with an unknown one (macbox build --upstream, a rollback).
+  qemu_has usb-kbd.x-ignore-idle && out+=(-global usb-kbd.x-ignore-idle=on)
   # Reims's VideoToolbox and M2 scaler devices, in the slots reims-ctl gives them (after the mapper)
   [ "$MACBOX_VIDEO" = on ] && out+=(-device apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8 \
     -device apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9)
