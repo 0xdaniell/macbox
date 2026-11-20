@@ -64,7 +64,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0034, 0035 the detach check | Every submission is checked, on metal2vulkan's scheduler thread, against the objects detached now. That list is now made once per change (a detach, an attach or a release), sorted, and asked by binary search (metal2vulkan 0100). Before, it was made again for every check and scanned: 18–24% of that thread's time. On by default. Live `detached_sorted=0` brings back the check as before, for an A/B in one boot. Measured: 1 simulator +3.5%, 3 simulators +5.3% ([performance.md](../../docs/performance.md#several-simulators-at-once-and-the-desktop-under-load)). |
 | 0036 `REIMS_VGPU_WINDOW_COMPOSITOR_FILE` | the windows move to another Wayland compositor while the VM runs: the file names the socket. Reims connects to it itself and hands SDL the connection; when the file changes, each window lets its input go, its render thread lets the swapchain and surface go, SDL's video restarts on the new socket, and the windows open there. On failure they go back. `<file>.on` says where they are. Off unless set; `MACBOX_VIEW_SWITCH=on` sets it. |
 
-## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 14 patches
+## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 15 patches
 
 | Patches | What they do |
 |---|---|
@@ -72,6 +72,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0004, 0005 coherent pages | with `REIMS_VGPU_COHERENT=1` the same markers serve metal2vulkan's trap-coherent surfaces. A run that doesn't end well leaves `coherent.running` in the census directory, and every later start boots without coherent pages until it's removed (`macbox coherent reset`), so a fault there costs one crash, not a crash loop. |
 | 0010–0013 KVM shortcuts for the GPU device | `x-irqfd` (interrupts through a KVM irqfd), `x-halt-poll-ns`, `x-ioeventfd` (doorbells through KVM ioeventfds): device properties, all off unless set |
 | 0014 the video devices | upstream's own 4895365e5b (on `steelbrain/reims-vgpu`, after bd95509), unchanged: `apple-videotoolbox-pci` (106b:1a03) and `apple-m2scaler-pci` (106b:1a0b), the transports of Reims's VideoToolbox and scaler devices. Without it the build can't attach them. Drop it when `QEMU_REF` moves past 4895365e5b. The devices stay detached unless `MACBOX_VIDEO=on` |
+| 0015 `x-ignore-idle` | usb-kbd can ignore the guest's idle timer and send reports only on key changes. The property defaults to off; macbox enables it with `-global usb-kbd.x-ignore-idle=on`. |
 
 ## Licenses
 

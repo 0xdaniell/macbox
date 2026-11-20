@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: macbox <macbox>
+Date: Sun, 15 Nov 2026 01:20:04 +0200
+Subject: [PATCH 15/15] usb-kbd: x-ignore-idle, an idle keyboard reports only on key
+ changes
+
+Allow usb-kbd to ignore the HID idle timer while preserving the idle value
+reported to the guest. The property defaults to off and can be changed live.
+The guest idle value is reset on device reset and is not migrated.
+
+---
+ hw/usb/dev-hid.c | 55 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index ae19d60203..1d0e36d405 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -43,6 +43,19 @@ struct USBHIDState {
+     uint32_t usb_version;
+     char *display;
+     uint32_t head;
++    /*
++     * x-ignore-idle (usb-kbd only, off by default). macOS sets
++     * the keyboard's idle rate to 24 ms, so an idle keyboard sends a report
++     * every 24 ms (41.6/s: 2026-11-15, QEMU's usb_xhci_xfer_success trace)
++     * and the guest's HID driver wakes for each. With it on, SET_IDLE is
++     * accepted and GET_IDLE answers it, but the keyboard reports only when
++     * a key changes, as it does at idle rate 0. macOS repeats held keys
++     * itself. Live: qom-set turns it on or off in a running VM (an A/B in
++     * one boot); -global usb-kbd.x-ignore-idle=on sets it at start. Not
++     * migrated.
++     */
++    bool ignore_idle;
++    uint8_t guest_idle;
+ };
+ 
+ #define TYPE_USB_HID "usb-hid"
+@@ -570,6 +583,7 @@ static void usb_hid_handle_reset(USBDevice *dev)
+     USBHIDState *us = USB_HID(dev);
+ 
+     hid_reset(&us->hid);
++    us->guest_idle = 0;
+ }
+ 
+ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
+@@ -635,10 +649,14 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
+         hs->protocol = value;
+         break;
+     case HID_GET_IDLE:
+-        data[0] = hs->idle;
++        data[0] = us->ignore_idle ? us->guest_idle : hs->idle;
+         p->actual_length = 1;
+         break;
+     case HID_SET_IDLE:
++        if (us->ignore_idle) {
++            us->guest_idle = (uint8_t) (value >> 8);
++            break;
++        }
+         hs->idle = (uint8_t) (value >> 8);
+         hid_set_next_idle(hs);
+         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
+@@ -844,6 +862,35 @@ static const Property usb_keyboard_properties[] = {
+         DEFINE_PROP_STRING("display", USBHIDState, display),
+ };
+ 
++static bool usb_kbd_get_ignore_idle(Object *obj, Error **errp)
++{
++    return USB_HID(obj)->ignore_idle;
++}
++
++/*
++ * On: the idle rate the guest set is kept aside and the keyboard's is 0, so
++ * its timer goes. Off: the guest's rate is the keyboard's again.
++ */
++static void usb_kbd_set_ignore_idle(Object *obj, bool value, Error **errp)
++{
++    USBHIDState *us = USB_HID(obj);
++    HIDState *hs = &us->hid;
++
++    if (value == us->ignore_idle) {
++        return;
++    }
++    if (value) {
++        us->guest_idle = hs->idle;
++        hs->idle = 0;
++    } else {
++        hs->idle = us->guest_idle;
++    }
++    us->ignore_idle = value;
++    if (hs->event) {
++        hid_set_next_idle(hs);
++    }
++}
++
+ static void usb_keyboard_class_initfn(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -853,6 +900,12 @@ static void usb_keyboard_class_initfn(ObjectClass *klass, const void *data)
+     uc->product_desc   = "QEMU USB Keyboard";
+     dc->vmsd = &vmstate_usb_kbd;
+     device_class_set_props(dc, usb_keyboard_properties);
++    object_class_property_add_bool(klass, "x-ignore-idle",
++                                   usb_kbd_get_ignore_idle,
++                                   usb_kbd_set_ignore_idle);
++    object_class_property_set_description(klass, "x-ignore-idle",
++        "Report only on key changes, whatever idle rate the "
++        "guest sets (live)");
+     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+ }
+ 
+-- 
+2.53.0
+
