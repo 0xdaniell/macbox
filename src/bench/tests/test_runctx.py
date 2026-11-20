@@ -114,3 +114,15 @@ class GuardForeign(unittest.TestCase):
         c.guest = G(0)
         c.a.allow_foreign = False
         self.assertIsNone(core.guard(c, 1, "x"))
+
+class KnobTimeout(unittest.TestCase):
+    def test_timeout_kills_descendant_group(self):
+        from macbench.runctx import shell_runner
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "marker")
+            run = Run(100)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                shell_runner(run, timeout=0.2)("(sleep 1; touch '%s') & wait" % marker)
+            time.sleep(1.2)
+            self.assertFalse(os.path.exists(marker))
+            run.cleanup()

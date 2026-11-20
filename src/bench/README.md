@@ -311,7 +311,7 @@ The Device panel needs Simlock and T3 Code, which the bench does not depend on. 
 command with `BENCH_PANEL_SECS` set and reads one JSON object from its last stdout line:
 `{"frames": [[t_seconds, counter], ...]}`: every frame a viewer received through the panel and the counter
 GlassBench's strip showed in it (the strip survives H.264). The bench then applies the same distinct-frame metrics and
-strip gate and judges `--panel-fps` / `--panel-p95` (55 / 25). Without a command the section is SKIP.
+strip gate over `BENCH_PANEL_SECS` seconds starting at the first received frame; the command must capture that full window. It judges `--panel-fps` / `--panel-p95` (55 / 25). Without a command the section is SKIP.
 
 ## The result file
 

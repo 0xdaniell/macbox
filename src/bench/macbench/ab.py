@@ -25,7 +25,7 @@ def make_knob(a, ctx):
             raise Stop("--knob live:KEY=VALUE needs the VM's live switch file (not found)")
         return LiveKnob(ctx.live_conf, k, v, ctx.run)
     if a.set_cmd and a.unset_cmd:
-        return CmdKnob(a.set_cmd, a.unset_cmd, ctx.run, shell_runner())
+        return CmdKnob(a.set_cmd, a.unset_cmd, ctx.run, shell_runner(ctx.run))
     raise Stop("a knob is needed: --knob live:KEY=VALUE, or --set-cmd and --unset-cmd")
 
 

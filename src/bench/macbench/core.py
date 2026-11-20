@@ -402,8 +402,13 @@ def build_step(ctx, n, mix, g, s0, s1, t_go, boot=None):
             sm.update(analysis.motion_metrics([t for t, _ in a_["unique"]], a.nominal_fps))
             sm["strip"] = {k: a_[k] for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks", "segments")}
             ok, why = analysis.strip.strip_gate(a_)
-            sm["strip_gate"] = {"ok": ok, "why": why}
             sm.update(analysis.agent_metrics(s["actions"], raw))
+            sm["frames"] = len(a_["unique"])
+            sm["missing_frames"] = a_["missing_frames"]
+            if sm["action_failures"] or sm["missing_frames"]:
+                ok = False
+                why = "agent action failures: %d; launches without frames: %d" % (sm["action_failures"], sm["missing_frames"])
+            sm["strip_gate"] = {"ok": ok, "why": why}
         else:
             ticks = None
             if role == "busy" and s["pace"] and raw:

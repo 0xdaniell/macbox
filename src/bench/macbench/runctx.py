@@ -50,21 +50,24 @@ class Run:
         return p
 
     def kill_children(self):
-        for p in list(self.children):
-            if p.poll() is None:
-                try:
-                    os.killpg(p.pid, signal.SIGTERM)
-                except OSError:
-                    pass
+        active = [p for p in list(self.children) if p.poll() is None]
+        for p in active:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
         t_end = time.monotonic() + 3
-        for p in list(self.children):
+        for p in active:
             try:
                 p.wait(max(0.1, t_end - time.monotonic()))
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                pass
+            # The shell can exit before its descendants, including ones ignoring SIGTERM.
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
         self.children.clear()
 
     # --- the one trap
@@ -224,9 +227,14 @@ class CmdKnob:
         return "cmd"
 
 
-def shell_runner(timeout=60):
+def shell_runner(run, timeout=60):
     def run_cmd(cmd):
-        p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+        p = run.popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            _, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            run.kill_children()
+            raise
         if p.returncode != 0:
-            raise RuntimeError("knob command failed (rc %d): %s" % (p.returncode, p.stderr.strip()[:120]))
+            raise RuntimeError("knob command failed (rc %d): %s" % (p.returncode, err.strip()[:120]))
     return run_cmd

@@ -176,7 +176,7 @@ def agent_strip(raw, actions):
     samples outside segments are not judged. Returns analyze_counters' dict summed over the segments, with
     "unique" concatenated and "segments" the number judged."""
     acts = sorted(actions, key=lambda x: x["t0"])
-    tot = {"unique": [], "repeats": 0, "lost": 0, "backwards": 0, "jumps": 0, "unreadable": 0, "span_ticks": 0, "segments": 0}
+    tot = {"unique": [], "repeats": 0, "lost": 0, "backwards": 0, "jumps": 0, "unreadable": 0, "span_ticks": 0, "segments": 0, "missing_frames": 0}
     for i, a in enumerate(acts):
         if a["op"] != "launch" or a.get("rc") != 0:
             continue
@@ -184,6 +184,7 @@ def agent_strip(raw, actions):
         seg = [(t, c) for t, c, _ in raw if t >= a["t0"] and (end is None or t < end) and c != SECOND_LOOK]
         first = next((k for k, (_, c) in enumerate(seg) if c >= 0), None)
         if first is None:
+            tot["missing_frames"] += 1
             continue
         r = strip.analyze_counters(seg[first:])
         tot["unique"] += r["unique"]

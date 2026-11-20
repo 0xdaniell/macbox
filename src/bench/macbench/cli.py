@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 from . import abrule, ab, chart, compare, core, fakes, hostprobe, others, scale, schema, targets
 from .runctx import DeadlineError, Run
@@ -205,7 +206,7 @@ def build_ctx(a, kind):
     doc = schema.new_result(kind if kind in schema.KINDS else "scale", params, {"host": {}, "guest": {}}, stamp)
     if kind == "scale":
         doc["data"] = {"mix": a.mix, "scale_x": a.scale_x, "steps": [], "summary": {"max_n": {}}}
-    path = os.path.join(a.out, "%s-%s%s.json" % (kind, stamp, "-dry" if dry else ""))
+    path = os.path.join(a.out, "%s-%s-%s%s.json" % (kind, stamp, uuid.uuid4().hex, "-dry" if dry else ""))
     ctx = core.Ctx(a, run, guest, host, coh, doc, path, clean, log)
     ctx.live_conf = live
     gold = Golden(a.golden_file)

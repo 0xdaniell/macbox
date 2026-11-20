@@ -391,3 +391,11 @@ class AgentAndMotion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AgentLaunchRegression(unittest.TestCase):
+    def test_unreadable_launch_is_counted(self):
+        actions = [{"op": "launch", "rc": 0, "t0": 0}, {"op": "terminate", "rc": 0, "t0": 2},
+                   {"op": "launch", "rc": 0, "t0": 3}, {"op": "terminate", "rc": 0, "t0": 5}]
+        result = analysis.agent_strip([(0.1, 1, 0), (0.2, 2, 0), (3.1, -1, 0)], actions)
+        self.assertEqual(result["missing_frames"], 1)
+        self.assertEqual(len(result["unique"]), 2)

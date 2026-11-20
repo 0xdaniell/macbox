@@ -1122,8 +1122,10 @@ def cmd_cycle(a):
             save_manifest(man)
             try:
                 t0 = now()
-                simctl("boot", cl, timeout=300)
-                simctl("bootstatus", cl, timeout=600)
+                if simctl("boot", cl, timeout=300)[0] != 0:
+                    raise GuestError("clone did not boot")
+                if simctl("bootstatus", cl, timeout=600)[0] != 0:
+                    raise GuestError("clone never finished booting")
                 t["clone_boot_s"] = round(now() - t0, 2)
             finally:
                 simctl("shutdown", cl, timeout=120)

@@ -143,6 +143,8 @@ def run_soak(ctx):
         gt = gates.leak_gate(k, xs, ys, bar, "MB/min")
         ctx.doc["gates"][gname] = gt
         ctx.section(gname, gt["status"], "SOAK %s: %s" % (gt["status"], gt["detail"]))
+    unstable = [k for k in ("start", "end") if not res[k]["stability"]["ok"]]
+    ctx.section("soak_stability", "FAIL" if unstable else "PASS", "SOAK stability: " + ("unstable windows: " + ", ".join(unstable) if unstable else "both windows stable"))
     f0 = min([s["fps"] for s in res["start"]["sims"] if s.get("fps") is not None] or [0])          # 0 fps is a stalled simulator, kept
     f1 = min([s["fps"] for s in res["end"]["sims"] if s.get("fps") is not None] or [0])
     ok = f0 > 0 and f1 >= 0.95 * f0
@@ -200,7 +202,8 @@ def run_panel(ctx):
         ctx.save()
         return
     an = strip.analyze_counters([(t, c) for t, c in frames])
-    m = stats.frame_stats([t for t, _ in an["unique"]], a.nominal_fps)
+    start = frames[0][0] if frames else 0.0
+    m = stats.frame_stats([t for t, _ in an["unique"]], a.nominal_fps, bounds=(start, start + a.secs))
     ok_s, why = strip.strip_gate(an)
     from . import targets
     tg = targets.parse_target("panel: fps>=%g, p95<=%g" % (a.panel_fps, a.panel_p95))
