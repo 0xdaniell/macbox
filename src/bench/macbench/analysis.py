@@ -62,20 +62,25 @@ def probe_latencies(raw, injections, timeout_s=2.0):
 
 def sim_metrics(idx, role, raw, injections, nominal_fps=60.0, timeout_s=2.0, app_ticks=None, window=None):
     """One simulator's entry in a step. A busy simulator gets frame metrics from its strip counters (distinct
-    frames), every simulator with probes gets the input proxy. `window` = (t_start, t_end) clips the raw lines."""
+    frames), every simulator with probes gets the input proxy. `window` = (t_start, t_end) clips the raw lines and
+    bounds the frame metrics: from the observer's first sample (its start-up is not the app's stall) to the window's
+    end, so a simulator that froze before the end shows the freeze in its fps and longest gap."""
+    bounds, seen = None, raw
     if window:
         raw = [r for r in raw if window[0] <= r[0] <= window[1]] or raw[:1]
+        if raw:
+            bounds = (max(window[0], raw[0][0]), window[1])
     sim = {"idx": idx, "role": role}
     if role == "busy":
         a = strip.analyze_counters([(t, c) for t, c, _ in raw if c != SECOND_LOOK])
-        fm = stats.frame_stats([t for t, _ in a["unique"]], nominal_fps)
+        fm = stats.frame_stats([t for t, _ in a["unique"]], nominal_fps, bounds)
         sim.update(fm)
         sim["strip"] = {k: a[k] for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks")}
         ok, why = strip.strip_gate(a, app_ticks)
         sim["strip_gate"] = {"ok": ok, "why": why}
         sim["app_ticks"] = app_ticks
     if injections:
-        pl = probe_latencies(raw, injections, timeout_s)
+        pl = probe_latencies(seen, injections, timeout_s)          # a probe's answer may land just after the window
         sim.update({"input_n": pl["n"], "input_misses": pl["misses"], "input_second_looks": pl["second_looks"], "input_p50_ms": pl["p50_ms"],
                     "input_p95_ms": pl["p95_ms"], "input_max_ms": pl["max_ms"], "input_call_p50_ms": pl["call_p50_ms"]})
     return sim
@@ -162,6 +167,30 @@ def agent_metrics(actions, raw):
     out["actions"] = len(actions)
     out["action_failures"] = sum(1 for a in actions if a.get("rc") not in (0, None))
     return out
+
+
+def agent_strip(raw, actions):
+    """The strip of an agent-mix simulator, judged per launch: each launch starts a new GlassBench whose counter
+    starts again at 0, and between a terminate and the next launch the app is meant to be off. A segment runs from
+    the first readable sample after a successful launch to the start of the next terminate (or launch, or the end);
+    samples outside segments are not judged. Returns analyze_counters' dict summed over the segments, with
+    "unique" concatenated and "segments" the number judged."""
+    acts = sorted(actions, key=lambda x: x["t0"])
+    tot = {"unique": [], "repeats": 0, "lost": 0, "backwards": 0, "jumps": 0, "unreadable": 0, "span_ticks": 0, "segments": 0}
+    for i, a in enumerate(acts):
+        if a["op"] != "launch" or a.get("rc") != 0:
+            continue
+        end = next((b["t0"] for b in acts[i + 1:] if b["op"] in ("terminate", "launch")), None)
+        seg = [(t, c) for t, c, _ in raw if t >= a["t0"] and (end is None or t < end) and c != SECOND_LOOK]
+        first = next((k for k, (_, c) in enumerate(seg) if c >= 0), None)
+        if first is None:
+            continue
+        r = strip.analyze_counters(seg[first:])
+        tot["unique"] += r["unique"]
+        for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks"):
+            tot[k] += r[k]
+        tot["segments"] += 1
+    return tot
 
 
 def motion_metrics(times, nominal_fps=60.0, still_ms=250.0):

@@ -128,10 +128,10 @@ started (explicit pids, never a bare `wait`), shuts down and deletes the bench's
 | `scale` | N = 1, 2, 3... simulators (`--n 1,2,3,4,6,8`, `--scale-x 1\|3`, `--mix`), per simulator numbers, the maximum sustainable N per quality target. Stops early when a floor is breached (`--floor`, default `fps>=20`), a gate fails or the system turns unstable. |
 | `idle` | The VM with no simulator: QEMU, GPU and memory standing cost against `--bar-qemu-cores` (0.15). |
 | `lifecycle` | `--cycles` times: create, boot, install, launch, first app frame, shut down, resume, first frame, clone, boot the clone, delete (medians of the timings below); a per-cycle leak gate; `--storm N`: N simulators booted at once. |
-| `soak` | `--soak-n` busy simulators for `--soak-minutes`: slope of QEMU's RSS and of the guest's memory, and the frame rate at the start against the end. |
+| `soak` | `--soak-n` busy simulators for `--soak-minutes`: slope of QEMU's RSS and of the guest's memory, and the slowest simulator's frame rate at the start against the end (a simulator at 0 counts). The strip and counter gates judge both windows. |
 | `build` | Build timing: the bench tools (swiftc) cold and warm; `--xcodebuild '<args>'` times your own project cold and warm (GlassBench is not an Xcode project, so the section is SKIP without it). |
 | `panel` | The Device panel's stream: pluggable (see [The panel section](#the-panel-section)); SKIP without `--panel-cmd`. |
-| `ab` | A B B A inside one window for one knob: ADOPT or CLOSE against a threshold fixed before the run. |
+| `ab` | A B B A inside one window for one knob: ADOPT or CLOSE against a threshold fixed before the run. Input probes run when the metric or a `--tails` entry is an input latency (all-busy and one-busy mixes only); a tail no arm pair measured closes the lever. |
 | `golden` | Records the pixel hash of the static reference screen for this setup in `baselines/golden.json`. |
 | `compare A.json B.json` | What moved, per N, beyond the noise (`--noise 0.04`); exit status 1 on a regression. |
 | `chart R.json [-o out.html]` | A self-contained HTML page of SVG charts: per-simulator fps and p95 against N, input proxy, QEMU CPU and GPU, guest CPU and memory, GPU ms per frame, fairness. No script, no external file. |
@@ -163,16 +163,20 @@ average.
 
 **Frames** (per animating simulator; GlassBench draws a 16-bit counter strip, see below). `simfps --strip` polls the
 simulator's framebuffer surface at about 2 kHz and reads the counter from every new surface.
-- *distinct frames*: surfaces whose counter differs from the previous distinct one. `fps` = (n - 1) / (last - first).
-- `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`: percentiles of the intervals between consecutive distinct frames
-  (`sorted[min(n-1, int((n-1)*p))]`, the rule of simfps and GlassBench itself). `over2x`: intervals longer than
-  2 / `--nominal-fps`. `longest_gap_s`: the longest interval, seconds (the "stall").
+- *distinct frames*: surfaces whose counter differs from the previous distinct one. `fps` = n / (window end - the
+  observer's first sample), so a simulator that froze before the window ended counts its frozen stretch.
+- `p50_ms`, `p95_ms`, `p99_ms`: percentiles of the intervals between consecutive distinct frames
+  (`sorted[min(n-1, int((n-1)*p))]`, the rule of simfps and GlassBench itself). `max_ms`, `over2x` (intervals longer
+  than 2 / `--nominal-fps`) and `longest_gap_s` (the "stall", seconds) also count the gap from the observer's first
+  sample to the first frame and from the last frame to the window's end.
 - `strip`: `repeats` (same counter on another surface: normal, the compositor makes more surfaces than the app
   ticks), `lost` (ticks that never reached the screen), `backwards` (an older counter after a newer one),
   `jumps` (forward by more than 1000), `unreadable` (references not found), `span_ticks` (ticks the counter moved).
 - `app_tick_fps`: GlassBench's own tick rate from its `pace.json` (the app, before the compositor), `surface_fps`:
   surface changes per second as simfps counts them. Three layers, so a loss can be placed.
-- The agent mix reports the same over the stretches of motion only (a gap above 250 ms ends a stretch).
+- The agent mix reports the same over the stretches of motion only (a gap above 250 ms ends a stretch). Its strip is
+  judged per launch (each launch starts a new app whose counter starts at 0): from the first readable sample after a
+  launch to the next terminate; the stretches with the app off are not judged.
 
 **Input latency proxy** (`input_p50_ms`, `input_p95_ms`, `input_max_ms`, `input_misses`, `input_call_p50_ms`).
 It is a proxy and says so. Without Simlock or agent-device, the guest injects an event with `simctl`: by default
@@ -215,8 +219,10 @@ installed device are timed too): `clone_s` (`simctl clone` of the seed + the Sli
 `cold_first_frame_s` (from the launch call to the first counter value `simfps` reads on the new surface); `shutdown_s`
 (shutting the booted device down), `resume_boot_s` and `resume_first_frame_s` (the same two again: "resume" here is
 shutdown then boot, not Simlock's parking); `delete_s` (`simctl delete` of the device and its overrides folder; stock
-path only: `clone_boot_s`, the boot of a clone of the installed device, deleted untimed). The boot storm
-(`--storm N`) clones N simulators and boots them at once.
+path only: `clone_boot_s`, the boot of a clone of the installed device, deleted untimed). A cycle with any of these
+missing (a launch that showed no app frame, for one) fails the lifecycle. The boot storm (`--storm N`) clones N
+simulators and boots them at once; with `--stock-devices` it creates and boots them one after the other, and the result
+says so (`parallel: false`, the whole time).
 
 **Guest memory** (`system.guest`): `mem_used_mb` = active + wired + compressor pages; `mem_free_mb` = free +
 speculative; `mem_avail_mb` is what the guard uses: free + speculative + inactive + purgeable (`vm_stat` pages; 4 KiB
@@ -269,7 +275,7 @@ written first. A gate that cannot be read is SKIP, shown as such, never PASS.
 | `strip` | no frame out of order, no counter jump, the counter advanced no more than the app's own tick log says, under 1% of samples unreadable. Lost ticks are the fps metric, not a gate failure. |
 | `tears` | no screenshot of the scrolling GlassBench shows a torn band (card spacing and gap heights, the old `tears.py` rule, standard library PNG decoding); SKIP when no screenshot shows cards. A torn picture fails the step and the run, and that N does not count as sustained, but the sweep goes on to the next N (the stack tears now and then: 3 flagged of 50 judged pictures in one night here) |
 | `pixels` | GlassBench `-static` screenshots agree with each other and match the stored golden (`baselines/golden.json`, key: macOS, runtime, device type, size), judged once on a freshly launched static app before the first window (a window with input probes flips the marker, so later static screens are not judged); SKIP with the pictures agreeing when no golden is stored: `macbox bench golden` records it |
-| `coherent_census` / `coherent_process` | in the census reports written since the run began: `overwrite_risk` and `sync_errors` stayed 0, and `late_copies_in_busy`, `late_beside_unplanned`, `plan_left_planned` did not rise. Deltas, not absolute counts. Reports come once a minute, so a short step may have none: SKIP. |
+| `coherent_census` / `coherent_process` | in the census reports written since the run began: `overwrite_risk` and `sync_errors` did not rise on any surface (the counters are cumulative per surface: judged against each surface's value at the mark, a surface new since then from 0), and `late_copies_in_busy`, `late_beside_unplanned`, `plan_left_planned` did not rise. Deltas, not absolute counts. Reports come once a minute, so a short step may have none: SKIP. |
 | `qemu_log` | no new `command buffer failed` line in QEMU's log (stamp waits are counted in the detail) |
 | `gpu_hang` | the hang flag did not appear |
 | `kernel_gpu` | no kernel GPU error line since the step began (SKIP when the journal is not readable) |

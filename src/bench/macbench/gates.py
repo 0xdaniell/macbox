@@ -49,6 +49,14 @@ def worst(gates):
     return not any(g["status"] == "FAIL" for g in gates.values())
 
 
+SURFACE_GATES = ("overwrite_risk", "sync_errors")
+SURFACE_ID = ("label", "at", "w", "h", "id")          # what names a surface in the renderer's census line
+
+
+def surface_key(d):
+    return tuple(d.get(k) for k in SURFACE_ID)
+
+
 class Coherent:
     """Reads Coherent's census (coherent.jsonl, a report a minute per surface), QEMU's log and the GPU hang flag."""
 
@@ -82,7 +90,11 @@ class Coherent:
                 for k in PROCESS_GATES:
                     proc[k] = max(proc[k], d.get(k, 0) or 0)
         size = os.path.getsize(self.qemu_log) if self.qemu_log and os.path.exists(self.qemu_log) else None
-        return {"n": len(lines), "proc": proc, "log_off": size, "hang": bool(self.hang_file and os.path.exists(self.hang_file))}
+        surf = {}
+        for d in lines:
+            if "process" not in d:
+                surf[surface_key(d)] = {k: d.get(k, 0) or 0 for k in SURFACE_GATES}
+        return {"n": len(lines), "proc": proc, "surf": surf, "log_off": size, "hang": bool(self.hang_file and os.path.exists(self.hang_file))}
 
     def check(self, mark):
         """Gates since the mark: overwrite_risk, sync_errors (new surface reports), process counters that rose,
@@ -96,10 +108,20 @@ class Coherent:
         elif not surf:
             res["coherent_census"] = gate("SKIP", "no census report since the mark (they come once a minute)")
         else:
-            risk = max((d.get("overwrite_risk", 0) or 0) for d in surf)
-            errs = max((d.get("sync_errors", 0) or 0) for d in surf)
+            # the reports' counters are cumulative per surface: judge what each surface added since the mark
+            base = dict(mark.get("surf") or {})
+            inc = {k: 0 for k in SURFACE_GATES}
+            for d in surf:
+                key = surface_key(d)
+                b = base.get(key, {})
+                for k in SURFACE_GATES:
+                    v = d.get(k, 0) or 0
+                    b0 = b.get(k, 0)
+                    inc[k] = max(inc[k], v - b0 if v >= b0 else v)          # lower than before: a new surface at the same place
+                base[key] = {k: d.get(k, 0) or 0 for k in SURFACE_GATES}
+            risk, errs = inc["overwrite_risk"], inc["sync_errors"]
             res["coherent_census"] = gate("FAIL" if risk or errs else "PASS",
-                                          "%d report(s): overwrite_risk max %d, sync_errors max %d" % (len(surf), risk, errs))
+                                          "%d report(s): overwrite_risk +%d, sync_errors +%d since the mark (per surface)" % (len(surf), risk, errs))
         proc = {k: mark["proc"][k] for k in PROCESS_GATES}
         for d in new:
             if "process" in d:

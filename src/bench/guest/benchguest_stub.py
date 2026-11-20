@@ -9,7 +9,8 @@ slimfail (simslim fails), slowslim (simslim takes 2 minutes: a run killed while 
 noinstall (simctl install does nothing), unsettled@N (a stray process burns 1.7 cores from N booted simulators),
 lostsim@N (the Mac's idle guard shuts the newest simulator down once N are booted), counterfail@N (the frame counter
 of the last simulator returns nothing from N booted), foreign@N (a simulator outside the bench boots when N are booted), transition@N (a bench device that is not Booted still has its launchd_sim: it must not read as foreign), swapgrow@N (the guest's swap-outs
-grow from N booted), compressor@N (the compressor holds 3 GB from N booted).
+grow from N booted), compressor@N (the compressor holds 3 GB from N booted), noframe@K (the K-th lifecycle launch never shows
+a readable app frame).
 The files a simulator leaves outside its device (Slim overrides, ~/.sim-keep, the idle guard) live under
 $BENCHGUEST_STATE too, so the bench's real file code runs against them."""
 import json
@@ -296,6 +297,7 @@ def stub_vmstat():
 class StubSimfps:
     def __init__(self, udid, secs, strip, start_at, raw_path):
         self.udid, self.secs, self.strip, self.start_at, self.raw = udid, secs, strip, start_at, raw_path
+        self.noframe = False
 
     def wait(self, timeout):
         cf = fault("counterfail")
@@ -336,7 +338,7 @@ class StubSimfps:
                 if mode != "busy":
                     lines.append("%.6f %d %d" % (t, -1, lum))
             if mode == "busy":
-                lines.append("%.6f %d %d" % (t, c if self.strip else -1, lum))
+                lines.append("%.6f %d %d" % (t, c if self.strip and not self.noframe else -1, lum))
         with open(self.raw, "w") as f:
             f.write("\n".join(lines) + "\n")
         n_frames = len(lines)
@@ -391,7 +393,14 @@ def install(mod):
 
     def spawn(udid, secs, label, strip, start_at, raw, probe=True):
         _log(["simfps", udid, "strip" if strip else "nostrip", "probe" if probe else "noprobe"])
-        return StubSimfps(udid, secs, strip, start_at, raw)
+        h = StubSimfps(udid, secs, strip, start_at, raw)
+        if label == "cycle":          # noframe@K: the K-th lifecycle launch never shows a readable app frame
+            s = load()
+            s["cycle_launches"] = s.get("cycle_launches", 0) + 1
+            save(s)
+            nf = fault("noframe")
+            h.noframe = nf is not None and s["cycle_launches"] == nf
+        return h
     mod.spawn_simfps = spawn
 
     calls = [0]

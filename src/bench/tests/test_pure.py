@@ -59,6 +59,28 @@ class Stats(unittest.TestCase):
         self.assertAlmostEqual(m2["longest_gap_s"], 0.067, places=2)
         self.assertEqual(stats.frame_stats([1.0])["fps"], 0.0)
 
+    def test_frame_stats_window_shows_a_freeze(self):
+        # 1 s at 60 fps, then the same picture until the 40 s window ends: not 60 fps with a 17 ms longest gap
+        t = [i / 60 for i in range(61)]
+        m = stats.frame_stats(t, bounds=(0.0, 40.0))
+        self.assertLess(m["fps"], 2.0)
+        self.assertGreater(m["longest_gap_s"], 38.0)
+        self.assertGreater(m["max_ms"], 38000)
+        self.assertEqual(m["over2x"], 1)
+        full = stats.frame_stats([i / 60 for i in range(2400)], bounds=(0.0, 40.0))      # animating to the end
+        self.assertAlmostEqual(full["fps"], 60.0, delta=0.1)
+        self.assertLess(full["longest_gap_s"], 0.02)
+        none = stats.frame_stats([], bounds=(0.0, 40.0))                                 # no frame at all
+        self.assertEqual((none["fps"], none["longest_gap_s"]), (0.0, 40.0))
+
+    def test_sim_metrics_window_fails_a_frozen_busy_sim(self):
+        raw = [(i / 60, i % 65536, 0) for i in range(61)] + [(1 + k * 0.016, 60, 0) for k in range(2440)]
+        sm = analysis.sim_metrics(0, "busy", raw, [], window=(0.0, 40.0))
+        self.assertLess(sm["fps"], 2.0)
+        self.assertIs(targets.evaluate(targets.parse_target(targets.DEFAULT_TARGETS[0]), [sm])["pass"], False)          # smooth60
+        late = [(0.5 + i / 60, i, 0) for i in range(2370)]          # the observer's first sample at 0.5 s is not a stall
+        self.assertLess(analysis.sim_metrics(0, "busy", late, [], window=(0.0, 40.0))["longest_gap_s"], 0.02)
+
     def test_stretches(self):
         t = [0, .01, .02, .03, 1.0, 1.01, 1.02]
         self.assertEqual(stats.stretches(t, 250), [(0, .03, 4), (1.0, 1.02, 3)])
@@ -130,6 +152,30 @@ class Strip(unittest.TestCase):
     def test_unreadable_share(self):
         s = [(i / 60, i) for i in range(50)] + [(1.0, -1)] * 10
         self.assertFalse(strip.strip_gate(strip.analyze_counters(s))[0])
+
+
+class AgentStrip(unittest.TestCase):
+    def test_each_launch_restarts_the_counter(self):
+        acts, raw, t = [], [], 0.0
+        for k in range(2):                                   # two ordinary launches of 180 frames, the app off between
+            acts.append({"op": "launch", "t0": t, "t1": t + 0.4, "rc": 0})
+            raw += [(t + 0.1 + j * 0.01, -1, 0) for j in range(5)]          # launching: no strip yet
+            raw += [(t + 0.5 + j / 60, j, 0) for j in range(180)]
+            acts.append({"op": "screenshot", "t0": t + 2, "t1": t + 2.2, "rc": 0})
+            acts.append({"op": "terminate", "t0": t + 3.5, "t1": t + 3.7, "rc": 0})
+            raw += [(t + 3.8 + j * 0.05, -1, 0) for j in range(20)]          # app off: unreadable, not judged
+            t += 5.0
+        whole = strip.analyze_counters([(x, c) for x, c, _ in raw])
+        self.assertGreater(whole["backwards"] + whole["jumps"], 0)       # the old analysis: a healthy run fails
+        a = analysis.agent_strip(raw, acts)
+        self.assertEqual((a["backwards"], a["jumps"], a["unreadable"], a["segments"]), (0, 0, 0, 2))
+        self.assertEqual(len(a["unique"]), 360)
+        self.assertTrue(strip.strip_gate(a)[0])
+
+    def test_out_of_order_inside_a_launch_still_fails(self):
+        acts = [{"op": "launch", "t0": 0.0, "t1": 0.3, "rc": 0}, {"op": "terminate", "t0": 4.0, "t1": 4.2, "rc": 0}]
+        raw = [(0.5 + j / 60, j, 0) for j in range(100)] + [(2.5, 50, 0)]
+        self.assertFalse(strip.strip_gate(analysis.agent_strip(raw, acts))[0])
 
 
 class Tears(unittest.TestCase):
@@ -282,6 +328,12 @@ class ABRule(unittest.TestCase):
         self.assertEqual(r["decision"], "CLOSE")
         r = abrule.decide(100, 110, 100, 110, tails={"p95": (20, 20.2, 20, 20.3, False)})
         self.assertEqual(r["decision"], "ADOPT")
+
+    def test_unmeasured_tail_closes(self):
+        r = abrule.decide(100, 110, 100, 110, tails={"input_p95": (None, None, None, None, False)})
+        self.assertEqual(r["decision"], "CLOSE")
+        self.assertIn("tail input_p95 not measured", r["why"])
+        self.assertFalse(r["tails"]["input_p95"]["measured"])
 
     def test_missing_values_close(self):
         self.assertEqual(abrule.decide(0, 1, 100, 110)["decision"], "CLOSE")

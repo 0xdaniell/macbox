@@ -28,29 +28,46 @@ def intervals_ms(times_s):
     return [(b - a) * 1000.0 for a, b in zip(times_s, times_s[1:])]
 
 
-def frame_stats(times_s, nominal_fps=60.0):
+def frame_stats(times_s, nominal_fps=60.0, bounds=None):
     """Per-simulator frame metrics from the times (seconds) of its distinct frames.
 
+    Without bounds:
     fps         (n - 1) / (last - first)
     p50..max    of the intervals between consecutive distinct frames, ms
     over2x      intervals longer than 2 / nominal_fps
     longest_gap_s  the longest interval in seconds
+
+    bounds = (t0, t1), the stretch the observer watched: frames outside it are dropped, fps is n / (t1 - t0),
+    and the gaps from t0 to the first frame and from the last frame to t1 count in max, over2x and the longest
+    gap (not in the percentiles), so a simulator that froze before the window ended shows it.
     """
+    if bounds:
+        t0, t1 = bounds
+        times_s = [t for t in times_s if t0 <= t <= t1]
     n = len(times_s)
     out = {"frames": n, "fps": 0.0, "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None,
            "over2x": 0, "longest_gap_s": None}
-    if n < 2:
-        return out
     iv = intervals_ms(times_s)
-    span = times_s[-1] - times_s[0]
-    out["fps"] = r1((n - 1) / span if span > 0 else 0.0)
-    out["p50_ms"] = r1(percentile(iv, 0.5))
-    out["p95_ms"] = r1(percentile(iv, 0.95))
-    out["p99_ms"] = r1(percentile(iv, 0.99))
-    out["max_ms"] = r1(max(iv))
-    thr = 2000.0 / nominal_fps
-    out["over2x"] = sum(1 for x in iv if x > thr)
-    out["longest_gap_s"] = r1(max(iv) / 1000.0, 3)
+    edges = []
+    if bounds:
+        dur = t1 - t0
+        out["fps"] = r1(n / dur if dur > 0 else 0.0)
+        edges = [(times_s[0] - t0) * 1000.0, (t1 - times_s[-1]) * 1000.0] if n else [dur * 1000.0]
+    elif n < 2:
+        return out
+    else:
+        span = times_s[-1] - times_s[0]
+        out["fps"] = r1((n - 1) / span if span > 0 else 0.0)
+    if iv:
+        out["p50_ms"] = r1(percentile(iv, 0.5))
+        out["p95_ms"] = r1(percentile(iv, 0.95))
+        out["p99_ms"] = r1(percentile(iv, 0.99))
+    gaps = iv + edges
+    if gaps:
+        out["max_ms"] = r1(max(gaps))
+        thr = 2000.0 / nominal_fps
+        out["over2x"] = sum(1 for x in gaps if x > thr)
+        out["longest_gap_s"] = r1(max(gaps) / 1000.0, 3)
     return out
 
 

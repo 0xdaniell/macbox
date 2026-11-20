@@ -38,8 +38,11 @@ def decide(a1, b1, a2, b2, higher_better=True, threshold=DEFAULT_THRESHOLD, tail
         t1, t2 = pair_effects(ta1, tb1, ta2, tb2, hb)
         te = None if t1 is None or t2 is None else (t1 + t2) / 2
         worse = te is not None and te < -tail_tol
-        tail_out[name] = {"effect": te, "worse": worse}
-        if worse:
+        tail_out[name] = {"effect": te, "worse": worse, "measured": te is not None}
+        if te is None:          # a tail the rule asked for but no arm pair measured cannot permit an adoption
+            adopt = False
+            why.append("tail %s not measured" % name)
+        elif worse:
             adopt = False
             why.append("tail %s worsens %+.1f%%" % (name, te * 100))
     return {"decision": "ADOPT" if adopt else "CLOSE", "effect": effect, "pairs": [e1, e2], "why": why, "tails": tail_out}

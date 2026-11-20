@@ -285,7 +285,9 @@ def grow(ctx, n, roles, install=True, parallel=False):
             for s_, bs in zip(fresh, b["sims"]):
                 ctx.sims.append({"idx": s_["idx"], "udid": s_["udid"]})
                 usable.append(bs["usable_s"])
-        boot = {"new": new, "all_usable_s": round(time.time() - t0, 2) if not parallel else groups[0][1]["all_s"], "each_usable_s": usable}
+        together = parallel and not ctx.stock          # stock devices are made and booted one by one even in a storm
+        boot = {"new": new, "all_usable_s": groups[0][1]["all_s"] if together else round(time.time() - t0, 2), "each_usable_s": usable,
+                "parallel": together}
     # roles may change with N (one-busy: only the first animates); (re)launch every simulator whose role changed or is new
     for i, s in enumerate(ctx.sims):
         want = roles[i]
@@ -396,9 +398,9 @@ def build_step(ctx, n, mix, g, s0, s1, t_go, boot=None):
         inj = [(x[0], x[1]) for x in s["injections"] if x[2] == 0 or True]
         if role == "agent":
             sm = {"idx": i, "role": role}
-            a_ = analysis.strip.analyze_counters([(t, c) for t, c, _ in raw])
+            a_ = analysis.agent_strip(raw, s["actions"])          # per launch: each one restarts the counter
             sm.update(analysis.motion_metrics([t for t, _ in a_["unique"]], a.nominal_fps))
-            sm["strip"] = {k: a_[k] for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks")}
+            sm["strip"] = {k: a_[k] for k in ("repeats", "lost", "backwards", "jumps", "unreadable", "span_ticks", "segments")}
             ok, why = analysis.strip.strip_gate(a_)
             sm["strip_gate"] = {"ok": ok, "why": why}
             sm.update(analysis.agent_metrics(s["actions"], raw))
@@ -407,7 +409,7 @@ def build_step(ctx, n, mix, g, s0, s1, t_go, boot=None):
             if role == "busy" and s["pace"] and raw:
                 ps = analysis.pace_summary(s["pace"], raw[0][0], raw[-1][0], t_go, t_end)
                 ticks = ps["app_ticks"]
-            sm = analysis.sim_metrics(i, role, raw, inj, a.nominal_fps, a.probe_timeout, ticks)
+            sm = analysis.sim_metrics(i, role, raw, inj, a.nominal_fps, a.probe_timeout, ticks, window=(t_go - 0.001, t_end))
             if role == "busy" and s["pace"] and raw:
                 sm["app_tick_fps"] = ps["app_tick_fps"]
         if role in ("busy", "agent") and sm.get("frames"):

@@ -18,6 +18,10 @@ def results():
         cases = {"clean": (SWEEP, ""), "unsettled": (SWEEP, "unsettled@2"), "lost": (SWEEP, "lostsim@2"), "counter": (SWEEP, "counterfail@2"),
                  "foreign": (SWEEP, "foreign@2"),
                  "ab_lost": (["ab", "--knob", "live:group_x=1", "--n", "2", "--arm-settle", "0.2", "--secs", "3", "--settle-max", "2"], "lostsim@2"),
+                 "lc_noframe": (["lifecycle", "--cycles", "2", "--secs", "3"], "noframe@1"),
+                 "lc_stock_storm": (["lifecycle", "--cycles", "1", "--storm", "2", "--secs", "3", "--stock-devices"], ""),
+                 "ab_input_tail": (["ab", "--knob", "live:group_x=1", "--n", "1", "--metric", "total_fps", "--tails", "input_p95", "--arm-settle", "0.2", "--secs", "4", "--settle-max", "2"], ""),
+                 "ab_input_agent": (["ab", "--knob", "live:group_x=1", "--n", "1", "--mix", "agent", "--metric", "total_fps", "--tails", "input_p95", "--secs", "3"], ""),
                  "soak_counter": (["soak", "--soak-n", "2", "--soak-minutes", "0.2", "--soak-every", "5", "--secs", "3", "--settle-max", "2"], "counterfail@2")}
         with concurrent.futures.ThreadPoolExecutor(8) as ex:
             futs = {k: ex.submit(run_case, a, f) for k, (a, f) in cases.items()}
@@ -97,6 +101,34 @@ class FrameCounter(unittest.TestCase):
         self.assertEqual(r["doc"]["gates"]["counter"]["status"], "FAIL")
         self.assertEqual(sections(r["doc"], "gate:counter")[0]["status"], "FAIL")
         self.assertNotEqual(r["rc"], 0, r["out"][-600:])
+
+    def test_a_launch_with_no_app_frame_fails_the_lifecycle(self):
+        r = results()["lc_noframe"]
+        s = sections(r["doc"], "lifecycle")[0]
+        self.assertEqual(s["status"], "FAIL", s["line"])
+        self.assertIn("cycle 1 cold_first_frame_s", s["line"])
+        self.assertNotEqual(r["rc"], 0)
+
+    def test_a_stock_storm_is_timed_and_named_as_serial(self):
+        r = results()["lc_stock_storm"]
+        st = r["doc"]["data"]["storm"]
+        self.assertFalse(st["parallel"])
+        self.assertGreaterEqual(st["boot_all_s"], max(st["each_s"]))          # the whole serial time, not the first boot
+        self.assertIn("one after the other", sections(r["doc"], "storm")[0]["line"])
+        self.assertEqual(sims_booted(r["state"]), [])
+
+    def test_an_input_tail_turns_the_probes_on(self):
+        r = results()["ab_input_tail"]
+        self.assertEqual(r["rc"], 0, r["out"][-800:])
+        t = r["doc"]["data"]["decision"]["tails"]["input_p95"]
+        self.assertTrue(t["measured"], r["doc"]["data"]["decision"])
+        self.assertTrue(all(a["values"]["input_p95"] is not None for a in r["doc"]["data"]["arms"]))
+        self.assertEqual(sims_booted(r["state"]), [])
+
+    def test_an_input_tail_needs_a_mix_with_probes(self):
+        r = results()["ab_input_agent"]
+        self.assertNotEqual(r["rc"], 0)
+        self.assertIn("needs input probes", r["out"])
 
     def test_gate_unit(self):
         ok = {"role": "busy", "simfps": {"fps": 60}, "raw": "1.0 5 255\n1.1 6 255\n"}

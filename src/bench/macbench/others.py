@@ -77,12 +77,15 @@ def run_lifecycle(ctx):
     keys = sorted({k for c in cyc for k in c})
     med = {k: _median([c[k] for c in cyc if c.get(k) is not None]) for k in keys}
     data["median_s"] = med
-    ok = all(v is not None for v in med.values()) and bool(cyc)
+    missing = ["cycle %d %s" % (i + 1, k) for i, c in enumerate(cyc) for k in keys if c.get(k) is None]
+    data["missing"] = missing
+    ok = all(v is not None for v in med.values()) and bool(cyc) and not missing
     names = (("create_s", "create"), ("clone_s", "clone of the seed" if not ctx.stock else "clone"), ("cold_boot_s", "cold boot"), ("install_s", "install"),
              ("cold_launch_call_s", "launch call"), ("cold_first_frame_s", "first app frame"), ("shutdown_s", "shutdown"), ("resume_boot_s", "resume boot"),
              ("resume_first_frame_s", "first frame after resume"), ("clone_boot_s", "clone boot"), ("delete_s", "delete"))
     ctx.section("lifecycle", "PASS" if ok else "FAIL", "LIFECYCLE %s (%d cycles, medians, s; %s): %s" % (
-        "PASS" if ok else "FAIL", len(cyc), "fresh stock devices" if ctx.stock else "clones of the seed", ", ".join("%s %s" % (label, med[k]) for k, label in names if k in med)))
+        "PASS" if ok else "FAIL", len(cyc), "fresh stock devices" if ctx.stock else "clones of the seed", ", ".join("%s %s" % (label, med[k]) for k, label in names if k in med)) +
+        ("; no value (a step failed, e.g. no app frame): %s" % ", ".join(missing[:6]) if missing else ""))
     leaks = {"qemu_mem": gates.leak_gate("QEMU memory (RSS + swap)", xs, rss, a.leak_rss_mb, "MB/cycle"),
              "guest_used": gates.leak_gate("guest used memory", xs, used, a.leak_guest_mb, "MB/cycle")}
     data["leak"] = {"qemu_mem_mb": rss, "guest_used_mb": used}
@@ -98,10 +101,11 @@ def run_lifecycle(ctx):
             t0 = time.time()
             boot = core.grow(ctx, n, ["busy"] * n, parallel=True)
             usable = time.time() - t0
-            data["storm"] = {"n": n, "boot_all_s": boot.get("all_usable_s"), "each_s": boot.get("each_usable_s"), "boot_and_launch_s": round(usable, 1)}
+            how = "at once" if boot.get("parallel") else "one after the other (stock devices)"
+            data["storm"] = {"n": n, "parallel": boot.get("parallel"), "boot_all_s": boot.get("all_usable_s"), "each_s": boot.get("each_usable_s"), "boot_and_launch_s": round(usable, 1)}
             ok = usable <= a.storm_bar_s
-            ctx.section("storm", "PASS" if ok else "FAIL", "BOOT STORM %s: %d simulators booted at once: all booted in %s s (slowest %s s), booted and app launched in %.0f s (bar <= %g)" % (
-                "PASS" if ok else "FAIL", n, boot.get("all_usable_s"), max(boot.get("each_usable_s") or [0]), usable, a.storm_bar_s))
+            ctx.section("storm", "PASS" if ok else "FAIL", "BOOT STORM %s: %d simulators booted %s: all booted in %s s (slowest %s s), booted and app launched in %.0f s (bar <= %g)" % (
+                "PASS" if ok else "FAIL", n, how, boot.get("all_usable_s"), max(boot.get("each_usable_s") or [0]), usable, a.storm_bar_s))
     ctx.doc["gates"].update(ctx.coh.check(ctx.marks["coh"]))
     ctx.save()
 
@@ -139,12 +143,13 @@ def run_soak(ctx):
         gt = gates.leak_gate(k, xs, ys, bar, "MB/min")
         ctx.doc["gates"][gname] = gt
         ctx.section(gname, gt["status"], "SOAK %s: %s" % (gt["status"], gt["detail"]))
-    f0 = min([s["fps"] for s in res["start"]["sims"] if s.get("fps")] or [0])
-    f1 = min([s["fps"] for s in res["end"]["sims"] if s.get("fps")] or [0])
+    f0 = min([s["fps"] for s in res["start"]["sims"] if s.get("fps") is not None] or [0])          # 0 fps is a stalled simulator, kept
+    f1 = min([s["fps"] for s in res["end"]["sims"] if s.get("fps") is not None] or [0])
     ok = f0 > 0 and f1 >= 0.95 * f0
     ctx.section("soak_fps", "PASS" if ok else "FAIL", "SOAK %s: slowest simulator %.1f fps at the start, %.1f after %g min (bar: not below 95%%)" % ("PASS" if ok else "FAIL", f0, f1, a.soak_minutes))
     ctx.doc["gates"].update(ctx.coh.check(ctx.marks["coh"]))
-    ctx.doc["gates"]["strip"] = gates.strip_gate_of(res["end"]["sims"])
+    sg = [gates.strip_gate_of(res[k]["sims"]) for k in ("start", "end")]          # a failure in either window stands
+    ctx.doc["gates"]["strip"] = next((dict(g, detail="%s window: %s" % (k, g["detail"])) for k, g in zip(("start", "end"), sg) if g["status"] == "FAIL"), sg[-1])
     cg = [res[k]["counter"] for k in ("start", "end")]
     ctx.doc["gates"]["counter"] = next((g for g in cg if g["status"] == "FAIL"), cg[-1])
     for name in ("counter", "strip"):          # a failed gate is a FAIL section: it sets the exit code

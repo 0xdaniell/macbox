@@ -38,6 +38,9 @@ def run_ab(ctx):
         a.knob or "cmd", metric, "higher" if hb else "lower", a.threshold * 100, ",".join(tails) or "none", a.tail_tol * 100)
     ctx.log(rule)
     ctx.doc["params"]["rule"] = rule
+    needs_input = any(m.startswith("input_") for m in [metric] + tails)          # the metric or a tail it must not worsen
+    if needs_input and a.mix not in ("all-busy", "one-busy"):
+        raise Stop("%s needs input probes, which run only in the all-busy and one-busy mixes" % ",".join(m for m in [metric] + tails if m.startswith("input_")))
     knob = make_knob(a, ctx)
     info = core.setup_guest(ctx)
     core.capture_env(ctx, info)
@@ -48,7 +51,7 @@ def run_ab(ctx):
         raise Stop(reason)
     ctx.host.n = n
     core.grow(ctx, n, core.roles_for(mix, n))
-    ctx.probe_method = scale.calibrate(ctx, ctx.sims[0])["chosen"] if mix in ("all-busy", "one-busy") and metric == "input_p95" else "none"
+    ctx.probe_method = scale.calibrate(ctx, ctx.sims[0])["chosen"] if needs_input else "none"
     core.settle(ctx, "before the A/B")
     ctx.doc["data"] = {"knob": knob.describe(), "metric": metric, "arms": [], "n": n, "mix": mix}
     vals = {"A": [], "B": []}

@@ -248,6 +248,22 @@ class Gates(unittest.TestCase):
         self.assertEqual(r["qemu_log"]["status"], "FAIL")
         self.assertEqual(r["gpu_hang"]["status"], "FAIL")
 
+    def test_census_counters_are_per_surface_increments(self):
+        # the renderer's census counters are cumulative: a surface that had a risk before the run and repeats the
+        # same count is not a new failure; one that adds to it is, and so is a new surface with its own risk
+        line = lambda at, risk: json.dumps({"label": "present", "at": at, "w": 1206, "h": 2622, "overwrite_risk": risk, "sync_errors": 0}) + "\n"
+        wr(self.census, "a", line("0x1000", 1))
+        c = gates.Coherent(self.d, self.log, self.hang)
+        m = c.mark()
+        wr(self.census, "a", line("0x1000", 1))
+        self.assertEqual(c.check(m)["coherent_census"]["status"], "PASS")
+        wr(self.census, "a", line("0x1000", 2))
+        self.assertEqual(c.check(m)["coherent_census"]["status"], "FAIL")
+        c2 = gates.Coherent(self.d, self.log, self.hang)
+        m2 = c2.mark()
+        wr(self.census, "a", line("0x9000", 1))
+        self.assertEqual(c2.check(m2)["coherent_census"]["status"], "FAIL")
+
     def test_unreadable_is_skip_never_pass(self):
         r = gates.Coherent(None, None, None).check({"n": 0, "proc": {k: 0 for k in gates.PROCESS_GATES}, "log_off": None, "hang": False})
         self.assertTrue(all(g["status"] == "SKIP" for g in r.values()), r)
