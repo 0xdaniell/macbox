@@ -458,10 +458,10 @@ cmd_next() {  # where the setup stands, and the next step
     step " " "install macOS and turn on SSH, in the VM's screen (docs/setup.md, steps 5 to 8):"
     say "        1. Disk Utility: erase \"QEMU HARDDISK Media\" as APFS; quit it; Reinstall macOS (30 to 60 min)."
     say "        2. Before the first desktop, set Metal's error mode from Recovery: macbox boot-picker on,"
-    say "           restart into the Recovery entry, open Utilities > Terminal, then: macbox recovery-fix"
+    say "           restart into the Recovery entry, open Utilities > Terminal, then: macbox recovery-fix --ssh"
     say "        3. Setup Assistant: an admin user named $MACBOX_GUEST_USER, no Apple Account needed."
-    say "        4. In the desktop, open Terminal, then: macbox ssh-bootstrap"
-    say "        An agent can do all of it with macbox screenshot / click / type / key."
+    say "        4. Without --ssh in step 2: in the desktop, open Terminal, then: macbox ssh-bootstrap"
+    say "        An agent can do all of it with macbox screenshot / click / type / key / click-text."
     return
   fi
   step x "ssh $MACBOX_SSH_HOST"
@@ -492,12 +492,38 @@ cmd_gui() {  # screenshot / click / type / key / scroll / wait, through QMP in t
   esac
 }
 
-cmd_recovery_fix() {  # types the METAL_ERROR_MODE line into Recovery's Terminal (focused)
-  say "typing into the VM: the Metal error-mode line (Recovery > Utilities > Terminal must be in front)"
-  printf '%s\n' 'cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot' |
-    cmd_gui type -
+cmd_recovery_fix() {  # types into Recovery's Terminal (focused): the Metal error-mode line, or with
+  # --ssh / --user, src/lib/recovery-setup.sh (that, plus first-boot SSH and the keyboard type)
+  local mode=
+  case "${1:-}" in
+    "") ;;
+    --ssh|--user) mode=${1#--} ;;
+    *) die "usage: macbox recovery-fix [--ssh|--user]" ;;
+  esac
+  if [ -z "$mode" ]; then
+    say "typing into the VM: the Metal error-mode line (Recovery > Utilities > Terminal must be in front)"
+    printf '%s\n' 'cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot' |
+      cmd_gui type -
+    cmd_gui key ret
+    say "the VM restarts if every step worked; then pick macOS in the picker (macbox boot-picker off hides it again)"
+    return
+  fi
+  [ -f "$KEY.pub" ] || die "no key: macbox init"
+  local script=/tmp/macbox-setup.sh
+  say "typing into the VM (Recovery > Utilities > Terminal must be in front): $script, about four minutes"
+  printf '%s\n' "cat > $script" | cmd_gui type -
   cmd_gui key ret
-  say "the VM restarts if every step worked; then pick macOS in the picker (macbox boot-picker off hides it again)"
+  { printf 'MACBOX_USER=%s\nMACBOX_KEY=%s\nMACBOX_MKUSER=%s\n' "$MACBOX_GUEST_USER" "'$(cat "$KEY.pub")'" "$([ "$mode" = user ] && echo 1 || echo 0)"
+    sed -e 's/^[[:space:]]*//' -e '/^#/d' -e '/^$/d' "$REPO/src/lib/recovery-setup.sh"
+  } | cmd_gui type -
+  cmd_gui key ret
+  cmd_gui key ctrl-d
+  printf '%s\n' "bash $script && reboot" | cmd_gui type -
+  cmd_gui key ret
+  if [ "$mode" = user ]; then
+    say "it asks for $MACBOX_GUEST_USER's password twice, in the VM: type it there (or macbox type - and macbox key ret)"
+  fi
+  say "the VM restarts if every step worked; pick macOS in the picker. After Setup Assistant: ssh $MACBOX_SSH_HOST true"
 }
 
 cmd_ssh_bootstrap() {  # types into the desktop's Terminal: this host's key, then Remote Login on
@@ -685,7 +711,9 @@ Setup (docs/setup.md):
   macbox build [--upstream]   the image, then Reims vGPU + metal2vulkan + QEMU (patched; --upstream: as upstream)
   macbox create [--macos tahoe] [--offline]   a new VM; macOS downloads from Apple
   macbox next                 where the setup stands, and the next step
-  macbox recovery-fix         type the Metal error-mode line into Recovery's Terminal
+  macbox recovery-fix [--ssh|--user]   type the Metal error-mode line into Recovery's Terminal;
+                              --ssh: also SSH at first boot (no ssh-bootstrap) and the keyboard type;
+                              --user: also the admin user, made offline (experimental)
   macbox boot-picker on|off   OpenCore's boot picker (to reach Recovery)
   macbox ssh-bootstrap        type the SSH key + Remote Login line into the desktop's Terminal
   macbox provision [step...]  copy src/guest/ to the Mac and run it (default: base tools stream-settings)
@@ -704,6 +732,7 @@ Day to day:
   macbox ssh [command]
   macbox screenshot [out.png] | click X Y [right|double] | move X Y | scroll X Y N
   macbox type TEXT|-  |  key COMBO...  |  wait SECONDS [out.png]
+  macbox find TEXT | click-text TEXT [--nth N] [--right|--double] | wait-text SECONDS TEXT   (OCR)
   macbox coherent [status|reset]   Coherent's crash guard (MACBOX_COHERENT=auto|on|off)
   macbox video-kexts          reims-util's video kexts into OpenCore (for MACBOX_VIDEO=on)
   macbox backup <name>
@@ -742,9 +771,9 @@ case "$sub" in
     else say "applies at the next macbox up"; fi ;;
   ssh) exec ssh "$MACBOX_SSH_HOST" "$@" ;;
   screenshot) cmd_gui shot "$@" ;;
-  click|move|scroll|type|key) cmd_gui "$sub" "$@" ;;
+  click|move|scroll|type|key|find|click-text|wait-text) cmd_gui "$sub" "$@" ;;
   wait) cmd_gui wait "${2:-}" "${1:-60}" ;;
-  recovery-fix) cmd_recovery_fix ;;
+  recovery-fix) cmd_recovery_fix "$@" ;;
   boot-picker)
     case "${1:-}" in
       on) container_start; ctl update-opencore "$MACBOX_VM" --boot-selection ;;

@@ -44,6 +44,10 @@ publishers. Thank you to everyone who made them.
 | [FFmpeg](https://ffmpeg.org/) | `sim-fps` reads recordings with ffprobe | LGPL-2.1+/GPL |
 | [Android Emulator and SDK](https://developer.android.com/studio) | the optional Android emulators | Android SDK License |
 
+`macbox recovery-fix --ssh/--user` (the offline user, the keyboard type, the first-boot job) and
+OCR of the screen follow what [cocoon-macos](https://github.com/cocoonstack/cocoon-macos) (MIT)
+does to install macOS unattended; macbox's code is its own.
+
 The simulator verification loop in the `simulators` skill (record every flow, hold 60 fps, look at
 the frames) follows the principles of [Appllama](https://appllama.io)'s app design skill.
 

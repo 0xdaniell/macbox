@@ -105,11 +105,18 @@ comes up properly (no Dock, or a gray screen). Set it before the first desktop:
 3. In Recovery, open Utilities > **Terminal**, then on the host:
 
    ```sh
-   ./macbox recovery-fix
+   ./macbox recovery-fix --ssh
    ```
 
-   It types the line Reims's README gives into that Terminal. The VM restarts only if every step
-   worked. If it doesn't restart, read the error in the screen and fix it.
+   It types a script into that Terminal (about four minutes) and runs it: the line Reims's README
+   gives, the keyboard type for QEMU's keyboard (so the Keyboard Setup Assistant doesn't ask), and
+   a first-boot job that turns on SSH with your key as soon as Setup Assistant has made the user.
+   Plain `./macbox recovery-fix` types only the Metal line, and step 8 then turns on SSH. The VM
+   restarts only if every step worked. If it doesn't restart, read the error in the screen and fix it.
+
+   `--user` also makes the administrator offline, asking for its password in that Terminal. It is
+   experimental and has not been run through a full install: cocoon-macos reports that macOS 26
+   can still show Setup Assistant. If it does, go through it without making a second user.
 4. Choose macOS in the menu.
 
 ## 7. Setup Assistant
@@ -121,7 +128,11 @@ offers (Location Services, analytics, Screen Time, Siri).
 
 ## 8. SSH
 
-On the desktop, open Terminal (⌘Space, "Terminal", Return), then on the host:
+With `recovery-fix --ssh` in step 6, SSH answers once Setup Assistant is done: `ssh macbox sw_vers`.
+If it doesn't, `sudo cat /var/log/macbox-firstboot.log` in the VM's Terminal says why; do the rest
+of this step.
+
+Otherwise, on the desktop, open Terminal (⌘Space, "Terminal", Return), then on the host:
 
 ```sh
 ./macbox ssh-bootstrap
