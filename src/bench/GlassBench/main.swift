@@ -2,7 +2,14 @@
 // A table of cards scrolls by itself at a fixed speed (time-based, so a dropped
 // frame skips content rather than slowing the scroll) under a glass navigation bar,
 // a glass tab bar and a floating glass toolbar with a glass button that keeps pulsing.
-// Launch arguments: -noglass (no floating glass, opaque bars), -speed <pt/s>, -nostrip.
+// Launch arguments: -noglass (no floating glass, opaque bars), -speed <pt/s>, -nostrip,
+// -static (nothing animates: a fixed picture for pixel-exact checks and for a simulator that sits idle),
+// -probe (an input marker, see below).
+//
+// The input marker (-probe): a 30 pt square at (21, 160) pt that flips between white and black on every
+// tap, on the Darwin notification dev.macbox.glassbench.toggle (`simctl spawn <udid> notifyutil -p ...`) and
+// on every glassbench://toggle URL (`simctl openurl`). The bench times from the injection to the
+// first surface whose marker flipped (bench/README.md, "input proxy").
 //
 // The frame strip: every display-link tick draws a 16-bit counter as blocks at the top left, so a
 // frame can be told apart from the one before it all the way to a viewer (simfps --strip at the
@@ -14,6 +21,34 @@ import UIKit
 let launchArgs = ProcessInfo.processInfo.arguments
 let noGlass = launchArgs.contains("-noglass")
 let showStrip = !launchArgs.contains("-nostrip")
+let isStatic = launchArgs.contains("-static")
+let showProbe = launchArgs.contains("-probe")
+
+/// The input marker: white until toggled, then black, then white again. It follows the system appearance
+/// until the first toggle, so `simctl ui appearance` flips it too (the bench's fallback injection).
+final class ProbeMarker: UIView {
+    private var dark = false
+    init() {
+        super.init(frame: CGRect(x: 21, y: 160, width: 30, height: 30))
+        backgroundColor = .systemBackground
+        layer.borderWidth = 1; layer.borderColor = UIColor.gray.cgColor
+        isUserInteractionEnabled = false
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func toggle() {
+        dark.toggle()
+        overrideUserInterfaceStyle = dark ? .dark : .light
+    }
+}
+var probeMarker: ProbeMarker?
+
+/// Any touch on the window flips the marker (the bench's tap injection).
+final class BenchWindow: UIWindow {
+    override func sendEvent(_ event: UIEvent) {
+        if event.type == .touches, event.allTouches?.contains(where: { $0.phase == .began }) == true { probeMarker?.toggle() }
+        super.sendEvent(event)
+    }
+}
 
 final class FrameStrip: UIView {
     static let origin = CGPoint(x: 21, y: 120), block: CGFloat = 20
@@ -155,7 +190,7 @@ final class BenchViewController: UITableViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if !noGlass, let host = navigationController?.view, pulse.superview == nil { addFloatingGlass(to: host) }
-        guard link == nil else { return }  // viewDidAppear runs again on every return to the app
+        guard link == nil, !isStatic else { return }  // viewDidAppear runs again on every return to the app
         link = CADisplayLink(target: self, selector: #selector(step))
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
         startTime = CACurrentMediaTime()
@@ -243,8 +278,20 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         other.tabBarItem = UITabBarItem(title: "Other", image: UIImage(systemName: "square.grid.2x2"), tag: 1)
         let tabs = UITabBarController(); tabs.viewControllers = [nav, other]
         if noGlass { tabs.tabBar.isHidden = true }
-        let w = UIWindow(windowScene: ws); w.rootViewController = tabs; w.makeKeyAndVisible()
+        let w = BenchWindow(windowScene: ws); w.rootViewController = tabs; w.makeKeyAndVisible()
         if showStrip { let f = FrameStrip(); w.addSubview(f); frameStrip = f }
+        if showProbe {
+            let m = ProbeMarker(); w.addSubview(m); probeMarker = m
+            // `simctl spawn <udid> notifyutil -p dev.macbox.glassbench.toggle`: an event from outside that puts
+            // nothing on the screen but the marker's flip (an openurl raises an alert, an appearance switch redraws all).
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, { _, _, _, _, _ in
+                DispatchQueue.main.async { probeMarker?.toggle() }
+            }, "dev.macbox.glassbench.toggle" as CFString, nil, .deliverImmediately)
+        }
         window = w
+    }
+
+    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
+        if contexts.contains(where: { $0.url.scheme == "glassbench" }) { probeMarker?.toggle() }
     }
 }

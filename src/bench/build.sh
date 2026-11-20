@@ -25,6 +25,10 @@ cat > "$APP/Info.plist" <<'PLIST'
   <key>MinimumOSVersion</key><string>26.0</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UILaunchScreen</key><dict/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>dev.macbox.glassbench</string>
+    <key>CFBundleURLSchemes</key><array><string>glassbench</string></array>
+  </dict></array>
   <key>UIApplicationSceneManifest</key><dict>
     <key>UIApplicationSupportsMultipleScenes</key><false/>
   </dict>
